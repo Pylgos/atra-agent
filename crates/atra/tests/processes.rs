@@ -15,8 +15,8 @@ const RUNNER: &str = env!("CARGO_BIN_EXE_atra-runner");
 #[tokio::test]
 async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let mut system = TestSystem::start().await;
-    system.launch("one").await;
-    system.launch("two").await;
+    system.launch("one", "allow").await;
+    system.launch("two", "ask").await;
 
     let thread = system.create_thread().await;
     let turn = system
@@ -24,6 +24,44 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .await;
     assert!(turn.status.success(), "{turn:?}");
     assert_eq!(turn.stdout, b"observed model-output\n");
+
+    let denied_thread = system.create_thread().await;
+    let pending = system
+        .send_message(denied_thread, "request a denied command")
+        .await;
+    assert!(pending.status.success(), "{pending:?}");
+    let pending_stdout = String::from_utf8(pending.stdout).unwrap();
+    let denied_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
+    assert!(pending_stdout.contains("runner: two"), "{pending_stdout:?}");
+    assert!(
+        pending_stdout.contains("command: printf should-not-run > denied-marker"),
+        "{pending_stdout:?}"
+    );
+    let denied = system
+        .deny(denied_approval_id, "not in this environment")
+        .await;
+    assert!(denied.status.success(), "{denied:?}");
+    assert_eq!(
+        denied.stdout,
+        b"denied user denied the tool call: not in this environment\n"
+    );
+    assert!(!system.workspace.path().join("denied-marker").exists());
+
+    let allowed_thread = system.create_thread().await;
+    let pending = system
+        .send_message(allowed_thread, "request an approved command")
+        .await;
+    assert!(pending.status.success(), "{pending:?}");
+    let allowed_approval_id = String::from_utf8(pending.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let allowed = system.allow(allowed_approval_id).await;
+    assert!(allowed.status.success(), "{allowed:?}");
+    assert_eq!(allowed.stdout, b"approved approved-output\n");
 
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
     let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
@@ -212,6 +250,56 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         events[3].payload["content"],
         serde_json::json!("observed model-output")
     );
+    let denied_events = system.events(denied_thread).await;
+    assert_eq!(
+        denied_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "user_message",
+            "tool_call",
+            "approval_request",
+            "approval_response",
+            "tool_result",
+            "assistant_message",
+        ]
+    );
+    assert_eq!(
+        denied_events[3].payload,
+        serde_json::json!({
+            "approval_id": denied_approval_id,
+            "decision": "deny",
+            "reason": "not in this environment",
+        })
+    );
+    let allowed_events = system.events(allowed_thread).await;
+    assert_eq!(
+        allowed_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "user_message",
+            "tool_call",
+            "approval_request",
+            "approval_response",
+            "tool_result",
+            "assistant_message",
+        ]
+    );
+    assert_eq!(
+        allowed_events[3].payload,
+        serde_json::json!({
+            "approval_id": allowed_approval_id,
+            "decision": "allow",
+            "reason": null,
+        })
+    );
+    assert_eq!(
+        allowed_events[4].payload["result"]["output"],
+        serde_json::json!("approved-output")
+    );
 }
 
 struct TestSystem {
@@ -243,6 +331,34 @@ impl TestSystem {
                 {
                     "assistant_message": {
                         "content": "observed {{tool_output}}"
+                    }
+                },
+                {
+                    "tool_call": {
+                        "name": "exec_command",
+                        "arguments": {
+                            "runner": "two",
+                            "command": "printf should-not-run > denied-marker"
+                        }
+                    }
+                },
+                {
+                    "assistant_message": {
+                        "content": "denied {{tool_output}}"
+                    }
+                },
+                {
+                    "tool_call": {
+                        "name": "exec_command",
+                        "arguments": {
+                            "runner": "two",
+                            "command": "printf approved-output"
+                        }
+                    }
+                },
+                {
+                    "assistant_message": {
+                        "content": "approved {{tool_output}}"
                     }
                 }
             ]"#,
@@ -284,7 +400,7 @@ impl TestSystem {
         self.controller = Some(controller);
     }
 
-    async fn launch(&self, name: &str) {
+    async fn launch(&self, name: &str, approval: &str) {
         let output = self
             .atra()
             .args([
@@ -293,7 +409,7 @@ impl TestSystem {
                 "--name",
                 name,
                 "--approval",
-                "allow",
+                approval,
                 "--",
                 RUNNER,
                 "--stdio",
@@ -330,6 +446,29 @@ impl TestSystem {
                 "--message",
                 message,
             ])
+            .output()
+            .await
+            .unwrap()
+    }
+
+    async fn deny(&self, approval: u64, reason: &str) -> std::process::Output {
+        self.atra()
+            .args([
+                "approval",
+                "deny",
+                "--approval",
+                &approval.to_string(),
+                "--reason",
+                reason,
+            ])
+            .output()
+            .await
+            .unwrap()
+    }
+
+    async fn allow(&self, approval: u64) -> std::process::Output {
+        self.atra()
+            .args(["approval", "allow", "--approval", &approval.to_string()])
             .output()
             .await
             .unwrap()

@@ -65,6 +65,8 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
         runners: Mutex::new(HashMap::new()),
         store,
         provider: Mutex::new(provider),
+        approvals: Mutex::new(HashMap::new()),
+        next_approval_id: AtomicU64::new(0),
     });
 
     loop {
@@ -109,6 +111,8 @@ struct State {
     runners: Mutex<HashMap<String, Arc<Runner>>>,
     store: Store,
     provider: Mutex<Option<FakeProvider>>,
+    approvals: Mutex<HashMap<u64, PendingApproval>>,
+    next_approval_id: AtomicU64,
 }
 
 impl State {
@@ -141,6 +145,13 @@ impl State {
                     .collect();
                 Ok(ControllerResponse::ThreadEvents { events })
             }
+            ControllerRequest::ApprovalAllow { approval_id } => {
+                self.resolve_approval(approval_id, true, None).await
+            }
+            ControllerRequest::ApprovalDeny {
+                approval_id,
+                reason,
+            } => self.resolve_approval(approval_id, false, reason).await,
             ControllerRequest::RunnerLaunch {
                 name,
                 approval,
@@ -233,7 +244,10 @@ impl State {
             )
             .await
             .context("failed to save user message")?;
+        self.continue_turn(thread_id).await
+    }
 
+    async fn continue_turn(&self, thread_id: i64) -> Result<ControllerResponse> {
         loop {
             let events = self
                 .store
@@ -269,34 +283,122 @@ impl State {
                         )
                         .await
                         .context("failed to save tool call")?;
-                    let result = match name.as_str() {
+                    match name.as_str() {
                         "exec_command" => {
                             let arguments: ExecCommandArguments = serde_json::from_value(arguments)
                                 .context("fake model returned invalid exec_command arguments")?;
-                            self.runner(&arguments.runner)
-                                .await?
-                                .request(RunnerRequest::ExecCommand {
-                                    command: arguments.command,
-                                    cwd: arguments.cwd,
-                                    background: arguments.background,
-                                    timeout_ms: arguments.timeout_ms,
-                                    timeout_action: arguments.timeout_action,
-                                })
-                                .await?
+                            let runner = self.runner(&arguments.runner).await?;
+                            if runner.approval().await == ApprovalPolicy::Ask {
+                                let approval_id =
+                                    self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
+                                self.store
+                                    .append(
+                                        thread_id,
+                                        EventKind::ApprovalRequest,
+                                        json!({
+                                            "approval_id": approval_id,
+                                            "runner": &arguments.runner,
+                                            "command": &arguments.command,
+                                            "cwd": &arguments.cwd,
+                                        }),
+                                    )
+                                    .await
+                                    .context("failed to save approval request")?;
+                                let response = ControllerResponse::ApprovalRequired {
+                                    approval_id,
+                                    thread_id,
+                                    runner: arguments.runner.clone(),
+                                    command: arguments.command.clone(),
+                                    cwd: arguments.cwd.clone(),
+                                };
+                                self.approvals.lock().await.insert(
+                                    approval_id,
+                                    PendingApproval {
+                                        thread_id,
+                                        arguments,
+                                    },
+                                );
+                                return Ok(response);
+                            }
+                            let result = self.execute(arguments).await?;
+                            self.save_tool_result(thread_id, &name, result).await?;
                         }
                         _ => bail!("model requested unsupported tool {name}"),
-                    };
-                    self.store
-                        .append(
-                            thread_id,
-                            EventKind::ToolResult,
-                            json!({ "name": &name, "result": result }),
-                        )
-                        .await
-                        .context("failed to save tool result")?;
+                    }
                 }
             }
         }
+    }
+
+    async fn resolve_approval(
+        &self,
+        approval_id: u64,
+        allowed: bool,
+        reason: Option<String>,
+    ) -> Result<ControllerResponse> {
+        let pending = self
+            .approvals
+            .lock()
+            .await
+            .remove(&approval_id)
+            .with_context(|| format!("approval {approval_id} is not pending"))?;
+        self.store
+            .append(
+                pending.thread_id,
+                EventKind::ApprovalResponse,
+                json!({
+                    "approval_id": approval_id,
+                    "decision": if allowed { "allow" } else { "deny" },
+                    "reason": &reason,
+                }),
+            )
+            .await
+            .context("failed to save approval response")?;
+
+        let result = if allowed {
+            self.execute(pending.arguments).await?
+        } else {
+            let output = match reason {
+                Some(reason) => format!("user denied the tool call: {reason}"),
+                None => "user denied the tool call".to_owned(),
+            };
+            json!({ "status": "denied", "output": output })
+        };
+        self.save_tool_result(pending.thread_id, "exec_command", result)
+            .await?;
+        self.continue_turn(pending.thread_id).await
+    }
+
+    async fn execute(&self, arguments: ExecCommandArguments) -> Result<serde_json::Value> {
+        let response = self
+            .runner(&arguments.runner)
+            .await?
+            .request(RunnerRequest::ExecCommand {
+                command: arguments.command,
+                cwd: arguments.cwd,
+                background: arguments.background,
+                timeout_ms: arguments.timeout_ms,
+                timeout_action: arguments.timeout_action,
+            })
+            .await?;
+        serde_json::to_value(response).context("failed to encode tool result")
+    }
+
+    async fn save_tool_result(
+        &self,
+        thread_id: i64,
+        name: &str,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        self.store
+            .append(
+                thread_id,
+                EventKind::ToolResult,
+                json!({ "name": name, "result": result }),
+            )
+            .await
+            .context("failed to save tool result")?;
+        Ok(())
     }
 
     async fn launch_runner(
@@ -353,6 +455,11 @@ struct ExecCommandArguments {
     timeout_ms: Option<u64>,
     #[serde(default = "return_running")]
     timeout_action: TimeoutAction,
+}
+
+struct PendingApproval {
+    thread_id: i64,
+    arguments: ExecCommandArguments,
 }
 
 fn return_running() -> TimeoutAction {
@@ -439,6 +546,10 @@ impl Runner {
 
     async fn request(&self, request: RunnerRequest) -> Result<ControllerResponse> {
         self.client.request(request).await
+    }
+
+    async fn approval(&self) -> ApprovalPolicy {
+        self.config.lock().await.0
     }
 }
 

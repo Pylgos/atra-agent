@@ -27,6 +27,13 @@ pub enum ControllerRequest {
     ThreadEvents {
         thread_id: i64,
     },
+    ApprovalAllow {
+        approval_id: u64,
+    },
+    ApprovalDeny {
+        approval_id: u64,
+        reason: Option<String>,
+    },
     RunnerLaunch {
         name: String,
         approval: ApprovalPolicy,
@@ -65,6 +72,13 @@ pub enum ControllerResponse {
     },
     TurnCompleted {
         content: String,
+    },
+    ApprovalRequired {
+        approval_id: u64,
+        thread_id: i64,
+        runner: String,
+        command: String,
+        cwd: Option<String>,
     },
     ThreadEvents {
         events: Vec<ThreadEvent>,

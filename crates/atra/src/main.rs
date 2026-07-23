@@ -36,6 +36,10 @@ enum Command {
         #[command(subcommand)]
         command: ThreadCommand,
     },
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +60,20 @@ enum ThreadCommand {
     Events {
         #[arg(long)]
         thread: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    Allow {
+        #[arg(long)]
+        approval: u64,
+    },
+    Deny {
+        #[arg(long)]
+        approval: u64,
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -182,20 +200,15 @@ async fn run() -> Result<()> {
         Command::Thread {
             command: ThreadCommand::Send { thread, message },
         } => {
-            match send_controller_request(
+            let response = send_controller_request(
                 &endpoint,
                 ControllerRequest::ThreadSend {
                     thread_id: thread,
                     message,
                 },
             )
-            .await?
-            {
-                ControllerResponse::TurnCompleted { content } => println!("{content}"),
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-            Ok(())
+            .await?;
+            display_turn_response(response)
         }
         Command::Thread {
             command: ThreadCommand::Events { thread },
@@ -219,6 +232,31 @@ async fn run() -> Result<()> {
                 response => bail!("controller returned an unexpected response: {response:?}"),
             }
             Ok(())
+        }
+        Command::Approval {
+            command: ApprovalCommand::Allow { approval },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::ApprovalAllow {
+                    approval_id: approval,
+                },
+            )
+            .await?;
+            display_turn_response(response)
+        }
+        Command::Approval {
+            command: ApprovalCommand::Deny { approval, reason },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::ApprovalDeny {
+                    approval_id: approval,
+                    reason,
+                },
+            )
+            .await?;
+            display_turn_response(response)
         }
         Command::Runner {
             command:
@@ -323,6 +361,32 @@ async fn run() -> Result<()> {
             .await?;
             display_process_response(response)
         }
+    }
+}
+
+fn display_turn_response(response: ControllerResponse) -> Result<()> {
+    match response {
+        ControllerResponse::TurnCompleted { content } => {
+            println!("{content}");
+            Ok(())
+        }
+        ControllerResponse::ApprovalRequired {
+            approval_id,
+            runner,
+            command,
+            cwd,
+            ..
+        } => {
+            println!("{approval_id}");
+            println!("runner: {runner}");
+            println!("command: {command}");
+            if let Some(cwd) = cwd {
+                println!("cwd: {cwd}");
+            }
+            Ok(())
+        }
+        ControllerResponse::Error { message } => bail!("{message}"),
+        response => bail!("controller returned an unexpected response: {response:?}"),
     }
 }
 
@@ -484,6 +548,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         ControllerResponse::Running => println!("running"),
         ControllerResponse::ThreadCreated { .. }
         | ControllerResponse::TurnCompleted { .. }
+        | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. } => {
             bail!("controller returned an unexpected thread response")
         }
