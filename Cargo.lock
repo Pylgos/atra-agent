@@ -114,6 +114,7 @@ dependencies = [
  "anyhow",
  "atra-protocol",
  "clap",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

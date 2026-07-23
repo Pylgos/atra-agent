@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse};
+use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse, TimeoutAction};
 use clap::{Parser, Subcommand, ValueEnum};
 use rustix::process::getuid;
 use sha2::{Digest, Sha256};
@@ -57,6 +57,34 @@ enum RunnerCommand {
         command: String,
         #[arg(long)]
         cwd: Option<String>,
+        #[arg(long)]
+        background: bool,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        #[arg(long, value_enum, default_value_t = OnTimeout::ReturnRunning)]
+        on_timeout: OnTimeout,
+    },
+    Wait {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        process_handle: u64,
+        #[arg(long)]
+        timeout_ms: u64,
+    },
+    Write {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        process_handle: u64,
+        #[arg(long)]
+        text: String,
+    },
+    Stop {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        process_handle: u64,
     },
 }
 
@@ -66,11 +94,26 @@ enum Approval {
     Allow,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum OnTimeout {
+    ReturnRunning,
+    Terminate,
+}
+
 impl From<Approval> for ApprovalPolicy {
     fn from(value: Approval) -> Self {
         match value {
             Approval::Ask => Self::Ask,
             Approval::Allow => Self::Allow,
+        }
+    }
+}
+
+impl From<OnTimeout> for TimeoutAction {
+    fn from(value: OnTimeout) -> Self {
+        match value {
+            OnTimeout::ReturnRunning => Self::ReturnRunning,
+            OnTimeout::Terminate => Self::Terminate,
         }
     }
 }
@@ -127,7 +170,15 @@ async fn run() -> Result<()> {
             .await
         }
         Command::Runner {
-            command: RunnerCommand::Exec { name, command, cwd },
+            command:
+                RunnerCommand::Exec {
+                    name,
+                    command,
+                    cwd,
+                    background,
+                    timeout_ms,
+                    on_timeout,
+                },
         } => {
             let response = send_controller_request(
                 &endpoint,
@@ -135,31 +186,112 @@ async fn run() -> Result<()> {
                     runner: name,
                     command,
                     cwd,
+                    background,
+                    timeout_ms,
+                    timeout_action: on_timeout.into(),
+                },
+            )
+            .await?;
+            display_process_response(response)
+        }
+        Command::Runner {
+            command:
+                RunnerCommand::Wait {
+                    name,
+                    process_handle,
+                    timeout_ms,
+                },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::WaitProcess {
+                    runner: name,
+                    process_handle,
+                    timeout_ms,
+                },
+            )
+            .await?;
+            display_process_response(response)
+        }
+        Command::Runner {
+            command:
+                RunnerCommand::Write {
+                    name,
+                    process_handle,
+                    text,
+                },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::WriteProcess {
+                    runner: name,
+                    process_handle,
+                    input: text.into_bytes(),
                 },
             )
             .await?;
             match response {
-                ControllerResponse::CommandFinished {
-                    stdout,
-                    stderr,
-                    exit_code,
-                } => {
-                    print!("{stdout}");
-                    eprint!("{stderr}");
-                    if exit_code != Some(0) {
-                        bail!(
-                            "command exited with {}",
-                            exit_code
-                                .map(|code| format!("status {code}"))
-                                .unwrap_or_else(|| "a signal".to_owned())
-                        );
-                    }
-                    Ok(())
-                }
+                ControllerResponse::InputWritten => Ok(()),
                 ControllerResponse::Error { message } => bail!("{message}"),
                 response => bail!("controller returned an unexpected response: {response:?}"),
             }
         }
+        Command::Runner {
+            command:
+                RunnerCommand::Stop {
+                    name,
+                    process_handle,
+                },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::StopProcess {
+                    runner: name,
+                    process_handle,
+                },
+            )
+            .await?;
+            display_process_response(response)
+        }
+    }
+}
+
+fn display_process_response(response: ControllerResponse) -> Result<()> {
+    match response {
+        ControllerResponse::ProcessStarted { process_handle } => {
+            println!("{process_handle}");
+            Ok(())
+        }
+        ControllerResponse::ProcessRunning {
+            process_handle,
+            output,
+        } => {
+            print!("{output}");
+            eprintln!("process {process_handle} is still running");
+            Ok(())
+        }
+        ControllerResponse::ProcessFinished { output, exit_code } => {
+            print!("{output}");
+            if exit_code != Some(0) {
+                bail!(
+                    "command exited with {}",
+                    exit_code
+                        .map(|code| format!("status {code}"))
+                        .unwrap_or_else(|| "a signal".to_owned())
+                );
+            }
+            Ok(())
+        }
+        ControllerResponse::ProcessTimedOut { output } => {
+            print!("{output}");
+            bail!("command timed out")
+        }
+        ControllerResponse::ProcessStopped { output } => {
+            print!("{output}");
+            Ok(())
+        }
+        ControllerResponse::Error { message } => bail!("{message}"),
+        response => bail!("controller returned an unexpected response: {response:?}"),
     }
 }
 
@@ -282,8 +414,13 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         ControllerResponse::Running => println!("running"),
         ControllerResponse::Launched => println!("launched"),
         ControllerResponse::AlreadyRunning => println!("already running"),
-        ControllerResponse::CommandFinished { .. } => {
-            bail!("controller returned an unexpected command result")
+        ControllerResponse::ProcessStarted { .. }
+        | ControllerResponse::ProcessRunning { .. }
+        | ControllerResponse::ProcessFinished { .. }
+        | ControllerResponse::ProcessTimedOut { .. }
+        | ControllerResponse::InputWritten
+        | ControllerResponse::ProcessStopped { .. } => {
+            bail!("controller returned an unexpected process response")
         }
         ControllerResponse::Error { message } => bail!("{message}"),
     }

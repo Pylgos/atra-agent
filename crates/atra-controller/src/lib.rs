@@ -1,16 +1,25 @@
 use std::{
-    collections::HashMap, fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc,
+    collections::HashMap,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Stdio,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use atra_protocol::{
-    ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerResponse,
+    ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerRequestEnvelope,
+    RunnerResponse, RunnerResponseEnvelope,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, oneshot},
 };
 
 #[allow(dead_code)]
@@ -55,9 +64,7 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
                     }
                 });
             }
-            Err(error) => {
-                tracing::warn!(%error, "failed to accept controller connection");
-            }
+            Err(error) => tracing::warn!(%error, "failed to accept controller connection"),
         }
     }
 }
@@ -70,27 +77,10 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
-    let response = match request {
-        ControllerRequest::Status => ControllerResponse::Running,
-        ControllerRequest::RunnerLaunch {
-            name,
-            approval,
-            command,
-        } => match state.launch_runner(name, approval, command).await {
-            Ok(response) => response,
-            Err(error) => ControllerResponse::Error {
-                message: format!("{error:#}"),
-            },
-        },
-        ControllerRequest::ExecCommand {
-            runner,
-            command,
-            cwd,
-        } => match state.exec_command(&runner, command, cwd).await {
-            Ok(response) => response,
-            Err(error) => ControllerResponse::Error {
-                message: format!("{error:#}"),
-            },
+    let response = match state.handle(request).await {
+        Ok(response) => response,
+        Err(error) => ControllerResponse::Error {
+            message: format!("{error:#}"),
         },
     };
     let mut response =
@@ -99,16 +89,101 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
     stream
         .write_all(&response)
         .await
-        .context("failed to write controller response")?;
-    Ok(())
+        .context("failed to write controller response")
 }
 
 #[derive(Default)]
 struct State {
-    runners: Mutex<HashMap<String, Runner>>,
+    runners: Mutex<HashMap<String, Arc<Runner>>>,
 }
 
 impl State {
+    async fn handle(&self, request: ControllerRequest) -> Result<ControllerResponse> {
+        match request {
+            ControllerRequest::Status => Ok(ControllerResponse::Running),
+            ControllerRequest::RunnerLaunch {
+                name,
+                approval,
+                command,
+            } => self.launch_runner(name, approval, command).await,
+            ControllerRequest::ExecCommand {
+                runner,
+                command,
+                cwd,
+                background,
+                timeout_ms,
+                timeout_action,
+            } => {
+                tracing::debug!(
+                    runner,
+                    %command,
+                    cwd = cwd.as_deref(),
+                    background,
+                    ?timeout_ms,
+                    ?timeout_action,
+                    "executing command"
+                );
+                self.runner(&runner)
+                    .await?
+                    .request(RunnerRequest::ExecCommand {
+                        command,
+                        cwd,
+                        background,
+                        timeout_ms,
+                        timeout_action,
+                    })
+                    .await
+            }
+            ControllerRequest::WaitProcess {
+                runner,
+                process_handle,
+                timeout_ms,
+            } => {
+                self.runner(&runner)
+                    .await?
+                    .request(RunnerRequest::WaitProcess {
+                        process_handle,
+                        timeout_ms,
+                    })
+                    .await
+            }
+            ControllerRequest::WriteProcess {
+                runner,
+                process_handle,
+                input,
+            } => {
+                tracing::info!(
+                    runner,
+                    process_handle,
+                    input_bytes = input.len(),
+                    "writing process input"
+                );
+                tracing::trace!(
+                    runner,
+                    process_handle,
+                    input = %String::from_utf8_lossy(&input),
+                    "process input"
+                );
+                self.runner(&runner)
+                    .await?
+                    .request(RunnerRequest::WriteProcess {
+                        process_handle,
+                        input,
+                    })
+                    .await
+            }
+            ControllerRequest::StopProcess {
+                runner,
+                process_handle,
+            } => {
+                self.runner(&runner)
+                    .await?
+                    .request(RunnerRequest::StopProcess { process_handle })
+                    .await
+            }
+        }
+    }
+
     async fn launch_runner(
         &self,
         name: String,
@@ -123,68 +198,40 @@ impl State {
         }
 
         let mut runners = self.runners.lock().await;
-        if let Some(runner) = runners.get_mut(&name) {
+        if let Some(runner) = runners.get(&name) {
             if runner
                 .child
+                .lock()
+                .await
                 .try_wait()
                 .with_context(|| format!("failed to inspect runner {name}"))?
                 .is_none()
             {
-                runner.approval = approval;
-                runner.command = command;
+                *runner.config.lock().await = (approval, command);
                 return Ok(ControllerResponse::AlreadyRunning);
             }
             runners.remove(&name);
         }
 
-        let runner = Runner::start(&name, approval, command).await?;
+        let runner = Arc::new(Runner::start(&name, approval, command).await?);
         runners.insert(name, runner);
         Ok(ControllerResponse::Launched)
     }
 
-    async fn exec_command(
-        &self,
-        name: &str,
-        command: String,
-        cwd: Option<String>,
-    ) -> Result<ControllerResponse> {
-        tracing::debug!(
-            runner = name,
-            %command,
-            cwd = cwd.as_deref(),
-            "executing command"
-        );
-        let mut runners = self.runners.lock().await;
-        let runner = runners
-            .get_mut(name)
-            .with_context(|| format!("runner {name} is not running"))?;
-        let response = runner.exec_command(name, command, cwd).await?;
-        if let ControllerResponse::CommandFinished {
-            ref stdout,
-            ref stderr,
-            exit_code,
-        } = response
-        {
-            tracing::info!(
-                runner = name,
-                ?exit_code,
-                stdout_bytes = stdout.len(),
-                stderr_bytes = stderr.len(),
-                "command finished"
-            );
-        }
-        Ok(response)
+    async fn runner(&self, name: &str) -> Result<Arc<Runner>> {
+        self.runners
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .with_context(|| format!("runner {name} is not running"))
     }
 }
 
 struct Runner {
-    approval: ApprovalPolicy,
-    command: Vec<String>,
-    child: Child,
-    #[allow(dead_code)]
-    stdin: ChildStdin,
-    #[allow(dead_code)]
-    stdout: BufReader<ChildStdout>,
+    config: Mutex<(ApprovalPolicy, Vec<String>)>,
+    child: Mutex<Child>,
+    client: RunnerClient,
 }
 
 impl Runner {
@@ -198,7 +245,7 @@ impl Runner {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start runner {name} using {}", command[0]))?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .context("runner stdin was not available")?;
@@ -206,11 +253,11 @@ impl Runner {
             .stdout
             .take()
             .context("runner stdout was not available")?;
-        let mut stdout = BufReader::new(stdout);
         let stderr = child
             .stderr
             .take()
             .context("runner stderr was not available")?;
+
         let runner_name = name.to_owned();
         tokio::spawn(async move {
             let mut stderr = BufReader::new(stderr);
@@ -238,26 +285,10 @@ impl Runner {
             }
         });
 
-        let mut initialize = serde_json::to_vec(&RunnerRequest::Initialize)
-            .context("failed to encode runner initialize request")?;
-        initialize.push(b'\n');
-        stdin
-            .write_all(&initialize)
-            .await
-            .with_context(|| format!("failed to initialize runner {name}"))?;
-
-        let mut response = String::new();
-        stdout
-            .read_line(&mut response)
-            .await
-            .with_context(|| format!("failed to read readiness from runner {name}"))?;
-        let response: RunnerResponse = serde_json::from_str(&response)
-            .with_context(|| format!("runner {name} returned an invalid readiness response"))?;
-        match response {
-            RunnerResponse::Ready => {}
-            RunnerResponse::CommandFinished { .. } => {
-                bail!("runner {name} returned a command result during initialization")
-            }
+        let client = RunnerClient::new(stdin, stdout, name);
+        match client.request(RunnerRequest::Initialize).await? {
+            ControllerResponse::Running => {}
+            response => bail!("runner {name} returned an invalid readiness response: {response:?}"),
         }
         if child
             .try_wait()
@@ -269,47 +300,135 @@ impl Runner {
         tracing::info!(runner = name, "runner ready");
 
         Ok(Self {
-            approval,
-            command,
-            child,
-            stdin,
-            stdout,
+            config: Mutex::new((approval, command)),
+            child: Mutex::new(child),
+            client,
         })
     }
 
-    async fn exec_command(
-        &mut self,
-        name: &str,
-        command: String,
-        cwd: Option<String>,
-    ) -> Result<ControllerResponse> {
-        let mut request = serde_json::to_vec(&RunnerRequest::ExecCommand { command, cwd })
-            .context("failed to encode runner command")?;
-        request.push(b'\n');
-        self.stdin
-            .write_all(&request)
-            .await
-            .with_context(|| format!("failed to send command to runner {name}"))?;
+    async fn request(&self, request: RunnerRequest) -> Result<ControllerResponse> {
+        self.client.request(request).await
+    }
+}
 
-        let mut response = String::new();
-        self.stdout
-            .read_line(&mut response)
-            .await
-            .with_context(|| format!("failed to read command result from runner {name}"))?;
-        let response: RunnerResponse = serde_json::from_str(&response)
-            .with_context(|| format!("runner {name} returned an invalid command response"))?;
-        match response {
-            RunnerResponse::CommandFinished {
-                stdout,
-                stderr,
-                exit_code,
-            } => Ok(ControllerResponse::CommandFinished {
-                stdout,
-                stderr,
-                exit_code,
-            }),
-            RunnerResponse::Ready => bail!("runner {name} returned an unexpected ready response"),
+struct RunnerClient {
+    stdin: Mutex<ChildStdin>,
+    pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RunnerResponse>>>>,
+    next_request_id: AtomicU64,
+    name: String,
+}
+
+impl RunnerClient {
+    fn new(stdin: ChildStdin, stdout: tokio::process::ChildStdout, name: &str) -> Self {
+        let pending = Arc::new(StdMutex::new(
+            HashMap::<u64, oneshot::Sender<RunnerResponse>>::new(),
+        ));
+        let reader_pending = Arc::clone(&pending);
+        let runner_name = name.to_owned();
+        tokio::spawn(async move {
+            let mut stdout = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdout.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => match serde_json::from_str::<RunnerResponseEnvelope>(&line) {
+                        Ok(envelope) => {
+                            if let Some(sender) =
+                                reader_pending.lock().unwrap().remove(&envelope.request_id)
+                            {
+                                let _ = sender.send(envelope.response);
+                            } else {
+                                tracing::warn!(
+                                    runner = runner_name,
+                                    request_id = envelope.request_id,
+                                    "runner returned an unknown request ID"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                runner = runner_name,
+                                %error,
+                                "runner returned an invalid response"
+                            );
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            runner = runner_name,
+                            %error,
+                            "failed to read runner response"
+                        );
+                        break;
+                    }
+                }
+            }
+            for (_, sender) in reader_pending.lock().unwrap().drain() {
+                let _ = sender.send(RunnerResponse::Error {
+                    message: format!("runner {runner_name} disconnected"),
+                });
+            }
+        });
+
+        Self {
+            stdin: Mutex::new(stdin),
+            pending,
+            next_request_id: AtomicU64::new(0),
+            name: name.to_owned(),
         }
+    }
+
+    async fn request(&self, request: RunnerRequest) -> Result<ControllerResponse> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending.lock().unwrap().insert(request_id, sender);
+
+        let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
+            request_id,
+            request,
+        })
+        .context("failed to encode runner request")?;
+        request.push(b'\n');
+        if let Err(error) = self.stdin.lock().await.write_all(&request).await {
+            self.pending.lock().unwrap().remove(&request_id);
+            return Err(error)
+                .with_context(|| format!("failed to send request to runner {}", self.name));
+        }
+
+        let response = receiver
+            .await
+            .with_context(|| format!("runner {} disconnected", self.name))?;
+        map_runner_response(response)
+    }
+}
+
+fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
+    match response {
+        RunnerResponse::Ready => Ok(ControllerResponse::Running),
+        RunnerResponse::ProcessStarted { process_handle } => {
+            Ok(ControllerResponse::ProcessStarted { process_handle })
+        }
+        RunnerResponse::ProcessRunning {
+            process_handle,
+            output,
+        } => Ok(ControllerResponse::ProcessRunning {
+            process_handle,
+            output,
+        }),
+        RunnerResponse::ProcessFinished { output, exit_code } => {
+            tracing::info!(?exit_code, output_bytes = output.len(), "process finished");
+            Ok(ControllerResponse::ProcessFinished { output, exit_code })
+        }
+        RunnerResponse::ProcessTimedOut { output } => {
+            Ok(ControllerResponse::ProcessTimedOut { output })
+        }
+        RunnerResponse::InputWritten => Ok(ControllerResponse::InputWritten),
+        RunnerResponse::ProcessStopped { output } => {
+            Ok(ControllerResponse::ProcessStopped { output })
+        }
+        RunnerResponse::Error { message } => bail!("{message}"),
     }
 }
 

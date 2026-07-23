@@ -21,15 +21,17 @@ async fn status_reports_running() {
 #[tokio::test]
 async fn launching_a_live_runner_is_idempotent() {
     let controller = TestController::start().await;
-    let launch = || ControllerRequest::RunnerLaunch {
+    let launch = || {
+        ControllerRequest::RunnerLaunch {
         name: "test".to_owned(),
         approval: ApprovalPolicy::Ask,
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "IFS= read -r request; printf '%s\\n' '{\"status\":\"ready\"}'; cat >/dev/null"
+            "IFS= read -r request; printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; cat >/dev/null"
                 .to_owned(),
         ],
+    }
     };
 
     assert_eq!(
@@ -56,11 +58,11 @@ async fn executes_a_foreground_command_through_a_runner() {
                     "-c".to_owned(),
                     concat!(
                         "IFS= read -r initialize; ",
-                        "printf '%s\\n' '{\"status\":\"ready\"}'; ",
+                        "printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; ",
                         "IFS= read -r command; ",
                         "printf '%s\\n' ",
-                        "'{\"status\":\"command_finished\",\"stdout\":\"out\",",
-                        "\"stderr\":\"err\",\"exit_code\":7}'"
+                        "'{\"request_id\":1,\"status\":\"process_finished\",",
+                        "\"output\":\"outerr\",\"exit_code\":7}'"
                     )
                     .to_owned(),
                 ],
@@ -77,12 +79,14 @@ async fn executes_a_foreground_command_through_a_runner() {
                 runner: "test".to_owned(),
                 command: "printf out; printf err >&2; exit 7".to_owned(),
                 cwd: None,
+                background: false,
+                timeout_ms: None,
+                timeout_action: atra_protocol::TimeoutAction::ReturnRunning,
             },
         )
         .await,
-        ControllerResponse::CommandFinished {
-            stdout: "out".to_owned(),
-            stderr: "err".to_owned(),
+        ControllerResponse::ProcessFinished {
+            output: "outerr".to_owned(),
             exit_code: Some(7),
         }
     );

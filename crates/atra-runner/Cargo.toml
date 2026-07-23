@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 atra-protocol.workspace = true
 clap.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
