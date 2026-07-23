@@ -6,6 +6,10 @@
 
 Atraは個人開発者向けのツールです。マルチテナント基盤や企業向けオーケストレーションシステムではありません。記載された動作を完全に実現できる、最小の設計を優先してください。
 
+実装はstageごとに進めます。
+各stageを開始する前に、設計判断が必要な点をまとめ、ユーザーと相談してください。仕様に曖昧さがある場合や追加の設計判断が必要な場合も、推測で進めず、その時点で積極的に判断を仰いでください。
+stageが完了したら作業を止め、ユーザーへ確認を依頼してください。
+
 ## 1. 絶対的な実装原則: 過剰設計を避ける
 
 型、テーブル、フィールド、trait、プロトコルメソッド、サービス、状態機械、互換処理、設定レイヤーを追加する前に、それを今必要としている機能を特定してください。
@@ -15,7 +19,7 @@ Atraは個人開発者向けのツールです。マルチテナント基盤や�
 特に、以下は禁止します。
 
 - 古いAtraのプロトコル、schema、command、開発版との互換性を維持しない。
-- deprecated aliasや寛容なparserを追加しない。
+- deprecated aliasや、明示されたCodex `apply_patch`互換性以外の寛容なparserを追加しない。
 - 汎用remote execution frameworkを作らない。
 - 汎用filesystem RPC APIを作らない。
 - まだ存在しない機能のために詳細な永続化schemaを作らない。
@@ -85,6 +89,8 @@ Controllerは長時間動作するlocal processです。以下を所有します
 - Clientとのapproval interaction
 - 最小限の永続化
 
+Controllerはworkspaceごとに一つ持ちます。現時点ではworkspace root探索を行わず、`atra`を起動したcanonicalなcwdをworkspaceとします。
+
 ### Runner
 
 Runnerはhost、sandbox、container、remote command環境内で動く小さな実行processです。
@@ -114,11 +120,29 @@ atra controller run
 atra controller status
 ```
 
+現時点では`run`と`status`が実装済みです。`start`と`stop`はcanonical commandとして後続stageで実装します。
+
 Client–Controller間のlocal通信にはUnix Domain Socketを使います。
 
 runtime directoryとsocketのfilesystem permissionをlocal security boundaryとして使います。local Runner起動のためのtoken systemは追加しないでください。
 
-古いAtra versionとのprotocol compatibilityは不要です。version negotiationやadapterを実装せず、互換性がない場合は拒否してください。
+socket endpointはcanonical cwdのSHA-256 digest先頭16桁を使い、以下に配置します。
+
+```text
+$XDG_RUNTIME_DIR/atra/<workspace-digest>/controller.sock
+```
+
+`XDG_RUNTIME_DIR`がない場合は`/tmp/atra-<uid>/<workspace-digest>/controller.sock`を使います。directoryとsocketには現在のユーザーだけがアクセスできるpermissionを設定します。
+
+XDG directoryの解決には小さな`xdg` crateを使い、環境変数fallbackを独自に増やさないでください。
+
+Controller stateは以下に配置します。
+
+```text
+$XDG_STATE_HOME/atra/<workspace-digest>/controller.sqlite3
+```
+
+古いAtra versionとのprotocol compatibilityは不要です。ControllerとRunnerは常に同時配布するため、protocol version field、version negotiation、adapterを実装しないでください。
 
 このタスクではpublic network protocolを設計しません。
 
@@ -159,6 +183,15 @@ setup scriptを短く保つため、launch commandは共通値を標準で環境
 
 approval policyはlaunch commandで指定し、Controllerが保持・判定します。Runner自身がapproval policyを選択したり、権限を広げたりしてはいけません。
 
+最初のapproval policyは以下の二つです。
+
+```text
+ask
+allow
+```
+
+Runner設定は起動時またはControllerからのmessageで設定し、Runnerには永続化しません。Controllerも現時点では設定fileを持たず、launchのたびにmemory上の設定を更新します。設定変更によるlive Runnerの再起動は不要です。
+
 Docker、Podman、Bubblewrap、SSH固有のlauncher logicをControllerへ追加しないでください。これらはsetup scriptが渡す通常のcommandです。
 
 ## 7. Runner transport
@@ -176,6 +209,10 @@ Runnerはstdoutへlogを書いてはいけません。
 Controllerが任意commandを起動し、そのstdio connectionを直接所有します。永続的なrelay CLI processは不要です。
 
 Runner protocolはstrictかつ小さく保ってください。現在必要なcommand実行とpatch適用だけを支えれば十分です。
+
+同じRunnerで複数threadのtool callを同時に処理できるよう、Controller–Runner間のrequestには内部的な`request_id`を持たせ、responseを多重化します。これはユーザー向けprocess handleやprotocol versionではありません。
+
+実装はTokioを使用します。
 
 ## 8. Containerへのdeploy
 
@@ -246,13 +283,15 @@ return_running
 terminate
 ```
 
-`return_running`はprocessをRunner管理下に残し、それまでのoutputとprocess IDを返します。
+`return_running`はprocessをRunner管理下に残し、それまでのoutputとprocess handleを返します。
 
 `terminate`はprocess groupを停止し、timeout resultを返します。
 
 #### Background mode
 
-commandを開始し、速やかにprocess IDを返します。
+commandを開始し、速やかにprocess handleを返します。
+
+`process_handle`はRunner内だけで意味を持つopaqueな値です。Linux PIDと誤解される`process ID`という名称をprotocolやUIで使わないでください。
 
 modelがすべての長時間commandを正確に予測することを要求しません。foreground commandが予想外にtimeoutした場合も、`return_running`によってmanaged processへ移行できます。
 
@@ -283,12 +322,14 @@ process group全体を停止します。通常終了を試し、必要なら強�
 managed processはRunnerが所有します。
 
 - commandごとにprocess groupを作成する。
-- stdoutとstderrを取得する。
+- stdoutとstderrをprocess開始時から一つのstreamへmergeし、観測された順序を保つ。通常は両者を区別しない。
 - stdin書き込みを許可する。
 - Runner終了時にmanaged processを停止する。
 - RunnerまたはControllerの再起動をまたいでprocess stateを永続化しない。
 
 Controllerは操作とeventをrouteしますが、自身ではcommandを実行しません。
+
+直接利用にも有用なため、model-facing toolとは別に`atra runner exec`、`wait`、`write`、`stop`をCLIとして公開します。
 
 ## 10. tmuxとPTY
 
@@ -341,6 +382,8 @@ Atra patchは二つのtarget指定形式を持ちます。どちらも正式なf
 
 line numberが不明な場合、または小さな編集をcontextで記述する方が安い場合に、周辺source contentを使います。
 
+参照用Codex実装の`apply_patch`入力構文をすべて受理してください。少なくともAdd、Delete、Update、Move、`@@` context、`*** End of File`、複数file、複数chunk、heredoc wrapperを含みます。context探索はCodexと同様に、完全一致、末尾空白無視、前後空白無視、一般的なUnicode punctuationの正規化の順で照合します。
+
 ### Numbered range hunk
 
 freshなline numberを使い、境界source lineだけを再掲して長い連続範囲を置換します。
@@ -370,9 +413,15 @@ rangeはinclusiveです。
 
 一行rangeでは`@ end`を省略できます。
 
-fileを変更する前に全hunkを検証し、overlapを拒否し、atomicに適用してください。
+同じfile snapshotを対象とするhunkのoverlapは拒否してください。
 
-後続タスクで明示されない限り、fuzzy relocation、旧構文alias、寛容な自動修復を追加しないでください。
+file operationはpatchに書かれた順序で適用します。途中で失敗した場合、それ以前に成功した変更は保持し、atomic rollbackは行いません。
+
+Codex互換の空白差許容以外に、旧Atra構文aliasや根拠のない自動修復を追加しないでください。
+
+patch適用はRunnerの責務です。実装は単独利用者しかいない間は`atra-runner`内のprivate moduleに保ち、独立crateへ分割しないでください。
+
+model-facing `apply_patch`にもRunnerごとのapproval policyを適用します。直接利用向けに`atra runner apply-patch --name ... [--cwd ...]`を提供し、patch本文はstdinから読みます。
 
 ## 13. Bundle tool
 
@@ -423,6 +472,8 @@ threads
 threadに属する順序付きevent
 ```
 
+storageにはSQLiteを使います。一つのControllerが順序付きeventへ追記しつつ複数Clientから読み書きするため、transaction、同時access、query、durabilityを自前で再実装せずに済むことを優先します。
+
 event streamには、現在使用するevent kindだけが必要です。
 
 - user message
@@ -434,6 +485,8 @@ event streamには、現在使用するevent kindだけが必要です。
 Turn、branch、summary、blob、subagent、projection、context snapshot、将来のschedule用に、詳細tableや必須fieldを作らないでください。
 
 live process stateは永続化しません。
+
+pending approvalとRunner設定もController再起動をまたいで復元しません。
 
 現在実装中の機能が、それなしでは正しく動かない場合にだけfieldやtableを追加してください。
 
@@ -468,6 +521,8 @@ clipboard readは実装しません。
 
 pure logicには通常のRust unit testを使用します。
 
+細かいtestを大量に先回りして追加しないでください。必要最小限のtestをstageごとに徐々に追加します。実際の利用形態を通る少数のprocess-level integration testを、重複する細粒度testより優先してください。
+
 ### Integration test
 
 Rust integration testを`cargo test`から実行します。
@@ -488,14 +543,22 @@ test内部から`cargo run`を実行したり、Cargoを再帰起動したりし
 最初のcommand execution integration testでは以下を確認します。
 
 1. 短いcommandが完了し、outputを返す。
-2. foreground commandがtimeoutし、running process IDを返せる。
-3. background commandがrunning process IDを返す。
+2. foreground commandがtimeoutし、running process handleを返せる。
+3. background commandがrunning process handleを返す。
 4. 最初のprocessがactiveな間に別commandを実行できる。
 5. `wait_process`が後から完了を観測する。
 6. `write_process`がstdinへ到達する。
 7. `stop_process`がprocess groupを停止する。
 8. Runner終了後にmanaged processが残らない。
 9. Controller再起動後も会話eventが残る。
+10. 同じRunnerへの長いwaitが別requestをblockしない。
+11. stdoutとstderrのmerged outputが観測順を保つ。
+12. Codex互換patch、numbered range、途中失敗時の部分適用が動作する。
+13. `apply_patch`を含むmodel tool callがRunner policyに従ってapprovalされる。
+
+Controller processのstderrはtest workspace内のlog fileへ書き、testがpanicした場合だけ出力してください。pipe bufferによって子processを停止させないでください。
+
+Unix socket bindを禁止するsandbox内ではprocess-level integration testが失敗します。その場合、timeoutを延ばして隠さず、許可されたsandbox外実行で検証してください。controller socketの起動待ちは1秒のままにします。
 
 live Codex-subscription testは、手動またはagentが明示的に実行します。通常CIには含めません。
 
@@ -507,17 +570,17 @@ container、tmux、terminal固有動作は、default test frameworkを拡大せ�
 
 推奨順序:
 
-1. sliceに必要な最小限のRust workspaceと共通protocol typeを作る。
-2. `atra controller run`、local Unix socket、status処理を実装する。
-3. 最小限のthreadとordered event persistenceを実装する。
-4. `atra-runner --stdio`を実装する。
-5. `atra runner launch --name ... -- COMMAND...`を実装する。
-6. 短いforeground command向けの`exec_command`を実装する。
-7. managed running processと三つのprocess toolを追加する。
-8. 決定的なfake model providerとprocess-level integration testを追加する。
-9. fake providerを使う最小限のAtra agent loopを接続する。
-10. Runnerごとのpolicyに必要な範囲だけapproval routingを追加する。
-11. Atra patchを実装する。
+1. [完了] sliceに必要な最小限のRust workspaceと共通protocol typeを作る。
+2. [完了] `atra controller run`、local Unix socket、status処理を実装する。
+3. [完了] 最小限のthreadとordered event persistenceを実装する。
+4. [完了] `atra-runner --stdio`を実装する。
+5. [完了] `atra runner launch --name ... -- COMMAND...`を実装する。
+6. [完了] 短いforeground command向けの`exec_command`を実装する。
+7. [完了] managed running processと三つのprocess toolを追加する。
+8. [完了・9と同時実装] 決定的なfake model providerとprocess-level integration testを追加する。
+9. [完了・8と同時実装] fake providerを使う最小限のAtra agent loopを接続する。
+10. [完了] Runnerごとのpolicyに必要な範囲だけapproval routingを追加する。denyはoptionalなreasonを受け取れる。
+11. [完了] Atra patchを実装する。
 12. 最初の全画面TUIとOSC 52 copyを実装する。
 13. tool bundle deployとcontainerへのRunner uploadを実装する。
 14. real Codex-subscription providerを統合し、手動確認する。
@@ -526,7 +589,26 @@ architectureを完成済みに見せるためだけに後続stageを先回りし
 
 各stageの終了時には、追加の抽象化より動作とtestを優先してください。
 
-## 19. 未指定事項の扱い
+現在の次stageは12のTUIです。
+
+## 19. 実装上の共通方針
+
+application boundaryのerrorには`anyhow`とcontextを使い、デバッグ可能なerror chainを保ってください。storageなど、呼び出し側がerror kindを実際に判定する狭いboundaryだけtyped errorを使用します。用途のない大きなerror enumを先に作らないでください。
+
+loggingには`tracing`を使い、stdoutをprotocol専用に保つためstderrへ出力します。`RUST_LOG`を尊重し、default levelは`info`です。command本文は`debug`、stdinやpatch本文は`trace`で記録できます。Runner stderrはControllerが読み、Runner名を付けてController logへ流します。command、stdin、patchはtranscriptにも残るため、これらをlog対象から一律除外する必要はありません。
+
+workspaceには現在、役割ごとに以下のcrateがあります。
+
+```text
+atra
+atra-controller
+atra-protocol
+atra-runner
+```
+
+機能を独立crateにするのは複数の実利用者や明確なdependency boundaryが生じた場合だけにしてください。
+
+## 20. 未指定事項の扱い
 
 この文書に詳細がない場合:
 
