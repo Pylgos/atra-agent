@@ -65,10 +65,12 @@ dependencies = [
  "anyhow",
  "atra-controller",
  "atra-protocol",
+ "atra-runner",
  "clap",
  "rustix",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "xdg",
 ]
@@ -101,6 +103,7 @@ dependencies = [
  "atra-protocol",
  "clap",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

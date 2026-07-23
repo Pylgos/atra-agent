@@ -49,6 +49,14 @@ enum RunnerCommand {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    Exec {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        command: String,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -107,6 +115,40 @@ async fn run() -> Result<()> {
                 },
             )
             .await
+        }
+        Command::Runner {
+            command: RunnerCommand::Exec { name, command, cwd },
+        } => {
+            let response = send_controller_request(
+                &endpoint,
+                ControllerRequest::ExecCommand {
+                    runner: name,
+                    command,
+                    cwd,
+                },
+            )
+            .await?;
+            match response {
+                ControllerResponse::CommandFinished {
+                    stdout,
+                    stderr,
+                    exit_code,
+                } => {
+                    print!("{stdout}");
+                    eprint!("{stderr}");
+                    if exit_code != Some(0) {
+                        bail!(
+                            "command exited with {}",
+                            exit_code
+                                .map(|code| format!("status {code}"))
+                                .unwrap_or_else(|| "a signal".to_owned())
+                        );
+                    }
+                    Ok(())
+                }
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
         }
     }
 }
@@ -209,6 +251,39 @@ async fn controller_status(endpoint: &Path) -> Result<()> {
 
 async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Result<()> {
     let is_status = matches!(request, ControllerRequest::Status);
+    let response = send_controller_request(endpoint, request).await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error)
+            if is_status
+                && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    )
+                }) =>
+        {
+            println!("stopped");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match response {
+        ControllerResponse::Running => println!("running"),
+        ControllerResponse::Launched => println!("launched"),
+        ControllerResponse::AlreadyRunning => println!("already running"),
+        ControllerResponse::CommandFinished { .. } => {
+            bail!("controller returned an unexpected command result")
+        }
+        ControllerResponse::Error { message } => bail!("{message}"),
+    }
+    Ok(())
+}
+
+async fn send_controller_request(
+    endpoint: &Path,
+    request: ControllerRequest,
+) -> Result<ControllerResponse> {
     let mut stream = match UnixStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(error)
@@ -217,11 +292,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            if is_status {
-                println!("stopped");
-                return Ok(());
-            }
-            bail!("controller is not running");
+            return Err(error).context("controller is not running");
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -244,11 +315,5 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         .context("failed to read controller response")?;
     let response: ControllerResponse =
         serde_json::from_str(&response).context("failed to decode controller response")?;
-    match response {
-        ControllerResponse::Running => println!("running"),
-        ControllerResponse::Launched => println!("launched"),
-        ControllerResponse::AlreadyRunning => println!("already running"),
-        ControllerResponse::Error { message } => bail!("{message}"),
-    }
-    Ok(())
+    Ok(response)
 }

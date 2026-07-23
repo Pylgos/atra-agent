@@ -43,6 +43,52 @@ async fn launching_a_live_runner_is_idempotent() {
 }
 
 #[tokio::test]
+async fn executes_a_foreground_command_through_a_runner() {
+    let controller = TestController::start().await;
+    assert_eq!(
+        request(
+            &controller.endpoint,
+            ControllerRequest::RunnerLaunch {
+                name: "test".to_owned(),
+                approval: ApprovalPolicy::Allow,
+                command: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    concat!(
+                        "IFS= read -r initialize; ",
+                        "printf '%s\\n' '{\"status\":\"ready\"}'; ",
+                        "IFS= read -r command; ",
+                        "printf '%s\\n' ",
+                        "'{\"status\":\"command_finished\",\"stdout\":\"out\",",
+                        "\"stderr\":\"err\",\"exit_code\":7}'"
+                    )
+                    .to_owned(),
+                ],
+            },
+        )
+        .await,
+        ControllerResponse::Launched
+    );
+
+    assert_eq!(
+        request(
+            &controller.endpoint,
+            ControllerRequest::ExecCommand {
+                runner: "test".to_owned(),
+                command: "printf out; printf err >&2; exit 7".to_owned(),
+                cwd: None,
+            },
+        )
+        .await,
+        ControllerResponse::CommandFinished {
+            stdout: "out".to_owned(),
+            stderr: "err".to_owned(),
+            exit_code: Some(7),
+        }
+    );
+}
+
+#[tokio::test]
 async fn stalled_client_does_not_block_another_client() {
     let controller = TestController::start().await;
     let _stalled_client = UnixStream::connect(&controller.endpoint).await.unwrap();

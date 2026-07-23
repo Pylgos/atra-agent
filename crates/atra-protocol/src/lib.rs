@@ -16,6 +16,11 @@ pub enum ControllerRequest {
         approval: ApprovalPolicy,
         command: Vec<String>,
     },
+    ExecCommand {
+        runner: String,
+        command: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -24,17 +29,33 @@ pub enum ControllerResponse {
     Running,
     Launched,
     AlreadyRunning,
-    Error { message: String },
+    CommandFinished {
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RunnerRequest {
     Initialize,
+    ExecCommand {
+        command: String,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunnerResponse {
     Ready,
+    CommandFinished {
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+    },
 }

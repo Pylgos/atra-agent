@@ -77,6 +77,16 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
                 message: format!("{error:#}"),
             },
         },
+        ControllerRequest::ExecCommand {
+            runner,
+            command,
+            cwd,
+        } => match state.exec_command(&runner, command, cwd).await {
+            Ok(response) => response,
+            Err(error) => ControllerResponse::Error {
+                message: format!("{error:#}"),
+            },
+        },
     };
     let mut response =
         serde_json::to_vec(&response).context("failed to encode controller response")?;
@@ -125,6 +135,19 @@ impl State {
         let runner = Runner::start(&name, approval, command).await?;
         runners.insert(name, runner);
         Ok(ControllerResponse::Launched)
+    }
+
+    async fn exec_command(
+        &self,
+        name: &str,
+        command: String,
+        cwd: Option<String>,
+    ) -> Result<ControllerResponse> {
+        let mut runners = self.runners.lock().await;
+        let runner = runners
+            .get_mut(name)
+            .with_context(|| format!("runner {name} is not running"))?;
+        runner.exec_command(name, command, cwd).await
     }
 }
 
@@ -175,6 +198,9 @@ impl Runner {
             .with_context(|| format!("runner {name} returned an invalid readiness response"))?;
         match response {
             RunnerResponse::Ready => {}
+            RunnerResponse::CommandFinished { .. } => {
+                bail!("runner {name} returned a command result during initialization")
+            }
         }
         if child
             .try_wait()
@@ -191,6 +217,41 @@ impl Runner {
             stdin,
             stdout,
         })
+    }
+
+    async fn exec_command(
+        &mut self,
+        name: &str,
+        command: String,
+        cwd: Option<String>,
+    ) -> Result<ControllerResponse> {
+        let mut request = serde_json::to_vec(&RunnerRequest::ExecCommand { command, cwd })
+            .context("failed to encode runner command")?;
+        request.push(b'\n');
+        self.stdin
+            .write_all(&request)
+            .await
+            .with_context(|| format!("failed to send command to runner {name}"))?;
+
+        let mut response = String::new();
+        self.stdout
+            .read_line(&mut response)
+            .await
+            .with_context(|| format!("failed to read command result from runner {name}"))?;
+        let response: RunnerResponse = serde_json::from_str(&response)
+            .with_context(|| format!("runner {name} returned an invalid command response"))?;
+        match response {
+            RunnerResponse::CommandFinished {
+                stdout,
+                stderr,
+                exit_code,
+            } => Ok(ControllerResponse::CommandFinished {
+                stdout,
+                stderr,
+                exit_code,
+            }),
+            RunnerResponse::Ready => bail!("runner {name} returned an unexpected ready response"),
+        }
     }
 }
 
