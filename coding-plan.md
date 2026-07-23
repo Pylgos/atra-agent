@@ -581,7 +581,7 @@ container、tmux、terminal固有動作は、default test frameworkを拡大せ�
 9. [完了・8と同時実装] fake providerを使う最小限のAtra agent loopを接続する。
 10. [完了] Runnerごとのpolicyに必要な範囲だけapproval routingを追加する。denyはoptionalなreasonを受け取れる。
 11. [完了] Atra patchを実装する。
-12. 最初の全画面TUIとOSC 52 copyを実装する。
+12. [完了] 最初の全画面TUIとOSC 52 copyを実装する。
 13. tool bundle deployとcontainerへのRunner uploadを実装する。
 14. real Codex-subscription providerを統合し、手動確認する。
 
@@ -589,7 +589,7 @@ architectureを完成済みに見せるためだけに後続stageを先回りし
 
 各stageの終了時には、追加の抽象化より動作とtestを優先してください。
 
-現在の次stageは12のTUIです。
+現在の次stageは13のtool bundle deployとcontainerへのRunner uploadです。
 
 ## 19. 実装上の共通方針
 

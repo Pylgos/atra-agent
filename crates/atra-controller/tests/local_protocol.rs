@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse};
+use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse, Thread};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -15,6 +15,84 @@ async fn status_reports_running() {
     assert_eq!(
         status(&controller.endpoint).await,
         ControllerResponse::Running
+    );
+}
+
+#[tokio::test]
+async fn lists_threads_newest_first() {
+    let controller = TestController::start().await;
+    let first = request(
+        &controller.endpoint,
+        ControllerRequest::ThreadCreate {
+            display_name: Some("Named".to_owned()),
+        },
+    )
+    .await;
+    let second = request(
+        &controller.endpoint,
+        ControllerRequest::ThreadCreate { display_name: None },
+    )
+    .await;
+
+    assert_eq!(
+        (first, second),
+        (
+            ControllerResponse::ThreadCreated { thread_id: 1 },
+            ControllerResponse::ThreadCreated { thread_id: 2 },
+        )
+    );
+    assert_eq!(
+        request(&controller.endpoint, ControllerRequest::ThreadList).await,
+        ControllerResponse::ThreadList {
+            threads: vec![
+                Thread {
+                    id: 2,
+                    display_name: None
+                },
+                Thread {
+                    id: 1,
+                    display_name: Some("Named".to_owned())
+                }
+            ]
+        }
+    );
+
+    assert_eq!(
+        request(
+            &controller.endpoint,
+            ControllerRequest::ThreadRename {
+                thread_id: 1,
+                display_name: "Renamed".to_owned(),
+            },
+        )
+        .await,
+        ControllerResponse::ThreadRenamed
+    );
+    assert!(matches!(
+        request(
+            &controller.endpoint,
+            ControllerRequest::ThreadSend {
+                thread_id: 2,
+                message: "First prompt".to_owned(),
+            },
+        )
+        .await,
+        ControllerResponse::Error { .. }
+    ));
+    assert_eq!(
+        request(&controller.endpoint, ControllerRequest::ThreadList).await,
+        ControllerResponse::ThreadList {
+            threads: vec![
+                Thread {
+                    id: 2,
+                    display_name: Some("First prompt".to_owned())
+                },
+                Thread {
+                    id: 1,
+                    display_name: Some("Renamed".to_owned())
+                }
+            ]
+        }
     );
 }
 

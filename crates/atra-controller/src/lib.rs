@@ -119,13 +119,34 @@ impl State {
     async fn handle(&self, request: ControllerRequest) -> Result<ControllerResponse> {
         match request {
             ControllerRequest::Status => Ok(ControllerResponse::Running),
-            ControllerRequest::ThreadCreate => {
+            ControllerRequest::ThreadCreate { display_name } => {
                 let thread_id = self
                     .store
-                    .create_thread()
+                    .create_thread(display_name)
                     .await
                     .context("failed to create thread")?;
                 Ok(ControllerResponse::ThreadCreated { thread_id })
+            }
+            ControllerRequest::ThreadList => {
+                let threads = self
+                    .store
+                    .threads()
+                    .await
+                    .context("failed to list threads")?;
+                Ok(ControllerResponse::ThreadList { threads })
+            }
+            ControllerRequest::ThreadRename {
+                thread_id,
+                display_name,
+            } => {
+                if display_name.trim().is_empty() {
+                    bail!("thread display name must not be empty");
+                }
+                self.store
+                    .rename_thread(thread_id, display_name)
+                    .await
+                    .context("failed to rename thread")?;
+                Ok(ControllerResponse::ThreadRenamed)
             }
             ControllerRequest::ThreadSend { thread_id, message } => {
                 self.run_turn(thread_id, message).await
@@ -243,6 +264,10 @@ impl State {
     }
 
     async fn run_turn(&self, thread_id: i64, message: String) -> Result<ControllerResponse> {
+        self.store
+            .name_thread_if_unnamed(thread_id, message.clone())
+            .await
+            .context("failed to name thread")?;
         self.store
             .append(
                 thread_id,

@@ -19,7 +19,14 @@ pub enum TimeoutAction {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ControllerRequest {
     Status,
-    ThreadCreate,
+    ThreadCreate {
+        display_name: Option<String>,
+    },
+    ThreadList,
+    ThreadRename {
+        thread_id: i64,
+        display_name: String,
+    },
     ThreadSend {
         thread_id: i64,
         message: String,
@@ -75,6 +82,10 @@ pub enum ControllerResponse {
     ThreadCreated {
         thread_id: i64,
     },
+    ThreadList {
+        threads: Vec<Thread>,
+    },
+    ThreadRenamed,
     TurnCompleted {
         content: String,
     },
@@ -120,6 +131,12 @@ pub struct ThreadEvent {
     pub sequence: i64,
     pub kind: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Thread {
+    pub id: i64,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

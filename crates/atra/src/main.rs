@@ -40,6 +40,7 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -50,7 +51,17 @@ enum ControllerCommand {
 
 #[derive(Subcommand)]
 enum ThreadCommand {
-    Create,
+    Create {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    List,
+    Rename {
+        #[arg(long)]
+        thread: i64,
+        #[arg(long)]
+        name: String,
+    },
     Send {
         #[arg(long)]
         thread: i64,
@@ -194,14 +205,49 @@ async fn run() -> Result<()> {
             command: ControllerCommand::Status,
         } => controller_status(&endpoint).await,
         Command::Thread {
-            command: ThreadCommand::Create,
+            command: ThreadCommand::Create { name },
         } => {
-            match send_controller_request(&endpoint, ControllerRequest::ThreadCreate).await? {
+            match send_controller_request(
+                &endpoint,
+                ControllerRequest::ThreadCreate { display_name: name },
+            )
+            .await?
+            {
                 ControllerResponse::ThreadCreated { thread_id } => println!("{thread_id}"),
                 ControllerResponse::Error { message } => bail!("{message}"),
                 response => bail!("controller returned an unexpected response: {response:?}"),
             }
             Ok(())
+        }
+        Command::Thread {
+            command: ThreadCommand::List,
+        } => {
+            match send_controller_request(&endpoint, ControllerRequest::ThreadList).await? {
+                ControllerResponse::ThreadList { threads } => {
+                    for thread in threads {
+                        println!(
+                            "{}\t{}",
+                            thread.id,
+                            thread.display_name.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+            Ok(())
+        }
+        Command::Thread {
+            command: ThreadCommand::Rename { thread, name },
+        } => {
+            controller_request(
+                &endpoint,
+                ControllerRequest::ThreadRename {
+                    thread_id: thread,
+                    display_name: name,
+                },
+            )
+            .await
         }
         Command::Thread {
             command: ThreadCommand::Send { thread, message },
@@ -308,6 +354,7 @@ async fn run() -> Result<()> {
             .await?;
             display_process_response(response)
         }
+        Command::Tui => atra_tui::run(endpoint).await,
         Command::Runner {
             command: RunnerCommand::ApplyPatch { name, cwd },
         } => {
@@ -577,7 +624,9 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
     };
     match response {
         ControllerResponse::Running => println!("running"),
+        ControllerResponse::ThreadRenamed => println!("renamed"),
         ControllerResponse::ThreadCreated { .. }
+        | ControllerResponse::ThreadList { .. }
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. } => {

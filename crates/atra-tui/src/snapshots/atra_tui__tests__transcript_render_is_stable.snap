@@ -1,0 +1,15 @@
+---
+source: crates/atra-tui/src/lib_tests.rs
+assertion_line: 54
+expression: terminal.backend().to_string()
+---
+"┌Threads─────────┐┌Transcript────────────┐"
+"│+ New thread    ││hello                 │"
+"│● Current work  ││Atra                  │"
+"│  Untitled threa││a deliberately wrapped│"
+"│                ││ response             │"
+"└────────────────┘└──────────────────────┘"
+"┌Message─────────────────────────────────┐"
+"│next                                    │"
+"└────────────────────────────────────────┘"
+"Ready                                     "

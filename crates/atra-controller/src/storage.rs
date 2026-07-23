@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use atra_protocol::Thread;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -62,7 +63,8 @@ impl Store {
                     PRAGMA foreign_keys = ON;
 
                     CREATE TABLE IF NOT EXISTS threads (
-                        id INTEGER PRIMARY KEY
+                        id INTEGER PRIMARY KEY,
+                        display_name TEXT
                     );
 
                     CREATE TABLE IF NOT EXISTS events (
@@ -80,11 +82,70 @@ impl Store {
         Ok(Self { connection })
     }
 
-    pub async fn create_thread(&self) -> tokio_rusqlite::Result<i64> {
+    pub async fn create_thread(&self, display_name: Option<String>) -> tokio_rusqlite::Result<i64> {
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO threads (display_name) VALUES (?1)",
+                    [display_name],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .await
+    }
+
+    pub async fn threads(&self) -> tokio_rusqlite::Result<Vec<Thread>> {
         self.connection
             .call(|connection| {
-                connection.execute("INSERT INTO threads DEFAULT VALUES", [])?;
-                Ok(connection.last_insert_rowid())
+                let mut statement =
+                    connection.prepare("SELECT id, display_name FROM threads ORDER BY id DESC")?;
+                statement
+                    .query_map([], |row| {
+                        Ok(Thread {
+                            id: row.get(0)?,
+                            display_name: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+    }
+
+    pub async fn rename_thread(
+        &self,
+        thread_id: i64,
+        display_name: String,
+    ) -> tokio_rusqlite::Result<()> {
+        self.connection
+            .call(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE threads SET display_name = ?1 WHERE id = ?2",
+                    params![display_name, thread_id],
+                )?;
+                if updated == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn name_thread_if_unnamed(
+        &self,
+        thread_id: i64,
+        display_name: String,
+    ) -> tokio_rusqlite::Result<()> {
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "
+                    UPDATE threads
+                    SET display_name = ?1
+                    WHERE id = ?2 AND display_name IS NULL
+                    ",
+                    params![display_name, thread_id],
+                )?;
+                Ok(())
             })
             .await
     }
@@ -169,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn events_keep_their_thread_order() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let thread = store.create_thread().await.unwrap();
+        let thread = store.create_thread(None).await.unwrap();
 
         assert_eq!(
             store
@@ -211,7 +272,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("controller.sqlite3");
         let store = Store::open(&database).await.unwrap();
-        let thread = store.create_thread().await.unwrap();
+        let thread = store.create_thread(None).await.unwrap();
         store
             .append(thread, EventKind::UserMessage, json!({"content": "saved"}))
             .await
@@ -227,6 +288,27 @@ mod tests {
                 kind: EventKind::UserMessage,
                 payload: json!({"content": "saved"}),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn threads_are_listed_newest_first() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let first = store.create_thread(Some("First".to_owned())).await.unwrap();
+        let second = store.create_thread(None).await.unwrap();
+
+        assert_eq!(
+            store.threads().await.unwrap(),
+            vec![
+                Thread {
+                    id: second,
+                    display_name: None,
+                },
+                Thread {
+                    id: first,
+                    display_name: Some("First".to_owned()),
+                },
+            ]
         );
     }
 }
