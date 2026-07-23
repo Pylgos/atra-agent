@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/atra", "crates/atra-protocol"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+[workspace.dependencies]
+atra-protocol = { path = "crates/atra-protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
