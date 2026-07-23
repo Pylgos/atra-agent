@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/atra", "crates/atra-protocol"]
+members = ["crates/atra", "crates/atra-controller", "crates/atra-protocol"]
 resolver = "3"
 
 [workspace.package]
@@ -8,5 +8,13 @@ license = "Apache-2.0"
 rust-version = "1.96"
 
 [workspace.dependencies]
+atra-controller = { path = "crates/atra-controller" }
 atra-protocol = { path = "crates/atra-protocol" }
+clap = { version = "4.5.51", features = ["derive"] }
+rustix = { version = "1.1.2", features = ["process"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt"] }
+xdg = "3.0.0"
