@@ -1,11 +1,10 @@
 use std::{
-    env,
-    error::Error,
-    fs,
+    env, fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, Result, bail};
 use atra_protocol::{ControllerRequest, ControllerResponse};
 use clap::{Parser, Subcommand};
 use rustix::process::getuid;
@@ -14,8 +13,6 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-
-type AppError = Box<dyn Error + Send + Sync>;
 
 #[derive(Parser)]
 #[command(name = "atra")]
@@ -41,12 +38,12 @@ enum ControllerCommand {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("atra: {error}");
+        eprintln!("atra: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), AppError> {
+async fn run() -> Result<()> {
     let command = Cli::parse().command;
     let workspace_id = workspace_id()?;
     let endpoint = controller_endpoint(&workspace_id)?;
@@ -64,12 +61,14 @@ async fn run() -> Result<(), AppError> {
     }
 }
 
-fn workspace_id() -> Result<String, AppError> {
-    let cwd = fs::canonicalize(env::current_dir()?)?;
+fn workspace_id() -> Result<String> {
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let cwd = fs::canonicalize(&cwd)
+        .with_context(|| format!("failed to resolve workspace directory {}", cwd.display()))?;
     Ok(format!("{:x}", Sha256::digest(cwd.as_os_str().as_encoded_bytes()))[..16].to_owned())
 }
 
-fn controller_endpoint(workspace_id: &str) -> Result<PathBuf, AppError> {
+fn controller_endpoint(workspace_id: &str) -> Result<PathBuf> {
     if let Some(endpoint) = env::var_os("ATRA_CONTROLLER_ENDPOINT") {
         return Ok(PathBuf::from(endpoint));
     }
@@ -85,15 +84,16 @@ fn controller_endpoint(workspace_id: &str) -> Result<PathBuf, AppError> {
     Ok(workspace_dir.join("controller.sock"))
 }
 
-fn controller_database(workspace_id: &str) -> Result<PathBuf, AppError> {
+fn controller_database(workspace_id: &str) -> Result<PathBuf> {
     if let Some(database) = env::var_os("ATRA_CONTROLLER_STATE") {
         return Ok(PathBuf::from(database));
     }
 
     let state_home = xdg::BaseDirectories::new()
         .get_state_home()
-        .ok_or("cannot determine the XDG state directory")?;
-    fs::create_dir_all(&state_home)?;
+        .context("cannot determine the XDG state directory")?;
+    fs::create_dir_all(&state_home)
+        .with_context(|| format!("failed to create state directory {}", state_home.display()))?;
     let atra_dir = state_home.join("atra");
     ensure_private_directory(&atra_dir)?;
     let workspace_dir = atra_dir.join(workspace_id);
@@ -101,29 +101,33 @@ fn controller_database(workspace_id: &str) -> Result<PathBuf, AppError> {
     Ok(workspace_dir.join("controller.sqlite3"))
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), AppError> {
+fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create directory {}", path.display()));
+        }
     }
 
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect directory {}", path.display()))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != getuid().as_raw()
         || metadata.mode() & 0o777 != 0o700
     {
-        return Err(format!(
+        bail!(
             "{} must be a directory owned by the current user with mode 0700",
             path.display()
-        )
-        .into());
+        );
     }
     Ok(())
 }
 
-async fn controller_status(endpoint: &Path) -> Result<(), AppError> {
+async fn controller_status(endpoint: &Path) -> Result<()> {
     let mut stream = match UnixStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(error)
@@ -135,15 +139,27 @@ async fn controller_status(endpoint: &Path) -> Result<(), AppError> {
             println!("stopped");
             return Ok(());
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to connect to controller at {}", endpoint.display())
+            });
+        }
     };
 
-    let mut request = serde_json::to_vec(&ControllerRequest::Status)?;
+    let mut request = serde_json::to_vec(&ControllerRequest::Status)
+        .context("failed to encode status request")?;
     request.push(b'\n');
-    stream.write_all(&request).await?;
+    stream
+        .write_all(&request)
+        .await
+        .context("failed to write status request")?;
     let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).await?;
-    let response: ControllerResponse = serde_json::from_str(&response)?;
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .await
+        .context("failed to read status response")?;
+    let response: ControllerResponse =
+        serde_json::from_str(&response).context("failed to decode status response")?;
     match response {
         ControllerResponse::Running => println!("running"),
     }

@@ -1,0 +1,68 @@
+use anyhow::{Context, Result};
+use atra_protocol::{RunnerRequest, RunnerResponse};
+use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+
+pub async fn run_stdio() -> Result<()> {
+    serve(BufReader::new(io::stdin()), io::stdout()).await
+}
+
+async fn serve(
+    mut reader: impl AsyncBufRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    let mut request = String::new();
+    reader
+        .read_line(&mut request)
+        .await
+        .context("failed to read runner request")?;
+    let request: RunnerRequest =
+        serde_json::from_str(&request).context("failed to decode runner request")?;
+
+    match request {
+        RunnerRequest::Initialize => {
+            let mut response = serde_json::to_vec(&RunnerResponse::Ready)
+                .context("failed to encode runner response")?;
+            response.push(b'\n');
+            writer
+                .write_all(&response)
+                .await
+                .context("failed to write runner response")?;
+            writer
+                .flush()
+                .await
+                .context("failed to flush runner stdout")?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_reports_ready() {
+        let input = BufReader::new(&b"{\"method\":\"initialize\"}\n"[..]);
+        let mut output = Vec::new();
+
+        serve(input, &mut output).await.unwrap();
+
+        assert_eq!(output, b"{\"status\":\"ready\"}\n");
+    }
+
+    #[tokio::test]
+    async fn unsupported_message_is_rejected_without_output() {
+        let input = BufReader::new(&b"{\"method\":\"execute\"}\n"[..]);
+        let (mut output_reader, output_writer) = tokio::io::duplex(64);
+
+        let error = serve(input, output_writer).await.unwrap_err();
+        let mut output = Vec::new();
+        output_reader.read_to_end(&mut output).await.unwrap();
+
+        assert!(format!("{error:#}").contains("unknown variant"));
+        assert!(output.is_empty());
+    }
+}
