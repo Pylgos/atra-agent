@@ -31,6 +31,11 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
 
     let listener = UnixListener::bind(endpoint)
         .with_context(|| format!("failed to bind controller socket {}", endpoint.display()))?;
+    tracing::info!(
+        endpoint = %endpoint.display(),
+        database = %database.display(),
+        "controller started"
+    );
     fs::set_permissions(endpoint, fs::Permissions::from_mode(0o600)).with_context(|| {
         format!(
             "failed to set permissions on controller socket {}",
@@ -46,12 +51,12 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(stream, &state).await {
-                        eprintln!("atra controller: {error:#}");
+                        tracing::warn!(error = %format!("{error:#}"), "client request failed");
                     }
                 });
             }
             Err(error) => {
-                eprintln!("atra controller: {error}");
+                tracing::warn!(%error, "failed to accept controller connection");
             }
         }
     }
@@ -143,11 +148,32 @@ impl State {
         command: String,
         cwd: Option<String>,
     ) -> Result<ControllerResponse> {
+        tracing::debug!(
+            runner = name,
+            %command,
+            cwd = cwd.as_deref(),
+            "executing command"
+        );
         let mut runners = self.runners.lock().await;
         let runner = runners
             .get_mut(name)
             .with_context(|| format!("runner {name} is not running"))?;
-        runner.exec_command(name, command, cwd).await
+        let response = runner.exec_command(name, command, cwd).await?;
+        if let ControllerResponse::CommandFinished {
+            ref stdout,
+            ref stderr,
+            exit_code,
+        } = response
+        {
+            tracing::info!(
+                runner = name,
+                ?exit_code,
+                stdout_bytes = stdout.len(),
+                stderr_bytes = stderr.len(),
+                "command finished"
+            );
+        }
+        Ok(response)
     }
 }
 
@@ -163,11 +189,12 @@ struct Runner {
 
 impl Runner {
     async fn start(name: &str, approval: ApprovalPolicy, command: Vec<String>) -> Result<Self> {
+        tracing::info!(runner = name, executable = command[0], "starting runner");
         let mut child = Command::new(&command[0])
             .args(&command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start runner {name} using {}", command[0]))?;
@@ -180,6 +207,36 @@ impl Runner {
             .take()
             .context("runner stdout was not available")?;
         let mut stdout = BufReader::new(stdout);
+        let stderr = child
+            .stderr
+            .take()
+            .context("runner stderr was not available")?;
+        let runner_name = name.to_owned();
+        tokio::spawn(async move {
+            let mut stderr = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stderr.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        tracing::info!(
+                            runner = runner_name,
+                            message = line.trim_end(),
+                            "runner log"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            runner = runner_name,
+                            %error,
+                            "failed to read runner log"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
 
         let mut initialize = serde_json::to_vec(&RunnerRequest::Initialize)
             .context("failed to encode runner initialize request")?;
@@ -209,6 +266,7 @@ impl Runner {
         {
             return Err(anyhow!("runner {name} exited during initialization"));
         }
+        tracing::info!(runner = name, "runner ready");
 
         Ok(Self {
             approval,

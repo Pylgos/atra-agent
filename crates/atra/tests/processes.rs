@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{process::Stdio, time::Duration};
 
 use rustix::process::{Pid, test_kill_process};
 use tempfile::TempDir;
@@ -75,6 +75,7 @@ impl TestSystem {
             .env("ATRA_CONTROLLER_ENDPOINT", &endpoint)
             .env("ATRA_CONTROLLER_STATE", database)
             .current_dir(workspace.path())
+            .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();

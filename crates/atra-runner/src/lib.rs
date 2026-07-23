@@ -25,7 +25,10 @@ async fn serve(
     let initialize: RunnerRequest =
         serde_json::from_str(&request).context("failed to decode runner initialize request")?;
     match initialize {
-        RunnerRequest::Initialize => write_response(&mut writer, &RunnerResponse::Ready).await?,
+        RunnerRequest::Initialize => {
+            tracing::info!("runner initialized");
+            write_response(&mut writer, &RunnerResponse::Ready).await?
+        }
         RunnerRequest::ExecCommand { .. } => {
             anyhow::bail!("runner received a command before initialization")
         }
@@ -46,6 +49,7 @@ async fn serve(
         let response = match request {
             RunnerRequest::Initialize => anyhow::bail!("runner was initialized more than once"),
             RunnerRequest::ExecCommand { command, cwd } => {
+                tracing::debug!(%command, cwd = cwd.as_deref(), "executing command");
                 let mut child = Command::new("bash");
                 child.args(["-lc", &command]);
                 if let Some(cwd) = cwd {
@@ -55,6 +59,12 @@ async fn serve(
                     .output()
                     .await
                     .context("failed to execute command with bash")?;
+                tracing::info!(
+                    exit_code = ?output.status.code(),
+                    stdout_bytes = output.stdout.len(),
+                    stderr_bytes = output.stderr.len(),
+                    "command finished"
+                );
                 RunnerResponse::CommandFinished {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
