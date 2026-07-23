@@ -34,11 +34,23 @@ async fn serve(
         }
     }
 
+    let mut request = String::new();
+    if reader
+        .read_line(&mut request)
+        .await
+        .context("failed to read runner request")?
+        != 0
+    {
+        anyhow::bail!("runner received an unsupported request after initialization");
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, BufReader};
 
     use super::*;
@@ -64,5 +76,33 @@ mod tests {
 
         assert!(format!("{error:#}").contains("unknown variant"));
         assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_runner_stays_alive_until_controller_disconnects() {
+        let (controller, runner) = tokio::io::duplex(64);
+        let (controller_reader, mut controller_writer) = tokio::io::split(controller);
+        let (runner_reader, runner_writer) = tokio::io::split(runner);
+        let mut task = tokio::spawn(serve(BufReader::new(runner_reader), runner_writer));
+
+        controller_writer
+            .write_all(b"{\"method\":\"initialize\"}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(controller_reader)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+
+        assert_eq!(response, "{\"status\":\"ready\"}\n");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await
+                .is_err()
+        );
+
+        drop(controller_writer);
+        task.await.unwrap().unwrap();
     }
 }

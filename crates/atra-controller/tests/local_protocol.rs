@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -15,6 +15,30 @@ async fn status_reports_running() {
     assert_eq!(
         status(&controller.endpoint).await,
         ControllerResponse::Running
+    );
+}
+
+#[tokio::test]
+async fn launching_a_live_runner_is_idempotent() {
+    let controller = TestController::start().await;
+    let launch = || ControllerRequest::RunnerLaunch {
+        name: "test".to_owned(),
+        approval: ApprovalPolicy::Ask,
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "IFS= read -r request; printf '%s\\n' '{\"status\":\"ready\"}'; cat >/dev/null"
+                .to_owned(),
+        ],
+    };
+
+    assert_eq!(
+        request(&controller.endpoint, launch()).await,
+        ControllerResponse::Launched
+    );
+    assert_eq!(
+        request(&controller.endpoint, launch()).await,
+        ControllerResponse::AlreadyRunning
     );
 }
 
@@ -46,8 +70,12 @@ async fn invalid_message_does_not_stop_controller() {
 }
 
 async fn status(endpoint: &PathBuf) -> ControllerResponse {
+    request(endpoint, ControllerRequest::Status).await
+}
+
+async fn request(endpoint: &PathBuf, request: ControllerRequest) -> ControllerResponse {
     let mut stream = UnixStream::connect(endpoint).await.unwrap();
-    let mut request = serde_json::to_vec(&ControllerRequest::Status).unwrap();
+    let mut request = serde_json::to_vec(&request).unwrap();
     request.push(b'\n');
     stream.write_all(&request).await.unwrap();
 

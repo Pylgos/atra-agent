@@ -1,10 +1,16 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    collections::HashMap, fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc,
+};
 
-use anyhow::{Context, Result, bail};
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use anyhow::{Context, Result, anyhow, bail};
+use atra_protocol::{
+    ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerResponse,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 
 #[allow(dead_code)]
@@ -32,12 +38,14 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
         )
     })?;
     let _socket = SocketGuard(endpoint);
+    let state = Arc::new(State::default());
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream).await {
+                    if let Err(error) = handle_client(stream, &state).await {
                         eprintln!("atra controller: {error:#}");
                     }
                 });
@@ -49,7 +57,7 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
     }
 }
 
-async fn handle_client(mut stream: UnixStream) -> Result<()> {
+async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
     let mut request = String::new();
     BufReader::new(&mut stream)
         .read_line(&mut request)
@@ -57,18 +65,133 @@ async fn handle_client(mut stream: UnixStream) -> Result<()> {
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
-    match request {
-        ControllerRequest::Status => {
-            let mut response = serde_json::to_vec(&ControllerResponse::Running)
-                .context("failed to encode controller response")?;
-            response.push(b'\n');
-            stream
-                .write_all(&response)
-                .await
-                .context("failed to write controller response")?;
-        }
-    }
+    let response = match request {
+        ControllerRequest::Status => ControllerResponse::Running,
+        ControllerRequest::RunnerLaunch {
+            name,
+            approval,
+            command,
+        } => match state.launch_runner(name, approval, command).await {
+            Ok(response) => response,
+            Err(error) => ControllerResponse::Error {
+                message: format!("{error:#}"),
+            },
+        },
+    };
+    let mut response =
+        serde_json::to_vec(&response).context("failed to encode controller response")?;
+    response.push(b'\n');
+    stream
+        .write_all(&response)
+        .await
+        .context("failed to write controller response")?;
     Ok(())
+}
+
+#[derive(Default)]
+struct State {
+    runners: Mutex<HashMap<String, Runner>>,
+}
+
+impl State {
+    async fn launch_runner(
+        &self,
+        name: String,
+        approval: ApprovalPolicy,
+        command: Vec<String>,
+    ) -> Result<ControllerResponse> {
+        if name.is_empty() {
+            bail!("runner name must not be empty");
+        }
+        if command.is_empty() {
+            bail!("runner command must not be empty");
+        }
+
+        let mut runners = self.runners.lock().await;
+        if let Some(runner) = runners.get_mut(&name) {
+            if runner
+                .child
+                .try_wait()
+                .with_context(|| format!("failed to inspect runner {name}"))?
+                .is_none()
+            {
+                runner.approval = approval;
+                runner.command = command;
+                return Ok(ControllerResponse::AlreadyRunning);
+            }
+            runners.remove(&name);
+        }
+
+        let runner = Runner::start(&name, approval, command).await?;
+        runners.insert(name, runner);
+        Ok(ControllerResponse::Launched)
+    }
+}
+
+struct Runner {
+    approval: ApprovalPolicy,
+    command: Vec<String>,
+    child: Child,
+    #[allow(dead_code)]
+    stdin: ChildStdin,
+    #[allow(dead_code)]
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Runner {
+    async fn start(name: &str, approval: ApprovalPolicy, command: Vec<String>) -> Result<Self> {
+        let mut child = Command::new(&command[0])
+            .args(&command[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start runner {name} using {}", command[0]))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("runner stdin was not available")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("runner stdout was not available")?;
+        let mut stdout = BufReader::new(stdout);
+
+        let mut initialize = serde_json::to_vec(&RunnerRequest::Initialize)
+            .context("failed to encode runner initialize request")?;
+        initialize.push(b'\n');
+        stdin
+            .write_all(&initialize)
+            .await
+            .with_context(|| format!("failed to initialize runner {name}"))?;
+
+        let mut response = String::new();
+        stdout
+            .read_line(&mut response)
+            .await
+            .with_context(|| format!("failed to read readiness from runner {name}"))?;
+        let response: RunnerResponse = serde_json::from_str(&response)
+            .with_context(|| format!("runner {name} returned an invalid readiness response"))?;
+        match response {
+            RunnerResponse::Ready => {}
+        }
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to inspect runner {name}"))?
+            .is_some()
+        {
+            return Err(anyhow!("runner {name} exited during initialization"));
+        }
+
+        Ok(Self {
+            approval,
+            command,
+            child,
+            stdin,
+            stdout,
+        })
+    }
 }
 
 struct SocketGuard<'a>(&'a Path);

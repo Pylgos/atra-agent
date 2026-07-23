@@ -5,8 +5,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ControllerRequest, ControllerResponse};
-use clap::{Parser, Subcommand};
+use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse};
+use clap::{Parser, Subcommand, ValueEnum};
 use rustix::process::getuid;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -27,12 +27,43 @@ enum Command {
         #[command(subcommand)]
         command: ControllerCommand,
     },
+    Runner {
+        #[command(subcommand)]
+        command: RunnerCommand,
+    },
 }
 
 #[derive(Subcommand)]
 enum ControllerCommand {
     Run,
     Status,
+}
+
+#[derive(Subcommand)]
+enum RunnerCommand {
+    Launch {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum)]
+        approval: Approval,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Approval {
+    Ask,
+    Allow,
+}
+
+impl From<Approval> for ApprovalPolicy {
+    fn from(value: Approval) -> Self {
+        match value {
+            Approval::Ask => Self::Ask,
+            Approval::Allow => Self::Allow,
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -58,7 +89,52 @@ async fn run() -> Result<()> {
         Command::Controller {
             command: ControllerCommand::Status,
         } => controller_status(&endpoint).await,
+        Command::Runner {
+            command:
+                RunnerCommand::Launch {
+                    name,
+                    approval,
+                    command,
+                },
+        } => {
+            let command = runner_command(command)?;
+            controller_request(
+                &endpoint,
+                ControllerRequest::RunnerLaunch {
+                    name,
+                    approval: approval.into(),
+                    command,
+                },
+            )
+            .await
+        }
     }
+}
+
+fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
+    if !command.is_empty() {
+        return Ok(command);
+    }
+
+    let binary = match env::var("ATRA_RUNNER_BINARY") {
+        Ok(binary) => PathBuf::from(binary),
+        Err(env::VarError::NotPresent) => {
+            let executable =
+                env::current_exe().context("failed to determine the atra executable path")?;
+            executable
+                .parent()
+                .context("atra executable has no parent directory")?
+                .join("atra-runner")
+        }
+        Err(error) => return Err(error).context("ATRA_RUNNER_BINARY is not valid UTF-8"),
+    };
+    Ok(vec![
+        binary
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("runner binary path is not valid UTF-8"))?,
+        "--stdio".to_owned(),
+    ])
 }
 
 fn workspace_id() -> Result<String> {
@@ -128,6 +204,11 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 async fn controller_status(endpoint: &Path) -> Result<()> {
+    controller_request(endpoint, ControllerRequest::Status).await
+}
+
+async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Result<()> {
+    let is_status = matches!(request, ControllerRequest::Status);
     let mut stream = match UnixStream::connect(endpoint).await {
         Ok(stream) => stream,
         Err(error)
@@ -136,8 +217,11 @@ async fn controller_status(endpoint: &Path) -> Result<()> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            println!("stopped");
-            return Ok(());
+            if is_status {
+                println!("stopped");
+                return Ok(());
+            }
+            bail!("controller is not running");
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -146,22 +230,25 @@ async fn controller_status(endpoint: &Path) -> Result<()> {
         }
     };
 
-    let mut request = serde_json::to_vec(&ControllerRequest::Status)
-        .context("failed to encode status request")?;
+    let mut request =
+        serde_json::to_vec(&request).context("failed to encode controller request")?;
     request.push(b'\n');
     stream
         .write_all(&request)
         .await
-        .context("failed to write status request")?;
+        .context("failed to write controller request")?;
     let mut response = String::new();
     BufReader::new(stream)
         .read_line(&mut response)
         .await
-        .context("failed to read status response")?;
+        .context("failed to read controller response")?;
     let response: ControllerResponse =
-        serde_json::from_str(&response).context("failed to decode status response")?;
+        serde_json::from_str(&response).context("failed to decode controller response")?;
     match response {
         ControllerResponse::Running => println!("running"),
+        ControllerResponse::Launched => println!("launched"),
+        ControllerResponse::AlreadyRunning => println!("already running"),
+        ControllerResponse::Error { message } => bail!("{message}"),
     }
     Ok(())
 }
