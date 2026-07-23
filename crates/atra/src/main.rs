@@ -32,12 +32,31 @@ enum Command {
         #[command(subcommand)]
         command: RunnerCommand,
     },
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
 }
 
 #[derive(Subcommand)]
 enum ControllerCommand {
     Run,
     Status,
+}
+
+#[derive(Subcommand)]
+enum ThreadCommand {
+    Create,
+    Send {
+        #[arg(long)]
+        thread: i64,
+        #[arg(long)]
+        message: String,
+    },
+    Events {
+        #[arg(long)]
+        thread: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,6 +169,57 @@ async fn run() -> Result<()> {
         Command::Controller {
             command: ControllerCommand::Status,
         } => controller_status(&endpoint).await,
+        Command::Thread {
+            command: ThreadCommand::Create,
+        } => {
+            match send_controller_request(&endpoint, ControllerRequest::ThreadCreate).await? {
+                ControllerResponse::ThreadCreated { thread_id } => println!("{thread_id}"),
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+            Ok(())
+        }
+        Command::Thread {
+            command: ThreadCommand::Send { thread, message },
+        } => {
+            match send_controller_request(
+                &endpoint,
+                ControllerRequest::ThreadSend {
+                    thread_id: thread,
+                    message,
+                },
+            )
+            .await?
+            {
+                ControllerResponse::TurnCompleted { content } => println!("{content}"),
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+            Ok(())
+        }
+        Command::Thread {
+            command: ThreadCommand::Events { thread },
+        } => {
+            match send_controller_request(
+                &endpoint,
+                ControllerRequest::ThreadEvents { thread_id: thread },
+            )
+            .await?
+            {
+                ControllerResponse::ThreadEvents { events } => {
+                    for event in events {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&event)
+                                .context("failed to encode thread event")?
+                        );
+                    }
+                }
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+            Ok(())
+        }
         Command::Runner {
             command:
                 RunnerCommand::Launch {
@@ -412,6 +482,11 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
     };
     match response {
         ControllerResponse::Running => println!("running"),
+        ControllerResponse::ThreadCreated { .. }
+        | ControllerResponse::TurnCompleted { .. }
+        | ControllerResponse::ThreadEvents { .. } => {
+            bail!("controller returned an unexpected thread response")
+        }
         ControllerResponse::Launched => println!("launched"),
         ControllerResponse::AlreadyRunning => println!("already running"),
         ControllerResponse::ProcessStarted { .. }

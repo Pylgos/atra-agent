@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +19,14 @@ pub enum TimeoutAction {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ControllerRequest {
     Status,
+    ThreadCreate,
+    ThreadSend {
+        thread_id: i64,
+        message: String,
+    },
+    ThreadEvents {
+        thread_id: i64,
+    },
     RunnerLaunch {
         name: String,
         approval: ApprovalPolicy,
@@ -51,6 +60,15 @@ pub enum ControllerRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControllerResponse {
     Running,
+    ThreadCreated {
+        thread_id: i64,
+    },
+    TurnCompleted {
+        content: String,
+    },
+    ThreadEvents {
+        events: Vec<ThreadEvent>,
+    },
     Launched,
     AlreadyRunning,
     ProcessStarted {
@@ -74,6 +92,13 @@ pub enum ControllerResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ThreadEvent {
+    pub sequence: i64,
+    pub kind: String,
+    pub payload: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

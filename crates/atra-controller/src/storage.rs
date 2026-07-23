@@ -19,7 +19,7 @@ pub(crate) enum EventKind {
 }
 
 impl EventKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",

@@ -1,8 +1,10 @@
-use std::{process::Stdio, time::Duration};
+use std::{fs, process::Stdio, time::Duration};
 
+use atra_protocol::ThreadEvent;
 use rustix::process::{Pid, test_kill_process};
 use tempfile::TempDir;
 use tokio::{
+    net::UnixStream,
     process::{Child, Command},
     time::{sleep, timeout},
 };
@@ -15,6 +17,13 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let mut system = TestSystem::start().await;
     system.launch("one").await;
     system.launch("two").await;
+
+    let thread = system.create_thread().await;
+    let turn = system
+        .send_message(thread, "run the scripted command")
+        .await;
+    assert!(turn.status.success(), "{turn:?}");
+    assert_eq!(turn.stdout, b"observed model-output\n");
 
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
     let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
@@ -180,11 +189,36 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     })
     .await
     .expect("runner or managed process survived controller exit");
+
+    system.start_controller().await;
+    let events = system.events(thread).await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "user_message",
+            "tool_call",
+            "tool_result",
+            "assistant_message"
+        ]
+    );
+    assert_eq!(
+        events[2].payload["result"]["output"],
+        serde_json::json!("model-output")
+    );
+    assert_eq!(
+        events[3].payload["content"],
+        serde_json::json!("observed model-output")
+    );
 }
 
 struct TestSystem {
     workspace: TempDir,
     endpoint: std::path::PathBuf,
+    database: std::path::PathBuf,
+    model_script: std::path::PathBuf,
     controller: Option<Child>,
 }
 
@@ -193,11 +227,45 @@ impl TestSystem {
         let workspace = tempfile::tempdir().unwrap();
         let endpoint = workspace.path().join("controller.sock");
         let database = workspace.path().join("controller.sqlite3");
+        let model_script = workspace.path().join("model.json");
+        fs::write(
+            &model_script,
+            r#"[
+                {
+                    "tool_call": {
+                        "name": "exec_command",
+                        "arguments": {
+                            "runner": "one",
+                            "command": "printf model-output"
+                        }
+                    }
+                },
+                {
+                    "assistant_message": {
+                        "content": "observed {{tool_output}}"
+                    }
+                }
+            ]"#,
+        )
+        .unwrap();
+        let mut system = Self {
+            workspace,
+            endpoint,
+            database,
+            model_script,
+            controller: None,
+        };
+        system.start_controller().await;
+        system
+    }
+
+    async fn start_controller(&mut self) {
         let controller = Command::new(ATRA)
             .args(["controller", "run"])
-            .env("ATRA_CONTROLLER_ENDPOINT", &endpoint)
-            .env("ATRA_CONTROLLER_STATE", database)
-            .current_dir(workspace.path())
+            .env("ATRA_CONTROLLER_ENDPOINT", &self.endpoint)
+            .env("ATRA_CONTROLLER_STATE", &self.database)
+            .env("ATRA_FAKE_MODEL_SCRIPT", &self.model_script)
+            .current_dir(self.workspace.path())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -205,7 +273,7 @@ impl TestSystem {
 
         timeout(Duration::from_secs(1), async {
             loop {
-                if endpoint.exists() {
+                if UnixStream::connect(&self.endpoint).await.is_ok() {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -213,12 +281,7 @@ impl TestSystem {
         })
         .await
         .expect("controller socket was not created");
-
-        Self {
-            workspace,
-            endpoint,
-            controller: Some(controller),
-        }
+        self.controller = Some(controller);
     }
 
     async fn launch(&self, name: &str) {
@@ -240,6 +303,51 @@ impl TestSystem {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, b"launched\n");
+    }
+
+    async fn create_thread(&self) -> i64 {
+        let output = self
+            .atra()
+            .args(["thread", "create"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    async fn send_message(&self, thread: i64, message: &str) -> std::process::Output {
+        self.atra()
+            .args([
+                "thread",
+                "send",
+                "--thread",
+                &thread.to_string(),
+                "--message",
+                message,
+            ])
+            .output()
+            .await
+            .unwrap()
+    }
+
+    async fn events(&self, thread: i64) -> Vec<ThreadEvent> {
+        let output = self
+            .atra()
+            .args(["thread", "events", "--thread", &thread.to_string()])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     async fn exec(&self, runner: &str, command: &str) -> std::io::Result<std::process::Output> {

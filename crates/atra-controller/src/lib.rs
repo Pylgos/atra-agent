@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::Stdio,
@@ -13,8 +13,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use atra_protocol::{
     ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope,
+    RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
+use serde::Deserialize;
+use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -22,13 +24,20 @@ use tokio::{
     sync::{Mutex, oneshot},
 };
 
+mod model;
 #[allow(dead_code)]
 mod storage;
 
+use model::{FakeProvider, ModelResponse};
+use storage::{EventKind, Store};
+
 pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
-    let _store = storage::Store::open(database)
+    let store = Store::open(database)
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
+    let provider = env::var_os("ATRA_FAKE_MODEL_SCRIPT")
+        .map(|path| FakeProvider::load(Path::new(&path)))
+        .transpose()?;
 
     if endpoint.exists() {
         match UnixStream::connect(endpoint).await {
@@ -52,7 +61,11 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
         )
     })?;
     let _socket = SocketGuard(endpoint);
-    let state = Arc::new(State::default());
+    let state = Arc::new(State {
+        runners: Mutex::new(HashMap::new()),
+        store,
+        provider: Mutex::new(provider),
+    });
 
     loop {
         match listener.accept().await {
@@ -92,15 +105,42 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
         .context("failed to write controller response")
 }
 
-#[derive(Default)]
 struct State {
     runners: Mutex<HashMap<String, Arc<Runner>>>,
+    store: Store,
+    provider: Mutex<Option<FakeProvider>>,
 }
 
 impl State {
     async fn handle(&self, request: ControllerRequest) -> Result<ControllerResponse> {
         match request {
             ControllerRequest::Status => Ok(ControllerResponse::Running),
+            ControllerRequest::ThreadCreate => {
+                let thread_id = self
+                    .store
+                    .create_thread()
+                    .await
+                    .context("failed to create thread")?;
+                Ok(ControllerResponse::ThreadCreated { thread_id })
+            }
+            ControllerRequest::ThreadSend { thread_id, message } => {
+                self.run_turn(thread_id, message).await
+            }
+            ControllerRequest::ThreadEvents { thread_id } => {
+                let events = self
+                    .store
+                    .events(thread_id)
+                    .await
+                    .context("failed to load thread events")?
+                    .into_iter()
+                    .map(|event| ThreadEvent {
+                        sequence: event.sequence,
+                        kind: event.kind.as_str().to_owned(),
+                        payload: event.payload,
+                    })
+                    .collect();
+                Ok(ControllerResponse::ThreadEvents { events })
+            }
             ControllerRequest::RunnerLaunch {
                 name,
                 approval,
@@ -184,6 +224,81 @@ impl State {
         }
     }
 
+    async fn run_turn(&self, thread_id: i64, message: String) -> Result<ControllerResponse> {
+        self.store
+            .append(
+                thread_id,
+                EventKind::UserMessage,
+                json!({ "content": message }),
+            )
+            .await
+            .context("failed to save user message")?;
+
+        loop {
+            let events = self
+                .store
+                .events(thread_id)
+                .await
+                .context("failed to load model history")?;
+            let response = self
+                .provider
+                .lock()
+                .await
+                .as_mut()
+                .context("no model provider is configured")?
+                .complete(&events)?;
+
+            match response {
+                ModelResponse::AssistantMessage { content } => {
+                    self.store
+                        .append(
+                            thread_id,
+                            EventKind::AssistantMessage,
+                            json!({ "content": content }),
+                        )
+                        .await
+                        .context("failed to save assistant message")?;
+                    return Ok(ControllerResponse::TurnCompleted { content });
+                }
+                ModelResponse::ToolCall { name, arguments } => {
+                    self.store
+                        .append(
+                            thread_id,
+                            EventKind::ToolCall,
+                            json!({ "name": &name, "arguments": &arguments }),
+                        )
+                        .await
+                        .context("failed to save tool call")?;
+                    let result = match name.as_str() {
+                        "exec_command" => {
+                            let arguments: ExecCommandArguments = serde_json::from_value(arguments)
+                                .context("fake model returned invalid exec_command arguments")?;
+                            self.runner(&arguments.runner)
+                                .await?
+                                .request(RunnerRequest::ExecCommand {
+                                    command: arguments.command,
+                                    cwd: arguments.cwd,
+                                    background: arguments.background,
+                                    timeout_ms: arguments.timeout_ms,
+                                    timeout_action: arguments.timeout_action,
+                                })
+                                .await?
+                        }
+                        _ => bail!("model requested unsupported tool {name}"),
+                    };
+                    self.store
+                        .append(
+                            thread_id,
+                            EventKind::ToolResult,
+                            json!({ "name": &name, "result": result }),
+                        )
+                        .await
+                        .context("failed to save tool result")?;
+                }
+            }
+        }
+    }
+
     async fn launch_runner(
         &self,
         name: String,
@@ -226,6 +341,22 @@ impl State {
             .cloned()
             .with_context(|| format!("runner {name} is not running"))
     }
+}
+
+#[derive(Deserialize)]
+struct ExecCommandArguments {
+    runner: String,
+    command: String,
+    cwd: Option<String>,
+    #[serde(default)]
+    background: bool,
+    timeout_ms: Option<u64>,
+    #[serde(default = "return_running")]
+    timeout_action: TimeoutAction,
+}
+
+fn return_running() -> TimeoutAction {
+    TimeoutAction::ReturnRunning
 }
 
 struct Runner {
