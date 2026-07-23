@@ -222,7 +222,7 @@ Runner binaryのhost bind mountも必須にしません。
 
 想定するcontainer flow:
 
-1. 現在のarchitectureに対応するRunner binaryを選択する。
+1. 現在のarchitectureに対応するplatform bundleからRunner binaryを選択する。
 2. 起動済みcontainerの`sh`とstdinを使ってbinaryをstream転送する。
 3. content-addressedな実行可能pathへ配置する。
 4. 同じbinaryが既に存在する場合はuploadを省略する。
@@ -423,11 +423,13 @@ patch適用はRunnerの責務です。実装は単独利用者しかいない間
 
 model-facing `apply_patch`にもRunnerごとのapproval policyを適用します。直接利用向けに`atra runner apply-patch --name ... [--cwd ...]`を提供し、patch本文はstdinから読みます。
 
-## 13. Bundle tool
+## 13. Platform bundle
 
 `rg`、`fd`、`jq`、`tmux`、BashをRunner executableへ直接埋め込まないでください。
 
-Controllerのdistributionは、manifestとtoolごとの独立圧縮blobを含むplatform別ZIP bundleを持てます。
+Controllerのdistributionは、manifest、Runner、toolごとの独立圧縮blobを含むplatform別ZIP bundleを持ちます。
+
+install済みbundleは`$XDG_DATA_HOME/atra/platforms/<platform>/`以下へcontent-addressedに配置し、現在選択中のbundleを小さな`current` fileで指定します。
 
 ControllerはRunner環境に不足しているtoolだけを送ります。
 
@@ -582,14 +584,14 @@ container、tmux、terminal固有動作は、default test frameworkを拡大せ�
 10. [完了] Runnerごとのpolicyに必要な範囲だけapproval routingを追加する。denyはoptionalなreasonを受け取れる。
 11. [完了] Atra patchを実装する。
 12. [完了] 最初の全画面TUIとOSC 52 copyを実装する。
-13. tool bundle deployとcontainerへのRunner uploadを実装する。
+13. [完了] platform bundle deployとcontainerへのRunner uploadを実装する。
 14. real Codex-subscription providerを統合し、手動確認する。
 
 architectureを完成済みに見せるためだけに後続stageを先回りして作らないでください。
 
 各stageの終了時には、追加の抽象化より動作とtestを優先してください。
 
-現在の次stageは13のtool bundle deployとcontainerへのRunner uploadです。
+現在の次stageは14のreal Codex-subscription provider統合です。
 
 ## 19. 実装上の共通方針
 

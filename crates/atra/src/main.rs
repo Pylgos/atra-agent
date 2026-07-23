@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    process::Command as TokioCommand,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -39,6 +40,10 @@ enum Command {
     Approval {
         #[command(subcommand)]
         command: ApprovalCommand,
+    },
+    Platform {
+        #[command(subcommand)]
+        command: PlatformCommand,
     },
     Tui,
 }
@@ -89,7 +94,18 @@ enum ApprovalCommand {
 }
 
 #[derive(Subcommand)]
+enum PlatformCommand {
+    Install { bundle: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum RunnerCommand {
+    Upload {
+        #[arg(long)]
+        runner_binary: Option<PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     Launch {
         #[arg(long)]
         name: String,
@@ -195,6 +211,9 @@ async fn run() -> Result<()> {
     let endpoint = controller_endpoint(&workspace_id)?;
 
     match command {
+        Command::Platform {
+            command: PlatformCommand::Install { bundle },
+        } => install_platform_bundle(&bundle),
         Command::Controller {
             command: ControllerCommand::Run,
         } => {
@@ -310,6 +329,13 @@ async fn run() -> Result<()> {
             .await?;
             display_turn_response(response)
         }
+        Command::Runner {
+            command:
+                RunnerCommand::Upload {
+                    runner_binary,
+                    command,
+                },
+        } => upload_runner(runner_binary, command).await,
         Command::Runner {
             command:
                 RunnerCommand::Launch {
@@ -512,7 +538,18 @@ fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
         return Ok(command);
     }
 
-    let binary = match env::var("ATRA_RUNNER_BINARY") {
+    let binary = runner_binary()?;
+    Ok(vec![
+        binary
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("runner binary path is not valid UTF-8"))?,
+        "--stdio".to_owned(),
+    ])
+}
+
+fn runner_binary() -> Result<PathBuf> {
+    Ok(match env::var("ATRA_RUNNER_BINARY") {
         Ok(binary) => PathBuf::from(binary),
         Err(env::VarError::NotPresent) => {
             let executable =
@@ -523,14 +560,145 @@ fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
                 .join("atra-runner")
         }
         Err(error) => return Err(error).context("ATRA_RUNNER_BINARY is not valid UTF-8"),
+    })
+}
+
+async fn upload_runner(binary_path: Option<PathBuf>, command: Vec<String>) -> Result<()> {
+    let binary = match binary_path {
+        Some(path) => fs::read(&path)
+            .with_context(|| format!("failed to read Runner binary {}", path.display()))?,
+        None => {
+            let bundle_path = current_platform_bundle()?;
+            atra_platform::PlatformBundle::load(&bundle_path)?
+                .runner()
+                .decompress()
+                .with_context(|| {
+                    format!(
+                        "failed to extract Runner from platform bundle {}",
+                        bundle_path.display()
+                    )
+                })?
+        }
     };
-    Ok(vec![
-        binary
-            .into_os_string()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("runner binary path is not valid UTF-8"))?,
-        "--stdio".to_owned(),
-    ])
+    let digest = format!("{:x}", Sha256::digest(&binary));
+    let remote_path = format!("/tmp/atra-runner/{digest}/atra-runner");
+    let script = format!(
+        "path='{remote_path}'; if [ -x \"$path\" ]; then cat >/dev/null; else \
+         mkdir -p \"${{path%/*}}\" && temporary=\"$path.tmp.$$\" && cat >\"$temporary\" && \
+         chmod 755 \"$temporary\" && mv \"$temporary\" \"$path\"; fi; printf '%s\\n' \"$path\""
+    );
+
+    let mut child = TokioCommand::new(&command[0])
+        .args(&command[1..])
+        .args(["-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start upload command {}", command[0]))?;
+    child
+        .stdin
+        .take()
+        .context("upload command stdin was not available")?
+        .write_all(&binary)
+        .await
+        .context("failed to stream Runner binary")?;
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to wait for Runner upload")?;
+    if !output.status.success() {
+        bail!("Runner upload command exited with {}", output.status);
+    }
+    let reported_path =
+        String::from_utf8(output.stdout).context("Runner upload path was not valid UTF-8")?;
+    if reported_path.trim() != remote_path {
+        bail!("Runner upload returned an unexpected path: {reported_path:?}");
+    }
+    println!("{remote_path}");
+    Ok(())
+}
+
+fn install_platform_bundle(source: &Path) -> Result<()> {
+    let bundle = atra_platform::PlatformBundle::load(source)?;
+    bundle.runner().decompress()?;
+    for name in bundle.tool_names() {
+        bundle
+            .tool(&name)
+            .expect("listed platform tool should exist")
+            .decompress()
+            .with_context(|| format!("failed to verify bundled tool {name}"))?;
+    }
+
+    let bytes = fs::read(source)
+        .with_context(|| format!("failed to read platform bundle {}", source.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let platform_directory = platform_data_directory()?.join(bundle.platform());
+    let bundles_directory = platform_directory.join("bundles");
+    fs::create_dir_all(&bundles_directory).with_context(|| {
+        format!(
+            "failed to create platform bundle directory {}",
+            bundles_directory.display()
+        )
+    })?;
+    let installed = bundles_directory.join(format!("{digest}.zip"));
+    if !installed.exists() {
+        let temporary = bundles_directory.join(format!(".{digest}.tmp-{}", std::process::id()));
+        fs::write(&temporary, bytes).with_context(|| {
+            format!(
+                "failed to write platform bundle temporary file {}",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, &installed).with_context(|| {
+            format!("failed to install platform bundle {}", installed.display())
+        })?;
+    }
+
+    let current = platform_directory.join("current");
+    let temporary = platform_directory.join(format!(".current.tmp-{}", std::process::id()));
+    fs::write(&temporary, format!("{digest}\n"))
+        .with_context(|| format!("failed to write current bundle {}", temporary.display()))?;
+    fs::rename(&temporary, &current)
+        .with_context(|| format!("failed to select current bundle {}", current.display()))?;
+    println!("{}", installed.display());
+    Ok(())
+}
+
+fn current_platform_bundle() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("ATRA_PLATFORM_BUNDLE") {
+        return Ok(PathBuf::from(path));
+    }
+    let platform_directory = platform_data_directory()?.join(host_platform()?);
+    let current = platform_directory.join("current");
+    let digest = fs::read_to_string(&current).with_context(|| {
+        format!(
+            "failed to read current platform bundle {}",
+            current.display()
+        )
+    })?;
+    let digest = digest.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("current platform bundle contains an invalid digest");
+    }
+    Ok(platform_directory
+        .join("bundles")
+        .join(format!("{digest}.zip")))
+}
+
+fn platform_data_directory() -> Result<PathBuf> {
+    Ok(xdg::BaseDirectories::new()
+        .get_data_home()
+        .context("cannot determine the XDG data directory")?
+        .join("atra/platforms"))
+}
+
+fn host_platform() -> Result<&'static str> {
+    match env::consts::ARCH {
+        "x86_64" => Ok("x86_64-linux-musl"),
+        "aarch64" => Ok("aarch64-linux-musl"),
+        architecture => bail!("unsupported host architecture {architecture}"),
+    }
 }
 
 fn workspace_id() -> Result<String> {

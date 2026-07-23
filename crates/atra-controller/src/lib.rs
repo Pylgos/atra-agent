@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
@@ -11,10 +11,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use atra_platform::PlatformBundle;
 use atra_protocol::{
     ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerRequestEnvelope,
     RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
@@ -38,6 +40,14 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
     let provider = env::var_os("ATRA_FAKE_MODEL_SCRIPT")
         .map(|path| FakeProvider::load(Path::new(&path)))
         .transpose()?;
+    let platform_bundle_path = match env::var_os("ATRA_PLATFORM_BUNDLE") {
+        Some(path) => Some(path.into()),
+        None => current_platform_bundle()?,
+    };
+    let platform_bundle = platform_bundle_path
+        .map(|path| PlatformBundle::load(&path))
+        .transpose()?
+        .map(Arc::new);
 
     if endpoint.exists() {
         match UnixStream::connect(endpoint).await {
@@ -67,6 +77,7 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
         provider: Mutex::new(provider),
         approvals: Mutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
+        platform_bundle,
     });
 
     loop {
@@ -113,6 +124,7 @@ struct State {
     provider: Mutex<Option<FakeProvider>>,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
     next_approval_id: AtomicU64,
+    platform_bundle: Option<Arc<PlatformBundle>>,
 }
 
 impl State {
@@ -498,7 +510,9 @@ impl State {
             runners.remove(&name);
         }
 
-        let runner = Arc::new(Runner::start(&name, approval, command).await?);
+        let runner = Arc::new(
+            Runner::start(&name, approval, command, self.platform_bundle.as_deref()).await?,
+        );
         runners.insert(name, runner);
         Ok(ControllerResponse::Launched)
     }
@@ -565,7 +579,12 @@ struct Runner {
 }
 
 impl Runner {
-    async fn start(name: &str, approval: ApprovalPolicy, command: Vec<String>) -> Result<Self> {
+    async fn start(
+        name: &str,
+        approval: ApprovalPolicy,
+        command: Vec<String>,
+        platform_bundle: Option<&PlatformBundle>,
+    ) -> Result<Self> {
         tracing::info!(runner = name, executable = command[0], "starting runner");
         let mut child = Command::new(&command[0])
             .args(&command[1..])
@@ -616,8 +635,45 @@ impl Runner {
         });
 
         let client = RunnerClient::new(stdin, stdout, name);
-        match client.request(RunnerRequest::Initialize).await? {
-            ControllerResponse::Running => {}
+        let requested_tools = platform_bundle
+            .map(PlatformBundle::tool_names)
+            .unwrap_or_default();
+        match client
+            .request_raw(RunnerRequest::Initialize {
+                tools: requested_tools,
+            })
+            .await?
+        {
+            RunnerResponse::Ready => {}
+            RunnerResponse::ToolsRequired { names } => {
+                let bundle =
+                    platform_bundle.context("runner requested tools without a platform bundle")?;
+                for tool_name in names {
+                    let tool = bundle
+                        .tool(&tool_name)
+                        .with_context(|| format!("runner requested unknown tool {tool_name}"))?;
+                    match client
+                        .request_raw(RunnerRequest::InstallTool {
+                            name: tool_name.clone(),
+                            digest: tool.digest().to_owned(),
+                            blob: STANDARD.encode(tool.compressed()),
+                        })
+                        .await?
+                    {
+                        RunnerResponse::ToolInstalled => {}
+                        response => bail!(
+                            "runner {name} returned an invalid install response for \
+                             {tool_name}: {response:?}"
+                        ),
+                    }
+                }
+                match client.request_raw(RunnerRequest::FinishInitialize).await? {
+                    RunnerResponse::Ready => {}
+                    response => {
+                        bail!("runner {name} returned an invalid readiness response: {response:?}")
+                    }
+                }
+            }
             response => bail!("runner {name} returned an invalid readiness response: {response:?}"),
         }
         if child
@@ -637,7 +693,7 @@ impl Runner {
     }
 
     async fn request(&self, request: RunnerRequest) -> Result<ControllerResponse> {
-        self.client.request(request).await
+        map_runner_response(self.client.request_raw(request).await?)
     }
 
     async fn approval(&self) -> ApprovalPolicy {
@@ -714,7 +770,7 @@ impl RunnerClient {
         }
     }
 
-    async fn request(&self, request: RunnerRequest) -> Result<ControllerResponse> {
+    async fn request_raw(&self, request: RunnerRequest) -> Result<RunnerResponse> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().unwrap().insert(request_id, sender);
@@ -734,13 +790,16 @@ impl RunnerClient {
         let response = receiver
             .await
             .with_context(|| format!("runner {} disconnected", self.name))?;
-        map_runner_response(response)
+        Ok(response)
     }
 }
 
 fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
     match response {
         RunnerResponse::Ready => Ok(ControllerResponse::Running),
+        RunnerResponse::ToolsRequired { .. } | RunnerResponse::ToolInstalled => {
+            bail!("runner returned an initialization response after becoming ready")
+        }
         RunnerResponse::ProcessStarted { process_handle } => {
             Ok(ControllerResponse::ProcessStarted { process_handle })
         }
@@ -765,6 +824,41 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::PatchApplied { output } => Ok(ControllerResponse::PatchApplied { output }),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
+}
+
+fn current_platform_bundle() -> Result<Option<PathBuf>> {
+    let platform = match env::consts::ARCH {
+        "x86_64" => "x86_64-linux-musl",
+        "aarch64" => "aarch64-linux-musl",
+        _ => return Ok(None),
+    };
+    let platform_directory = xdg::BaseDirectories::new()
+        .get_data_home()
+        .context("cannot determine the XDG data directory")?
+        .join("atra/platforms")
+        .join(platform);
+    let current = platform_directory.join("current");
+    let digest = match fs::read_to_string(&current) {
+        Ok(digest) => digest,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read current platform bundle {}",
+                    current.display()
+                )
+            });
+        }
+    };
+    let digest = digest.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("current platform bundle contains an invalid digest");
+    }
+    Ok(Some(
+        platform_directory
+            .join("bundles")
+            .join(format!("{digest}.zip")),
+    ))
 }
 
 struct SocketGuard<'a>(&'a Path);

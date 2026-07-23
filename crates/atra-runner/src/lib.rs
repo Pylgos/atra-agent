@@ -1,7 +1,11 @@
 use std::{
     collections::HashMap,
+    env,
+    ffi::OsString,
     os::fd::OwnedFd,
+    os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream as StdUnixStream,
+    path::PathBuf,
     process::Stdio,
     sync::{
         Arc,
@@ -14,7 +18,9 @@ use anyhow::{Context, Result, bail};
 use atra_protocol::{
     RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, TimeoutAction,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rustix::process::{Pid, Signal, kill_process_group};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -44,20 +50,31 @@ async fn serve(
     }
     let envelope: RunnerRequestEnvelope =
         serde_json::from_str(&line).context("failed to decode runner initialize request")?;
-    if !matches!(envelope.request, RunnerRequest::Initialize) {
-        bail!("runner received a command before initialization");
-    }
-
     let writer = Arc::new(Mutex::new(writer));
+    let tools = Arc::new(Mutex::new(ToolEnvironment::default()));
+    let response = match envelope.request {
+        RunnerRequest::Initialize { tools: requested } => {
+            let names = requested
+                .into_iter()
+                .filter(|name| !command_available(name))
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                tracing::info!("runner initialized");
+                RunnerResponse::Ready
+            } else {
+                RunnerResponse::ToolsRequired { names }
+            }
+        }
+        _ => bail!("runner received a command before initialization"),
+    };
     write_response(
         &writer,
         RunnerResponseEnvelope {
             request_id: envelope.request_id,
-            response: RunnerResponse::Ready,
+            response,
         },
     )
     .await?;
-    tracing::info!("runner initialized");
 
     let processes = Arc::new(ProcessManager::default());
     loop {
@@ -74,8 +91,9 @@ async fn serve(
             serde_json::from_str(&line).context("failed to decode runner request")?;
         let writer = Arc::clone(&writer);
         let processes = Arc::clone(&processes);
+        let tools = Arc::clone(&tools);
         tokio::spawn(async move {
-            let response = match handle_request(&processes, envelope.request).await {
+            let response = match handle_request(&processes, &tools, envelope.request).await {
                 Ok(response) => response,
                 Err(error) => RunnerResponse::Error {
                     message: format!("{error:#}"),
@@ -98,10 +116,20 @@ async fn serve(
 
 async fn handle_request(
     processes: &ProcessManager,
+    tools: &Mutex<ToolEnvironment>,
     request: RunnerRequest,
 ) -> Result<RunnerResponse> {
     match request {
-        RunnerRequest::Initialize => bail!("runner was initialized more than once"),
+        RunnerRequest::Initialize { .. } => bail!("runner was initialized more than once"),
+        RunnerRequest::InstallTool { name, digest, blob } => {
+            let directory = install_tool(&name, &digest, &blob).await?;
+            tools.lock().await.add(directory);
+            Ok(RunnerResponse::ToolInstalled)
+        }
+        RunnerRequest::FinishInitialize => {
+            tracing::info!("runner initialized with deployed tools");
+            Ok(RunnerResponse::Ready)
+        }
         RunnerRequest::ExecCommand {
             command,
             cwd,
@@ -110,7 +138,8 @@ async fn handle_request(
             timeout_action,
         } => {
             tracing::debug!(%command, cwd = cwd.as_deref(), "executing command");
-            let process = processes.start(command, cwd).await?;
+            let path = tools.lock().await.path();
+            let process = processes.start(command, cwd, path).await?;
             if background {
                 return Ok(RunnerResponse::ProcessStarted {
                     process_handle: process.handle,
@@ -174,13 +203,111 @@ async fn write_response(
 }
 
 #[derive(Default)]
+struct ToolEnvironment {
+    directories: Vec<PathBuf>,
+}
+
+impl ToolEnvironment {
+    fn add(&mut self, directory: PathBuf) {
+        if !self.directories.contains(&directory) {
+            self.directories.push(directory);
+        }
+    }
+
+    fn path(&self) -> Option<OsString> {
+        if self.directories.is_empty() {
+            return None;
+        }
+        let mut paths = self.directories.clone();
+        paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        env::join_paths(paths).ok()
+    }
+}
+
+fn command_available(name: &str) -> bool {
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| {
+            let path = directory.join(name);
+            path.is_file()
+                && path
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+async fn install_tool(name: &str, digest: &str, blob: &str) -> Result<PathBuf> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("invalid tool name {name:?}");
+    }
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid tool digest");
+    }
+
+    let compressed = STANDARD
+        .decode(blob)
+        .context("failed to decode tool blob")?;
+    let name = name.to_owned();
+    let digest = digest.to_ascii_lowercase();
+    tokio::task::spawn_blocking(move || {
+        let executable =
+            zstd::decode_all(compressed.as_slice()).context("failed to decompress tool blob")?;
+        let actual = format!("{:x}", Sha256::digest(&executable));
+        if actual != digest {
+            bail!("tool {name} digest mismatch: expected {digest}, got {actual}");
+        }
+
+        let root = env::var_os("ATRA_TOOL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::temp_dir().join("atra-tools"));
+        let directory = root.join(&digest);
+        let path = directory.join(&name);
+        if !path.exists() {
+            std::fs::create_dir_all(&directory).with_context(|| {
+                format!("failed to create tool directory {}", directory.display())
+            })?;
+            let temporary = directory.join(format!(".{name}.tmp-{}", std::process::id()));
+            std::fs::write(&temporary, executable)
+                .with_context(|| format!("failed to write tool {}", temporary.display()))?;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| {
+                    format!("failed to make tool executable {}", temporary.display())
+                })?;
+            match std::fs::rename(&temporary, &path) {
+                Ok(()) => {}
+                Err(error) if path.exists() => {
+                    let _ = std::fs::remove_file(&temporary);
+                    tracing::debug!(%error, tool = name, "tool was installed concurrently");
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to install tool {}", path.display()));
+                }
+            }
+        }
+        Ok(directory)
+    })
+    .await
+    .context("tool install task failed")?
+}
+
+#[derive(Default)]
 struct ProcessManager {
     next_handle: AtomicU64,
     processes: Mutex<HashMap<u64, Arc<ManagedProcess>>>,
 }
 
 impl ProcessManager {
-    async fn start(&self, command: String, cwd: Option<String>) -> Result<Arc<ManagedProcess>> {
+    async fn start(
+        &self,
+        command: String,
+        cwd: Option<String>,
+        path: Option<OsString>,
+    ) -> Result<Arc<ManagedProcess>> {
         let (output_reader, output_writer) =
             StdUnixStream::pair().context("failed to create command output stream")?;
         output_reader
@@ -198,6 +325,9 @@ impl ProcessManager {
             .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
             .process_group(0)
             .kill_on_drop(true);
+        if let Some(path) = path {
+            child.env("PATH", path);
+        }
         if let Some(cwd) = cwd {
             child.current_dir(cwd);
         }

@@ -2,6 +2,7 @@
 members = [
     "crates/atra",
     "crates/atra-controller",
+    "crates/atra-platform",
     "crates/atra-protocol",
     "crates/atra-runner",
     "crates/atra-tui",
@@ -16,6 +17,7 @@ rust-version = "1.96"
 [workspace.dependencies]
 anyhow = "1.0.100"
 atra-controller = { path = "crates/atra-controller" }
+atra-platform = { path = "crates/atra-platform" }
 atra-protocol = { path = "crates/atra-protocol" }
 atra-runner = { path = "crates/atra-runner" }
 atra-tui = { path = "crates/atra-tui" }
@@ -45,3 +47,5 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 unicode-width = "0.2.2"
 xdg = "3.0.0"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+zstd = "0.13.3"

@@ -1,0 +1,84 @@
+FROM docker.io/library/rust:1.96-alpine3.22 AS runner-build
+
+RUN apk add --no-cache build-base musl-dev
+WORKDIR /source
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && RUSTFLAGS="-C target-feature=+crt-static" \
+        cargo build --locked --release --target "$target" -p atra --bin atra-runner \
+    && cp "target/$target/release/atra-runner" /atra-runner
+
+FROM docker.io/library/alpine:3.22 AS build
+
+ARG BASH_VERSION=5.3
+ARG FD_VERSION=10.3.0
+ARG JQ_VERSION=1.8.1
+ARG RIPGREP_VERSION=14.1.1
+ARG TMUX_VERSION=3.5a
+
+RUN apk add --no-cache \
+    autoconf \
+    automake \
+    bison \
+    build-base \
+    cargo \
+    curl \
+    libevent-dev \
+    libevent-static \
+    libtool \
+    linux-headers \
+    ncurses-dev \
+    ncurses-static \
+    openssl-dev \
+    openssl-libs-static \
+    pkgconf \
+    zstd-static
+
+WORKDIR /build
+
+RUN curl -fsSLO "https://ftp.gnu.org/gnu/bash/bash-${BASH_VERSION}.tar.gz" \
+    && tar -xzf "bash-${BASH_VERSION}.tar.gz" \
+    && cd "bash-${BASH_VERSION}" \
+    && ./configure --prefix=/opt/atra --enable-static-link --without-bash-malloc \
+        LDFLAGS=-static \
+    && make -j"$(nproc)" \
+    && make install
+
+RUN curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-${JQ_VERSION}.tar.gz" \
+        -o "jq-${JQ_VERSION}.tar.gz" \
+    && tar -xzf "jq-${JQ_VERSION}.tar.gz" \
+    && cd "jq-${JQ_VERSION}" \
+    && ./configure --prefix=/opt/atra --disable-maintainer-mode --with-oniguruma=builtin \
+        --disable-shared --enable-static \
+    && make -j"$(nproc)" LDFLAGS=-all-static \
+    && make install LDFLAGS=-all-static
+
+RUN curl -fsSLO "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" \
+    && tar -xzf "tmux-${TMUX_VERSION}.tar.gz" \
+    && cd "tmux-${TMUX_VERSION}" \
+    && PKG_CONFIG="pkg-config --static" ./configure --prefix=/opt/atra \
+        LDFLAGS=-static \
+    && make -j"$(nproc)" \
+    && make install
+
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && RUSTFLAGS="-C target-feature=+crt-static" \
+        cargo install --locked --root /opt/atra --target "$target" \
+        ripgrep --version "${RIPGREP_VERSION}" \
+    && RUSTFLAGS="-C target-feature=+crt-static" \
+        cargo install --locked --root /opt/atra --target "$target" \
+        fd-find --version "${FD_VERSION}"
+
+FROM build AS package
+
+ARG TARGETARCH
+
+RUN apk add --no-cache file jq zip zstd
+COPY --from=runner-build /atra-runner /opt/atra/bin/atra-runner
+COPY tools/platform-bundle/package.sh /usr/local/bin/package-platform-bundle
+RUN chmod +x /usr/local/bin/package-platform-bundle \
+    && package-platform-bundle "/out/atra-platform-${TARGETARCH}-linux-musl.zip"
+
+FROM scratch
+COPY --from=package /out/ /

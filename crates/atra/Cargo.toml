@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 atra-controller.workspace = true
+atra-platform.workspace = true
 atra-protocol.workspace = true
 atra-runner.workspace = true
 atra-tui.workspace = true

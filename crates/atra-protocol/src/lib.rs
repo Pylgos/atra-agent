@@ -156,7 +156,15 @@ pub struct RunnerResponseEnvelope {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RunnerRequest {
-    Initialize,
+    Initialize {
+        tools: Vec<String>,
+    },
+    InstallTool {
+        name: String,
+        digest: String,
+        blob: String,
+    },
+    FinishInitialize,
     ExecCommand {
         command: String,
         cwd: Option<String>,
@@ -185,6 +193,10 @@ pub enum RunnerRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunnerResponse {
     Ready,
+    ToolsRequired {
+        names: Vec<String>,
+    },
+    ToolInstalled,
     ProcessStarted {
         process_handle: u64,
     },
