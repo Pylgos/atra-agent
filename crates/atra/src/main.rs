@@ -48,34 +48,57 @@ async fn main() {
 
 async fn run() -> Result<(), AppError> {
     let command = Cli::parse().command;
-    let endpoint = controller_endpoint()?;
+    let workspace_id = workspace_id()?;
+    let endpoint = controller_endpoint(&workspace_id)?;
 
     match command {
         Command::Controller {
             command: ControllerCommand::Run,
-        } => atra_controller::run(&endpoint).await,
+        } => {
+            let database = controller_database(&workspace_id)?;
+            atra_controller::run(&endpoint, &database).await
+        }
         Command::Controller {
             command: ControllerCommand::Status,
         } => controller_status(&endpoint).await,
     }
 }
 
-fn controller_endpoint() -> Result<PathBuf, AppError> {
+fn workspace_id() -> Result<String, AppError> {
+    let cwd = fs::canonicalize(env::current_dir()?)?;
+    Ok(format!("{:x}", Sha256::digest(cwd.as_os_str().as_encoded_bytes()))[..16].to_owned())
+}
+
+fn controller_endpoint(workspace_id: &str) -> Result<PathBuf, AppError> {
     if let Some(endpoint) = env::var_os("ATRA_CONTROLLER_ENDPOINT") {
         return Ok(PathBuf::from(endpoint));
     }
 
-    let cwd = fs::canonicalize(env::current_dir()?)?;
-    let workspace_id = format!("{:x}", Sha256::digest(cwd.as_os_str().as_encoded_bytes()));
     let runtime_dir = match xdg::BaseDirectories::new().get_runtime_directory() {
         Ok(path) => path.join("atra"),
         Err(_) => PathBuf::from(format!("/tmp/atra-{}", getuid().as_raw())),
     };
 
     ensure_private_directory(&runtime_dir)?;
-    let workspace_dir = runtime_dir.join(&workspace_id[..16]);
+    let workspace_dir = runtime_dir.join(workspace_id);
     ensure_private_directory(&workspace_dir)?;
     Ok(workspace_dir.join("controller.sock"))
+}
+
+fn controller_database(workspace_id: &str) -> Result<PathBuf, AppError> {
+    if let Some(database) = env::var_os("ATRA_CONTROLLER_STATE") {
+        return Ok(PathBuf::from(database));
+    }
+
+    let state_home = xdg::BaseDirectories::new()
+        .get_state_home()
+        .ok_or("cannot determine the XDG state directory")?;
+    fs::create_dir_all(&state_home)?;
+    let atra_dir = state_home.join("atra");
+    ensure_private_directory(&atra_dir)?;
+    let workspace_dir = atra_dir.join(workspace_id);
+    ensure_private_directory(&workspace_dir)?;
+    Ok(workspace_dir.join("controller.sqlite3"))
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), AppError> {

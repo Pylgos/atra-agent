@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use atra_protocol::{ControllerRequest, ControllerResponse};
 use tempfile::TempDir;
@@ -69,22 +69,30 @@ impl TestController {
     async fn start() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let endpoint = directory.path().join("controller.sock");
+        let database = directory.path().join("controller.sqlite3");
         let server_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            atra_controller::run(&server_endpoint).await.unwrap();
+            atra_controller::run(&server_endpoint, &database)
+                .await
+                .unwrap();
         });
 
-        for _ in 0..100 {
-            if endpoint.exists() {
-                return Self {
-                    endpoint,
-                    task,
-                    _directory: directory,
-                };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if endpoint.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("controller socket was not created");
+
+        Self {
+            endpoint,
+            task,
+            _directory: directory,
         }
-        panic!("controller socket was not created");
     }
 }
 

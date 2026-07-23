@@ -6,9 +6,14 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
+#[allow(dead_code)]
+mod storage;
+
 type ControllerError = Box<dyn Error + Send + Sync>;
 
-pub async fn run(endpoint: &Path) -> Result<(), ControllerError> {
+pub async fn run(endpoint: &Path, database: &Path) -> Result<(), ControllerError> {
+    let _store = storage::Store::open(database).await?;
+
     if endpoint.exists() {
         match UnixStream::connect(endpoint).await {
             Ok(_) => return Err("controller is already running".into()),
