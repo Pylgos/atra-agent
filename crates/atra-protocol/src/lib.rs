@@ -47,6 +47,11 @@ pub enum ControllerRequest {
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
     },
+    ApplyPatch {
+        runner: String,
+        patch: String,
+        cwd: Option<String>,
+    },
     WaitProcess {
         runner: String,
         process_handle: u64,
@@ -76,9 +81,8 @@ pub enum ControllerResponse {
     ApprovalRequired {
         approval_id: u64,
         thread_id: i64,
-        runner: String,
-        command: String,
-        cwd: Option<String>,
+        tool: String,
+        arguments: Value,
     },
     ThreadEvents {
         events: Vec<ThreadEvent>,
@@ -101,6 +105,9 @@ pub enum ControllerResponse {
     },
     InputWritten,
     ProcessStopped {
+        output: String,
+    },
+    PatchApplied {
         output: String,
     },
     Error {
@@ -140,6 +147,10 @@ pub enum RunnerRequest {
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
     },
+    ApplyPatch {
+        patch: String,
+        cwd: Option<String>,
+    },
     WaitProcess {
         process_handle: u64,
         timeout_ms: u64,
@@ -173,6 +184,9 @@ pub enum RunnerResponse {
     },
     InputWritten,
     ProcessStopped {
+        output: String,
+    },
+    PatchApplied {
         output: String,
     },
     Error {

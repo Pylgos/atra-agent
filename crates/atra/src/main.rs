@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rustix::process::getuid;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
 use tracing_subscriber::EnvFilter;
@@ -100,6 +100,12 @@ enum RunnerCommand {
         timeout_ms: Option<u64>,
         #[arg(long, value_enum, default_value_t = OnTimeout::ReturnRunning)]
         on_timeout: OnTimeout,
+    },
+    ApplyPatch {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cwd: Option<String>,
     },
     Wait {
         #[arg(long)]
@@ -303,6 +309,32 @@ async fn run() -> Result<()> {
             display_process_response(response)
         }
         Command::Runner {
+            command: RunnerCommand::ApplyPatch { name, cwd },
+        } => {
+            let mut patch = String::new();
+            tokio::io::stdin()
+                .read_to_string(&mut patch)
+                .await
+                .context("failed to read patch from stdin")?;
+            match send_controller_request(
+                &endpoint,
+                ControllerRequest::ApplyPatch {
+                    runner: name,
+                    patch,
+                    cwd,
+                },
+            )
+            .await?
+            {
+                ControllerResponse::PatchApplied { output } => {
+                    print!("{output}");
+                    Ok(())
+                }
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+        }
+        Command::Runner {
             command:
                 RunnerCommand::Wait {
                     name,
@@ -372,17 +404,16 @@ fn display_turn_response(response: ControllerResponse) -> Result<()> {
         }
         ControllerResponse::ApprovalRequired {
             approval_id,
-            runner,
-            command,
-            cwd,
+            tool,
+            arguments,
             ..
         } => {
             println!("{approval_id}");
-            println!("runner: {runner}");
-            println!("command: {command}");
-            if let Some(cwd) = cwd {
-                println!("cwd: {cwd}");
-            }
+            println!("tool: {tool}");
+            println!(
+                "arguments: {}",
+                serde_json::to_string(&arguments).context("failed to encode tool arguments")?
+            );
             Ok(())
         }
         ControllerResponse::Error { message } => bail!("{message}"),
@@ -559,7 +590,8 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ProcessFinished { .. }
         | ControllerResponse::ProcessTimedOut { .. }
         | ControllerResponse::InputWritten
-        | ControllerResponse::ProcessStopped { .. } => {
+        | ControllerResponse::ProcessStopped { .. }
+        | ControllerResponse::PatchApplied { .. } => {
             bail!("controller returned an unexpected process response")
         }
         ControllerResponse::Error { message } => bail!("{message}"),

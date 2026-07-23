@@ -185,6 +185,13 @@ impl State {
                     })
                     .await
             }
+            ControllerRequest::ApplyPatch { runner, patch, cwd } => {
+                tracing::debug!(runner, cwd = cwd.as_deref(), "applying patch");
+                self.runner(&runner)
+                    .await?
+                    .request(RunnerRequest::ApplyPatch { patch, cwd })
+                    .await
+            }
             ControllerRequest::WaitProcess {
                 runner,
                 process_handle,
@@ -287,47 +294,71 @@ impl State {
                         "exec_command" => {
                             let arguments: ExecCommandArguments = serde_json::from_value(arguments)
                                 .context("fake model returned invalid exec_command arguments")?;
-                            let runner = self.runner(&arguments.runner).await?;
-                            if runner.approval().await == ApprovalPolicy::Ask {
-                                let approval_id =
-                                    self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
-                                self.store
-                                    .append(
-                                        thread_id,
-                                        EventKind::ApprovalRequest,
-                                        json!({
-                                            "approval_id": approval_id,
-                                            "runner": &arguments.runner,
-                                            "command": &arguments.command,
-                                            "cwd": &arguments.cwd,
-                                        }),
-                                    )
-                                    .await
-                                    .context("failed to save approval request")?;
-                                let response = ControllerResponse::ApprovalRequired {
-                                    approval_id,
-                                    thread_id,
-                                    runner: arguments.runner.clone(),
-                                    command: arguments.command.clone(),
-                                    cwd: arguments.cwd.clone(),
-                                };
-                                self.approvals.lock().await.insert(
-                                    approval_id,
-                                    PendingApproval {
-                                        thread_id,
-                                        arguments,
-                                    },
-                                );
+                            if let Some(response) = self
+                                .route_tool(thread_id, name, ToolArguments::ExecCommand(arguments))
+                                .await?
+                            {
                                 return Ok(response);
                             }
-                            let result = self.execute(arguments).await?;
-                            self.save_tool_result(thread_id, &name, result).await?;
+                        }
+                        "apply_patch" => {
+                            let arguments: ApplyPatchArguments = serde_json::from_value(arguments)
+                                .context("fake model returned invalid apply_patch arguments")?;
+                            if let Some(response) = self
+                                .route_tool(thread_id, name, ToolArguments::ApplyPatch(arguments))
+                                .await?
+                            {
+                                return Ok(response);
+                            }
                         }
                         _ => bail!("model requested unsupported tool {name}"),
                     }
                 }
             }
         }
+    }
+
+    async fn route_tool(
+        &self,
+        thread_id: i64,
+        name: String,
+        arguments: ToolArguments,
+    ) -> Result<Option<ControllerResponse>> {
+        let runner = self.runner(arguments.runner()).await?;
+        if runner.approval().await == ApprovalPolicy::Ask {
+            let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let arguments_json =
+                serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
+            self.store
+                .append(
+                    thread_id,
+                    EventKind::ApprovalRequest,
+                    json!({
+                        "approval_id": approval_id,
+                        "tool": &name,
+                        "arguments": &arguments_json,
+                    }),
+                )
+                .await
+                .context("failed to save approval request")?;
+            self.approvals.lock().await.insert(
+                approval_id,
+                PendingApproval {
+                    thread_id,
+                    name: name.clone(),
+                    arguments,
+                },
+            );
+            return Ok(Some(ControllerResponse::ApprovalRequired {
+                approval_id,
+                thread_id,
+                tool: name,
+                arguments: arguments_json,
+            }));
+        }
+        let result = self.execute(arguments).await?;
+        self.save_tool_result(thread_id, &name, result).await?;
+        Ok(None)
     }
 
     async fn resolve_approval(
@@ -364,23 +395,35 @@ impl State {
             };
             json!({ "status": "denied", "output": output })
         };
-        self.save_tool_result(pending.thread_id, "exec_command", result)
+        self.save_tool_result(pending.thread_id, &pending.name, result)
             .await?;
         self.continue_turn(pending.thread_id).await
     }
 
-    async fn execute(&self, arguments: ExecCommandArguments) -> Result<serde_json::Value> {
-        let response = self
-            .runner(&arguments.runner)
-            .await?
-            .request(RunnerRequest::ExecCommand {
-                command: arguments.command,
-                cwd: arguments.cwd,
-                background: arguments.background,
-                timeout_ms: arguments.timeout_ms,
-                timeout_action: arguments.timeout_action,
-            })
-            .await?;
+    async fn execute(&self, arguments: ToolArguments) -> Result<serde_json::Value> {
+        let response = match arguments {
+            ToolArguments::ExecCommand(arguments) => {
+                self.runner(&arguments.runner)
+                    .await?
+                    .request(RunnerRequest::ExecCommand {
+                        command: arguments.command,
+                        cwd: arguments.cwd,
+                        background: arguments.background,
+                        timeout_ms: arguments.timeout_ms,
+                        timeout_action: arguments.timeout_action,
+                    })
+                    .await?
+            }
+            ToolArguments::ApplyPatch(arguments) => {
+                self.runner(&arguments.runner)
+                    .await?
+                    .request(RunnerRequest::ApplyPatch {
+                        patch: arguments.patch,
+                        cwd: arguments.cwd,
+                    })
+                    .await?
+            }
+        };
         serde_json::to_value(response).context("failed to encode tool result")
     }
 
@@ -445,7 +488,7 @@ impl State {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct ExecCommandArguments {
     runner: String,
     command: String,
@@ -457,9 +500,33 @@ struct ExecCommandArguments {
     timeout_action: TimeoutAction,
 }
 
+#[derive(Deserialize, serde::Serialize)]
+struct ApplyPatchArguments {
+    runner: String,
+    patch: String,
+    cwd: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ToolArguments {
+    ExecCommand(ExecCommandArguments),
+    ApplyPatch(ApplyPatchArguments),
+}
+
+impl ToolArguments {
+    fn runner(&self) -> &str {
+        match self {
+            Self::ExecCommand(arguments) => &arguments.runner,
+            Self::ApplyPatch(arguments) => &arguments.runner,
+        }
+    }
+}
+
 struct PendingApproval {
     thread_id: i64,
-    arguments: ExecCommandArguments,
+    name: String,
+    arguments: ToolArguments,
 }
 
 fn return_running() -> TimeoutAction {
@@ -670,6 +737,7 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::ProcessStopped { output } => {
             Ok(ControllerResponse::ProcessStopped { output })
         }
+        RunnerResponse::PatchApplied { output } => Ok(ControllerResponse::PatchApplied { output }),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }

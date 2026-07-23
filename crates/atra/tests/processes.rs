@@ -32,9 +32,13 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(pending.status.success(), "{pending:?}");
     let pending_stdout = String::from_utf8(pending.stdout).unwrap();
     let denied_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
-    assert!(pending_stdout.contains("runner: two"), "{pending_stdout:?}");
     assert!(
-        pending_stdout.contains("command: printf should-not-run > denied-marker"),
+        pending_stdout.contains("tool: exec_command"),
+        "{pending_stdout:?}"
+    );
+    assert!(
+        pending_stdout.contains("\"runner\":\"two\"")
+            && pending_stdout.contains("printf should-not-run > denied-marker"),
         "{pending_stdout:?}"
     );
     let denied = system
@@ -62,6 +66,88 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let allowed = system.allow(allowed_approval_id).await;
     assert!(allowed.status.success(), "{allowed:?}");
     assert_eq!(allowed.stdout, b"approved approved-output\n");
+
+    fs::write(
+        system.workspace.path().join("patch-target.txt"),
+        "alpha\n  old spacing\nmiddle one\nmiddle two\nomega\n",
+    )
+    .unwrap();
+    fs::write(system.workspace.path().join("delete-me.txt"), "obsolete\n").unwrap();
+    fs::write(system.workspace.path().join("move-me.txt"), "old tail\n").unwrap();
+    let patch = "*** Begin Patch\n\
+*** Update File: patch-target.txt\n\
+@@\n\
+-old spacing\n\
++new spacing\n\
+@ start 3\n\
+-middle one\n\
+@ end 4\n\
+-middle two\n\
++middle replacement\n\
+*** Add File: added.txt\n\
++added\n\
+*** Delete File: delete-me.txt\n\
+*** Update File: move-me.txt\n\
+*** Move to: moved.txt\n\
+@@\n\
+-old tail\n\
++new tail\n\
+*** End of File\n\
+\n\
+*** End Patch\n";
+    let patched = system.apply_patch("one", patch).await;
+    assert!(patched.status.success(), "{patched:?}");
+    assert_eq!(
+        fs::read_to_string(system.workspace.path().join("patch-target.txt")).unwrap(),
+        "alpha\nnew spacing\nmiddle replacement\nomega\n"
+    );
+    assert_eq!(
+        fs::read_to_string(system.workspace.path().join("added.txt")).unwrap(),
+        "added\n"
+    );
+    assert!(!system.workspace.path().join("delete-me.txt").exists());
+    assert!(!system.workspace.path().join("move-me.txt").exists());
+    assert_eq!(
+        fs::read_to_string(system.workspace.path().join("moved.txt")).unwrap(),
+        "new tail\n"
+    );
+    let partial = system
+        .apply_patch(
+            "one",
+            "*** Begin Patch\n\
+*** Add File: applied-before-error.txt\n\
++kept\n\
+*** Update File: missing.txt\n\
+@@\n\
+-missing\n\
++changed\n\
+*** End Patch\n",
+        )
+        .await;
+    assert!(!partial.status.success(), "{partial:?}");
+    assert_eq!(
+        fs::read_to_string(system.workspace.path().join("applied-before-error.txt")).unwrap(),
+        "kept\n"
+    );
+
+    let patch_thread = system.create_thread().await;
+    let pending = system
+        .send_message(patch_thread, "request an approved patch")
+        .await;
+    assert!(pending.status.success(), "{pending:?}");
+    let pending_stdout = String::from_utf8(pending.stdout).unwrap();
+    assert!(
+        pending_stdout.contains("tool: apply_patch"),
+        "{pending_stdout:?}"
+    );
+    let patch_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
+    let approved_patch = system.allow(patch_approval_id).await;
+    assert!(approved_patch.status.success(), "{approved_patch:?}");
+    assert_eq!(approved_patch.stdout, b"patched patch-ok\n");
+    assert_eq!(
+        fs::read_to_string(system.workspace.path().join("model-patched.txt")).unwrap(),
+        "patch-ok\n"
+    );
 
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
     let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
@@ -307,6 +393,7 @@ struct TestSystem {
     endpoint: std::path::PathBuf,
     database: std::path::PathBuf,
     model_script: std::path::PathBuf,
+    controller_log: std::path::PathBuf,
     controller: Option<Child>,
 }
 
@@ -316,6 +403,7 @@ impl TestSystem {
         let endpoint = workspace.path().join("controller.sock");
         let database = workspace.path().join("controller.sqlite3");
         let model_script = workspace.path().join("model.json");
+        let controller_log = workspace.path().join("controller.log");
         fs::write(
             &model_script,
             r#"[
@@ -360,6 +448,20 @@ impl TestSystem {
                     "assistant_message": {
                         "content": "approved {{tool_output}}"
                     }
+                },
+                {
+                    "tool_call": {
+                        "name": "apply_patch",
+                        "arguments": {
+                            "runner": "two",
+                            "patch": "*** Begin Patch\n*** Add File: model-patched.txt\n+patch-ok\n*** End Patch"
+                        }
+                    }
+                },
+                {
+                    "assistant_message": {
+                        "content": "patched patch-ok"
+                    }
                 }
             ]"#,
         )
@@ -369,6 +471,7 @@ impl TestSystem {
             endpoint,
             database,
             model_script,
+            controller_log,
             controller: None,
         };
         system.start_controller().await;
@@ -376,13 +479,18 @@ impl TestSystem {
     }
 
     async fn start_controller(&mut self) {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.controller_log)
+            .unwrap();
         let controller = Command::new(ATRA)
             .args(["controller", "run"])
             .env("ATRA_CONTROLLER_ENDPOINT", &self.endpoint)
             .env("ATRA_CONTROLLER_STATE", &self.database)
             .env("ATRA_FAKE_MODEL_SCRIPT", &self.model_script)
             .current_dir(self.workspace.path())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -434,6 +542,31 @@ impl TestSystem {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    async fn apply_patch(&self, runner: &str, patch: &str) -> std::process::Output {
+        let mut child = self
+            .atra()
+            .args([
+                "runner",
+                "apply-patch",
+                "--name",
+                runner,
+                "--cwd",
+                self.workspace.path().to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use tokio::io::AsyncWriteExt;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .await
+            .unwrap();
+        child.wait_with_output().await.unwrap()
     }
 
     async fn send_message(&self, thread: i64, message: &str) -> std::process::Output {
@@ -607,6 +740,12 @@ impl Drop for TestSystem {
     fn drop(&mut self) {
         if let Some(controller) = &mut self.controller {
             let _ = controller.start_kill();
+        }
+        if std::thread::panicking()
+            && let Ok(log) = fs::read_to_string(&self.controller_log)
+            && !log.is_empty()
+        {
+            eprintln!("controller log:\n{log}");
         }
     }
 }

@@ -23,6 +23,8 @@ use tokio::{
     time::{Instant, sleep, sleep_until},
 };
 
+mod patch;
+
 pub async fn run_stdio() -> Result<()> {
     serve(BufReader::new(io::stdin()), io::stdout()).await
 }
@@ -121,6 +123,22 @@ async fn handle_request(
                     timeout_action,
                 )
                 .await
+        }
+        RunnerRequest::ApplyPatch { patch, cwd } => {
+            tracing::info!(
+                patch_bytes = patch.len(),
+                cwd = cwd.as_deref(),
+                "applying patch"
+            );
+            tracing::trace!(%patch, "patch content");
+            let cwd = match cwd {
+                Some(cwd) => std::path::PathBuf::from(cwd),
+                None => std::env::current_dir().context("failed to determine runner cwd")?,
+            };
+            let output = tokio::task::spawn_blocking(move || patch::apply(&patch, &cwd))
+                .await
+                .context("patch task failed")??;
+            Ok(RunnerResponse::PatchApplied { output })
         }
         RunnerRequest::WaitProcess {
             process_handle,
