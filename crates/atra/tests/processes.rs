@@ -516,6 +516,8 @@ impl TestSystem {
                 "launch",
                 "--name",
                 name,
+                "--description",
+                "integration test runner",
                 "--approval",
                 approval,
                 "--",

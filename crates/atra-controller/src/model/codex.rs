@@ -416,6 +416,18 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
     let tools = json!([
         {
             "type": "function",
+            "name": "list_runners",
+            "description": "List the available Atra Runners and their roles. Use this when the appropriate execution environment is not already known.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
             "name": "exec_command",
             "description": "Execute a Bash command on a named Atra Runner.",
             "strict": false,

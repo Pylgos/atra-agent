@@ -163,6 +163,7 @@ canonicalな形:
 ```sh
 atra runner launch \
   --name host-raw \
+  --description "host環境で直接commandを実行する" \
   --approval ask \
   -- "$ATRA_RUNNER_BINARY" --stdio
 ```
@@ -170,6 +171,7 @@ atra runner launch \
 `atra runner launch`は冪等なreconcile操作です。
 
 - 名前付きRunnerのController所有設定を更新する。
+- descriptionはagentが実行先を選ぶための役割説明としてControllerが保持する。
 - 同名のlive Runnerが既に存在する場合、新しいRunnerを起動しない。
 - 存在しない場合、指定されたcommandを起動する。
 - commandのstdin/stdoutを一つのRunnerとしてControllerへ接続する。
@@ -238,6 +240,7 @@ upload用bootstrapではcontainerに既存の`sh`を使用できます。Runner�
 model-facing command toolは以下です。
 
 ```text
+list_runners
 exec_command
 wait_process
 write_process
@@ -246,6 +249,8 @@ apply_patch
 ```
 
 process操作をaction dispatch型の一つのtoolへ統合しないでください。それぞれのschemaは大きく異なります。
+
+`list_runners`は、現在利用可能なRunnerの名前と役割説明を返すController上の読み取り専用toolです。Runner上では実行せず、approvalを要求しません。
 
 ### `exec_command`
 

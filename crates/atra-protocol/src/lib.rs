@@ -49,8 +49,10 @@ pub enum ControllerRequest {
         approval_id: u64,
         reason: Option<String>,
     },
+    RunnerList,
     RunnerLaunch {
         name: String,
+        description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
     },
@@ -113,6 +115,9 @@ pub enum ControllerResponse {
     ThreadEvents {
         events: Vec<ThreadEvent>,
     },
+    RunnerList {
+        runners: Vec<Runner>,
+    },
     Launched,
     AlreadyRunning,
     ProcessStarted {
@@ -158,6 +163,12 @@ pub struct Thread {
     pub display_name: Option<String>,
     pub model: String,
     pub reasoning_effort: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Runner {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

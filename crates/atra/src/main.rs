@@ -118,6 +118,7 @@ enum PlatformCommand {
 
 #[derive(Subcommand)]
 enum RunnerCommand {
+    List,
     Upload {
         #[arg(long)]
         runner_binary: Option<PathBuf>,
@@ -127,6 +128,8 @@ enum RunnerCommand {
     Launch {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        description: String,
         #[arg(long, value_enum)]
         approval: Approval,
         #[arg(last = true)]
@@ -392,6 +395,20 @@ async fn run() -> Result<()> {
             display_turn_response(response)
         }
         Command::Runner {
+            command: RunnerCommand::List,
+        } => {
+            match send_controller_request(&endpoint, ControllerRequest::RunnerList).await? {
+                ControllerResponse::RunnerList { runners } => {
+                    for runner in runners {
+                        println!("{}\t{}", runner.name, runner.description);
+                    }
+                }
+                ControllerResponse::Error { message } => bail!("{message}"),
+                response => bail!("controller returned an unexpected response: {response:?}"),
+            }
+            Ok(())
+        }
+        Command::Runner {
             command:
                 RunnerCommand::Upload {
                     runner_binary,
@@ -402,6 +419,7 @@ async fn run() -> Result<()> {
             command:
                 RunnerCommand::Launch {
                     name,
+                    description,
                     approval,
                     command,
                 },
@@ -411,6 +429,7 @@ async fn run() -> Result<()> {
                 &endpoint,
                 ControllerRequest::RunnerLaunch {
                     name,
+                    description,
                     approval: approval.into(),
                     command,
                 },
@@ -870,6 +889,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. }
+        | ControllerResponse::RunnerList { .. }
         | ControllerResponse::CodexLoginRequired
         | ControllerResponse::CodexLoggedIn { .. } => {
             bail!("controller returned an unexpected thread response")

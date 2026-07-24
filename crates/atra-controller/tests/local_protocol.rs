@@ -109,15 +109,16 @@ async fn launching_a_live_runner_is_idempotent() {
     let controller = TestController::start().await;
     let launch = || {
         ControllerRequest::RunnerLaunch {
-        name: "test".to_owned(),
-        approval: ApprovalPolicy::Ask,
-        command: vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "IFS= read -r request; printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; cat >/dev/null"
-                .to_owned(),
-        ],
-    }
+            name: "test".to_owned(),
+            description: "test runner".to_owned(),
+            approval: ApprovalPolicy::Ask,
+            command: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "IFS= read -r request; printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; cat >/dev/null"
+                    .to_owned(),
+            ],
+        }
     };
 
     assert_eq!(
@@ -138,6 +139,7 @@ async fn executes_a_foreground_command_through_a_runner() {
             &controller.endpoint,
             ControllerRequest::RunnerLaunch {
                 name: "test".to_owned(),
+                description: "test runner".to_owned(),
                 approval: ApprovalPolicy::Allow,
                 command: vec![
                     "/bin/sh".to_owned(),

@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use atra_platform::PlatformBundle;
 use atra_protocol::{
-    ApprovalPolicy, ControllerRequest, ControllerResponse, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
+    ApprovalPolicy, ControllerRequest, ControllerResponse, Runner as RunnerInfo, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
@@ -300,11 +300,18 @@ impl State {
                 approval_id,
                 reason,
             } => self.resolve_approval(approval_id, false, reason).await,
+            ControllerRequest::RunnerList => Ok(ControllerResponse::RunnerList {
+                runners: self.list_runners().await?,
+            }),
             ControllerRequest::RunnerLaunch {
                 name,
+                description,
                 approval,
                 command,
-            } => self.launch_runner(name, approval, command).await,
+            } => {
+                self.launch_runner(name, description, approval, command)
+                    .await
+            }
             ControllerRequest::ExecCommand {
                 runner,
                 command,
@@ -550,6 +557,14 @@ impl State {
                                 return Ok(response);
                             }
                         }
+                        "list_runners" => {
+                            let result = serde_json::to_value(ControllerResponse::RunnerList {
+                                runners: self.list_runners().await?,
+                            })
+                            .context("failed to encode runner list")?;
+                            self.save_tool_result(thread_id, &name, call_id.as_deref(), result)
+                                .await?;
+                        }
                         _ => bail!("model requested unsupported tool {name}"),
                     }
                 }
@@ -695,6 +710,7 @@ impl State {
     async fn launch_runner(
         &self,
         name: String,
+        description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
     ) -> Result<ControllerResponse> {
@@ -715,17 +731,56 @@ impl State {
                 .with_context(|| format!("failed to inspect runner {name}"))?
                 .is_none()
             {
-                *runner.config.lock().await = (approval, command);
+                *runner.config.lock().await = RunnerConfig {
+                    description,
+                    approval,
+                    _command: command,
+                };
                 return Ok(ControllerResponse::AlreadyRunning);
             }
             runners.remove(&name);
         }
 
         let runner = Arc::new(
-            Runner::start(&name, approval, command, self.platform_bundle.as_deref()).await?,
+            Runner::start(
+                &name,
+                description,
+                approval,
+                command,
+                self.platform_bundle.as_deref(),
+            )
+            .await?,
         );
         runners.insert(name, runner);
         Ok(ControllerResponse::Launched)
+    }
+
+    async fn list_runners(&self) -> Result<Vec<RunnerInfo>> {
+        let mut runners = self.runners.lock().await;
+        let mut stopped = Vec::new();
+        let mut result = Vec::new();
+        for (name, runner) in runners.iter() {
+            if runner
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .with_context(|| format!("failed to inspect runner {name}"))?
+                .is_some()
+            {
+                stopped.push(name.clone());
+                continue;
+            }
+            result.push(RunnerInfo {
+                name: name.clone(),
+                description: runner.config.lock().await.description.clone(),
+            });
+        }
+        for name in stopped {
+            runners.remove(&name);
+        }
+        result.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        Ok(result)
     }
 
     async fn runner(&self, name: &str) -> Result<Arc<Runner>> {
@@ -785,14 +840,21 @@ fn return_running() -> TimeoutAction {
 }
 
 struct Runner {
-    config: Mutex<(ApprovalPolicy, Vec<String>)>,
+    config: Mutex<RunnerConfig>,
     child: Mutex<Child>,
     client: RunnerClient,
+}
+
+struct RunnerConfig {
+    description: String,
+    approval: ApprovalPolicy,
+    _command: Vec<String>,
 }
 
 impl Runner {
     async fn start(
         name: &str,
+        description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
         platform_bundle: Option<&PlatformBundle>,
@@ -898,7 +960,11 @@ impl Runner {
         tracing::info!(runner = name, "runner ready");
 
         Ok(Self {
-            config: Mutex::new((approval, command)),
+            config: Mutex::new(RunnerConfig {
+                description,
+                approval,
+                _command: command,
+            }),
             child: Mutex::new(child),
             client,
         })
@@ -909,7 +975,7 @@ impl Runner {
     }
 
     async fn approval(&self) -> ApprovalPolicy {
-        self.config.lock().await.0
+        self.config.lock().await.approval
     }
 }
 
