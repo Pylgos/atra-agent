@@ -160,6 +160,20 @@ enum TurnUpdate {
         thread_id: i64,
         content: String,
     },
+    ToolCallStarted {
+        thread_id: i64,
+        item_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        thread_id: i64,
+        item_id: String,
+        delta: String,
+    },
+    Event {
+        thread_id: i64,
+        event: ThreadEvent,
+    },
     Completed(Result<TurnCompletion>),
 }
 
@@ -169,6 +183,7 @@ struct App {
     models: Vec<Model>,
     thread_id: Option<i64>,
     transcript: Vec<TranscriptItem>,
+    tool_call_preview: Option<(String, usize)>,
     input: String,
     status: String,
     approval: Option<Approval>,
@@ -212,6 +227,7 @@ impl App {
             models,
             thread_id,
             transcript,
+            tool_call_preview: None,
             input: String::new(),
             status: if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
@@ -275,6 +291,7 @@ impl App {
                 KeyCode::Char('n') => {
                     self.thread_id = None;
                     self.transcript.clear();
+                    self.tool_call_preview = None;
                     self.input.clear();
                     self.approval = None;
                     self.renaming = false;
@@ -462,6 +479,7 @@ impl App {
             if index == 0 {
                 self.thread_id = None;
                 self.transcript.clear();
+                self.tool_call_preview = None;
                 self.approval = None;
                 self.renaming = false;
                 self.model_picker = None;
@@ -470,6 +488,7 @@ impl App {
             } else if let Some(thread) = self.threads.get(index - 1) {
                 self.thread_id = Some(thread.id);
                 self.transcript = load_transcript(&self.endpoint, thread.id).await?;
+                self.tool_call_preview = None;
                 self.approval = None;
                 self.renaming = false;
                 self.model_picker = None;
@@ -729,8 +748,61 @@ impl App {
                 }
                 return Ok(());
             }
+            TurnUpdate::ToolCallStarted {
+                thread_id,
+                item_id,
+                name,
+            } => {
+                if self.thread_id == Some(thread_id) {
+                    let index = self.transcript.len();
+                    self.transcript.push(TranscriptItem {
+                        role: Role::Tool,
+                        text: format!("{} ", sanitize(&name)),
+                    });
+                    self.tool_call_preview = Some((item_id, index));
+                }
+                return Ok(());
+            }
+            TurnUpdate::ToolCallDelta {
+                thread_id,
+                item_id,
+                delta,
+            } => {
+                if self.thread_id == Some(thread_id)
+                    && let Some((preview_id, index)) = &self.tool_call_preview
+                    && preview_id == &item_id
+                {
+                    self.transcript[*index].text.push_str(&sanitize(&delta));
+                }
+                return Ok(());
+            }
+            TurnUpdate::Event { thread_id, event } => {
+                if self.thread_id == Some(thread_id) {
+                    let item_id = event
+                        .payload
+                        .get("item_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let Some(item) = event_to_item(event) else {
+                        return Ok(());
+                    };
+                    if item.role == Role::Tool
+                        && let Some(item_id) = item_id
+                        && let Some((preview_id, index)) = self.tool_call_preview.take()
+                        && preview_id == item_id
+                    {
+                        self.transcript[index] = item;
+                        return Ok(());
+                    }
+                    self.transcript.push(item);
+                }
+                return Ok(());
+            }
             TurnUpdate::Completed(Ok(completion)) => completion,
             TurnUpdate::Completed(Err(error)) => {
+                if let Some((_, index)) = self.tool_call_preview.take() {
+                    self.transcript.remove(index);
+                }
                 self.turn_pending = false;
                 self.status = sanitize(&format!("{error:#}"));
                 return Ok(());
@@ -1080,15 +1152,25 @@ fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
         ),
         "tool_call" => (
             Role::Tool,
-            format!(
-                "{} {}",
-                event.payload.get("name")?.as_str()?,
-                event.payload.get("arguments")?
-            ),
+            match event
+                .payload
+                .get("input")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(input) => format!("{} {}", event.payload.get("name")?.as_str()?, input),
+                None => format!(
+                    "{} {}",
+                    event.payload.get("name")?.as_str()?,
+                    event.payload.get("arguments")?
+                ),
+            },
         ),
         "tool_result" => (
             Role::ToolResult,
-            serde_json::to_string_pretty(event.payload.get("result")?).ok()?,
+            match event.payload.get("result")? {
+                serde_json::Value::String(result) => result.clone(),
+                result => serde_json::to_string_pretty(result).ok()?,
+            },
         ),
         "approval_request" => (
             Role::ApprovalRequest,
@@ -1189,6 +1271,27 @@ async fn request_stream(
         match serde_json::from_str(&response).context("failed to decode controller response")? {
             ControllerResponse::TurnDelta { content } => {
                 updates.send(TurnUpdate::Delta { thread_id, content }).ok();
+            }
+            ControllerResponse::ToolCallStarted { item_id, name } => {
+                updates
+                    .send(TurnUpdate::ToolCallStarted {
+                        thread_id,
+                        item_id,
+                        name,
+                    })
+                    .ok();
+            }
+            ControllerResponse::ToolCallDelta { item_id, delta } => {
+                updates
+                    .send(TurnUpdate::ToolCallDelta {
+                        thread_id,
+                        item_id,
+                        delta,
+                    })
+                    .ok();
+            }
+            ControllerResponse::TurnEvent { event } => {
+                updates.send(TurnUpdate::Event { thread_id, event }).ok();
             }
             response => return Ok(response),
         }

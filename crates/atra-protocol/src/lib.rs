@@ -68,7 +68,6 @@ pub enum ControllerRequest {
     ApplyPatch {
         runner: String,
         patch: String,
-        cwd: Option<String>,
     },
     WaitProcess {
         runner: String,
@@ -104,6 +103,17 @@ pub enum ControllerResponse {
     ThreadModelChanged,
     TurnDelta {
         content: String,
+    },
+    ToolCallStarted {
+        item_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        item_id: String,
+        delta: String,
+    },
+    TurnEvent {
+        event: ThreadEvent,
     },
     TurnCompleted {
         content: String,
@@ -221,7 +231,6 @@ pub enum RunnerRequest {
     },
     ApplyPatch {
         patch: String,
-        cwd: Option<String>,
     },
     WaitProcess {
         process_handle: u64,

@@ -41,6 +41,7 @@ fn transcript_render_is_stable() {
         models: Vec::new(),
         thread_id: Some(2),
         transcript: items,
+        tool_call_preview: None,
         input: "next".to_owned(),
         status: "Ready".to_owned(),
         approval: None,

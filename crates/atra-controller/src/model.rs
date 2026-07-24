@@ -1,13 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use crate::storage::Event;
 use anyhow::Result;
-use atra_protocol::Model;
+use atra_protocol::{Model, ThreadEvent};
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use serde::Deserialize;
-use tokio::sync::mpsc;
-
-use crate::storage::Event;
 
 use self::{codex::CodexProvider, fake::FakeProvider};
 
@@ -28,6 +26,19 @@ pub(crate) enum ModelResponse {
         #[serde(default)]
         call_id: Option<String>,
     },
+    CustomToolCall {
+        item_id: Option<String>,
+        name: String,
+        input: String,
+        call_id: String,
+    },
+}
+
+pub(crate) enum ModelStreamEvent {
+    AssistantDelta(String),
+    ToolCallStarted { item_id: String, name: String },
+    ToolCallDelta { item_id: String, delta: String },
+    ThreadEvent(ThreadEvent),
 }
 
 pub(crate) struct ModelCompletion {
@@ -85,14 +96,14 @@ impl Provider {
         model: &str,
         reasoning_effort: &str,
         events: &[Event],
-        deltas: Option<&mpsc::UnboundedSender<String>>,
+        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
         prompt_cache_key: &str,
     ) -> Result<ModelCompletion> {
         match self {
             Self::Fake(provider) => provider.complete(events),
             Self::Codex(provider) => {
                 provider
-                    .complete(model, reasoning_effort, events, deltas, prompt_cache_key)
+                    .complete(model, reasoning_effort, events, updates, prompt_cache_key)
                     .await
             }
         }

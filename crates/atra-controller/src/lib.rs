@@ -36,7 +36,7 @@ mod model;
 #[allow(dead_code)]
 mod storage;
 
-use model::{DEFAULT_MODEL, ModelResponse, Provider};
+use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
 use storage::{EventKind, Store};
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
@@ -170,23 +170,28 @@ async fn handle_client(
         closed?;
         return Ok(());
     }
-    if let ControllerRequest::ThreadSend { thread_id, message } = request {
-        let (deltas, mut pending_deltas) = mpsc::unbounded_channel();
+    if matches!(
+        request,
+        ControllerRequest::ThreadSend { .. }
+            | ControllerRequest::ApprovalAllow { .. }
+            | ControllerRequest::ApprovalDeny { .. }
+    ) {
+        let (updates, mut pending_updates) = mpsc::unbounded_channel();
         let response = {
-            let response = state.run_turn(thread_id, message, Some(&deltas));
+            let response = state.handle_streaming(request, &updates);
             tokio::pin!(response);
             loop {
                 tokio::select! {
                     response = &mut response => break response,
-                    Some(content) = pending_deltas.recv() => {
-                        write_response(&mut stream, &ControllerResponse::TurnDelta { content }).await?;
+                    Some(update) = pending_updates.recv() => {
+                        write_stream_update(&mut stream, update).await?;
                     }
                 }
             }
         };
-        drop(deltas);
-        while let Ok(content) = pending_deltas.try_recv() {
-            write_response(&mut stream, &ControllerResponse::TurnDelta { content }).await?;
+        drop(updates);
+        while let Ok(update) = pending_updates.try_recv() {
+            write_stream_update(&mut stream, update).await?;
         }
         let response = response.unwrap_or_else(|error| ControllerResponse::Error {
             message: format!("{error:#}"),
@@ -200,6 +205,20 @@ async fn handle_client(
         },
     };
     write_response(&mut stream, &response).await
+}
+
+async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) -> Result<()> {
+    let response = match update {
+        ModelStreamEvent::AssistantDelta(content) => ControllerResponse::TurnDelta { content },
+        ModelStreamEvent::ToolCallStarted { item_id, name } => {
+            ControllerResponse::ToolCallStarted { item_id, name }
+        }
+        ModelStreamEvent::ToolCallDelta { item_id, delta } => {
+            ControllerResponse::ToolCallDelta { item_id, delta }
+        }
+        ModelStreamEvent::ThreadEvent(event) => ControllerResponse::TurnEvent { event },
+    };
+    write_response(stream, &response).await
 }
 
 async fn write_response(stream: &mut UnixStream, response: &ControllerResponse) -> Result<()> {
@@ -224,6 +243,30 @@ struct State {
 }
 
 impl State {
+    async fn handle_streaming(
+        &self,
+        request: ControllerRequest,
+        updates: &mpsc::UnboundedSender<ModelStreamEvent>,
+    ) -> Result<ControllerResponse> {
+        match request {
+            ControllerRequest::ThreadSend { thread_id, message } => {
+                self.run_turn(thread_id, message, Some(updates)).await
+            }
+            ControllerRequest::ApprovalAllow { approval_id } => {
+                self.resolve_approval(approval_id, true, None, Some(updates))
+                    .await
+            }
+            ControllerRequest::ApprovalDeny {
+                approval_id,
+                reason,
+            } => {
+                self.resolve_approval(approval_id, false, reason, Some(updates))
+                    .await
+            }
+            _ => unreachable!("non-streaming request dispatched as streaming"),
+        }
+    }
+
     async fn codex_login_status(&self) -> Result<ControllerResponse> {
         match self.provider.lock().await.login_status().await {
             Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
@@ -321,12 +364,15 @@ impl State {
             }
             ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
             ControllerRequest::ApprovalAllow { approval_id } => {
-                self.resolve_approval(approval_id, true, None).await
+                self.resolve_approval(approval_id, true, None, None).await
             }
             ControllerRequest::ApprovalDeny {
                 approval_id,
                 reason,
-            } => self.resolve_approval(approval_id, false, reason).await,
+            } => {
+                self.resolve_approval(approval_id, false, reason, None)
+                    .await
+            }
             ControllerRequest::RunnerList => Ok(ControllerResponse::RunnerList {
                 runners: self.list_runners().await?,
             }),
@@ -367,11 +413,11 @@ impl State {
                     })
                     .await
             }
-            ControllerRequest::ApplyPatch { runner, patch, cwd } => {
-                tracing::debug!(runner, cwd = cwd.as_deref(), "applying patch");
+            ControllerRequest::ApplyPatch { runner, patch } => {
+                tracing::debug!(runner, "applying patch");
                 self.runner(&runner)
                     .await?
-                    .request(RunnerRequest::ApplyPatch { patch, cwd })
+                    .request(RunnerRequest::ApplyPatch { patch })
                     .await
             }
             ControllerRequest::WaitProcess {
@@ -428,7 +474,7 @@ impl State {
         &self,
         thread_id: i64,
         message: String,
-        deltas: Option<&mpsc::UnboundedSender<String>>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
         self.store
             .name_thread_if_unnamed(thread_id, message.clone())
@@ -442,13 +488,13 @@ impl State {
             )
             .await
             .context("failed to save user message")?;
-        self.continue_turn(thread_id, deltas).await
+        self.continue_turn(thread_id, updates).await
     }
 
     async fn continue_turn(
         &self,
         thread_id: i64,
-        deltas: Option<&mpsc::UnboundedSender<String>>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
         loop {
             let mut events = self
@@ -502,7 +548,7 @@ impl State {
                     &model,
                     &reasoning_effort,
                     &events,
-                    deltas,
+                    updates,
                     &prompt_cache_key,
                 )
                 .await?;
@@ -541,18 +587,18 @@ impl State {
                     arguments,
                     call_id,
                 } => {
-                    self.store
-                        .append(
-                            thread_id,
-                            EventKind::ToolCall,
-                            json!({
-                                "name": &name,
-                                "arguments": &arguments,
-                                "call_id": &call_id,
-                            }),
-                        )
-                        .await
-                        .context("failed to save tool call")?;
+                    self.append_event(
+                        thread_id,
+                        EventKind::ToolCall,
+                        json!({
+                            "name": &name,
+                            "arguments": &arguments,
+                            "call_id": &call_id,
+                        }),
+                        updates,
+                    )
+                    .await
+                    .context("failed to save tool call")?;
                     match name.as_str() {
                         "exec_command" => {
                             let arguments: ExecCommandArguments = serde_json::from_value(arguments)
@@ -563,6 +609,8 @@ impl State {
                                     name,
                                     call_id,
                                     ToolArguments::ExecCommand(arguments),
+                                    false,
+                                    updates,
                                 )
                                 .await?
                             {
@@ -578,6 +626,8 @@ impl State {
                                     name,
                                     call_id,
                                     ToolArguments::ApplyPatch(arguments),
+                                    false,
+                                    updates,
                                 )
                                 .await?
                             {
@@ -585,14 +635,122 @@ impl State {
                             }
                         }
                         "list_runners" => {
-                            let result = serde_json::to_value(ControllerResponse::RunnerList {
-                                runners: self.list_runners().await?,
-                            })
-                            .context("failed to encode runner list")?;
-                            self.save_tool_result(thread_id, &name, call_id.as_deref(), result)
-                                .await?;
+                            let runners = self.list_runners().await?;
+                            let result = if runners.is_empty() {
+                                "No runners are available.".to_owned()
+                            } else {
+                                format!(
+                                    "Available runners:\n{}",
+                                    runners
+                                        .into_iter()
+                                        .map(|runner| {
+                                            format!("- {}: {}", runner.name, runner.description)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                )
+                            };
+                            self.save_tool_result(
+                                thread_id,
+                                &name,
+                                call_id.as_deref(),
+                                serde_json::Value::String(result),
+                                false,
+                                updates,
+                            )
+                            .await?;
+                        }
+                        "wait_process" => {
+                            let arguments: WaitProcessArguments = serde_json::from_value(arguments)
+                                .context("model returned invalid wait_process arguments")?;
+                            if let Some(response) = self
+                                .route_tool(
+                                    thread_id,
+                                    name,
+                                    call_id,
+                                    ToolArguments::WaitProcess(arguments),
+                                    false,
+                                    updates,
+                                )
+                                .await?
+                            {
+                                return Ok(response);
+                            }
+                        }
+                        "write_process" => {
+                            let arguments: WriteProcessArguments =
+                                serde_json::from_value(arguments)
+                                    .context("model returned invalid write_process arguments")?;
+                            if let Some(response) = self
+                                .route_tool(
+                                    thread_id,
+                                    name,
+                                    call_id,
+                                    ToolArguments::WriteProcess(arguments),
+                                    false,
+                                    updates,
+                                )
+                                .await?
+                            {
+                                return Ok(response);
+                            }
+                        }
+                        "stop_process" => {
+                            let arguments: StopProcessArguments = serde_json::from_value(arguments)
+                                .context("model returned invalid stop_process arguments")?;
+                            if let Some(response) = self
+                                .route_tool(
+                                    thread_id,
+                                    name,
+                                    call_id,
+                                    ToolArguments::StopProcess(arguments),
+                                    false,
+                                    updates,
+                                )
+                                .await?
+                            {
+                                return Ok(response);
+                            }
                         }
                         _ => bail!("model requested unsupported tool {name}"),
+                    }
+                }
+                ModelResponse::CustomToolCall {
+                    item_id,
+                    name,
+                    input,
+                    call_id,
+                } => {
+                    if name != "apply_patch" {
+                        bail!("model requested unsupported custom tool {name}");
+                    }
+                    self.append_event(
+                        thread_id,
+                        EventKind::ToolCall,
+                        json!({
+                            "type": "custom",
+                            "item_id": &item_id,
+                            "name": &name,
+                            "input": &input,
+                            "call_id": &call_id,
+                        }),
+                        updates,
+                    )
+                    .await
+                    .context("failed to save tool call")?;
+                    let arguments = parse_apply_patch_input(input)?;
+                    if let Some(response) = self
+                        .route_tool(
+                            thread_id,
+                            name,
+                            Some(call_id),
+                            ToolArguments::ApplyPatch(arguments),
+                            true,
+                            updates,
+                        )
+                        .await?
+                    {
+                        return Ok(response);
                     }
                 }
             }
@@ -605,24 +763,26 @@ impl State {
         name: String,
         call_id: Option<String>,
         arguments: ToolArguments,
+        custom: bool,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<Option<ControllerResponse>> {
         let runner = self.runner(arguments.runner()).await?;
         if runner.approval().await == ApprovalPolicy::Ask {
             let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
             let arguments_json =
                 serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
-            self.store
-                .append(
-                    thread_id,
-                    EventKind::ApprovalRequest,
-                    json!({
-                        "approval_id": approval_id,
-                        "tool": &name,
-                        "arguments": &arguments_json,
-                    }),
-                )
-                .await
-                .context("failed to save approval request")?;
+            self.append_event(
+                thread_id,
+                EventKind::ApprovalRequest,
+                json!({
+                    "approval_id": approval_id,
+                    "tool": &name,
+                    "arguments": &arguments_json,
+                }),
+                updates,
+            )
+            .await
+            .context("failed to save approval request")?;
             self.approvals.lock().await.insert(
                 approval_id,
                 PendingApproval {
@@ -630,6 +790,7 @@ impl State {
                     name: name.clone(),
                     call_id,
                     arguments,
+                    custom,
                 },
             );
             return Ok(Some(ControllerResponse::ApprovalRequired {
@@ -640,8 +801,15 @@ impl State {
             }));
         }
         let result = self.execute(arguments).await?;
-        self.save_tool_result(thread_id, &name, call_id.as_deref(), result)
-            .await?;
+        self.save_tool_result(
+            thread_id,
+            &name,
+            call_id.as_deref(),
+            result,
+            custom,
+            updates,
+        )
+        .await?;
         Ok(None)
     }
 
@@ -650,6 +818,7 @@ impl State {
         approval_id: u64,
         allowed: bool,
         reason: Option<String>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
         let pending = self
             .approvals
@@ -657,18 +826,18 @@ impl State {
             .await
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
-        self.store
-            .append(
-                pending.thread_id,
-                EventKind::ApprovalResponse,
-                json!({
-                    "approval_id": approval_id,
-                    "decision": if allowed { "allow" } else { "deny" },
-                    "reason": &reason,
-                }),
-            )
-            .await
-            .context("failed to save approval response")?;
+        self.append_event(
+            pending.thread_id,
+            EventKind::ApprovalResponse,
+            json!({
+                "approval_id": approval_id,
+                "decision": if allowed { "allow" } else { "deny" },
+                "reason": &reason,
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save approval response")?;
 
         let result = if allowed {
             self.execute(pending.arguments).await?
@@ -677,16 +846,18 @@ impl State {
                 Some(reason) => format!("user denied the tool call: {reason}"),
                 None => "user denied the tool call".to_owned(),
             };
-            json!({ "status": "denied", "output": output })
+            serde_json::Value::String(output)
         };
         self.save_tool_result(
             pending.thread_id,
             &pending.name,
             pending.call_id.as_deref(),
             result,
+            pending.custom,
+            updates,
         )
         .await?;
-        self.continue_turn(pending.thread_id, None).await
+        self.continue_turn(pending.thread_id, updates).await
     }
 
     async fn execute(&self, arguments: ToolArguments) -> Result<serde_json::Value> {
@@ -694,7 +865,7 @@ impl State {
             ToolArguments::ExecCommand(arguments) => {
                 self.runner(&arguments.runner)
                     .await?
-                    .request(RunnerRequest::ExecCommand {
+                    .request_raw(RunnerRequest::ExecCommand {
                         command: arguments.command,
                         cwd: arguments.cwd,
                         background: arguments.background,
@@ -704,16 +875,63 @@ impl State {
                     .await?
             }
             ToolArguments::ApplyPatch(arguments) => {
-                self.runner(&arguments.runner)
+                let response = self
+                    .runner(&arguments.runner)
                     .await?
-                    .request(RunnerRequest::ApplyPatch {
+                    .request_raw(RunnerRequest::ApplyPatch {
                         patch: arguments.patch,
-                        cwd: arguments.cwd,
                     })
+                    .await?;
+                return Ok(serde_json::Value::String(match response {
+                    RunnerResponse::PatchApplied { output } => output,
+                    RunnerResponse::Error { message } => bail!("{message}"),
+                    _ => bail!("runner returned an invalid apply_patch response"),
+                }));
+            }
+            ToolArguments::WaitProcess(arguments) => {
+                let response = self
+                    .runner(&arguments.runner)
                     .await?
+                    .request_raw(RunnerRequest::WaitProcess {
+                        process_handle: arguments.process_handle,
+                        timeout_ms: arguments.timeout_ms,
+                    })
+                    .await?;
+                return Ok(serde_json::Value::String(format_process_response(
+                    "wait_process",
+                    response,
+                )?));
+            }
+            ToolArguments::WriteProcess(arguments) => {
+                let response = self
+                    .runner(&arguments.runner)
+                    .await?
+                    .request_raw(RunnerRequest::WriteProcess {
+                        process_handle: arguments.process_handle,
+                        input: arguments.input.into_bytes(),
+                    })
+                    .await?;
+                return Ok(serde_json::Value::String(match response {
+                    RunnerResponse::InputWritten => "Input written.".to_owned(),
+                    RunnerResponse::Error { message } => bail!("{message}"),
+                    _ => bail!("runner returned an invalid write_process response"),
+                }));
+            }
+            ToolArguments::StopProcess(arguments) => {
+                let response = self
+                    .runner(&arguments.runner)
+                    .await?
+                    .request_raw(RunnerRequest::StopProcess {
+                        process_handle: arguments.process_handle,
+                    })
+                    .await?;
+                return Ok(serde_json::Value::String(format_process_response(
+                    "stop_process",
+                    response,
+                )?));
             }
         };
-        serde_json::to_value(response).context("failed to encode tool result")
+        Ok(serde_json::Value::String(format_exec_response(response)?))
     }
 
     async fn save_tool_result(
@@ -722,15 +940,42 @@ impl State {
         name: &str,
         call_id: Option<&str>,
         result: serde_json::Value,
+        custom: bool,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<()> {
-        self.store
-            .append(
-                thread_id,
-                EventKind::ToolResult,
-                json!({ "name": name, "call_id": call_id, "result": result }),
-            )
-            .await
-            .context("failed to save tool result")?;
+        self.append_event(
+            thread_id,
+            EventKind::ToolResult,
+            json!({
+                "type": custom.then_some("custom"),
+                "name": name,
+                "call_id": call_id,
+                "result": result,
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save tool result")?;
+        Ok(())
+    }
+
+    async fn append_event(
+        &self,
+        thread_id: i64,
+        kind: EventKind,
+        payload: serde_json::Value,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> tokio_rusqlite::Result<()> {
+        let sequence = self.store.append(thread_id, kind, payload.clone()).await?;
+        if let Some(updates) = updates {
+            updates
+                .send(ModelStreamEvent::ThreadEvent(ThreadEvent {
+                    sequence,
+                    kind: kind.as_str().to_owned(),
+                    payload,
+                }))
+                .ok();
+        }
         Ok(())
     }
 
@@ -836,7 +1081,40 @@ struct ExecCommandArguments {
 struct ApplyPatchArguments {
     runner: String,
     patch: String,
-    cwd: Option<String>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct WaitProcessArguments {
+    runner: String,
+    process_handle: u64,
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct WriteProcessArguments {
+    runner: String,
+    process_handle: u64,
+    input: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+struct StopProcessArguments {
+    runner: String,
+    process_handle: u64,
+}
+
+fn parse_apply_patch_input(patch: String) -> Result<ApplyPatchArguments> {
+    let mut lines = patch.lines();
+    if lines.next() != Some("*** Begin Patch") {
+        bail!("custom apply_patch input must start with '*** Begin Patch'");
+    }
+    let runner = lines
+        .next()
+        .and_then(|line| line.strip_prefix("*** Environment ID: "))
+        .filter(|runner| !runner.is_empty())
+        .context("custom apply_patch input must include a non-empty Environment ID")?
+        .to_owned();
+    Ok(ApplyPatchArguments { runner, patch })
 }
 
 #[derive(serde::Serialize)]
@@ -844,6 +1122,9 @@ struct ApplyPatchArguments {
 enum ToolArguments {
     ExecCommand(ExecCommandArguments),
     ApplyPatch(ApplyPatchArguments),
+    WaitProcess(WaitProcessArguments),
+    WriteProcess(WriteProcessArguments),
+    StopProcess(StopProcessArguments),
 }
 
 impl ToolArguments {
@@ -851,6 +1132,9 @@ impl ToolArguments {
         match self {
             Self::ExecCommand(arguments) => &arguments.runner,
             Self::ApplyPatch(arguments) => &arguments.runner,
+            Self::WaitProcess(arguments) => &arguments.runner,
+            Self::WriteProcess(arguments) => &arguments.runner,
+            Self::StopProcess(arguments) => &arguments.runner,
         }
     }
 }
@@ -860,6 +1144,7 @@ struct PendingApproval {
     name: String,
     call_id: Option<String>,
     arguments: ToolArguments,
+    custom: bool,
 }
 
 fn return_running() -> TimeoutAction {
@@ -1001,6 +1286,10 @@ impl Runner {
         map_runner_response(self.client.request_raw(request).await?)
     }
 
+    async fn request_raw(&self, request: RunnerRequest) -> Result<RunnerResponse> {
+        self.client.request_raw(request).await
+    }
+
     async fn approval(&self) -> ApprovalPolicy {
         self.config.lock().await.approval
     }
@@ -1129,6 +1418,68 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::PatchApplied { output } => Ok(ControllerResponse::PatchApplied { output }),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
+}
+
+fn format_exec_response(response: RunnerResponse) -> Result<String> {
+    match response {
+        RunnerResponse::ProcessStarted { process_handle } => Ok(format!(
+            "atra exec_command: process started with handle {process_handle}"
+        )),
+        RunnerResponse::ProcessRunning {
+            process_handle,
+            output,
+        } => Ok(format!(
+            "atra exec_command: process {process_handle} is still running\n{output}"
+        )),
+        RunnerResponse::ProcessFinished {
+            output,
+            exit_code: Some(0),
+        } => Ok(format!(
+            "atra exec_command: process finished with exit code 0\n{output}"
+        )),
+        RunnerResponse::ProcessFinished { output, exit_code } => {
+            let exit_code = exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            Ok(format!(
+                "atra exec_command: process finished with exit code {exit_code}\n{output}"
+            ))
+        }
+        RunnerResponse::ProcessTimedOut { output } => {
+            Ok(format!("atra exec_command: process timed out\n{output}"))
+        }
+        RunnerResponse::Error { message } => bail!("{message}"),
+        RunnerResponse::Ready
+        | RunnerResponse::ToolsRequired { .. }
+        | RunnerResponse::ToolInstalled
+        | RunnerResponse::InputWritten
+        | RunnerResponse::ProcessStopped { .. }
+        | RunnerResponse::PatchApplied { .. } => {
+            bail!("runner returned an invalid tool response")
+        }
+    }
+}
+
+fn format_process_response(tool: &str, response: RunnerResponse) -> Result<String> {
+    let (description, output) = match response {
+        RunnerResponse::ProcessRunning {
+            process_handle,
+            output,
+        } => (format!("process {process_handle} is still running"), output),
+        RunnerResponse::ProcessFinished { output, exit_code } => (
+            format!(
+                "process finished with exit code {}",
+                exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ),
+            output,
+        ),
+        RunnerResponse::ProcessStopped { output } => ("process stopped".to_owned(), output),
+        RunnerResponse::Error { message } => bail!("{message}"),
+        _ => bail!("runner returned an invalid {tool} response"),
+    };
+    Ok(format!("atra {tool}: {description}\n{output}"))
 }
 
 fn current_platform_bundle() -> Result<Option<PathBuf>> {

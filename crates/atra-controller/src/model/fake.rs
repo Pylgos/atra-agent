@@ -26,7 +26,11 @@ impl FakeProvider {
         if let ModelResponse::AssistantMessage { content } = &mut response
             && let Some(output) = events.iter().rev().find_map(|event| {
                 (event.kind == EventKind::ToolResult)
-                    .then(|| event.payload.pointer("/result/output")?.as_str())
+                    .then(|| {
+                        event.payload["result"]
+                            .as_str()
+                            .or_else(|| event.payload.pointer("/result/output")?.as_str())
+                    })
                     .flatten()
             })
         {

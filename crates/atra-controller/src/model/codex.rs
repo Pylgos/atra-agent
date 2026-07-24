@@ -22,7 +22,7 @@ use tokio::sync::{RwLock, mpsc};
 
 use atra_protocol::Model;
 
-use super::{ModelCompletion, ModelResponse};
+use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
 use crate::storage::{Event, EventKind};
 
 const INSTRUCTIONS: &str = "You are Atra Agent. Use the provided tools when needed. \
@@ -153,7 +153,7 @@ impl CodexProvider {
         model: &str,
         reasoning_effort: &str,
         events: &[Event],
-        deltas: Option<&mpsc::UnboundedSender<String>>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
         prompt_cache_key: &str,
     ) -> Result<ModelCompletion> {
         let auth = self
@@ -214,8 +214,29 @@ impl CodexProvider {
         while let Some(event) = stream.next().await {
             match event.context("Codex response stream failed")? {
                 ResponseEvent::OutputTextDelta(delta) => {
-                    if let Some(deltas) = deltas {
-                        deltas.send(delta).ok();
+                    if let Some(updates) = updates {
+                        updates.send(ModelStreamEvent::AssistantDelta(delta)).ok();
+                    }
+                }
+                ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
+                    id: Some(item_id),
+                    name,
+                    ..
+                }) => {
+                    if let Some(updates) = updates {
+                        updates
+                            .send(ModelStreamEvent::ToolCallStarted {
+                                item_id: item_id.to_string(),
+                                name,
+                            })
+                            .ok();
+                    }
+                }
+                ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
+                    if let Some(updates) = updates {
+                        updates
+                            .send(ModelStreamEvent::ToolCallDelta { item_id, delta })
+                            .ok();
                     }
                 }
                 ResponseEvent::OutputItemDone(item) => {
@@ -352,6 +373,17 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         }],
                         phase: None,
                     }),
+                    EventKind::ToolCall if event.payload["type"] == "custom" => {
+                        ResponseItem::CustomToolCall {
+                            id: None,
+                            status: Some("completed".to_owned()),
+                            call_id: event.payload["call_id"].as_str()?.to_owned(),
+                            name: event.payload["name"].as_str()?.to_owned(),
+                            namespace: None,
+                            input: event.payload["input"].as_str()?.to_owned(),
+                            internal_chat_message_metadata_passthrough: None,
+                        }
+                    }
                     EventKind::ToolCall => ResponseItem::FunctionCall {
                         id: None,
                         name: event.payload["name"].as_str()?.to_owned(),
@@ -360,12 +392,21 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         call_id: event.payload["call_id"].as_str()?.to_owned(),
                         internal_chat_message_metadata_passthrough: None,
                     },
+                    EventKind::ToolResult if event.payload["type"] == "custom" => {
+                        ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
+                            call_id: event.payload["call_id"].as_str()?.to_owned(),
+                            name: event.payload["name"].as_str().map(str::to_owned),
+                            output: FunctionCallOutputPayload::from_text(tool_result_text(
+                                &event.payload["result"],
+                            )),
+                        })
+                    }
                     EventKind::ToolResult => {
                         ResponseItem::from(ResponseInputItem::FunctionCallOutput {
                             call_id: event.payload["call_id"].as_str()?.to_owned(),
-                            output: FunctionCallOutputPayload::from_text(
-                                serde_json::to_string(&event.payload["result"]).ok()?,
-                            ),
+                            output: FunctionCallOutputPayload::from_text(tool_result_text(
+                                &event.payload["result"],
+                            )),
                         })
                     }
                     EventKind::Reasoning => {
@@ -381,6 +422,13 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
             .collect::<Result<Vec<_>>>()?,
     );
     Ok(input)
+}
+
+fn tool_result_text(result: &serde_json::Value) -> String {
+    result
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| result.to_string())
 }
 
 fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
@@ -407,6 +455,18 @@ fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
             arguments: serde_json::from_str(&arguments)
                 .context("Codex returned invalid tool arguments")?,
             call_id: Some(call_id),
+        })),
+        ResponseItem::CustomToolCall {
+            id,
+            name,
+            input,
+            call_id,
+            ..
+        } => Ok(Some(ModelResponse::CustomToolCall {
+            item_id: id.map(String::from),
+            name,
+            input,
+            call_id,
         })),
         _ => Ok(None),
     }
@@ -450,18 +510,59 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
         },
         {
             "type": "function",
-            "name": "apply_patch",
-            "description": "Apply an Atra patch on a named Atra Runner.",
+            "name": "wait_process",
+            "description": "Wait for more output or completion from a background process on a named Atra Runner.",
             "strict": false,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "runner": {"type": "string"},
-                    "patch": {"type": "string"},
-                    "cwd": {"type": ["string", "null"]}
+                    "process_handle": {"type": "integer"},
+                    "timeout_ms": {"type": "integer"}
                 },
-                "required": ["runner", "patch"],
+                "required": ["runner", "process_handle", "timeout_ms"],
                 "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "write_process",
+            "description": "Write text to the standard input of a background process on a named Atra Runner.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "runner": {"type": "string"},
+                    "process_handle": {"type": "integer"},
+                    "input": {"type": "string"}
+                },
+                "required": ["runner", "process_handle", "input"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "stop_process",
+            "description": "Stop a background process on a named Atra Runner.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "runner": {"type": "string"},
+                    "process_handle": {"type": "integer"}
+                },
+                "required": ["runner", "process_handle"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply an Atra patch. Put the target Runner name in the required `*** Environment ID: <runner>` line.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: begin_patch environment_id hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nenvironment_id: \"*** Environment ID: \" filename LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF"
             }
         }
     ]);

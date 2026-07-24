@@ -153,17 +153,10 @@ async fn handle_request(
                 )
                 .await
         }
-        RunnerRequest::ApplyPatch { patch, cwd } => {
-            tracing::info!(
-                patch_bytes = patch.len(),
-                cwd = cwd.as_deref(),
-                "applying patch"
-            );
+        RunnerRequest::ApplyPatch { patch } => {
+            tracing::info!(patch_bytes = patch.len(), "applying patch");
             tracing::trace!(%patch, "patch content");
-            let cwd = match cwd {
-                Some(cwd) => std::path::PathBuf::from(cwd),
-                None => std::env::current_dir().context("failed to determine runner cwd")?,
-            };
+            let cwd = std::env::current_dir().context("failed to determine runner cwd")?;
             let output = tokio::task::spawn_blocking(move || patch::apply(&patch, &cwd))
                 .await
                 .context("patch task failed")??;

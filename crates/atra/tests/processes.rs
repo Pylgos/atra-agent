@@ -23,7 +23,10 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .send_message(thread, "run the scripted command")
         .await;
     assert!(turn.status.success(), "{turn:?}");
-    assert_eq!(turn.stdout, b"observed model-output\n");
+    assert_eq!(
+        turn.stdout,
+        b"observed atra exec_command: process finished with exit code 0\nmodel-output\n"
+    );
 
     let denied_thread = system.create_thread().await;
     let pending = system
@@ -65,7 +68,10 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .unwrap();
     let allowed = system.allow(allowed_approval_id).await;
     assert!(allowed.status.success(), "{allowed:?}");
-    assert_eq!(allowed.stdout, b"approved approved-output\n");
+    assert_eq!(
+        allowed.stdout,
+        b"approved atra exec_command: process finished with exit code 0\napproved-output\n"
+    );
 
     fs::write(
         system.workspace.path().join("patch-target.txt"),
@@ -329,12 +335,14 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        events[2].payload["result"]["output"],
-        serde_json::json!("model-output")
+        events[2].payload["result"],
+        serde_json::json!("atra exec_command: process finished with exit code 0\nmodel-output")
     );
     assert_eq!(
         events[3].payload["content"],
-        serde_json::json!("observed model-output")
+        serde_json::json!(
+            "observed atra exec_command: process finished with exit code 0\nmodel-output"
+        )
     );
     let denied_events = system.events(denied_thread).await;
     assert_eq!(
@@ -383,8 +391,8 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         })
     );
     assert_eq!(
-        allowed_events[4].payload["result"]["output"],
-        serde_json::json!("approved-output")
+        allowed_events[4].payload["result"],
+        serde_json::json!("atra exec_command: process finished with exit code 0\napproved-output")
     );
 }
 
@@ -549,14 +557,7 @@ impl TestSystem {
     async fn apply_patch(&self, runner: &str, patch: &str) -> std::process::Output {
         let mut child = self
             .atra()
-            .args([
-                "runner",
-                "apply-patch",
-                "--name",
-                runner,
-                "--cwd",
-                self.workspace.path().to_str().unwrap(),
-            ])
+            .args(["runner", "apply-patch", "--name", runner])
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();

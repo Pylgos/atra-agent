@@ -169,8 +169,6 @@ enum RunnerCommand {
     ApplyPatch {
         #[arg(long)]
         name: String,
-        #[arg(long)]
-        cwd: Option<String>,
     },
     Wait {
         #[arg(long)]
@@ -518,7 +516,7 @@ async fn run() -> Result<()> {
             }
         }
         Command::Runner {
-            command: RunnerCommand::ApplyPatch { name, cwd },
+            command: RunnerCommand::ApplyPatch { name },
         } => {
             let mut patch = String::new();
             tokio::io::stdin()
@@ -530,7 +528,6 @@ async fn run() -> Result<()> {
                 ControllerRequest::ApplyPatch {
                     runner: name,
                     patch,
-                    cwd,
                 },
             )
             .await?
@@ -1191,6 +1188,9 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ThreadList { .. }
         | ControllerResponse::ModelList { .. }
         | ControllerResponse::TurnDelta { .. }
+        | ControllerResponse::ToolCallStarted { .. }
+        | ControllerResponse::ToolCallDelta { .. }
+        | ControllerResponse::TurnEvent { .. }
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. }
@@ -1243,12 +1243,21 @@ async fn send_controller_request(
         .write_all(&request)
         .await
         .context("failed to write controller request")?;
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .await
-        .context("failed to read controller response")?;
-    let response: ControllerResponse =
-        serde_json::from_str(&response).context("failed to decode controller response")?;
-    Ok(response)
+    let mut responses = BufReader::new(stream).lines();
+    loop {
+        let response = responses
+            .next_line()
+            .await
+            .context("failed to read controller response")?
+            .context("controller closed the response stream")?;
+        let response =
+            serde_json::from_str(&response).context("failed to decode controller response")?;
+        match response {
+            ControllerResponse::TurnDelta { .. }
+            | ControllerResponse::ToolCallStarted { .. }
+            | ControllerResponse::ToolCallDelta { .. }
+            | ControllerResponse::TurnEvent { .. } => {}
+            response => return Ok(response),
+        }
+    }
 }
