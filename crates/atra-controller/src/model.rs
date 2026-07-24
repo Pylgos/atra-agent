@@ -92,7 +92,7 @@ impl Provider {
     }
 
     pub(crate) async fn complete(
-        &mut self,
+        &self,
         model: &str,
         reasoning_effort: &str,
         events: &[Event],
@@ -100,7 +100,7 @@ impl Provider {
         prompt_cache_key: &str,
     ) -> Result<ModelCompletion> {
         match self {
-            Self::Fake(provider) => provider.complete(events),
+            Self::Fake(provider) => provider.complete(events).await,
             Self::Codex(provider) => {
                 provider
                     .complete(model, reasoning_effort, events, updates, prompt_cache_key)

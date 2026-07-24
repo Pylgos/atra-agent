@@ -646,6 +646,7 @@ workspaceには現在、役割ごとに以下のcrateがあります。
 
 ```text
 atra-cli
+atra-client
 atra-controller
 atra-platform
 atra-protocol

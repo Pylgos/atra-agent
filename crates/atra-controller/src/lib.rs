@@ -32,6 +32,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
 };
 
+mod connection;
 mod model;
 #[allow(dead_code)]
 mod storage;
@@ -113,7 +114,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
     let state = Arc::new(State {
         runners: Mutex::new(HashMap::new()),
         store,
-        provider: Mutex::new(provider),
+        provider,
         approvals: Mutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
         platform_bundle,
@@ -129,7 +130,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
                     let state = Arc::clone(&state);
                     let shutdown = shutdown.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_client(stream, &state, &shutdown).await {
+                        if let Err(error) = connection::handle_client(stream, &state, &shutdown).await {
                             tracing::warn!(error = %format!("{error:#}"), "client request failed");
                         }
                     });
@@ -146,95 +147,10 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
     }
 }
 
-async fn handle_client(
-    mut stream: UnixStream,
-    state: &State,
-    shutdown: &watch::Sender<bool>,
-) -> Result<()> {
-    let mut request = String::new();
-    BufReader::new(&mut stream)
-        .read_line(&mut request)
-        .await
-        .context("failed to read controller request")?;
-    let request: ControllerRequest =
-        serde_json::from_str(&request).context("failed to decode controller request")?;
-    if request == ControllerRequest::Shutdown {
-        let response = write_response(&mut stream, &ControllerResponse::Stopping).await;
-        let closed = stream
-            .shutdown()
-            .await
-            .context("failed to close shutdown response stream");
-        drop(stream);
-        shutdown.send_replace(true);
-        response?;
-        closed?;
-        return Ok(());
-    }
-    if matches!(
-        request,
-        ControllerRequest::ThreadSend { .. }
-            | ControllerRequest::ApprovalAllow { .. }
-            | ControllerRequest::ApprovalDeny { .. }
-    ) {
-        let (updates, mut pending_updates) = mpsc::unbounded_channel();
-        let response = {
-            let response = state.handle_streaming(request, &updates);
-            tokio::pin!(response);
-            loop {
-                tokio::select! {
-                    response = &mut response => break response,
-                    Some(update) = pending_updates.recv() => {
-                        write_stream_update(&mut stream, update).await?;
-                    }
-                }
-            }
-        };
-        drop(updates);
-        while let Ok(update) = pending_updates.try_recv() {
-            write_stream_update(&mut stream, update).await?;
-        }
-        let response = response.unwrap_or_else(|error| ControllerResponse::Error {
-            message: format!("{error:#}"),
-        });
-        return write_response(&mut stream, &response).await;
-    }
-    let response = match state.handle(request).await {
-        Ok(response) => response,
-        Err(error) => ControllerResponse::Error {
-            message: format!("{error:#}"),
-        },
-    };
-    write_response(&mut stream, &response).await
-}
-
-async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) -> Result<()> {
-    let response = match update {
-        ModelStreamEvent::AssistantDelta(content) => ControllerResponse::TurnDelta { content },
-        ModelStreamEvent::ToolCallStarted { item_id, name } => {
-            ControllerResponse::ToolCallStarted { item_id, name }
-        }
-        ModelStreamEvent::ToolCallDelta { item_id, delta } => {
-            ControllerResponse::ToolCallDelta { item_id, delta }
-        }
-        ModelStreamEvent::ThreadEvent(event) => ControllerResponse::TurnEvent { event },
-    };
-    write_response(stream, &response).await
-}
-
-async fn write_response(stream: &mut UnixStream, response: &ControllerResponse) -> Result<()> {
-    let mut response =
-        serde_json::to_vec(response).context("failed to encode controller response")?;
-    response.push(b'\n');
-    stream
-        .write_all(&response)
-        .await
-        .context("failed to write controller response")
-}
-
-struct State {
+pub(crate) struct State {
     runners: Mutex<HashMap<String, Arc<Runner>>>,
     store: Store,
-    provider: Mutex<Provider>,
+    provider: Provider,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
     next_approval_id: AtomicU64,
     platform_bundle: Option<Arc<PlatformBundle>>,
@@ -268,7 +184,7 @@ impl State {
     }
 
     async fn codex_login_status(&self) -> Result<ControllerResponse> {
-        match self.provider.lock().await.login_status().await {
+        match self.provider.login_status().await {
             Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
             None => Ok(ControllerResponse::CodexLoginRequired),
         }
@@ -295,7 +211,7 @@ impl State {
                 Ok(ControllerResponse::ThreadList { threads })
             }
             ControllerRequest::ModelList => Ok(ControllerResponse::ModelList {
-                models: self.provider.lock().await.models().await?,
+                models: self.provider.models().await?,
             }),
             ControllerRequest::ThreadRename {
                 thread_id,
@@ -321,7 +237,7 @@ impl State {
                 if reasoning_effort.trim().is_empty() {
                     bail!("reasoning effort must not be empty");
                 }
-                let models = self.provider.lock().await.models().await?;
+                let models = self.provider.models().await?;
                 let selected = models
                     .iter()
                     .find(|candidate| candidate.id == model)
@@ -359,7 +275,7 @@ impl State {
             }
             ControllerRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
-                self.provider.lock().await.reload_auth().await;
+                self.provider.reload_auth().await;
                 self.codex_login_status().await
             }
             ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
@@ -508,8 +424,8 @@ impl State {
                 .await
                 .context("failed to load thread model")?;
             let prompt_cache_key = format!("{}-{thread_id}", self.prompt_cache_namespace);
-            let mut provider = self.provider.lock().await;
-            let auto_compact_token_limit = provider
+            let auto_compact_token_limit = self
+                .provider
                 .models()
                 .await?
                 .into_iter()
@@ -528,7 +444,8 @@ impl State {
                 .zip(auto_compact_token_limit)
                 .is_some_and(|(tokens, limit)| tokens >= limit)
             {
-                let items = provider
+                let items = self
+                    .provider
                     .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
                     .await?;
                 if !items.is_empty() {
@@ -543,7 +460,8 @@ impl State {
                         .context("failed to reload compacted model history")?;
                 }
             }
-            let completion = provider
+            let completion = self
+                .provider
                 .complete(
                     &model,
                     &reasoning_effort,
@@ -552,7 +470,6 @@ impl State {
                     &prompt_cache_key,
                 )
                 .await?;
-            drop(provider);
             for item in completion.reasoning {
                 self.store
                     .append(thread_id, EventKind::Reasoning, json!({ "item": item }))

@@ -1,12 +1,13 @@
 use std::{collections::VecDeque, fs, path::Path};
 
 use anyhow::{Context, Result};
+use tokio::sync::Mutex;
 
 use super::{ModelCompletion, ModelResponse};
 use crate::storage::{Event, EventKind};
 
 pub(crate) struct FakeProvider {
-    responses: VecDeque<ModelResponse>,
+    responses: Mutex<VecDeque<ModelResponse>>,
 }
 
 impl FakeProvider {
@@ -15,12 +16,16 @@ impl FakeProvider {
             .with_context(|| format!("failed to read fake model script {}", path.display()))?;
         let responses = serde_json::from_slice(&script)
             .with_context(|| format!("failed to decode fake model script {}", path.display()))?;
-        Ok(Self { responses })
+        Ok(Self {
+            responses: Mutex::new(responses),
+        })
     }
 
-    pub(super) fn complete(&mut self, events: &[Event]) -> Result<ModelCompletion> {
+    pub(super) async fn complete(&self, events: &[Event]) -> Result<ModelCompletion> {
         let mut response = self
             .responses
+            .lock()
+            .await
             .pop_front()
             .context("fake model script has no response remaining")?;
         if let ModelResponse::AssistantMessage { content } = &mut response

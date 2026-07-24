@@ -461,6 +461,7 @@ name = "atra-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atra-client",
  "atra-controller",
  "atra-platform",
  "atra-protocol",
@@ -477,6 +478,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xdg",
+]
+
+[[package]]
+name = "atra-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atra-protocol",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -548,6 +559,7 @@ name = "atra-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atra-client",
  "atra-protocol",
  "base64 0.22.1",
  "crossterm",

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/atra-cli",
+    "crates/atra-client",
     "crates/atra-controller",
     "crates/atra-platform",
     "crates/atra-protocol",
@@ -17,6 +18,7 @@ rust-version = "1.96"
 [workspace.dependencies]
 anyhow = "1.0.100"
 atra-controller = { path = "crates/atra-controller" }
+atra-client = { path = "crates/atra-client" }
 atra-platform = { path = "crates/atra-platform" }
 atra-protocol = { path = "crates/atra-protocol" }
 atra-runner = { path = "crates/atra-runner" }

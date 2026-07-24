@@ -1,6 +1,6 @@
 ---
-source: crates/atra-tui/src/lib_tests.rs
-assertion_line: 54
+source: crates/atra-tui/src/app_tests.rs
+assertion_line: 70
 expression: terminal.backend().to_string()
 ---
 "┌Threads─────────┐┌Transcript────────────┐"

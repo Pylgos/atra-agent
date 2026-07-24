@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+atra-client.workspace = true
 atra-controller.workspace = true
 atra-platform.workspace = true
 atra-protocol.workspace = true
