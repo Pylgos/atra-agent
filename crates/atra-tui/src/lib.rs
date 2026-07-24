@@ -28,6 +28,7 @@ use ratatui::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
+    sync::mpsc,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -121,9 +122,17 @@ struct TranscriptLayout {
     rows: Vec<MappedRow>,
 }
 
+struct TurnCompletion {
+    message: Option<String>,
+    thread_id: i64,
+    threads: Option<Vec<Thread>>,
+    response: ControllerResponse,
+}
+
 struct App {
     endpoint: PathBuf,
     threads: Vec<Thread>,
+    models: Vec<Model>,
     thread_id: Option<i64>,
     transcript: Vec<TranscriptItem>,
     input: String,
@@ -131,11 +140,13 @@ struct App {
     approval: Option<Approval>,
     renaming: bool,
     model_picker: Option<ModelPicker>,
+    new_thread_model: Option<(String, String)>,
     login_required: bool,
     selection_start: Option<SelectionPoint>,
     selection_end: Option<SelectionPoint>,
     transcript_layout: TranscriptLayout,
     sidebar: Rect,
+    turn_pending: bool,
 }
 
 impl App {
@@ -156,9 +167,15 @@ impl App {
             ControllerResponse::Error { message } => bail!("{message}"),
             response => bail!("controller returned an unexpected response: {response:?}"),
         };
+        let models = match request(&endpoint, ControllerRequest::ModelList).await? {
+            ControllerResponse::ModelList { models } => models,
+            ControllerResponse::Error { .. } => Vec::new(),
+            response => bail!("controller returned an unexpected response: {response:?}"),
+        };
         Ok(Self {
             endpoint,
             threads,
+            models,
             thread_id,
             transcript,
             input: String::new(),
@@ -171,6 +188,7 @@ impl App {
             approval: None,
             renaming: false,
             model_picker: None,
+            new_thread_model: None,
             login_required,
             selection_start: None,
             selection_end: None,
@@ -179,30 +197,41 @@ impl App {
                 rows: Vec::new(),
             },
             sidebar: Rect::default(),
+            turn_pending: false,
         })
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let mut events = EventStream::new();
+        let (turns, mut completed_turns) = mpsc::unbounded_channel();
         loop {
             terminal.draw(|frame| self.render(frame))?;
-            let Some(event) = events.next().await.transpose()? else {
-                return Ok(());
-            };
-            match event {
-                Event::Key(key) if self.handle_key(key).await? => return Ok(()),
-                Event::Mouse(mouse) => self.handle_mouse(mouse).await?,
-                Event::Resize(_, _) => {}
-                _ => {}
+            tokio::select! {
+                event = events.next() => {
+                    let Some(event) = event.transpose()? else {
+                        return Ok(());
+                    };
+                    match event {
+                        Event::Key(key) if self.handle_key(key, &turns).await? => return Ok(()),
+                        Event::Mouse(mouse) => self.handle_mouse(mouse).await?,
+                        Event::Resize(_, _) => {}
+                        _ => {}
+                    }
+                }
+                Some(completion) = completed_turns.recv() => {
+                    self.complete_turn(completion)?;
+                }
             }
         }
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+    async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        turns: &mpsc::UnboundedSender<Result<TurnCompletion>>,
+    ) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
-            if self.thread_id.is_some() {
-                self.open_model_picker().await?;
-            }
+            self.open_model_picker()?;
             return Ok(false);
         }
 
@@ -216,6 +245,7 @@ impl App {
                     self.approval = None;
                     self.renaming = false;
                     self.model_picker = None;
+                    self.new_thread_model = None;
                     self.clear_selection();
                 }
                 KeyCode::Char('r') if self.thread_id.is_some() => {
@@ -229,8 +259,8 @@ impl App {
                         .unwrap_or_default();
                     self.status = "Enter saves the thread name · Esc cancels".to_owned();
                 }
-                KeyCode::Char('m') if self.thread_id.is_some() => {
-                    self.open_model_picker().await?;
+                KeyCode::Char('m') => {
+                    self.open_model_picker()?;
                 }
                 KeyCode::Char('l') if self.login_required => {
                     self.status = "Complete Codex login in your browser…".to_owned();
@@ -257,11 +287,11 @@ impl App {
             match key.code {
                 KeyCode::Char('y') => {
                     let id = approval.id;
-                    self.resolve_approval(id, true).await?;
+                    self.resolve_approval(id, true, turns);
                 }
                 KeyCode::Char('n') => {
                     let id = approval.id;
-                    self.resolve_approval(id, false).await?;
+                    self.resolve_approval(id, false, turns);
                 }
                 _ => {}
             }
@@ -340,7 +370,9 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Enter if !self.input.trim().is_empty() => self.send().await?,
+            KeyCode::Enter if !self.input.trim().is_empty() && !self.turn_pending => {
+                self.send(turns)
+            }
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -351,36 +383,34 @@ impl App {
         Ok(false)
     }
 
-    async fn open_model_picker(&mut self) -> Result<()> {
+    fn open_model_picker(&mut self) -> Result<()> {
         self.renaming = false;
-        let thread = self
-            .threads
-            .iter()
-            .find(|thread| Some(thread.id) == self.thread_id)
-            .context("selected thread is missing")?;
-        let models = match request(&self.endpoint, ControllerRequest::ModelList).await? {
-            ControllerResponse::ModelList { models } => models,
-            ControllerResponse::Error { message } => {
-                self.status = sanitize(&message);
-                return Ok(());
-            }
-            response => bail!("controller returned an unexpected response: {response:?}"),
-        };
-        if models.is_empty() {
+        if self.models.is_empty() {
             self.status = "No models are available".to_owned();
             return Ok(());
         }
-        let model_index = models
+        let selected = self
+            .threads
             .iter()
-            .position(|model| model.id == thread.model)
+            .find(|thread| Some(thread.id) == self.thread_id)
+            .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
+            .or_else(|| {
+                self.new_thread_model
+                    .as_ref()
+                    .map(|(model, effort)| (model.as_str(), effort.as_str()))
+            });
+        let model_index = self
+            .models
+            .iter()
+            .position(|model| selected.is_some_and(|(selected, _)| model.id == selected))
             .unwrap_or(0);
-        let effort_index = models[model_index]
+        let effort_index = self.models[model_index]
             .supported_reasoning_efforts
             .iter()
-            .position(|effort| effort == &thread.reasoning_effort)
+            .position(|effort| selected.is_some_and(|(_, selected)| effort == selected))
             .unwrap_or(0);
         self.model_picker = Some(ModelPicker {
-            models,
+            models: self.models.clone(),
             model_index,
             effort_index,
             selecting_effort: false,
@@ -401,6 +431,7 @@ impl App {
                 self.approval = None;
                 self.renaming = false;
                 self.model_picker = None;
+                self.new_thread_model = None;
                 self.clear_selection();
             } else if let Some(thread) = self.threads.get(index - 1) {
                 self.thread_id = Some(thread.id);
@@ -428,51 +459,85 @@ impl App {
         Ok(())
     }
 
-    async fn send(&mut self) -> Result<()> {
+    fn send(&mut self, turns: &mpsc::UnboundedSender<Result<TurnCompletion>>) {
         let message = std::mem::take(&mut self.input);
-        let thread_id = match self.thread_id {
-            Some(thread_id) => thread_id,
-            None => match request(
-                &self.endpoint,
-                ControllerRequest::ThreadCreate { display_name: None },
-            )
-            .await?
-            {
-                ControllerResponse::ThreadCreated { thread_id } => {
-                    self.threads =
-                        match request(&self.endpoint, ControllerRequest::ThreadList).await? {
-                            ControllerResponse::ThreadList { threads } => threads,
+        self.transcript.push(TranscriptItem {
+            role: "You",
+            text: sanitize(&message),
+        });
+        self.turn_pending = true;
+        self.status = "Waiting for Atra Controller…".to_owned();
+        let endpoint = self.endpoint.clone();
+        let existing_thread_id = self.thread_id;
+        let new_thread_model = self.new_thread_model.take();
+        let turns = turns.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let (thread_id, created) = match existing_thread_id {
+                    Some(thread_id) => (thread_id, false),
+                    None => {
+                        let thread_id = match request(
+                            &endpoint,
+                            ControllerRequest::ThreadCreate { display_name: None },
+                        )
+                        .await?
+                        {
+                            ControllerResponse::ThreadCreated { thread_id } => thread_id,
                             ControllerResponse::Error { message } => bail!("{message}"),
                             response => {
                                 bail!("controller returned an unexpected response: {response:?}")
                             }
                         };
-                    self.thread_id = Some(thread_id);
-                    thread_id
-                }
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            },
-        };
-        self.transcript.push(TranscriptItem {
-            role: "You",
-            text: sanitize(&message),
+                        if let Some((model, reasoning_effort)) = new_thread_model {
+                            match request(
+                                &endpoint,
+                                ControllerRequest::ThreadSetModel {
+                                    thread_id,
+                                    model,
+                                    reasoning_effort,
+                                },
+                            )
+                            .await?
+                            {
+                                ControllerResponse::ThreadModelChanged => {}
+                                ControllerResponse::Error { message } => bail!("{message}"),
+                                response => bail!(
+                                    "controller returned an unexpected response: {response:?}"
+                                ),
+                            }
+                        }
+                        (thread_id, true)
+                    }
+                };
+                let response = request(
+                    &endpoint,
+                    ControllerRequest::ThreadSend {
+                        thread_id,
+                        message: message.clone(),
+                    },
+                )
+                .await?;
+                let threads = if created {
+                    match request(&endpoint, ControllerRequest::ThreadList).await? {
+                        ControllerResponse::ThreadList { threads } => Some(threads),
+                        ControllerResponse::Error { message } => bail!("{message}"),
+                        response => {
+                            bail!("controller returned an unexpected response: {response:?}")
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(TurnCompletion {
+                    message: Some(message),
+                    thread_id,
+                    threads,
+                    response,
+                })
+            }
+            .await;
+            let _ = turns.send(result);
         });
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .find(|thread| thread.id == thread_id)
-            && thread.display_name.is_none()
-        {
-            thread.display_name = Some(message.clone());
-        }
-        self.status = "Waiting for Atra Controller…".to_owned();
-        let response = request(
-            &self.endpoint,
-            ControllerRequest::ThreadSend { thread_id, message },
-        )
-        .await?;
-        self.accept_turn_response(response)
     }
 
     async fn rename(&mut self) -> Result<()> {
@@ -505,7 +570,6 @@ impl App {
     }
 
     async fn change_model(&mut self) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
         let picker = self
             .model_picker
             .as_ref()
@@ -517,6 +581,12 @@ impl App {
             .get(picker.effort_index)
             .cloned()
             .unwrap_or_else(|| selected.default_reasoning_effort.clone());
+        let Some(thread_id) = self.thread_id else {
+            self.new_thread_model = Some((model, reasoning_effort));
+            self.model_picker = None;
+            self.status = "Model selected for new thread".to_owned();
+            return Ok(());
+        };
         match request(
             &self.endpoint,
             ControllerRequest::ThreadSetModel {
@@ -545,7 +615,12 @@ impl App {
         }
     }
 
-    async fn resolve_approval(&mut self, approval_id: u64, allowed: bool) -> Result<()> {
+    fn resolve_approval(
+        &mut self,
+        approval_id: u64,
+        allowed: bool,
+        turns: &mpsc::UnboundedSender<Result<TurnCompletion>>,
+    ) {
         let request_message = if allowed {
             ControllerRequest::ApprovalAllow { approval_id }
         } else {
@@ -555,9 +630,51 @@ impl App {
             }
         };
         self.approval = None;
+        self.turn_pending = true;
         self.status = "Waiting for Atra Controller…".to_owned();
-        let response = request(&self.endpoint, request_message).await?;
-        self.accept_turn_response(response)
+        let endpoint = self.endpoint.clone();
+        let thread_id = self.thread_id.expect("approval belongs to a thread");
+        let turns = turns.clone();
+        tokio::spawn(async move {
+            let result = request(&endpoint, request_message)
+                .await
+                .map(|response| TurnCompletion {
+                    message: None,
+                    thread_id,
+                    threads: None,
+                    response,
+                });
+            let _ = turns.send(result);
+        });
+    }
+
+    fn complete_turn(&mut self, completion: Result<TurnCompletion>) -> Result<()> {
+        self.turn_pending = false;
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.status = sanitize(&format!("{error:#}"));
+                return Ok(());
+            }
+        };
+        if let Some(threads) = completion.threads {
+            self.threads = threads;
+        }
+        if let Some(message) = completion.message
+            && self.thread_id.is_none()
+            && self
+                .transcript
+                .last()
+                .is_some_and(|item| item.role == "You" && item.text == sanitize(&message))
+        {
+            self.thread_id = Some(completion.thread_id);
+        }
+        if self.thread_id == Some(completion.thread_id) {
+            self.accept_turn_response(completion.response)?;
+        } else {
+            self.status = "Ready".to_owned();
+        }
+        Ok(())
     }
 
     fn accept_turn_response(&mut self, response: ControllerResponse) -> Result<()> {

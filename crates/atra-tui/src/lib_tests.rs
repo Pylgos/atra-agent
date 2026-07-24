@@ -38,6 +38,7 @@ fn transcript_render_is_stable() {
                 reasoning_effort: "medium".to_owned(),
             },
         ],
+        models: Vec::new(),
         thread_id: Some(2),
         transcript: items,
         input: "next".to_owned(),
@@ -45,6 +46,7 @@ fn transcript_render_is_stable() {
         approval: None,
         renaming: false,
         model_picker: None,
+        new_thread_model: None,
         login_required: false,
         selection_start: None,
         selection_end: None,
@@ -53,6 +55,7 @@ fn transcript_render_is_stable() {
             rows: Vec::new(),
         },
         sidebar: Rect::default(),
+        turn_pending: false,
     };
 
     terminal.draw(|frame| app.render(frame)).unwrap();

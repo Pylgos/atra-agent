@@ -157,7 +157,7 @@ pub struct Thread {
     pub reasoning_effort: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Model {
     pub id: String,
     pub display_name: String,
