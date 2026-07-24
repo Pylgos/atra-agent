@@ -47,11 +47,15 @@ async fn lists_threads_newest_first() {
             threads: vec![
                 Thread {
                     id: 2,
-                    display_name: None
+                    display_name: None,
+                    model: "gpt-5.6-sol".to_owned(),
+                    reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
                     id: 1,
-                    display_name: Some("Named".to_owned())
+                    display_name: Some("Named".to_owned()),
+                    model: "gpt-5.6-sol".to_owned(),
+                    reasoning_effort: "medium".to_owned(),
                 }
             ]
         }
@@ -85,11 +89,15 @@ async fn lists_threads_newest_first() {
             threads: vec![
                 Thread {
                     id: 2,
-                    display_name: Some("First prompt".to_owned())
+                    display_name: Some("First prompt".to_owned()),
+                    model: "gpt-5.6-sol".to_owned(),
+                    reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
                     id: 1,
-                    display_name: Some("Renamed".to_owned())
+                    display_name: Some("Renamed".to_owned()),
+                    model: "gpt-5.6-sol".to_owned(),
+                    reasoning_effort: "medium".to_owned(),
                 }
             ]
         }
@@ -226,9 +234,10 @@ impl TestController {
         let directory = tempfile::tempdir().unwrap();
         let endpoint = directory.path().join("controller.sock");
         let database = directory.path().join("controller.sqlite3");
+        let auth_home = directory.path().join("auth");
         let server_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            atra_controller::run(&server_endpoint, &database)
+            atra_controller::run(&server_endpoint, &database, &auth_home)
                 .await
                 .unwrap();
         });

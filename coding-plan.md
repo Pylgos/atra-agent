@@ -585,13 +585,13 @@ container、tmux、terminal固有動作は、default test frameworkを拡大せ�
 11. [完了] Atra patchを実装する。
 12. [完了] 最初の全画面TUIとOSC 52 copyを実装する。
 13. [完了] platform bundle deployとcontainerへのRunner uploadを実装する。
-14. real Codex-subscription providerを統合し、手動確認する。
+14. [完了] real Codex-subscription providerを統合し、手動確認する。
 
 architectureを完成済みに見せるためだけに後続stageを先回りして作らないでください。
 
 各stageの終了時には、追加の抽象化より動作とtestを優先してください。
 
-現在の次stageは14のreal Codex-subscription provider統合です。
+初期実装stage 1–14は完了しています。
 
 ## 19. 実装上の共通方針
 

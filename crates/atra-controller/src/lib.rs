@@ -17,6 +17,11 @@ use atra_protocol::{
     RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
+use codex_login::{
+    AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthRouteConfig, CLIENT_ID, ServerOptions,
+    run_login_server,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
@@ -30,16 +35,45 @@ mod model;
 #[allow(dead_code)]
 mod storage;
 
-use model::{FakeProvider, ModelResponse};
+use model::{CodexProvider, DEFAULT_MODEL, FakeProvider, ModelResponse, Provider};
 use storage::{EventKind, Store};
 
-pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
+pub async fn codex_login(auth_home: &Path) -> Result<()> {
+    fs::create_dir_all(auth_home)
+        .with_context(|| format!("failed to create auth directory {}", auth_home.display()))?;
+    fs::set_permissions(auth_home, fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "failed to set permissions on auth directory {}",
+            auth_home.display()
+        )
+    })?;
+    let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+        OutboundProxyPolicy::ReqwestDefault,
+    ));
+    let server = run_login_server(ServerOptions::new(
+        auth_home.to_owned(),
+        CLIENT_ID.to_owned(),
+        None,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+        route,
+    ))
+    .context("failed to start Codex login")?;
+    eprintln!("Open this URL to sign in:\n{}", server.auth_url);
+    server
+        .block_until_done()
+        .await
+        .context("Codex login failed")
+}
+
+pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<()> {
     let store = Store::open(database)
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
-    let provider = env::var_os("ATRA_FAKE_MODEL_SCRIPT")
-        .map(|path| FakeProvider::load(Path::new(&path)))
-        .transpose()?;
+    let provider = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
+        Some(path) => Provider::Fake(FakeProvider::load(Path::new(&path))?),
+        None => Provider::Codex(CodexProvider::new(auth_home.to_owned()).await),
+    };
     let platform_bundle_path = match env::var_os("ATRA_PLATFORM_BUNDLE") {
         Some(path) => Some(path.into()),
         None => current_platform_bundle()?,
@@ -78,6 +112,7 @@ pub async fn run(endpoint: &Path, database: &Path) -> Result<()> {
         approvals: Mutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
         platform_bundle,
+        auth_home: auth_home.to_owned(),
     });
 
     loop {
@@ -121,20 +156,31 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
 struct State {
     runners: Mutex<HashMap<String, Arc<Runner>>>,
     store: Store,
-    provider: Mutex<Option<FakeProvider>>,
+    provider: Mutex<Provider>,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
     next_approval_id: AtomicU64,
     platform_bundle: Option<Arc<PlatformBundle>>,
+    auth_home: PathBuf,
 }
 
 impl State {
+    async fn codex_login_status(&self) -> Result<ControllerResponse> {
+        match &*self.provider.lock().await {
+            Provider::Fake(_) => Ok(ControllerResponse::CodexLoggedIn { email: None }),
+            Provider::Codex(provider) => match provider.login_status().await {
+                Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
+                None => Ok(ControllerResponse::CodexLoginRequired),
+            },
+        }
+    }
+
     async fn handle(&self, request: ControllerRequest) -> Result<ControllerResponse> {
         match request {
             ControllerRequest::Status => Ok(ControllerResponse::Running),
             ControllerRequest::ThreadCreate { display_name } => {
                 let thread_id = self
                     .store
-                    .create_thread(display_name)
+                    .create_thread(display_name, DEFAULT_MODEL.to_owned(), "medium".to_owned())
                     .await
                     .context("failed to create thread")?;
                 Ok(ControllerResponse::ThreadCreated { thread_id })
@@ -147,6 +193,9 @@ impl State {
                     .context("failed to list threads")?;
                 Ok(ControllerResponse::ThreadList { threads })
             }
+            ControllerRequest::ModelList => Ok(ControllerResponse::ModelList {
+                models: self.provider.lock().await.models().await?,
+            }),
             ControllerRequest::ThreadRename {
                 thread_id,
                 display_name,
@@ -159,6 +208,35 @@ impl State {
                     .await
                     .context("failed to rename thread")?;
                 Ok(ControllerResponse::ThreadRenamed)
+            }
+            ControllerRequest::ThreadSetModel {
+                thread_id,
+                model,
+                reasoning_effort,
+            } => {
+                if model.trim().is_empty() {
+                    bail!("thread model must not be empty");
+                }
+                if reasoning_effort.trim().is_empty() {
+                    bail!("reasoning effort must not be empty");
+                }
+                let models = self.provider.lock().await.models().await?;
+                let selected = models
+                    .iter()
+                    .find(|candidate| candidate.id == model)
+                    .with_context(|| format!("unknown model {model}"))?;
+                if !selected
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|candidate| candidate == &reasoning_effort)
+                {
+                    bail!("reasoning effort {reasoning_effort} is not supported by model {model}");
+                }
+                self.store
+                    .set_thread_model(thread_id, model, reasoning_effort)
+                    .await
+                    .context("failed to change thread model")?;
+                Ok(ControllerResponse::ThreadModelChanged)
             }
             ControllerRequest::ThreadSend { thread_id, message } => {
                 self.run_turn(thread_id, message).await
@@ -178,6 +256,14 @@ impl State {
                     .collect();
                 Ok(ControllerResponse::ThreadEvents { events })
             }
+            ControllerRequest::CodexLogin => {
+                codex_login(&self.auth_home).await?;
+                if let Provider::Codex(provider) = &*self.provider.lock().await {
+                    provider.reload_auth().await;
+                }
+                self.codex_login_status().await
+            }
+            ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
             ControllerRequest::ApprovalAllow { approval_id } => {
                 self.resolve_approval(approval_id, true, None).await
             }
@@ -298,13 +384,17 @@ impl State {
                 .events(thread_id)
                 .await
                 .context("failed to load model history")?;
+            let (model, reasoning_effort) = self
+                .store
+                .thread_model(thread_id)
+                .await
+                .context("failed to load thread model")?;
             let response = self
                 .provider
                 .lock()
                 .await
-                .as_mut()
-                .context("no model provider is configured")?
-                .complete(&events)?;
+                .complete(&model, &reasoning_effort, &events)
+                .await?;
 
             match response {
                 ModelResponse::AssistantMessage { content } => {
@@ -318,12 +408,20 @@ impl State {
                         .context("failed to save assistant message")?;
                     return Ok(ControllerResponse::TurnCompleted { content });
                 }
-                ModelResponse::ToolCall { name, arguments } => {
+                ModelResponse::ToolCall {
+                    name,
+                    arguments,
+                    call_id,
+                } => {
                     self.store
                         .append(
                             thread_id,
                             EventKind::ToolCall,
-                            json!({ "name": &name, "arguments": &arguments }),
+                            json!({
+                                "name": &name,
+                                "arguments": &arguments,
+                                "call_id": &call_id,
+                            }),
                         )
                         .await
                         .context("failed to save tool call")?;
@@ -332,7 +430,12 @@ impl State {
                             let arguments: ExecCommandArguments = serde_json::from_value(arguments)
                                 .context("fake model returned invalid exec_command arguments")?;
                             if let Some(response) = self
-                                .route_tool(thread_id, name, ToolArguments::ExecCommand(arguments))
+                                .route_tool(
+                                    thread_id,
+                                    name,
+                                    call_id,
+                                    ToolArguments::ExecCommand(arguments),
+                                )
                                 .await?
                             {
                                 return Ok(response);
@@ -342,7 +445,12 @@ impl State {
                             let arguments: ApplyPatchArguments = serde_json::from_value(arguments)
                                 .context("fake model returned invalid apply_patch arguments")?;
                             if let Some(response) = self
-                                .route_tool(thread_id, name, ToolArguments::ApplyPatch(arguments))
+                                .route_tool(
+                                    thread_id,
+                                    name,
+                                    call_id,
+                                    ToolArguments::ApplyPatch(arguments),
+                                )
                                 .await?
                             {
                                 return Ok(response);
@@ -359,6 +467,7 @@ impl State {
         &self,
         thread_id: i64,
         name: String,
+        call_id: Option<String>,
         arguments: ToolArguments,
     ) -> Result<Option<ControllerResponse>> {
         let runner = self.runner(arguments.runner()).await?;
@@ -383,6 +492,7 @@ impl State {
                 PendingApproval {
                     thread_id,
                     name: name.clone(),
+                    call_id,
                     arguments,
                 },
             );
@@ -394,7 +504,8 @@ impl State {
             }));
         }
         let result = self.execute(arguments).await?;
-        self.save_tool_result(thread_id, &name, result).await?;
+        self.save_tool_result(thread_id, &name, call_id.as_deref(), result)
+            .await?;
         Ok(None)
     }
 
@@ -432,8 +543,13 @@ impl State {
             };
             json!({ "status": "denied", "output": output })
         };
-        self.save_tool_result(pending.thread_id, &pending.name, result)
-            .await?;
+        self.save_tool_result(
+            pending.thread_id,
+            &pending.name,
+            pending.call_id.as_deref(),
+            result,
+        )
+        .await?;
         self.continue_turn(pending.thread_id).await
     }
 
@@ -468,13 +584,14 @@ impl State {
         &self,
         thread_id: i64,
         name: &str,
+        call_id: Option<&str>,
         result: serde_json::Value,
     ) -> Result<()> {
         self.store
             .append(
                 thread_id,
                 EventKind::ToolResult,
-                json!({ "name": name, "result": result }),
+                json!({ "name": name, "call_id": call_id, "result": result }),
             )
             .await
             .context("failed to save tool result")?;
@@ -565,6 +682,7 @@ impl ToolArguments {
 struct PendingApproval {
     thread_id: i64,
     name: String,
+    call_id: Option<String>,
     arguments: ToolArguments,
 }
 

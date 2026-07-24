@@ -23,9 +23,15 @@ pub enum ControllerRequest {
         display_name: Option<String>,
     },
     ThreadList,
+    ModelList,
     ThreadRename {
         thread_id: i64,
         display_name: String,
+    },
+    ThreadSetModel {
+        thread_id: i64,
+        model: String,
+        reasoning_effort: String,
     },
     ThreadSend {
         thread_id: i64,
@@ -34,6 +40,8 @@ pub enum ControllerRequest {
     ThreadEvents {
         thread_id: i64,
     },
+    CodexLogin,
+    CodexLoginStatus,
     ApprovalAllow {
         approval_id: u64,
     },
@@ -85,7 +93,11 @@ pub enum ControllerResponse {
     ThreadList {
         threads: Vec<Thread>,
     },
+    ModelList {
+        models: Vec<Model>,
+    },
     ThreadRenamed,
+    ThreadModelChanged,
     TurnCompleted {
         content: String,
     },
@@ -124,6 +136,10 @@ pub enum ControllerResponse {
     Error {
         message: String,
     },
+    CodexLoginRequired,
+    CodexLoggedIn {
+        email: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -137,6 +153,17 @@ pub struct ThreadEvent {
 pub struct Thread {
     pub id: i64,
     pub display_name: Option<String>,
+    pub model: String,
+    pub reasoning_effort: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Model {
+    pub id: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -64,7 +64,9 @@ impl Store {
 
                     CREATE TABLE IF NOT EXISTS threads (
                         id INTEGER PRIMARY KEY,
-                        display_name TEXT
+                        display_name TEXT,
+                        model TEXT NOT NULL,
+                        reasoning_effort TEXT NOT NULL
                     );
 
                     CREATE TABLE IF NOT EXISTS events (
@@ -82,12 +84,17 @@ impl Store {
         Ok(Self { connection })
     }
 
-    pub async fn create_thread(&self, display_name: Option<String>) -> tokio_rusqlite::Result<i64> {
+    pub async fn create_thread(
+        &self,
+        display_name: Option<String>,
+        model: String,
+        reasoning_effort: String,
+    ) -> tokio_rusqlite::Result<i64> {
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    "INSERT INTO threads (display_name) VALUES (?1)",
-                    [display_name],
+                    "INSERT INTO threads (display_name, model, reasoning_effort) VALUES (?1, ?2, ?3)",
+                    params![display_name, model, reasoning_effort],
                 )?;
                 Ok(connection.last_insert_rowid())
             })
@@ -97,13 +104,15 @@ impl Store {
     pub async fn threads(&self) -> tokio_rusqlite::Result<Vec<Thread>> {
         self.connection
             .call(|connection| {
-                let mut statement =
-                    connection.prepare("SELECT id, display_name FROM threads ORDER BY id DESC")?;
+                let mut statement = connection
+                    .prepare("SELECT id, display_name, model, reasoning_effort FROM threads ORDER BY id DESC")?;
                 statement
                     .query_map([], |row| {
                         Ok(Thread {
                             id: row.get(0)?,
                             display_name: row.get(1)?,
+                            model: row.get(2)?,
+                            reasoning_effort: row.get(3)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -126,6 +135,38 @@ impl Store {
                     return Err(rusqlite::Error::QueryReturnedNoRows);
                 }
                 Ok(())
+            })
+            .await
+    }
+
+    pub async fn set_thread_model(
+        &self,
+        thread_id: i64,
+        model: String,
+        reasoning_effort: String,
+    ) -> tokio_rusqlite::Result<()> {
+        self.connection
+            .call(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE threads SET model = ?1, reasoning_effort = ?2 WHERE id = ?3",
+                    params![model, reasoning_effort, thread_id],
+                )?;
+                if updated == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn thread_model(&self, thread_id: i64) -> tokio_rusqlite::Result<(String, String)> {
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT model, reasoning_effort FROM threads WHERE id = ?1",
+                    [thread_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
             })
             .await
     }
@@ -230,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn events_keep_their_thread_order() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let thread = store.create_thread(None).await.unwrap();
+        let thread = store
+            .create_thread(None, "test-model".to_owned(), "medium".to_owned())
+            .await
+            .unwrap();
 
         assert_eq!(
             store
@@ -272,7 +316,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("controller.sqlite3");
         let store = Store::open(&database).await.unwrap();
-        let thread = store.create_thread(None).await.unwrap();
+        let thread = store
+            .create_thread(None, "test-model".to_owned(), "medium".to_owned())
+            .await
+            .unwrap();
         store
             .append(thread, EventKind::UserMessage, json!({"content": "saved"}))
             .await
@@ -294,8 +341,18 @@ mod tests {
     #[tokio::test]
     async fn threads_are_listed_newest_first() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let first = store.create_thread(Some("First".to_owned())).await.unwrap();
-        let second = store.create_thread(None).await.unwrap();
+        let first = store
+            .create_thread(
+                Some("First".to_owned()),
+                "model-a".to_owned(),
+                "low".to_owned(),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .create_thread(None, "model-b".to_owned(), "high".to_owned())
+            .await
+            .unwrap();
 
         assert_eq!(
             store.threads().await.unwrap(),
@@ -303,10 +360,14 @@ mod tests {
                 Thread {
                     id: second,
                     display_name: None,
+                    model: "model-b".to_owned(),
+                    reasoning_effort: "high".to_owned(),
                 },
                 Thread {
                     id: first,
                     display_name: Some("First".to_owned()),
+                    model: "model-a".to_owned(),
+                    reasoning_effort: "low".to_owned(),
                 },
             ]
         );

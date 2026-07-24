@@ -28,10 +28,14 @@ fn transcript_render_is_stable() {
             Thread {
                 id: 2,
                 display_name: Some("Current work".to_owned()),
+                model: "gpt-5.6-sol".to_owned(),
+                reasoning_effort: "medium".to_owned(),
             },
             Thread {
                 id: 1,
                 display_name: None,
+                model: "gpt-5.6-sol".to_owned(),
+                reasoning_effort: "medium".to_owned(),
             },
         ],
         thread_id: Some(2),
@@ -40,6 +44,8 @@ fn transcript_render_is_stable() {
         status: "Ready".to_owned(),
         approval: None,
         renaming: false,
+        model_picker: None,
+        login_required: false,
         selection_start: None,
         selection_end: None,
         transcript_layout: TranscriptLayout {

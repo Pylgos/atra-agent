@@ -45,12 +45,22 @@ enum Command {
         #[command(subcommand)]
         command: PlatformCommand,
     },
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
     Tui,
 }
 
 #[derive(Subcommand)]
 enum ControllerCommand {
     Run,
+    Status,
+}
+
+#[derive(Subcommand)]
+enum CodexCommand {
+    Login,
     Status,
 }
 
@@ -66,6 +76,14 @@ enum ThreadCommand {
         thread: i64,
         #[arg(long)]
         name: String,
+    },
+    Model {
+        #[arg(long)]
+        thread: i64,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        reasoning_effort: String,
     },
     Send {
         #[arg(long)]
@@ -211,6 +229,32 @@ async fn run() -> Result<()> {
     let endpoint = controller_endpoint(&workspace_id)?;
 
     match command {
+        Command::Codex {
+            command: CodexCommand::Login,
+        } => {
+            atra_controller::codex_login(&codex_auth_home()?).await?;
+            println!("logged in");
+            Ok(())
+        }
+        Command::Codex {
+            command: CodexCommand::Status,
+        } => match send_controller_request(&endpoint, ControllerRequest::CodexLoginStatus).await? {
+            ControllerResponse::CodexLoggedIn { email } => {
+                println!(
+                    "logged in{}",
+                    email
+                        .map(|email| format!(" as {email}"))
+                        .unwrap_or_default()
+                );
+                Ok(())
+            }
+            ControllerResponse::CodexLoginRequired => {
+                println!("logged out");
+                Ok(())
+            }
+            ControllerResponse::Error { message } => bail!("{message}"),
+            response => bail!("controller returned an unexpected response: {response:?}"),
+        },
         Command::Platform {
             command: PlatformCommand::Install { bundle },
         } => install_platform_bundle(&bundle),
@@ -218,7 +262,7 @@ async fn run() -> Result<()> {
             command: ControllerCommand::Run,
         } => {
             let database = controller_database(&workspace_id)?;
-            atra_controller::run(&endpoint, &database).await
+            atra_controller::run(&endpoint, &database, &codex_auth_home()?).await
         }
         Command::Controller {
             command: ControllerCommand::Status,
@@ -264,6 +308,24 @@ async fn run() -> Result<()> {
                 ControllerRequest::ThreadRename {
                     thread_id: thread,
                     display_name: name,
+                },
+            )
+            .await
+        }
+        Command::Thread {
+            command:
+                ThreadCommand::Model {
+                    thread,
+                    model,
+                    reasoning_effort,
+                },
+        } => {
+            controller_request(
+                &endpoint,
+                ControllerRequest::ThreadSetModel {
+                    thread_id: thread,
+                    model,
+                    reasoning_effort,
                 },
             )
             .await
@@ -693,6 +755,13 @@ fn platform_data_directory() -> Result<PathBuf> {
         .join("atra/platforms"))
 }
 
+fn codex_auth_home() -> Result<PathBuf> {
+    Ok(xdg::BaseDirectories::new()
+        .get_data_home()
+        .context("cannot determine the XDG data directory")?
+        .join("atra/codex"))
+}
+
 fn host_platform() -> Result<&'static str> {
     match env::consts::ARCH {
         "x86_64" => Ok("x86_64-linux-musl"),
@@ -793,11 +862,15 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
     match response {
         ControllerResponse::Running => println!("running"),
         ControllerResponse::ThreadRenamed => println!("renamed"),
+        ControllerResponse::ThreadModelChanged => println!("model changed"),
         ControllerResponse::ThreadCreated { .. }
         | ControllerResponse::ThreadList { .. }
+        | ControllerResponse::ModelList { .. }
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ApprovalRequired { .. }
-        | ControllerResponse::ThreadEvents { .. } => {
+        | ControllerResponse::ThreadEvents { .. }
+        | ControllerResponse::CodexLoginRequired
+        | ControllerResponse::CodexLoggedIn { .. } => {
             bail!("controller returned an unexpected thread response")
         }
         ControllerResponse::Launched => println!("launched"),

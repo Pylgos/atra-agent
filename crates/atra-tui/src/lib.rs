@@ -5,12 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ControllerRequest, ControllerResponse, Thread, ThreadEvent};
+use atra_protocol::{ControllerRequest, ControllerResponse, Model, Thread, ThreadEvent};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -22,7 +23,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -46,8 +47,13 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("failed to enter the terminal UI")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .context("failed to enter the terminal UI")?;
         Ok(Self {
             terminal: Terminal::new(CrosstermBackend::new(stdout))
                 .context("failed to initialize the terminal")?,
@@ -60,6 +66,7 @@ impl TerminalGuard {
             disable_raw_mode().context("failed to disable terminal raw mode")?;
             execute!(
                 self.terminal.backend_mut(),
+                PopKeyboardEnhancementFlags,
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )
@@ -90,6 +97,13 @@ struct Approval {
     description: String,
 }
 
+struct ModelPicker {
+    models: Vec<Model>,
+    model_index: usize,
+    effort_index: usize,
+    selecting_effort: bool,
+}
+
 #[derive(Clone, Copy)]
 struct SelectionPoint {
     offset: usize,
@@ -116,6 +130,8 @@ struct App {
     status: String,
     approval: Option<Approval>,
     renaming: bool,
+    model_picker: Option<ModelPicker>,
+    login_required: bool,
     selection_start: Option<SelectionPoint>,
     selection_end: Option<SelectionPoint>,
     transcript_layout: TranscriptLayout,
@@ -134,16 +150,28 @@ impl App {
             Some(thread_id) => load_transcript(&endpoint, thread_id).await?,
             None => Vec::new(),
         };
+        let login_required = match request(&endpoint, ControllerRequest::CodexLoginStatus).await? {
+            ControllerResponse::CodexLoginRequired => true,
+            ControllerResponse::CodexLoggedIn { .. } => false,
+            ControllerResponse::Error { message } => bail!("{message}"),
+            response => bail!("controller returned an unexpected response: {response:?}"),
+        };
         Ok(Self {
             endpoint,
             threads,
             thread_id,
             transcript,
             input: String::new(),
-            status: "Enter sends · Ctrl-N new · Ctrl-R rename · drag to select · Ctrl-C copies"
-                .to_owned(),
+            status: if login_required {
+                "Codex login required · Ctrl-L login".to_owned()
+            } else {
+                "Enter sends · Ctrl-N new · Ctrl-R rename · Ctrl-M/Alt-M model · Ctrl-C copies"
+                    .to_owned()
+            },
             approval: None,
             renaming: false,
+            model_picker: None,
+            login_required,
             selection_start: None,
             selection_end: None,
             transcript_layout: TranscriptLayout {
@@ -171,6 +199,13 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
+            if self.thread_id.is_some() {
+                self.open_model_picker().await?;
+            }
+            return Ok(false);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('q') => return Ok(true),
@@ -180,10 +215,12 @@ impl App {
                     self.input.clear();
                     self.approval = None;
                     self.renaming = false;
+                    self.model_picker = None;
                     self.clear_selection();
                 }
                 KeyCode::Char('r') if self.thread_id.is_some() => {
                     self.renaming = true;
+                    self.model_picker = None;
                     self.input = self
                         .threads
                         .iter()
@@ -191,6 +228,24 @@ impl App {
                         .and_then(|thread| thread.display_name.clone())
                         .unwrap_or_default();
                     self.status = "Enter saves the thread name · Esc cancels".to_owned();
+                }
+                KeyCode::Char('m') if self.thread_id.is_some() => {
+                    self.open_model_picker().await?;
+                }
+                KeyCode::Char('l') if self.login_required => {
+                    self.status = "Complete Codex login in your browser…".to_owned();
+                    match request(&self.endpoint, ControllerRequest::CodexLogin).await? {
+                        ControllerResponse::CodexLoggedIn { .. } => {
+                            self.login_required = false;
+                            self.status = "Codex login complete".to_owned();
+                        }
+                        ControllerResponse::Error { message } => {
+                            self.status = sanitize(&message);
+                        }
+                        response => {
+                            bail!("controller returned an unexpected response: {response:?}")
+                        }
+                    }
                 }
                 KeyCode::Char('c') => self.copy_selection()?,
                 _ => {}
@@ -230,6 +285,60 @@ impl App {
             return Ok(false);
         }
 
+        if let Some(picker) = &mut self.model_picker {
+            match key.code {
+                KeyCode::Up => {
+                    if picker.selecting_effort {
+                        picker.effort_index = picker.effort_index.saturating_sub(1);
+                    } else {
+                        picker.model_index = picker.model_index.saturating_sub(1);
+                        let model = &picker.models[picker.model_index];
+                        picker.effort_index = model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .position(|effort| effort == &model.default_reasoning_effort)
+                            .unwrap_or(0);
+                    }
+                }
+                KeyCode::Down => {
+                    if picker.selecting_effort {
+                        let count = picker.models[picker.model_index]
+                            .supported_reasoning_efforts
+                            .len();
+                        picker.effort_index =
+                            (picker.effort_index + 1).min(count.saturating_sub(1));
+                    } else {
+                        picker.model_index =
+                            (picker.model_index + 1).min(picker.models.len().saturating_sub(1));
+                        let model = &picker.models[picker.model_index];
+                        picker.effort_index = model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .position(|effort| effort == &model.default_reasoning_effort)
+                            .unwrap_or(0);
+                    }
+                }
+                KeyCode::Enter if picker.selecting_effort => self.change_model().await?,
+                KeyCode::Enter => {
+                    picker.selecting_effort = true;
+                    self.status =
+                        "Select reasoning effort · Enter applies · Esc goes back".to_owned();
+                }
+                KeyCode::Esc => {
+                    if picker.selecting_effort {
+                        picker.selecting_effort = false;
+                        self.status =
+                            "Select model · Enter chooses effort · Esc cancels".to_owned();
+                    } else {
+                        self.model_picker = None;
+                        self.status = "Ready".to_owned();
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Enter if !self.input.trim().is_empty() => self.send().await?,
             KeyCode::Backspace => {
@@ -240,6 +349,44 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    async fn open_model_picker(&mut self) -> Result<()> {
+        self.renaming = false;
+        let thread = self
+            .threads
+            .iter()
+            .find(|thread| Some(thread.id) == self.thread_id)
+            .context("selected thread is missing")?;
+        let models = match request(&self.endpoint, ControllerRequest::ModelList).await? {
+            ControllerResponse::ModelList { models } => models,
+            ControllerResponse::Error { message } => {
+                self.status = sanitize(&message);
+                return Ok(());
+            }
+            response => bail!("controller returned an unexpected response: {response:?}"),
+        };
+        if models.is_empty() {
+            self.status = "No models are available".to_owned();
+            return Ok(());
+        }
+        let model_index = models
+            .iter()
+            .position(|model| model.id == thread.model)
+            .unwrap_or(0);
+        let effort_index = models[model_index]
+            .supported_reasoning_efforts
+            .iter()
+            .position(|effort| effort == &thread.reasoning_effort)
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker {
+            models,
+            model_index,
+            effort_index,
+            selecting_effort: false,
+        });
+        self.status = "Select model · Enter chooses effort · Esc cancels".to_owned();
+        Ok(())
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -253,12 +400,14 @@ impl App {
                 self.transcript.clear();
                 self.approval = None;
                 self.renaming = false;
+                self.model_picker = None;
                 self.clear_selection();
             } else if let Some(thread) = self.threads.get(index - 1) {
                 self.thread_id = Some(thread.id);
                 self.transcript = load_transcript(&self.endpoint, thread.id).await?;
                 self.approval = None;
                 self.renaming = false;
+                self.model_picker = None;
                 self.clear_selection();
             }
             return Ok(());
@@ -290,13 +439,14 @@ impl App {
             .await?
             {
                 ControllerResponse::ThreadCreated { thread_id } => {
-                    self.threads.insert(
-                        0,
-                        Thread {
-                            id: thread_id,
-                            display_name: None,
-                        },
-                    );
+                    self.threads =
+                        match request(&self.endpoint, ControllerRequest::ThreadList).await? {
+                            ControllerResponse::ThreadList { threads } => threads,
+                            ControllerResponse::Error { message } => bail!("{message}"),
+                            response => {
+                                bail!("controller returned an unexpected response: {response:?}")
+                            }
+                        };
                     self.thread_id = Some(thread_id);
                     thread_id
                 }
@@ -347,6 +497,47 @@ impl App {
                 }
                 self.renaming = false;
                 self.status = "Thread renamed".to_owned();
+                Ok(())
+            }
+            ControllerResponse::Error { message } => bail!("{message}"),
+            response => bail!("controller returned an unexpected response: {response:?}"),
+        }
+    }
+
+    async fn change_model(&mut self) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        let picker = self
+            .model_picker
+            .as_ref()
+            .context("model picker is closed")?;
+        let selected = &picker.models[picker.model_index];
+        let model = selected.id.clone();
+        let reasoning_effort = selected
+            .supported_reasoning_efforts
+            .get(picker.effort_index)
+            .cloned()
+            .unwrap_or_else(|| selected.default_reasoning_effort.clone());
+        match request(
+            &self.endpoint,
+            ControllerRequest::ThreadSetModel {
+                thread_id,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            },
+        )
+        .await?
+        {
+            ControllerResponse::ThreadModelChanged => {
+                if let Some(thread) = self
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.id == thread_id)
+                {
+                    thread.model = model;
+                    thread.reasoning_effort = reasoning_effort;
+                }
+                self.model_picker = None;
+                self.status = "Thread model changed".to_owned();
                 Ok(())
             }
             ControllerResponse::Error { message } => bail!("{message}"),
@@ -461,8 +652,11 @@ impl App {
             input,
         );
         frame.render_widget(Paragraph::new(self.status.as_str()), status);
-        if self.approval.is_none() {
+        if self.approval.is_none() && self.model_picker.is_none() {
             frame.set_cursor_position((input.x + 1 + self.input.len() as u16, input.y + 1));
+        }
+        if let Some(picker) = &self.model_picker {
+            render_model_picker(frame, picker);
         }
     }
 
@@ -507,6 +701,70 @@ impl App {
     fn clear_selection(&mut self) {
         self.selection_start = None;
         self.selection_end = None;
+    }
+}
+
+fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
+    let width = frame.area().width.saturating_sub(8).min(72);
+    let height = frame.area().height.saturating_sub(4).min(18);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let selected_model = &picker.models[picker.model_index];
+    if picker.selecting_effort {
+        let items = selected_model
+            .supported_reasoning_efforts
+            .iter()
+            .enumerate()
+            .map(|(index, effort)| {
+                let marker = if index == picker.effort_index {
+                    "●"
+                } else {
+                    " "
+                };
+                ListItem::new(format!("{marker} {effort}"))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(format!(
+                        "Reasoning effort · {}",
+                        selected_model.display_name
+                    ))
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+    } else {
+        let items = picker
+            .models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                let marker = if index == picker.model_index {
+                    "●"
+                } else {
+                    " "
+                };
+                let description = model.description.as_deref().unwrap_or_default();
+                ListItem::new(vec![
+                    Line::from(format!("{marker} {}", model.display_name)),
+                    Line::from(Span::styled(
+                        format!("  {description}"),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(Block::default().title("Select model").borders(Borders::ALL)),
+            area,
+        );
     }
 }
 
