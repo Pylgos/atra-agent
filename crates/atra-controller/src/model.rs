@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use atra_protocol::Model;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsage;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -26,6 +28,12 @@ pub(crate) enum ModelResponse {
         #[serde(default)]
         call_id: Option<String>,
     },
+}
+
+pub(crate) struct ModelCompletion {
+    pub response: ModelResponse,
+    pub reasoning: Vec<ResponseItem>,
+    pub token_usage: Option<TokenUsage>,
 }
 
 pub(crate) enum Provider {
@@ -65,6 +73,8 @@ impl Provider {
                 supported_reasoning_efforts: ["low", "medium", "high", "xhigh"]
                     .map(str::to_owned)
                     .to_vec(),
+                context_window: None,
+                auto_compact_token_limit: None,
             }]),
             Self::Codex(provider) => provider.models().await,
         }
@@ -76,12 +86,30 @@ impl Provider {
         reasoning_effort: &str,
         events: &[Event],
         deltas: Option<&mpsc::UnboundedSender<String>>,
-    ) -> Result<ModelResponse> {
+        prompt_cache_key: &str,
+    ) -> Result<ModelCompletion> {
         match self {
             Self::Fake(provider) => provider.complete(events),
             Self::Codex(provider) => {
                 provider
-                    .complete(model, reasoning_effort, events, deltas)
+                    .complete(model, reasoning_effort, events, deltas, prompt_cache_key)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn compact(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<Vec<ResponseItem>> {
+        match self {
+            Self::Fake(_) => Ok(Vec::new()),
+            Self::Codex(provider) => {
+                provider
+                    .compact(model, reasoning_effort, events, prompt_cache_key)
                     .await
             }
         }

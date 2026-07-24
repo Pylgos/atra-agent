@@ -23,7 +23,7 @@ stageが完了したら作業を止め、ユーザーへ確認を依頼してく
 - 汎用remote execution frameworkを作らない。
 - 汎用filesystem RPC APIを作らない。
 - まだ存在しない機能のために詳細な永続化schemaを作らない。
-- 後続タスクで明示されない限り、branch、compaction、subagent orchestration、remote authentication、Web API、plugin system、migration frameworkを追加しない。
+- 後続タスクで明示されない限り、branch、subagent orchestration、remote authentication、Web API、plugin system、migration frameworkを追加しない。
 - 小さな実装詳細を公開architectureへ昇格させない。
 - 現時点で実装が一つしかなく、直ちにtest boundaryやdependency boundaryとして必要でもない抽象化を作らない。
 - 二つの設計が要件を満たす場合、概念と永続状態が少ない方を選ぶ。
@@ -461,6 +461,12 @@ subscription要件をAPI key課金へ黙って置き換えないでください�
 
 実装には再利用可能なCodexのauthenticationまたはmodel client codeが必要になる可能性があります。その依存だけを隔離し、Codexのconversation、tool、approval architectureをAtraへ取り込まないでください。
 
+Codex providerではthreadごとに安定したprompt cache keyを使用します。
+
+Responses APIには`reasoning.encrypted_content`を要求し、返されたopaque reasoning itemをmodel-visible historyへ保持します。生のchain-of-thoughtを独自形式へ変換または表示しないでください。
+
+modelが示すauto compact token limitへ達した場合はResponses compaction endpointを使用します。元eventはuser-visible historyとして保持し、compaction item以降をmodelへ渡すactive historyとして扱います。
+
 ## 15. 最小限の永続化
 
 永続化は意図的に小さく保ってください。
@@ -483,8 +489,11 @@ event streamには、現在使用するevent kindだけが必要です。
 - tool call
 - tool result
 - approval requestとresponse
+- opaque reasoning item
+- token usage
+- compaction item
 
-Turn、branch、summary、blob、subagent、projection、context snapshot、将来のschedule用に、詳細tableや必須fieldを作らないでください。
+Turn、branch、独自summary、blob、subagent、projection、context snapshot、将来のschedule用に、詳細tableや必須fieldを作らないでください。
 
 live process stateは永続化しません。
 

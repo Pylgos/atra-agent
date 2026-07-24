@@ -1,9 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use codex_api::{
-    AuthProvider, Compression, ModelsClient, Reasoning, ResponseEvent, ResponsesApiRequest,
-    ResponsesApiTools, ResponsesClient, ResponsesOptions,
+    AuthProvider, CompactClient, CompactionInput, Compression, ModelsClient, Reasoning,
+    ResponseEvent, ResponsesApiRequest, ResponsesApiTools, ResponsesClient, ResponsesOptions,
 };
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
@@ -18,11 +18,11 @@ use codex_protocol::openai_models::ModelVisibility;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use serde_json::{json, value::RawValue};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use atra_protocol::Model;
 
-use super::ModelResponse;
+use super::{ModelCompletion, ModelResponse};
 use crate::storage::{Event, EventKind};
 
 const INSTRUCTIONS: &str = "You are Atra Agent. Use the provided tools when needed. \
@@ -30,6 +30,7 @@ Return a final answer after completing the user's request.";
 
 pub(crate) struct CodexProvider {
     auth: Arc<AuthManager>,
+    models: RwLock<Option<Vec<Model>>>,
 }
 
 impl CodexProvider {
@@ -50,6 +51,7 @@ impl CodexProvider {
                 )
                 .await,
             ),
+            models: RwLock::new(None),
         }
     }
 
@@ -63,9 +65,13 @@ impl CodexProvider {
 
     pub(super) async fn reload_auth(&self) {
         self.auth.reload().await;
+        *self.models.write().await = None;
     }
 
     pub(super) async fn models(&self) -> Result<Vec<Model>> {
+        if let Some(models) = self.models.read().await.as_ref() {
+            return Ok(models.clone());
+        }
         let auth = self
             .auth
             .auth()
@@ -109,10 +115,12 @@ impl CodexProvider {
             }
             bundled
         };
-        Ok(models
+        let models = models
             .into_iter()
             .filter(|model| model.visibility == ModelVisibility::List)
             .map(|model| {
+                let context_window = model.context_window;
+                let auto_compact_token_limit = model.auto_compact_token_limit();
                 let default_reasoning_effort = model
                     .default_reasoning_level
                     .unwrap_or_default()
@@ -131,9 +139,13 @@ impl CodexProvider {
                     description: model.description,
                     default_reasoning_effort,
                     supported_reasoning_efforts,
+                    context_window,
+                    auto_compact_token_limit,
                 }
             })
-            .collect())
+            .collect::<Vec<_>>();
+        *self.models.write().await = Some(models.clone());
+        Ok(models)
     }
 
     pub(super) async fn complete(
@@ -142,7 +154,8 @@ impl CodexProvider {
         reasoning_effort: &str,
         events: &[Event],
         deltas: Option<&mpsc::UnboundedSender<String>>,
-    ) -> Result<ModelResponse> {
+        prompt_cache_key: &str,
+    ) -> Result<ModelCompletion> {
         let auth = self
             .auth
             .auth()
@@ -168,9 +181,9 @@ impl CodexProvider {
             store: false,
             stream: true,
             stream_options: None,
-            include: Vec::new(),
+            include: vec!["reasoning.encrypted_content".to_owned()],
             service_tier: None,
-            prompt_cache_key: None,
+            prompt_cache_key: Some(prompt_cache_key.to_owned()),
             text: None,
             client_metadata: None,
         };
@@ -195,6 +208,9 @@ impl CodexProvider {
             .await
             .context("Codex request failed")?;
 
+        let mut response = None;
+        let mut reasoning = Vec::new();
+        let mut token_usage = None;
         while let Some(event) = stream.next().await {
             match event.context("Codex response stream failed")? {
                 ResponseEvent::OutputTextDelta(delta) => {
@@ -203,14 +219,75 @@ impl CodexProvider {
                     }
                 }
                 ResponseEvent::OutputItemDone(item) => {
-                    if let Some(response) = response_from_item(item)? {
-                        return Ok(response);
+                    if matches!(item, ResponseItem::Reasoning { .. }) {
+                        reasoning.push(item);
+                    } else if let Some(item_response) = response_from_item(item)? {
+                        response = Some(item_response);
                     }
                 }
+                ResponseEvent::Completed {
+                    token_usage: usage, ..
+                } => token_usage = usage,
                 _ => {}
             }
         }
-        bail!("Codex response ended without an assistant message or tool call")
+        Ok(ModelCompletion {
+            response: response
+                .context("Codex response ended without an assistant message or tool call")?,
+            reasoning,
+            token_usage,
+        })
+    }
+
+    pub(super) async fn compact(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<Vec<ResponseItem>> {
+        let auth = self
+            .auth
+            .auth()
+            .await
+            .filter(CodexAuth::is_chatgpt_auth)
+            .context("Codex login required; run `atra codex login`")?;
+        let provider = ModelProviderInfo::create_openai_provider(None)
+            .to_api_provider(Some(auth.auth_mode()))
+            .context("failed to configure Codex compaction endpoint")?;
+        let client = CompactClient::new(
+            codex_api::ReqwestTransport::from_http_client(create_client()),
+            provider,
+            Arc::new(BearerAuth::new(&auth)?),
+        );
+        let input = model_input(events)?;
+        client
+            .compact_input(
+                &CompactionInput {
+                    model,
+                    input: &input,
+                    instructions: INSTRUCTIONS,
+                    tools: Some(tool_definitions()?),
+                    parallel_tool_calls: false,
+                    reasoning: Some(Reasoning {
+                        effort: Some(
+                            reasoning_effort
+                                .parse()
+                                .map_err(|error: String| anyhow::anyhow!(error))?,
+                        ),
+                        summary: None,
+                        context: None,
+                    }),
+                    service_tier: None,
+                    prompt_cache_key: Some(prompt_cache_key),
+                    text: None,
+                },
+                HeaderMap::new(),
+                Duration::from_secs(300),
+                None,
+            )
+            .await
+            .context("Codex compaction failed")
     }
 }
 
@@ -243,45 +320,67 @@ impl AuthProvider for BearerAuth {
 }
 
 fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
-    events
+    let mut input = Vec::new();
+    let events = if let Some(index) = events
         .iter()
-        .filter_map(|event| {
-            let item = match event.kind {
-                EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
-                    role: "user".to_owned(),
-                    content: vec![ContentItem::InputText {
-                        text: event.payload["content"].as_str()?.to_owned(),
-                    }],
-                    phase: None,
-                }),
-                EventKind::AssistantMessage => ResponseItem::from(ResponseInputItem::Message {
-                    role: "assistant".to_owned(),
-                    content: vec![ContentItem::OutputText {
-                        text: event.payload["content"].as_str()?.to_owned(),
-                    }],
-                    phase: None,
-                }),
-                EventKind::ToolCall => ResponseItem::FunctionCall {
-                    id: None,
-                    name: event.payload["name"].as_str()?.to_owned(),
-                    namespace: None,
-                    arguments: event.payload["arguments"].to_string(),
-                    call_id: event.payload["call_id"].as_str()?.to_owned(),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-                EventKind::ToolResult => {
-                    ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+        .rposition(|event| event.kind == EventKind::Compaction)
+    {
+        input.extend(
+            serde_json::from_value::<Vec<ResponseItem>>(events[index].payload["items"].clone())
+                .context("stored compaction contains invalid response items")?,
+        );
+        &events[index + 1..]
+    } else {
+        events
+    };
+    input.extend(
+        events
+            .iter()
+            .filter_map(|event| {
+                let item = match event.kind {
+                    EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
+                        role: "user".to_owned(),
+                        content: vec![ContentItem::InputText {
+                            text: event.payload["content"].as_str()?.to_owned(),
+                        }],
+                        phase: None,
+                    }),
+                    EventKind::AssistantMessage => ResponseItem::from(ResponseInputItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![ContentItem::OutputText {
+                            text: event.payload["content"].as_str()?.to_owned(),
+                        }],
+                        phase: None,
+                    }),
+                    EventKind::ToolCall => ResponseItem::FunctionCall {
+                        id: None,
+                        name: event.payload["name"].as_str()?.to_owned(),
+                        namespace: None,
+                        arguments: event.payload["arguments"].to_string(),
                         call_id: event.payload["call_id"].as_str()?.to_owned(),
-                        output: FunctionCallOutputPayload::from_text(
-                            serde_json::to_string(&event.payload["result"]).ok()?,
-                        ),
-                    })
-                }
-                EventKind::ApprovalRequest | EventKind::ApprovalResponse => return None,
-            };
-            Some(Ok(item))
-        })
-        .collect()
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    EventKind::ToolResult => {
+                        ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+                            call_id: event.payload["call_id"].as_str()?.to_owned(),
+                            output: FunctionCallOutputPayload::from_text(
+                                serde_json::to_string(&event.payload["result"]).ok()?,
+                            ),
+                        })
+                    }
+                    EventKind::Reasoning => {
+                        serde_json::from_value(event.payload["item"].clone()).ok()?
+                    }
+                    EventKind::ApprovalRequest
+                    | EventKind::ApprovalResponse
+                    | EventKind::Compaction
+                    | EventKind::TokenUsage => return None,
+                };
+                Some(Ok(item))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(input)
 }
 
 fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {

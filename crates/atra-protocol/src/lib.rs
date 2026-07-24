@@ -167,6 +167,10 @@ pub struct Model {
     pub description: Option<String>,
     pub default_reasoning_effort: String,
     pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub context_window: Option<i64>,
+    #[serde(default)]
+    pub auto_compact_token_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

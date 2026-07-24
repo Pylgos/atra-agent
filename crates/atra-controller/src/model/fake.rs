@@ -2,7 +2,7 @@ use std::{collections::VecDeque, fs, path::Path};
 
 use anyhow::{Context, Result};
 
-use super::ModelResponse;
+use super::{ModelCompletion, ModelResponse};
 use crate::storage::{Event, EventKind};
 
 pub(crate) struct FakeProvider {
@@ -18,7 +18,7 @@ impl FakeProvider {
         Ok(Self { responses })
     }
 
-    pub(super) fn complete(&mut self, events: &[Event]) -> Result<ModelResponse> {
+    pub(super) fn complete(&mut self, events: &[Event]) -> Result<ModelCompletion> {
         let mut response = self
             .responses
             .pop_front()
@@ -32,6 +32,10 @@ impl FakeProvider {
         {
             *content = content.replace("{{tool_output}}", output);
         }
-        Ok(response)
+        Ok(ModelCompletion {
+            response,
+            reasoning: Vec::new(),
+            token_usage: None,
+        })
     }
 }

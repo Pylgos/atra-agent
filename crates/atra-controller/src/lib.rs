@@ -24,6 +24,7 @@ use codex_login::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -70,6 +71,10 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
     let store = Store::open(database)
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
+    let prompt_cache_namespace = format!(
+        "{:x}",
+        Sha256::digest(database.as_os_str().as_encoded_bytes())
+    );
     let provider = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
         Some(path) => Provider::fake(Path::new(&path))?,
         None => Provider::codex(auth_home.to_owned()).await,
@@ -113,6 +118,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         next_approval_id: AtomicU64::new(0),
         platform_bundle,
         auth_home: auth_home.to_owned(),
+        prompt_cache_namespace,
     });
 
     loop {
@@ -188,6 +194,7 @@ struct State {
     next_approval_id: AtomicU64,
     platform_bundle: Option<Arc<PlatformBundle>>,
     auth_home: PathBuf,
+    prompt_cache_namespace: String,
 }
 
 impl State {
@@ -410,7 +417,7 @@ impl State {
         deltas: Option<&mpsc::UnboundedSender<String>>,
     ) -> Result<ControllerResponse> {
         loop {
-            let events = self
+            let mut events = self
                 .store
                 .events(thread_id)
                 .await
@@ -420,14 +427,70 @@ impl State {
                 .thread_model(thread_id)
                 .await
                 .context("failed to load thread model")?;
-            let response = self
-                .provider
-                .lock()
-                .await
-                .complete(&model, &reasoning_effort, &events, deltas)
+            let prompt_cache_key = format!("{}-{thread_id}", self.prompt_cache_namespace);
+            let mut provider = self.provider.lock().await;
+            let auto_compact_token_limit = provider
+                .models()
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.id == model)
+                .and_then(|model| model.auto_compact_token_limit);
+            let active_history_start = events
+                .iter()
+                .rposition(|event| event.kind == EventKind::Compaction)
+                .map_or(0, |index| index + 1);
+            let active_tokens = events[active_history_start..]
+                .iter()
+                .rev()
+                .find(|event| event.kind == EventKind::TokenUsage)
+                .and_then(|event| event.payload["total_tokens"].as_i64());
+            if active_tokens
+                .zip(auto_compact_token_limit)
+                .is_some_and(|(tokens, limit)| tokens >= limit)
+            {
+                let items = provider
+                    .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
+                    .await?;
+                if !items.is_empty() {
+                    self.store
+                        .append(thread_id, EventKind::Compaction, json!({ "items": items }))
+                        .await
+                        .context("failed to save compacted model history")?;
+                    events = self
+                        .store
+                        .events(thread_id)
+                        .await
+                        .context("failed to reload compacted model history")?;
+                }
+            }
+            let completion = provider
+                .complete(
+                    &model,
+                    &reasoning_effort,
+                    &events,
+                    deltas,
+                    &prompt_cache_key,
+                )
                 .await?;
+            drop(provider);
+            for item in completion.reasoning {
+                self.store
+                    .append(thread_id, EventKind::Reasoning, json!({ "item": item }))
+                    .await
+                    .context("failed to save encrypted reasoning")?;
+            }
+            if let Some(usage) = completion.token_usage {
+                self.store
+                    .append(
+                        thread_id,
+                        EventKind::TokenUsage,
+                        serde_json::to_value(usage).context("failed to encode token usage")?,
+                    )
+                    .await
+                    .context("failed to save token usage")?;
+            }
 
-            match response {
+            match completion.response {
                 ModelResponse::AssistantMessage { content } => {
                     self.store
                         .append(
