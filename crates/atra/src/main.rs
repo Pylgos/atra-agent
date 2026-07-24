@@ -510,7 +510,9 @@ async fn run() -> Result<()> {
         }
         Command::Tui => {
             if prepare_tui(&workspace, &endpoint, &workspace_id).await? {
-                atra_tui::run(endpoint).await
+                let history =
+                    controller_database(&workspace_id)?.with_file_name("tui-history.jsonl");
+                atra_tui::run(endpoint, history).await
             } else {
                 Ok(())
             }

@@ -1,5 +1,7 @@
 use std::{
+    fs::{self, OpenOptions},
     io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -17,6 +19,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
+use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -30,11 +33,14 @@ use tokio::{
     net::UnixStream,
     sync::mpsc,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub async fn run(endpoint: PathBuf) -> Result<()> {
+pub async fn run(endpoint: PathBuf, history_path: PathBuf) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let result = App::load(endpoint).await?.run(&mut terminal.terminal).await;
+    let result = App::load(endpoint, history_path)
+        .await?
+        .run(&mut terminal.terminal)
+        .await;
     terminal.restore()?;
     result
 }
@@ -179,12 +185,18 @@ enum TurnUpdate {
 
 struct App {
     endpoint: PathBuf,
+    history_path: PathBuf,
     threads: Vec<Thread>,
     models: Vec<Model>,
     thread_id: Option<i64>,
     transcript: Vec<TranscriptItem>,
     tool_call_preview: Option<(String, usize)>,
     input: String,
+    input_cursor: usize,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
+    word_segmenter: WordSegmenterBorrowed<'static>,
     status: String,
     approval: Option<Approval>,
     renaming: bool,
@@ -199,7 +211,7 @@ struct App {
 }
 
 impl App {
-    async fn load(endpoint: PathBuf) -> Result<Self> {
+    async fn load(endpoint: PathBuf, history_path: PathBuf) -> Result<Self> {
         let threads = match request(&endpoint, ControllerRequest::ThreadList).await? {
             ControllerResponse::ThreadList { threads } => threads,
             ControllerResponse::Error { message } => bail!("{message}"),
@@ -223,12 +235,18 @@ impl App {
         };
         Ok(Self {
             endpoint,
+            input_history: load_history(&history_path)?,
+            history_path,
             threads,
             models,
             thread_id,
             transcript,
             tool_call_preview: None,
             input: String::new(),
+            input_cursor: 0,
+            history_index: None,
+            history_draft: String::new(),
+            word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
             status: if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
             } else {
@@ -254,8 +272,12 @@ impl App {
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let mut events = EventStream::new();
         let (turns, mut completed_turns) = mpsc::unbounded_channel();
+        let mut redraw = tokio::time::interval(Duration::from_millis(16));
+        redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        terminal.draw(|frame| self.render(frame))?;
+        redraw.tick().await;
+        let mut dirty = false;
         loop {
-            terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
                 event = events.next() => {
                     let Some(event) = event.transpose()? else {
@@ -267,9 +289,17 @@ impl App {
                         Event::Resize(_, _) => {}
                         _ => {}
                     }
+                    dirty = true;
                 }
                 Some(completion) = completed_turns.recv() => {
                     self.update_turn(completion)?;
+                    dirty = true;
+                }
+                _ = redraw.tick() => {
+                    if dirty {
+                        terminal.draw(|frame| self.render(frame))?;
+                        dirty = false;
+                    }
                 }
             }
         }
@@ -293,6 +323,8 @@ impl App {
                     self.transcript.clear();
                     self.tool_call_preview = None;
                     self.input.clear();
+                    self.input_cursor = 0;
+                    self.reset_history_navigation();
                     self.approval = None;
                     self.renaming = false;
                     self.model_picker = None;
@@ -308,6 +340,8 @@ impl App {
                         .find(|thread| Some(thread.id) == self.thread_id)
                         .and_then(|thread| thread.display_name.clone())
                         .unwrap_or_default();
+                    self.input_cursor = self.input.len();
+                    self.reset_history_navigation();
                     self.status = "Enter saves the thread name · Esc cancels".to_owned();
                 }
                 KeyCode::Char('m') => {
@@ -328,7 +362,35 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Char('c') => self.copy_selection()?,
+                KeyCode::Char('c')
+                    if self
+                        .selection_range()
+                        .is_some_and(|(start, end)| start != end) =>
+                {
+                    self.copy_selection()?
+                }
+                KeyCode::Char('c') => {
+                    if !self.input.is_empty() {
+                        let input = std::mem::take(&mut self.input);
+                        self.record_history(input)?;
+                    }
+                    self.input_cursor = 0;
+                    self.reset_history_navigation();
+                }
+                KeyCode::Char('a') => self.input_cursor = 0,
+                KeyCode::Char('e') => self.input_cursor = self.input.len(),
+                KeyCode::Char('u') => {
+                    self.input.drain(..self.input_cursor);
+                    self.input_cursor = 0;
+                    self.reset_history_navigation();
+                }
+                KeyCode::Char('k') => {
+                    self.input.truncate(self.input_cursor);
+                    self.reset_history_navigation();
+                }
+                KeyCode::Char('w') | KeyCode::Backspace => self.delete_word_backward(),
+                KeyCode::Left => self.move_word_backward(),
+                KeyCode::Right => self.move_word_forward(),
                 _ => {}
             }
             return Ok(false);
@@ -352,13 +414,17 @@ impl App {
         if self.renaming {
             match key.code {
                 KeyCode::Enter if !self.input.trim().is_empty() => self.rename().await?,
-                KeyCode::Backspace => {
-                    self.input.pop();
-                }
-                KeyCode::Char(character) => self.input.push(character),
+                KeyCode::Backspace => self.delete_backward(),
+                KeyCode::Delete => self.delete_forward(),
+                KeyCode::Left => self.move_backward(),
+                KeyCode::Right => self.move_forward(),
+                KeyCode::Home => self.input_cursor = 0,
+                KeyCode::End => self.input_cursor = self.input.len(),
+                KeyCode::Char(character) => self.insert(character),
                 KeyCode::Esc => {
                     self.renaming = false;
                     self.input.clear();
+                    self.input_cursor = 0;
                     self.status = "Ready".to_owned();
                 }
                 _ => {}
@@ -422,16 +488,131 @@ impl App {
 
         match key.code {
             KeyCode::Enter if !self.input.trim().is_empty() && !self.turn_pending => {
-                self.send(turns)
+                self.send(turns)?
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(character) => self.input.push(character),
+            KeyCode::Backspace => self.delete_backward(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_backward(),
+            KeyCode::Right => self.move_forward(),
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input.len(),
+            KeyCode::Up => self.previous_history(),
+            KeyCode::Down => self.next_history(),
+            KeyCode::Char(character) => self.insert(character),
             KeyCode::Esc => self.clear_selection(),
             _ => {}
         }
         Ok(false)
+    }
+
+    fn insert(&mut self, character: char) {
+        self.input.insert(self.input_cursor, character);
+        self.input_cursor += character.len_utf8();
+        self.reset_history_navigation();
+    }
+
+    fn delete_backward(&mut self) {
+        if let Some((index, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input.drain(index..self.input_cursor);
+            self.input_cursor = index;
+            self.reset_history_navigation();
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if let Some(character) = self.input[self.input_cursor..].chars().next() {
+            self.input
+                .drain(self.input_cursor..self.input_cursor + character.len_utf8());
+            self.reset_history_navigation();
+        }
+    }
+
+    fn move_backward(&mut self) {
+        if let Some((index, _)) = self.input[..self.input_cursor].char_indices().next_back() {
+            self.input_cursor = index;
+        }
+    }
+
+    fn move_forward(&mut self) {
+        if let Some(character) = self.input[self.input_cursor..].chars().next() {
+            self.input_cursor += character.len_utf8();
+        }
+    }
+
+    fn delete_word_backward(&mut self) {
+        let end = self.input_cursor;
+        self.move_word_backward();
+        if self.input_cursor < end {
+            self.input.drain(self.input_cursor..end);
+            self.reset_history_navigation();
+        }
+    }
+
+    fn move_word_backward(&mut self) {
+        let mut start = 0;
+        let mut previous_word = None;
+        for (end, word_type) in self
+            .word_segmenter
+            .segment_str(&self.input)
+            .iter_with_word_type()
+        {
+            if word_type.is_word_like() && start < self.input_cursor {
+                previous_word = Some(start);
+            }
+            if end >= self.input_cursor {
+                break;
+            }
+            start = end;
+        }
+        self.input_cursor = previous_word.unwrap_or(0);
+    }
+
+    fn move_word_forward(&mut self) {
+        for (end, word_type) in self
+            .word_segmenter
+            .segment_str(&self.input)
+            .iter_with_word_type()
+        {
+            if word_type.is_word_like() && end > self.input_cursor {
+                self.input_cursor = end;
+                return;
+            }
+        }
+        self.input_cursor = self.input.len();
+    }
+
+    fn previous_history(&mut self) {
+        let index = match self.history_index {
+            Some(0) => return,
+            Some(index) => index - 1,
+            None if self.input_history.is_empty() => return,
+            None => {
+                self.history_draft.clone_from(&self.input);
+                self.input_history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.input.clone_from(&self.input_history[index]);
+        self.input_cursor = self.input.len();
+    }
+
+    fn next_history(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            self.history_index = Some(index + 1);
+            self.input.clone_from(&self.input_history[index + 1]);
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+        self.input_cursor = self.input.len();
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
     }
 
     fn open_model_picker(&mut self) -> Result<()> {
@@ -512,8 +693,11 @@ impl App {
         Ok(())
     }
 
-    fn send(&mut self, turns: &mpsc::UnboundedSender<TurnUpdate>) {
+    fn send(&mut self, turns: &mpsc::UnboundedSender<TurnUpdate>) -> Result<()> {
         let message = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
+        self.record_history(message.clone())?;
+        self.reset_history_navigation();
         self.transcript.push(TranscriptItem {
             role: Role::User,
             text: sanitize(&message),
@@ -595,11 +779,41 @@ impl App {
             .await;
             let _ = turns.send(TurnUpdate::Completed(result));
         });
+        Ok(())
+    }
+
+    fn record_history(&mut self, input: String) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.history_path)
+            .with_context(|| {
+                format!("failed to open TUI history {}", self.history_path.display())
+            })?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set TUI history permissions {}",
+                    self.history_path.display()
+                )
+            })?;
+        let mut line = serde_json::to_vec(&input).context("failed to encode TUI history")?;
+        line.push(b'\n');
+        file.write_all(&line).with_context(|| {
+            format!(
+                "failed to write TUI history {}",
+                self.history_path.display()
+            )
+        })?;
+        self.input_history.push(input);
+        Ok(())
     }
 
     async fn rename(&mut self) -> Result<()> {
         let thread_id = self.thread_id.context("no thread is selected")?;
         let display_name = std::mem::take(&mut self.input);
+        self.input_cursor = 0;
         match request(
             &self.endpoint,
             ControllerRequest::ThreadRename {
@@ -913,14 +1127,22 @@ impl App {
                 None => "Message".to_owned(),
             }
         };
+        let cursor_column = self.input[..self.input_cursor].width();
+        let visible_input_width = usize::from(input.width.saturating_sub(2));
+        let horizontal_scroll =
+            cursor_column.saturating_sub(visible_input_width.saturating_sub(1)) as u16;
         frame.render_widget(
             Paragraph::new(self.input.as_str())
+                .scroll((0, horizontal_scroll))
                 .block(Block::default().title(input_title).borders(Borders::ALL)),
             input,
         );
         frame.render_widget(Paragraph::new(self.status.as_str()), status);
         if self.approval.is_none() && self.model_picker.is_none() {
-            frame.set_cursor_position((input.x + 1 + self.input.len() as u16, input.y + 1));
+            frame.set_cursor_position((
+                input.x + 1 + cursor_column as u16 - horizontal_scroll,
+                input.y + 1,
+            ));
         }
         if let Some(picker) = &self.model_picker {
             render_model_picker(frame, picker);
@@ -1127,6 +1349,30 @@ fn transcript_lines<'a>(
         offset += 1;
     }
     lines
+}
+
+fn load_history(path: &Path) -> Result<Vec<String>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read TUI history {}", path.display()));
+        }
+    };
+    contents
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line).with_context(|| {
+                format!(
+                    "failed to decode TUI history {} at line {}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        })
+        .collect()
 }
 
 async fn load_transcript(endpoint: &Path, thread_id: i64) -> Result<Vec<TranscriptItem>> {
