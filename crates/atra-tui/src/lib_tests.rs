@@ -12,11 +12,11 @@ fn sanitizes_terminal_control_sequences() {
 fn transcript_render_is_stable() {
     let items = vec![
         TranscriptItem {
-            role: "You",
+            role: Role::User,
             text: "hello".to_owned(),
         },
         TranscriptItem {
-            role: "Atra",
+            role: Role::Assistant,
             text: "a deliberately wrapped response".to_owned(),
         },
     ];
@@ -66,7 +66,7 @@ fn transcript_render_is_stable() {
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
     let items = vec![TranscriptItem {
-        role: "Atra",
+        role: Role::Assistant,
         text: "abcdefgh\nsecond".to_owned(),
     }];
 

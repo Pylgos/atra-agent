@@ -866,6 +866,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         ControllerResponse::ThreadCreated { .. }
         | ControllerResponse::ThreadList { .. }
         | ControllerResponse::ModelList { .. }
+        | ControllerResponse::TurnDelta { .. }
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. }

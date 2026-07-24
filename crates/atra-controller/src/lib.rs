@@ -28,14 +28,14 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
 };
 
 mod model;
 #[allow(dead_code)]
 mod storage;
 
-use model::{CodexProvider, DEFAULT_MODEL, FakeProvider, ModelResponse, Provider};
+use model::{DEFAULT_MODEL, ModelResponse, Provider};
 use storage::{EventKind, Store};
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
@@ -71,8 +71,8 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
     let provider = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
-        Some(path) => Provider::Fake(FakeProvider::load(Path::new(&path))?),
-        None => Provider::Codex(CodexProvider::new(auth_home.to_owned()).await),
+        Some(path) => Provider::fake(Path::new(&path))?,
+        None => Provider::codex(auth_home.to_owned()).await,
     };
     let platform_bundle_path = match env::var_os("ATRA_PLATFORM_BUNDLE") {
         Some(path) => Some(path.into()),
@@ -138,14 +138,41 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
+    if let ControllerRequest::ThreadSend { thread_id, message } = request {
+        let (deltas, mut pending_deltas) = mpsc::unbounded_channel();
+        let response = {
+            let response = state.run_turn(thread_id, message, Some(&deltas));
+            tokio::pin!(response);
+            loop {
+                tokio::select! {
+                    response = &mut response => break response,
+                    Some(content) = pending_deltas.recv() => {
+                        write_response(&mut stream, &ControllerResponse::TurnDelta { content }).await?;
+                    }
+                }
+            }
+        };
+        drop(deltas);
+        while let Ok(content) = pending_deltas.try_recv() {
+            write_response(&mut stream, &ControllerResponse::TurnDelta { content }).await?;
+        }
+        let response = response.unwrap_or_else(|error| ControllerResponse::Error {
+            message: format!("{error:#}"),
+        });
+        return write_response(&mut stream, &response).await;
+    }
     let response = match state.handle(request).await {
         Ok(response) => response,
         Err(error) => ControllerResponse::Error {
             message: format!("{error:#}"),
         },
     };
+    write_response(&mut stream, &response).await
+}
+
+async fn write_response(stream: &mut UnixStream, response: &ControllerResponse) -> Result<()> {
     let mut response =
-        serde_json::to_vec(&response).context("failed to encode controller response")?;
+        serde_json::to_vec(response).context("failed to encode controller response")?;
     response.push(b'\n');
     stream
         .write_all(&response)
@@ -165,12 +192,9 @@ struct State {
 
 impl State {
     async fn codex_login_status(&self) -> Result<ControllerResponse> {
-        match &*self.provider.lock().await {
-            Provider::Fake(_) => Ok(ControllerResponse::CodexLoggedIn { email: None }),
-            Provider::Codex(provider) => match provider.login_status().await {
-                Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
-                None => Ok(ControllerResponse::CodexLoginRequired),
-            },
+        match self.provider.lock().await.login_status().await {
+            Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
+            None => Ok(ControllerResponse::CodexLoginRequired),
         }
     }
 
@@ -239,7 +263,7 @@ impl State {
                 Ok(ControllerResponse::ThreadModelChanged)
             }
             ControllerRequest::ThreadSend { thread_id, message } => {
-                self.run_turn(thread_id, message).await
+                self.run_turn(thread_id, message, None).await
             }
             ControllerRequest::ThreadEvents { thread_id } => {
                 let events = self
@@ -258,9 +282,7 @@ impl State {
             }
             ControllerRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
-                if let Provider::Codex(provider) = &*self.provider.lock().await {
-                    provider.reload_auth().await;
-                }
+                self.provider.lock().await.reload_auth().await;
                 self.codex_login_status().await
             }
             ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
@@ -361,7 +383,12 @@ impl State {
         }
     }
 
-    async fn run_turn(&self, thread_id: i64, message: String) -> Result<ControllerResponse> {
+    async fn run_turn(
+        &self,
+        thread_id: i64,
+        message: String,
+        deltas: Option<&mpsc::UnboundedSender<String>>,
+    ) -> Result<ControllerResponse> {
         self.store
             .name_thread_if_unnamed(thread_id, message.clone())
             .await
@@ -374,10 +401,14 @@ impl State {
             )
             .await
             .context("failed to save user message")?;
-        self.continue_turn(thread_id).await
+        self.continue_turn(thread_id, deltas).await
     }
 
-    async fn continue_turn(&self, thread_id: i64) -> Result<ControllerResponse> {
+    async fn continue_turn(
+        &self,
+        thread_id: i64,
+        deltas: Option<&mpsc::UnboundedSender<String>>,
+    ) -> Result<ControllerResponse> {
         loop {
             let events = self
                 .store
@@ -393,7 +424,7 @@ impl State {
                 .provider
                 .lock()
                 .await
-                .complete(&model, &reasoning_effort, &events)
+                .complete(&model, &reasoning_effort, &events, deltas)
                 .await?;
 
             match response {
@@ -550,7 +581,7 @@ impl State {
             result,
         )
         .await?;
-        self.continue_turn(pending.thread_id).await
+        self.continue_turn(pending.thread_id, None).await
     }
 
     async fn execute(&self, arguments: ToolArguments) -> Result<serde_json::Value> {

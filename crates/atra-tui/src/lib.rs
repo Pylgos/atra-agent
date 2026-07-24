@@ -89,8 +89,31 @@ impl Drop for TerminalGuard {
 
 #[derive(Clone)]
 struct TranscriptItem {
-    role: &'static str,
+    role: Role,
     text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    User,
+    Assistant,
+    Tool,
+    ToolResult,
+    ApprovalRequest,
+    ApprovalResponse,
+}
+
+impl Role {
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "You",
+            Self::Assistant => "Atra",
+            Self::Tool => "Tool",
+            Self::ToolResult => "Tool result",
+            Self::ApprovalRequest => "Approval requested",
+            Self::ApprovalResponse => "Approval",
+        }
+    }
 }
 
 struct Approval {
@@ -123,10 +146,21 @@ struct TranscriptLayout {
 }
 
 struct TurnCompletion {
-    message: Option<String>,
     thread_id: i64,
-    threads: Option<Vec<Thread>>,
     response: ControllerResponse,
+}
+
+enum TurnUpdate {
+    Started {
+        message: String,
+        thread_id: i64,
+        threads: Vec<Thread>,
+    },
+    Delta {
+        thread_id: i64,
+        content: String,
+    },
+    Completed(Result<TurnCompletion>),
 }
 
 struct App {
@@ -219,7 +253,7 @@ impl App {
                     }
                 }
                 Some(completion) = completed_turns.recv() => {
-                    self.complete_turn(completion)?;
+                    self.update_turn(completion)?;
                 }
             }
         }
@@ -228,7 +262,7 @@ impl App {
     async fn handle_key(
         &mut self,
         key: KeyEvent,
-        turns: &mpsc::UnboundedSender<Result<TurnCompletion>>,
+        turns: &mpsc::UnboundedSender<TurnUpdate>,
     ) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
             self.open_model_picker()?;
@@ -459,10 +493,10 @@ impl App {
         Ok(())
     }
 
-    fn send(&mut self, turns: &mpsc::UnboundedSender<Result<TurnCompletion>>) {
+    fn send(&mut self, turns: &mpsc::UnboundedSender<TurnUpdate>) {
         let message = std::mem::take(&mut self.input);
         self.transcript.push(TranscriptItem {
-            role: "You",
+            role: Role::User,
             text: sanitize(&message),
         });
         self.turn_pending = true;
@@ -473,8 +507,8 @@ impl App {
         let turns = turns.clone();
         tokio::spawn(async move {
             let result = async {
-                let (thread_id, created) = match existing_thread_id {
-                    Some(thread_id) => (thread_id, false),
+                let thread_id = match existing_thread_id {
+                    Some(thread_id) => thread_id,
                     None => {
                         let thread_id = match request(
                             &endpoint,
@@ -506,37 +540,41 @@ impl App {
                                 ),
                             }
                         }
-                        (thread_id, true)
+                        let threads =
+                            match request(&endpoint, ControllerRequest::ThreadList).await? {
+                                ControllerResponse::ThreadList { threads } => threads,
+                                ControllerResponse::Error { message } => bail!("{message}"),
+                                response => bail!(
+                                    "controller returned an unexpected response: {response:?}"
+                                ),
+                            };
+                        turns
+                            .send(TurnUpdate::Started {
+                                message: message.clone(),
+                                thread_id,
+                                threads,
+                            })
+                            .ok();
+                        thread_id
                     }
                 };
-                let response = request(
+                let response = request_stream(
                     &endpoint,
                     ControllerRequest::ThreadSend {
                         thread_id,
                         message: message.clone(),
                     },
+                    thread_id,
+                    &turns,
                 )
                 .await?;
-                let threads = if created {
-                    match request(&endpoint, ControllerRequest::ThreadList).await? {
-                        ControllerResponse::ThreadList { threads } => Some(threads),
-                        ControllerResponse::Error { message } => bail!("{message}"),
-                        response => {
-                            bail!("controller returned an unexpected response: {response:?}")
-                        }
-                    }
-                } else {
-                    None
-                };
                 Ok(TurnCompletion {
-                    message: Some(message),
                     thread_id,
-                    threads,
                     response,
                 })
             }
             .await;
-            let _ = turns.send(result);
+            let _ = turns.send(TurnUpdate::Completed(result));
         });
     }
 
@@ -619,7 +657,7 @@ impl App {
         &mut self,
         approval_id: u64,
         allowed: bool,
-        turns: &mpsc::UnboundedSender<Result<TurnCompletion>>,
+        turns: &mpsc::UnboundedSender<TurnUpdate>,
     ) {
         let request_message = if allowed {
             ControllerRequest::ApprovalAllow { approval_id }
@@ -636,41 +674,81 @@ impl App {
         let thread_id = self.thread_id.expect("approval belongs to a thread");
         let turns = turns.clone();
         tokio::spawn(async move {
-            let result = request(&endpoint, request_message)
+            let result = request_stream(&endpoint, request_message, thread_id, &turns)
                 .await
                 .map(|response| TurnCompletion {
-                    message: None,
                     thread_id,
-                    threads: None,
                     response,
                 });
-            let _ = turns.send(result);
+            let _ = turns.send(TurnUpdate::Completed(result));
         });
     }
 
-    fn complete_turn(&mut self, completion: Result<TurnCompletion>) -> Result<()> {
-        self.turn_pending = false;
-        let completion = match completion {
-            Ok(completion) => completion,
-            Err(error) => {
+    fn update_turn(&mut self, update: TurnUpdate) -> Result<()> {
+        let completion = match update {
+            TurnUpdate::Started {
+                message,
+                thread_id,
+                threads,
+            } => {
+                self.threads = threads;
+                if self.thread_id.is_none()
+                    && self.transcript.last().is_some_and(|item| {
+                        item.role == Role::User && item.text == sanitize(&message)
+                    })
+                {
+                    self.thread_id = Some(thread_id);
+                }
+                if let Some(thread) = self
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.id == thread_id)
+                {
+                    thread.display_name = Some(message);
+                }
+                return Ok(());
+            }
+            TurnUpdate::Delta { thread_id, content } => {
+                if self.thread_id == Some(thread_id) {
+                    if self
+                        .transcript
+                        .last()
+                        .is_some_and(|item| item.role == Role::Assistant)
+                    {
+                        self.transcript
+                            .last_mut()
+                            .unwrap()
+                            .text
+                            .push_str(&sanitize(&content));
+                    } else {
+                        self.transcript.push(TranscriptItem {
+                            role: Role::Assistant,
+                            text: sanitize(&content),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::Completed(Ok(completion)) => completion,
+            TurnUpdate::Completed(Err(error)) => {
+                self.turn_pending = false;
                 self.status = sanitize(&format!("{error:#}"));
                 return Ok(());
             }
         };
-        if let Some(threads) = completion.threads {
-            self.threads = threads;
-        }
-        if let Some(message) = completion.message
-            && self.thread_id.is_none()
-            && self
-                .transcript
-                .last()
-                .is_some_and(|item| item.role == "You" && item.text == sanitize(&message))
-        {
-            self.thread_id = Some(completion.thread_id);
-        }
+        self.turn_pending = false;
         if self.thread_id == Some(completion.thread_id) {
-            self.accept_turn_response(completion.response)?;
+            match completion.response {
+                ControllerResponse::TurnCompleted { .. }
+                    if self
+                        .transcript
+                        .last()
+                        .is_some_and(|item| item.role == Role::Assistant) =>
+                {
+                    self.status = "Ready".to_owned();
+                }
+                response => self.accept_turn_response(response)?,
+            }
         } else {
             self.status = "Ready".to_owned();
         }
@@ -681,7 +759,7 @@ impl App {
         match response {
             ControllerResponse::TurnCompleted { content } => {
                 self.transcript.push(TranscriptItem {
-                    role: "Atra",
+                    role: Role::Assistant,
                     text: sanitize(&content),
                 });
                 self.status = "Ready".to_owned();
@@ -941,7 +1019,7 @@ fn transcript_lines<'a>(
     let mut offset = 0;
     for item in items {
         lines.push(Line::from(Span::styled(
-            item.role,
+            item.role.label(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -992,10 +1070,16 @@ async fn load_transcript(endpoint: &Path, thread_id: i64) -> Result<Vec<Transcri
 
 fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
     let (role, text) = match event.kind.as_str() {
-        "user_message" => ("You", event.payload.get("content")?.as_str()?.to_owned()),
-        "assistant_message" => ("Atra", event.payload.get("content")?.as_str()?.to_owned()),
+        "user_message" => (
+            Role::User,
+            event.payload.get("content")?.as_str()?.to_owned(),
+        ),
+        "assistant_message" => (
+            Role::Assistant,
+            event.payload.get("content")?.as_str()?.to_owned(),
+        ),
         "tool_call" => (
-            "Tool",
+            Role::Tool,
             format!(
                 "{} {}",
                 event.payload.get("name")?.as_str()?,
@@ -1003,11 +1087,11 @@ fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
             ),
         ),
         "tool_result" => (
-            "Tool result",
+            Role::ToolResult,
             serde_json::to_string_pretty(event.payload.get("result")?).ok()?,
         ),
         "approval_request" => (
-            "Approval requested",
+            Role::ApprovalRequest,
             format!(
                 "{} {}",
                 event.payload.get("tool")?.as_str()?,
@@ -1015,7 +1099,7 @@ fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
             ),
         ),
         "approval_response" => (
-            "Approval",
+            Role::ApprovalResponse,
             event.payload.get("decision")?.as_str()?.to_owned(),
         ),
         _ => return None,
@@ -1077,6 +1161,38 @@ async fn request(endpoint: &Path, request: ControllerRequest) -> Result<Controll
     .context("controller request timed out")?
     .context("failed to read controller response")?;
     serde_json::from_str(&response).context("failed to decode controller response")
+}
+
+async fn request_stream(
+    endpoint: &Path,
+    request: ControllerRequest,
+    thread_id: i64,
+    updates: &mpsc::UnboundedSender<TurnUpdate>,
+) -> Result<ControllerResponse> {
+    let mut stream = UnixStream::connect(endpoint)
+        .await
+        .with_context(|| format!("failed to connect to controller at {}", endpoint.display()))?;
+    let mut encoded =
+        serde_json::to_vec(&request).context("failed to encode controller request")?;
+    encoded.push(b'\n');
+    stream
+        .write_all(&encoded)
+        .await
+        .context("failed to write controller request")?;
+    let mut responses = BufReader::new(stream).lines();
+    loop {
+        let response = tokio::time::timeout(Duration::from_secs(300), responses.next_line())
+            .await
+            .context("controller request timed out")?
+            .context("failed to read controller response")?
+            .context("controller closed the response stream")?;
+        match serde_json::from_str(&response).context("failed to decode controller response")? {
+            ControllerResponse::TurnDelta { content } => {
+                updates.send(TurnUpdate::Delta { thread_id, content }).ok();
+            }
+            response => return Ok(response),
+        }
+    }
 }
 
 #[cfg(test)]

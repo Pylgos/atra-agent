@@ -98,6 +98,9 @@ pub enum ControllerResponse {
     },
     ThreadRenamed,
     ThreadModelChanged,
+    TurnDelta {
+        content: String,
+    },
     TurnCompleted {
         content: String,
     },
