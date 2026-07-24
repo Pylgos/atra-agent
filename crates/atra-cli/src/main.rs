@@ -135,6 +135,10 @@ enum PlatformCommand {
 
 #[derive(Subcommand)]
 enum RunnerCommand {
+    Run {
+        #[arg(long)]
+        stdio: bool,
+    },
     List,
     Upload {
         #[arg(long)]
@@ -243,6 +247,15 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let command = Cli::parse().command;
+    if let Command::Runner {
+        command: RunnerCommand::Run { stdio },
+    } = &command
+    {
+        if !*stdio {
+            bail!("--stdio is required");
+        }
+        return atra_runner::run_stdio().await;
+    }
     let workspace = workspace_root()?;
     if matches!(
         &command,
@@ -441,6 +454,9 @@ async fn run() -> Result<()> {
             .await?;
             display_turn_response(response)
         }
+        Command::Runner {
+            command: RunnerCommand::Run { .. },
+        } => unreachable!("runner run is handled before workspace setup"),
         Command::Runner {
             command: RunnerCommand::List,
         } => {
@@ -673,29 +689,16 @@ fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
         return Ok(command);
     }
 
-    let binary = runner_binary()?;
+    let binary = env::current_exe().context("failed to determine the atra executable path")?;
     Ok(vec![
         binary
             .into_os_string()
             .into_string()
-            .map_err(|_| anyhow::anyhow!("runner binary path is not valid UTF-8"))?,
+            .map_err(|_| anyhow::anyhow!("atra executable path is not valid UTF-8"))?,
+        "runner".to_owned(),
+        "run".to_owned(),
         "--stdio".to_owned(),
     ])
-}
-
-fn runner_binary() -> Result<PathBuf> {
-    Ok(match env::var("ATRA_RUNNER_BINARY") {
-        Ok(binary) => PathBuf::from(binary),
-        Err(env::VarError::NotPresent) => {
-            let executable =
-                env::current_exe().context("failed to determine the atra executable path")?;
-            executable
-                .parent()
-                .context("atra executable has no parent directory")?
-                .join("atra-runner")
-        }
-        Err(error) => return Err(error).context("ATRA_RUNNER_BINARY is not valid UTF-8"),
-    })
 }
 
 async fn upload_runner(binary_path: Option<PathBuf>, command: Vec<String>) -> Result<()> {
@@ -936,13 +939,11 @@ async fn workspace_start(workspace: &Path, endpoint: &Path, workspace_id: &str) 
     controller_start(workspace, endpoint, &database).await?;
 
     let atra_binary = env::current_exe().context("failed to determine the atra executable path")?;
-    let runner_binary = runner_binary()?;
     let status = TokioCommand::new("bash")
         .args(["-c", &config.setup])
         .current_dir(workspace)
         .env("ATRA_BINARY", &atra_binary)
         .env("ATRA_CONTROLLER_ENDPOINT", endpoint)
-        .env("ATRA_RUNNER_BINARY", runner_binary)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

@@ -190,8 +190,7 @@ canonicalな形:
 atra runner launch \
   --name host-raw \
   --description "host環境で直接commandを実行する" \
-  --approval ask \
-  -- "$ATRA_RUNNER_BINARY" --stdio
+  --approval ask
 ```
 
 `atra runner launch`は冪等なreconcile操作です。
@@ -207,7 +206,10 @@ atra runner launch \
 
 一つのsetup scriptから`atra runner launch`を任意回数呼び出せます。起動数や宣言的launcher fileは要求しません。
 
-setup scriptを短く保つため、launch commandは共通値を標準で環境変数から参照します。少なくともController endpointとRunner binary pathにdefaultを持たせてください。
+setup scriptを短く保つため、Controller endpointは標準で環境変数から参照します。
+commandを省略したlocal Runnerは、実行中の`atra` binaryを使って
+`atra runner run --stdio`として起動します。containerやremote環境では、
+platform bundleのstandalone `atra-runner`を明示的なcommandとして渡します。
 
 approval policyはlaunch commandで指定し、Controllerが保持・判定します。Runner自身がapproval policyを選択したり、権限を広げたりしてはいけません。
 
@@ -643,10 +645,12 @@ loggingには`tracing`を使い、stdoutをprotocol専用に保つためstderr�
 workspaceには現在、役割ごとに以下のcrateがあります。
 
 ```text
-atra
+atra-cli
 atra-controller
+atra-platform
 atra-protocol
 atra-runner
+atra-tui
 ```
 
 機能を独立crateにするのは複数の実利用者や明確なdependency boundaryが生じた場合だけにしてください。

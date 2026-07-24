@@ -10,7 +10,6 @@ use tokio::{
 };
 
 const ATRA: &str = env!("CARGO_BIN_EXE_atra");
-const RUNNER: &str = env!("CARGO_BIN_EXE_atra-runner");
 
 #[tokio::test]
 async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
@@ -528,9 +527,6 @@ impl TestSystem {
                 "integration test runner",
                 "--approval",
                 approval,
-                "--",
-                RUNNER,
-                "--stdio",
             ])
             .output()
             .await

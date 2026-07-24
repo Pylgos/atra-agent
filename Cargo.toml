@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/atra",
+    "crates/atra-cli",
     "crates/atra-controller",
     "crates/atra-platform",
     "crates/atra-protocol",

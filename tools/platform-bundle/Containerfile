@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
     && RUSTFLAGS="-C target-feature=+crt-static" \
-        cargo build --locked --release --target "$target" -p atra --bin atra-runner \
+        cargo build --locked --release --target "$target" -p atra-runner --bin atra-runner \
     && cp "target/$target/release/atra-runner" /atra-runner
 
 FROM docker.io/library/alpine:3.22 AS build
