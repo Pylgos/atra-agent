@@ -146,6 +146,32 @@ $XDG_STATE_HOME/atra/<workspace-digest>/controller.sqlite3
 
 このタスクではpublic network protocolを設計しません。
 
+### Workspace setup
+
+ControllerとRunnerの起動をまとめるcanonicalなcommand:
+
+```sh
+atra workspace init
+atra workspace start
+```
+
+`workspace init`はcanonical cwdに`.config/atra.toml`と
+`.config/atra-setup.bash`を生成します。既存fileは上書きしません。
+
+workspace設定はsetup commandを持ちます。
+
+```toml
+setup = "bash .config/atra-setup.bash"
+```
+
+生成するsetup scriptは、`host`という名前のlocal Runnerをapproval `ask`で起動します。
+`workspace start`はControllerをbackgroundで起動した後、workspace rootでsetup commandを
+毎回実行します。これにより、冪等な`atra runner launch`を使ってRunner設定をreconcile
+できます。setupに失敗した場合もControllerは停止しません。
+
+`atra tui`はControllerが停止中でworkspace設定が存在する場合に限り、workspaceを起動
+するかterminal上で確認します。自動起動確認を他のCLI commandへは適用しません。
+
 ## 6. 名前付きRunnerと`atra runner launch`
 
 一つのsetup scriptから、動的に0個以上のRunnerを作成できます。
@@ -600,6 +626,7 @@ container、tmux、terminal固有動作は、default test frameworkを拡大せ�
 12. [完了] 最初の全画面TUIとOSC 52 copyを実装する。
 13. [完了] platform bundle deployとcontainerへのRunner uploadを実装する。
 14. [完了] real Codex-subscription providerを統合し、手動確認する。
+15. [完了] Controllerのbackground lifecycleとworkspace setupを実装する。
 
 architectureを完成済みに見せるためだけに後続stageを先回りして作らないでください。
 

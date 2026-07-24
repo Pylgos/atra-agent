@@ -29,7 +29,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot, watch},
 };
 
 mod model;
@@ -121,22 +121,36 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         prompt_cache_namespace,
     });
 
+    let (shutdown, mut shutdown_requested) = watch::channel(false);
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, &state).await {
-                        tracing::warn!(error = %format!("{error:#}"), "client request failed");
-                    }
-                });
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let state = Arc::clone(&state);
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_client(stream, &state, &shutdown).await {
+                            tracing::warn!(error = %format!("{error:#}"), "client request failed");
+                        }
+                    });
+                }
+                Err(error) => tracing::warn!(%error, "failed to accept controller connection"),
+            },
+            changed = shutdown_requested.changed() => {
+                if changed.is_ok() && *shutdown_requested.borrow() {
+                    tracing::info!("controller stopping");
+                    return Ok(());
+                }
             }
-            Err(error) => tracing::warn!(%error, "failed to accept controller connection"),
         }
     }
 }
 
-async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
+async fn handle_client(
+    mut stream: UnixStream,
+    state: &State,
+    shutdown: &watch::Sender<bool>,
+) -> Result<()> {
     let mut request = String::new();
     BufReader::new(&mut stream)
         .read_line(&mut request)
@@ -144,6 +158,18 @@ async fn handle_client(mut stream: UnixStream, state: &State) -> Result<()> {
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
+    if request == ControllerRequest::Shutdown {
+        let response = write_response(&mut stream, &ControllerResponse::Stopping).await;
+        let closed = stream
+            .shutdown()
+            .await
+            .context("failed to close shutdown response stream");
+        drop(stream);
+        shutdown.send_replace(true);
+        response?;
+        closed?;
+        return Ok(());
+    }
     if let ControllerRequest::ThreadSend { thread_id, message } = request {
         let (deltas, mut pending_deltas) = mpsc::unbounded_channel();
         let response = {
@@ -208,6 +234,7 @@ impl State {
     async fn handle(&self, request: ControllerRequest) -> Result<ControllerResponse> {
         match request {
             ControllerRequest::Status => Ok(ControllerResponse::Running),
+            ControllerRequest::Shutdown => unreachable!("shutdown is handled before dispatch"),
             ControllerRequest::ThreadCreate { display_name } => {
                 let thread_id = self
                     .store

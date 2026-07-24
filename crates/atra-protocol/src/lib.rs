@@ -19,6 +19,7 @@ pub enum TimeoutAction {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ControllerRequest {
     Status,
+    Shutdown,
     ThreadCreate {
         display_name: Option<String>,
     },
@@ -89,6 +90,7 @@ pub enum ControllerRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ControllerResponse {
     Running,
+    Stopping,
     ThreadCreated {
         thread_id: i64,
     },
