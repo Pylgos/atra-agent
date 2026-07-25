@@ -1,9 +1,12 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -106,25 +109,20 @@ impl App {
             .borders(Borders::ALL)
             .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
-        let (lines, tool_ranges) = transcript_lines(
+        let (lines, item_ranges) = transcript_lines(
             &self.transcript,
             self.selection_range(),
             &self.expanded_tools,
-            self.selected_tool,
+            self.selected_item,
+            inner.width,
         );
-        let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
+        let content_length = lines.len();
+        let max_scroll = content_length.saturating_sub(usize::from(inner.height));
+        self.transcript_max_scroll = max_scroll;
         self.transcript_scroll = self.transcript_scroll.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.transcript_scroll) as u16;
-        let max_horizontal_scroll = lines
-            .iter()
-            .map(|line| line.to_string().width())
-            .max()
-            .unwrap_or_default()
-            .saturating_sub(usize::from(inner.width));
-        self.transcript_horizontal_scroll =
-            self.transcript_horizontal_scroll.min(max_horizontal_scroll);
-        let horizontal_scroll = self.transcript_horizontal_scroll as u16;
-        self.tool_areas = tool_ranges
+        self.transcript_item_ranges = item_ranges.clone();
+        self.item_areas = item_ranges
             .into_iter()
             .filter_map(|(index, rows)| {
                 let start = rows.start.saturating_sub(usize::from(scroll));
@@ -142,17 +140,50 @@ impl App {
             })
             .collect();
         self.transcript_layout =
-            layout_transcript(&self.transcript, inner, scroll, horizontal_scroll);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((scroll, horizontal_scroll))
-                .block(block),
-            area,
-        );
+            layout_transcript(&self.transcript, &self.expanded_tools, inner, scroll);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+        if max_scroll > 0 && inner.height > 2 {
+            self.transcript_scrollbar_area = Rect::new(area.right() - 1, inner.y, 1, inner.height);
+            let scrollbar_position =
+                usize::from(scroll).saturating_mul(content_length.saturating_sub(1)) / max_scroll;
+            let track_height = inner.height.saturating_sub(2);
+            let denominator = content_length
+                .saturating_sub(1)
+                .saturating_add(usize::from(inner.height));
+            let thumb_len = rounded_divide(
+                usize::from(inner.height).saturating_mul(usize::from(track_height)),
+                denominator,
+            )
+            .clamp(1, usize::from(track_height)) as u16;
+            let thumb_start = rounded_divide(
+                scrollbar_position.saturating_mul(usize::from(track_height)),
+                denominator,
+            )
+            .min(usize::from(track_height.saturating_sub(thumb_len)))
+                as u16;
+            self.transcript_scrollbar_thumb_start = thumb_start;
+            self.transcript_scrollbar_thumb_len = thumb_len;
+            let mut scrollbar_state =
+                ScrollbarState::new(content_length).position(scrollbar_position);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut scrollbar_state,
+            );
+        } else {
+            self.transcript_scrollbar_area = Rect::default();
+            self.transcript_scrollbar_drag_offset = None;
+        }
     }
 
     fn render_debug_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.tool_areas.clear();
+        self.item_areas.clear();
+        self.transcript_scrollbar_area = Rect::default();
+        self.transcript_max_scroll = 0;
+        self.transcript_scrollbar_drag_offset = None;
         let [requests, detail] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(27), Constraint::Min(20)])
@@ -382,6 +413,10 @@ impl App {
         );
         lines
     }
+}
+
+fn rounded_divide(numerator: usize, denominator: usize) -> usize {
+    (numerator + denominator / 2) / denominator
 }
 
 fn section(name: &str) -> Line<'static> {

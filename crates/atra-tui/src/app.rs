@@ -29,27 +29,60 @@ use unicode_width::UnicodeWidthChar;
 use crate::controller::{request, request_stream};
 
 #[derive(Clone)]
-pub(crate) struct TranscriptItem {
-    role: Role,
-    text: String,
-    markdown: Option<Vec<Line<'static>>>,
+pub(crate) enum TranscriptItem {
+    Message {
+        author: Author,
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        arguments: Option<serde_json::Value>,
+    },
+    ToolResult {
+        result: serde_json::Value,
+    },
+    ApprovalRequest {
+        tool: String,
+    },
+    ApprovalResponse {
+        allowed: bool,
+    },
 }
 
 impl TranscriptItem {
-    fn new(role: Role, text: String) -> Self {
-        let markdown = matches!(role, Role::User | Role::Assistant).then(|| render_markdown(&text));
-        Self {
-            role,
-            text,
-            markdown,
-        }
+    fn message(author: Author, text: String) -> Self {
+        Self::Message { author, text }
     }
 
-    fn append(&mut self, text: &str) {
-        self.text.push_str(text);
-        if self.markdown.is_some() {
-            self.markdown = Some(render_markdown(&self.text));
-        }
+    fn append_message(&mut self, content: &str) {
+        let Self::Message { text, .. } = self else {
+            unreachable!()
+        };
+        text.push_str(content);
+    }
+
+    fn is_tool_result(&self) -> bool {
+        matches!(self, Self::ToolResult { .. })
+    }
+
+    fn is_user_message(&self) -> bool {
+        matches!(
+            self,
+            Self::Message {
+                author: Author::User,
+                ..
+            }
+        )
+    }
+
+    fn is_assistant_message(&self) -> bool {
+        matches!(
+            self,
+            Self::Message {
+                author: Author::Assistant,
+                ..
+            }
+        )
     }
 }
 
@@ -68,26 +101,9 @@ pub(crate) enum FocusPane {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Role {
+pub(crate) enum Author {
     User,
     Assistant,
-    Tool,
-    ToolResult,
-    ApprovalRequest,
-    ApprovalResponse,
-}
-
-impl Role {
-    fn label(self) -> &'static str {
-        match self {
-            Self::User => "You",
-            Self::Assistant => "Atra",
-            Self::Tool => "Tool",
-            Self::ToolResult => "Tool result",
-            Self::ApprovalRequest => "Approval requested",
-            Self::ApprovalResponse => "Approval",
-        }
-    }
 }
 
 pub(crate) struct Approval {
@@ -119,6 +135,12 @@ pub(crate) struct TranscriptLayout {
     rows: Vec<MappedRow>,
 }
 
+struct DisplayedLine {
+    marker: Option<char>,
+    line: Line<'static>,
+    continuation: bool,
+}
+
 pub(crate) struct TurnCompletion {
     thread_id: i64,
     response: ControllerResponse,
@@ -138,11 +160,6 @@ pub(crate) enum TurnUpdate {
         thread_id: i64,
         item_id: String,
         name: String,
-    },
-    ToolCallDelta {
-        thread_id: i64,
-        item_id: String,
-        delta: String,
     },
     Event {
         thread_id: i64,
@@ -180,17 +197,22 @@ pub(crate) struct App {
     pub(crate) transcript_mode: TranscriptMode,
     pub(crate) focus: FocusPane,
     pub(crate) transcript_scroll: usize,
-    pub(crate) transcript_horizontal_scroll: usize,
     pub(crate) detail_scroll: usize,
     pub(crate) selected_request: Option<usize>,
     pub(crate) raw_request: bool,
     pub(crate) expanded_tools: HashSet<usize>,
-    pub(crate) selected_tool: Option<usize>,
+    pub(crate) selected_item: Option<usize>,
     pub(crate) transcript_area: Rect,
+    pub(crate) transcript_scrollbar_area: Rect,
+    pub(crate) transcript_max_scroll: usize,
+    pub(crate) transcript_scrollbar_thumb_start: u16,
+    pub(crate) transcript_scrollbar_thumb_len: u16,
+    pub(crate) transcript_scrollbar_drag_offset: Option<u16>,
     pub(crate) input_area: Rect,
     pub(crate) request_list_area: Rect,
     pub(crate) detail_area: Rect,
-    pub(crate) tool_areas: Vec<(usize, Rect)>,
+    pub(crate) item_areas: Vec<(usize, Rect)>,
+    pub(crate) transcript_item_ranges: Vec<(usize, std::ops::Range<usize>)>,
 }
 
 impl App {
@@ -253,17 +275,22 @@ impl App {
             transcript_mode: TranscriptMode::Coding,
             focus: FocusPane::Input,
             transcript_scroll: 0,
-            transcript_horizontal_scroll: 0,
             detail_scroll: 0,
             selected_request: None,
             raw_request: false,
             expanded_tools: HashSet::new(),
-            selected_tool: None,
+            selected_item: None,
             transcript_area: Rect::default(),
+            transcript_scrollbar_area: Rect::default(),
+            transcript_max_scroll: 0,
+            transcript_scrollbar_thumb_start: 0,
+            transcript_scrollbar_thumb_len: 0,
+            transcript_scrollbar_drag_offset: None,
             input_area: Rect::default(),
             request_list_area: Rect::default(),
             detail_area: Rect::default(),
-            tool_areas: Vec::new(),
+            item_areas: Vec::new(),
+            transcript_item_ranges: Vec::new(),
         })
     }
 
@@ -573,6 +600,57 @@ impl App {
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .transcript_scrollbar_area
+                    .contains((mouse.column, mouse.row).into()) =>
+            {
+                self.focus = FocusPane::Transcript;
+                let position = mouse.row.saturating_sub(self.transcript_scrollbar_area.y);
+                if position == 0 {
+                    self.transcript_scroll = self
+                        .transcript_scroll
+                        .saturating_add(1)
+                        .min(self.transcript_max_scroll);
+                } else if position == self.transcript_scrollbar_area.height.saturating_sub(1) {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                } else {
+                    let track_position = position - 1;
+                    let thumb_end = self
+                        .transcript_scrollbar_thumb_start
+                        .saturating_add(self.transcript_scrollbar_thumb_len);
+                    let drag_offset = if track_position >= self.transcript_scrollbar_thumb_start
+                        && track_position < thumb_end
+                    {
+                        track_position - self.transcript_scrollbar_thumb_start
+                    } else {
+                        self.transcript_scrollbar_thumb_len / 2
+                    };
+                    self.transcript_scrollbar_drag_offset = Some(drag_offset);
+                    self.drag_transcript_scrollbar(track_position);
+                }
+                return Ok(());
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+                if self.transcript_scrollbar_drag_offset.is_some() =>
+            {
+                let track_position = mouse
+                    .row
+                    .saturating_sub(self.transcript_scrollbar_area.y + 1)
+                    .min(self.transcript_scrollbar_area.height.saturating_sub(3));
+                self.drag_transcript_scrollbar(track_position);
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if self.transcript_scrollbar_drag_offset.is_some() =>
+            {
+                self.transcript_scrollbar_drag_offset = None;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if self.detail_area.contains((mouse.column, mouse.row).into()) {
                     self.detail_scroll = self.detail_scroll.saturating_sub(3);
@@ -652,21 +730,30 @@ impl App {
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some((index, _)) = self
-                .tool_areas
+                .item_areas
                 .iter()
                 .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
         {
             let index = *index;
-            self.selected_tool = Some(index);
-            if !self.expanded_tools.remove(&index) {
+            if self.selected_item == Some(index)
+                && self.transcript[index].is_tool_result()
+                && !self.expanded_tools.remove(&index)
+            {
                 self.expanded_tools.insert(index);
             }
+            self.selected_item = Some(index);
             self.focus = FocusPane::Transcript;
-            return Ok(());
         }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.transcript_mode == TranscriptMode::Coding
+                    && self
+                        .transcript_area
+                        .contains((mouse.column, mouse.row).into())
+                {
+                    self.focus = FocusPane::Transcript;
+                }
                 self.selection_start = self.point_at(mouse.column, mouse.row);
                 self.selection_end = self.selection_start;
             }
@@ -680,13 +767,33 @@ impl App {
         Ok(())
     }
 
+    fn drag_transcript_scrollbar(&mut self, track_position: u16) {
+        let movable_height = self
+            .transcript_scrollbar_area
+            .height
+            .saturating_sub(2)
+            .saturating_sub(self.transcript_scrollbar_thumb_len);
+        let thumb_start = track_position
+            .saturating_sub(self.transcript_scrollbar_drag_offset.unwrap())
+            .min(movable_height);
+        let scroll = if movable_height == 0 {
+            0
+        } else {
+            self.transcript_max_scroll
+                .saturating_mul(usize::from(thumb_start))
+                .saturating_add(usize::from(movable_height) / 2)
+                / usize::from(movable_height)
+        };
+        self.transcript_scroll = self.transcript_max_scroll.saturating_sub(scroll);
+    }
+
     fn send(&mut self, turns: &mpsc::UnboundedSender<TurnUpdate>) -> Result<()> {
         let message = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.record_history(message.clone())?;
         self.reset_history_navigation();
         self.transcript
-            .push(TranscriptItem::new(Role::User, sanitize(&message)));
+            .push(TranscriptItem::message(Author::User, sanitize(&message)));
         self.turn_pending = true;
         self.status = "Waiting for Atra Controller…".to_owned();
         let endpoint = self.endpoint.clone();
@@ -912,7 +1019,13 @@ impl App {
                 self.threads = threads;
                 if self.thread_id.is_none()
                     && self.transcript.last().is_some_and(|item| {
-                        item.role == Role::User && item.text == sanitize(&message)
+                        matches!(
+                            item,
+                            TranscriptItem::Message {
+                                author: Author::User,
+                                text,
+                            } if text == &sanitize(&message)
+                        )
                     })
                 {
                     self.thread_id = Some(thread_id);
@@ -931,15 +1044,17 @@ impl App {
                     if self
                         .transcript
                         .last()
-                        .is_some_and(|item| item.role == Role::Assistant)
+                        .is_some_and(TranscriptItem::is_assistant_message)
                     {
                         self.transcript
                             .last_mut()
                             .unwrap()
-                            .append(&sanitize(&content));
+                            .append_message(&sanitize(&content));
                     } else {
-                        self.transcript
-                            .push(TranscriptItem::new(Role::Assistant, sanitize(&content)));
+                        self.transcript.push(TranscriptItem::message(
+                            Author::Assistant,
+                            sanitize(&content),
+                        ));
                     }
                 }
                 return Ok(());
@@ -951,24 +1066,11 @@ impl App {
             } => {
                 if self.thread_id == Some(thread_id) {
                     let index = self.transcript.len();
-                    self.transcript.push(TranscriptItem::new(
-                        Role::Tool,
-                        format!("{} ", sanitize(&name)),
-                    ));
+                    self.transcript.push(TranscriptItem::ToolCall {
+                        name: sanitize(&name),
+                        arguments: None,
+                    });
                     self.tool_call_preview = Some((item_id, index));
-                }
-                return Ok(());
-            }
-            TurnUpdate::ToolCallDelta {
-                thread_id,
-                item_id,
-                delta,
-            } => {
-                if self.thread_id == Some(thread_id)
-                    && let Some((preview_id, index)) = &self.tool_call_preview
-                    && preview_id == &item_id
-                {
-                    self.transcript[*index].append(&sanitize(&delta));
                 }
                 return Ok(());
             }
@@ -983,7 +1085,7 @@ impl App {
                     let Some(item) = event_to_item(event) else {
                         return Ok(());
                     };
-                    if item.role == Role::Tool
+                    if matches!(item, TranscriptItem::ToolCall { .. })
                         && let Some(item_id) = item_id
                         && let Some((preview_id, index)) = self.tool_call_preview.take()
                         && preview_id == item_id
@@ -1012,7 +1114,7 @@ impl App {
                     if self
                         .transcript
                         .last()
-                        .is_some_and(|item| item.role == Role::Assistant) =>
+                        .is_some_and(TranscriptItem::is_assistant_message) =>
                 {
                     self.status = "Ready".to_owned();
                 }
@@ -1027,8 +1129,10 @@ impl App {
     fn accept_turn_response(&mut self, response: ControllerResponse) -> Result<()> {
         match response {
             ControllerResponse::TurnCompleted { content } => {
-                self.transcript
-                    .push(TranscriptItem::new(Role::Assistant, sanitize(&content)));
+                self.transcript.push(TranscriptItem::message(
+                    Author::Assistant,
+                    sanitize(&content),
+                ));
                 self.status = "Ready".to_owned();
             }
             ControllerResponse::ApprovalRequired {
@@ -1096,12 +1200,11 @@ impl App {
 
     fn reset_view(&mut self) {
         self.transcript_scroll = 0;
-        self.transcript_horizontal_scroll = 0;
         self.detail_scroll = 0;
         self.selected_request = None;
         self.raw_request = false;
         self.expanded_tools.clear();
-        self.selected_tool = None;
+        self.selected_item = None;
         self.focus = FocusPane::Input;
     }
 
@@ -1125,15 +1228,7 @@ impl App {
     fn handle_pane_key(&mut self, key: KeyEvent) {
         match self.focus {
             FocusPane::Transcript => match key.code {
-                KeyCode::Left => {
-                    self.transcript_horizontal_scroll =
-                        self.transcript_horizontal_scroll.saturating_sub(4)
-                }
-                KeyCode::Right => {
-                    self.transcript_horizontal_scroll =
-                        self.transcript_horizontal_scroll.saturating_add(4)
-                }
-                KeyCode::Home => self.transcript_horizontal_scroll = 0,
+                KeyCode::Home => self.transcript_scroll = self.transcript_max_scroll,
                 KeyCode::PageUp => {
                     self.transcript_scroll = self
                         .transcript_scroll
@@ -1144,10 +1239,11 @@ impl App {
                         .transcript_scroll
                         .saturating_sub(usize::from(self.transcript_area.height))
                 }
-                KeyCode::Up => self.select_tool(false),
-                KeyCode::Down => self.select_tool(true),
+                KeyCode::Up => self.select_item(false),
+                KeyCode::Down => self.select_item(true),
                 KeyCode::Enter => {
-                    if let Some(index) = self.selected_tool
+                    if let Some(index) = self.selected_item
+                        && self.transcript[index].is_tool_result()
                         && !self.expanded_tools.remove(&index)
                     {
                         self.expanded_tools.insert(index);
@@ -1205,65 +1301,82 @@ impl App {
             .count()
     }
 
-    fn select_tool(&mut self, forward: bool) {
-        let tools = self
-            .transcript
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| (item.role == Role::ToolResult).then_some(index))
-            .collect::<Vec<_>>();
-        if tools.is_empty() {
-            self.selected_tool = None;
+    fn select_item(&mut self, forward: bool) {
+        if self.transcript.is_empty() {
+            self.selected_item = None;
             return;
         }
-        let current = self
-            .selected_tool
-            .and_then(|selected| tools.iter().position(|index| *index == selected));
-        let next = match (current, forward) {
-            (Some(index), true) => (index + 1).min(tools.len() - 1),
+        let next = match (self.selected_item, forward) {
+            (Some(index), true) => (index + 1).min(self.transcript.len() - 1),
             (Some(index), false) => index.saturating_sub(1),
             (None, true) => 0,
-            (None, false) => tools.len() - 1,
+            (None, false) => self.transcript.len() - 1,
         };
-        self.selected_tool = Some(tools[next]);
+        self.selected_item = Some(next);
+        let scroll = self
+            .transcript_item_ranges
+            .iter()
+            .find_map(|(index, rows)| (*index == next).then_some(rows.start));
+        if let Some(item_start) = scroll {
+            let viewport_start = self
+                .transcript_max_scroll
+                .saturating_sub(self.transcript_scroll);
+            let viewport_end =
+                viewport_start + usize::from(self.transcript_area.height.saturating_sub(2));
+            if item_start < viewport_start || item_start >= viewport_end {
+                self.transcript_scroll = self
+                    .transcript_max_scroll
+                    .saturating_sub(item_start.min(self.transcript_max_scroll));
+            }
+        }
     }
 }
 
 pub(crate) fn layout_transcript(
     items: &[TranscriptItem],
+    expanded_tools: &HashSet<usize>,
     area: Rect,
     scroll: u16,
-    horizontal_scroll: u16,
 ) -> TranscriptLayout {
     let mut text = String::new();
     let mut rows = Vec::new();
     let mut virtual_y = 0_u16;
-    for item in items {
-        virtual_y += 1;
-        let item_start = text.len();
-        text.push_str(&item.text);
-        for source_line in item.text.split_inclusive('\n') {
-            let content = source_line.strip_suffix('\n').unwrap_or(source_line);
-            let content_start =
-                item_start + source_line.as_ptr() as usize - item.text.as_ptr() as usize;
+    for (item_index, item) in items.iter().enumerate() {
+        let mut first_line = true;
+        for displayed in displayed_item_lines(item, item_index, expanded_tools, area.width) {
+            if !first_line && !displayed.continuation {
+                text.push('\n');
+            }
+            first_line = false;
+            let line = displayed.line;
+            let content = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let content_start = text.len();
+            text.push_str(&content);
             let mut cells = Vec::new();
             for (byte, character) in content.char_indices() {
                 let character_width = character.width().unwrap_or(0);
                 cells.extend(std::iter::repeat_n(content_start + byte, character_width));
             }
             if virtual_y >= scroll && virtual_y - scroll < area.height {
-                let start = usize::from(horizontal_scroll).min(cells.len());
-                let end = (start + usize::from(area.width)).min(cells.len());
                 rows.push(MappedRow {
-                    x: area.x,
+                    x: area.x + 2,
                     y: area.y + virtual_y - scroll,
-                    cells: cells[start..end].to_vec(),
+                    cells,
                     end: content_start + content.len(),
                 });
             }
             virtual_y += 1;
         }
         text.push('\n');
+        if items.get(item_index + 1).is_none_or(|next| {
+            !matches!(item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
+        }) {
+            virtual_y += 1;
+        }
     }
     TranscriptLayout { text, rows }
 }
@@ -1311,87 +1424,332 @@ impl StyleSheet for AtraMarkdownStyle {
     }
 }
 
-pub(crate) fn transcript_lines<'a>(
-    items: &'a [TranscriptItem],
+pub(crate) fn transcript_lines(
+    items: &[TranscriptItem],
     selection: Option<(usize, usize)>,
     expanded_tools: &HashSet<usize>,
-    selected_tool: Option<usize>,
-) -> (Vec<Line<'a>>, Vec<(usize, std::ops::Range<usize>)>) {
+    selected_item: Option<usize>,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<(usize, std::ops::Range<usize>)>) {
     let mut lines = Vec::new();
-    let mut tool_ranges = Vec::new();
+    let mut item_ranges = Vec::new();
     let mut offset = 0;
     for (item_index, item) in items.iter().enumerate() {
         let item_start = lines.len();
-        lines.push(Line::from(Span::styled(
-            item.role.label(),
-            if selected_tool == Some(item_index) {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+        let mut first_line = true;
+        for displayed in displayed_item_lines(item, item_index, expanded_tools, width) {
+            if !first_line && !displayed.continuation {
+                offset += 1;
+            }
+            first_line = false;
+            let DisplayedLine {
+                marker,
+                line,
+                continuation: _,
+            } = displayed;
+            let line_len = line
+                .spans
+                .iter()
+                .map(|span| span.content.len())
+                .sum::<usize>();
+            let gutter_style = if item.is_user_message() {
+                Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            },
-        )));
-        if matches!(item.role, Role::User | Role::Assistant) {
-            lines.extend(item.markdown.as_ref().unwrap().iter().map(|line| {
-                Line {
-                    style: line.style,
-                    alignment: line.alignment,
-                    spans: line
-                        .spans
-                        .iter()
-                        .map(|span| Span::styled(span.content.as_ref(), span.style))
-                        .collect(),
-                }
-            }));
-            offset += item.text.len() + 1;
-            if item.role == Role::ToolResult {
-                tool_ranges.push((item_index, item_start..lines.len()));
+            };
+            let mut spans = vec![
+                Span::styled(
+                    marker.unwrap_or(' ').to_string(),
+                    marker_style(item, selected_item == Some(item_index)),
+                ),
+                Span::styled(" ", gutter_style),
+            ];
+            spans.extend(highlight_selection(line, offset, selection).spans);
+            if item.is_user_message() {
+                let rendered_width = spans.iter().map(Span::width).sum::<usize>();
+                spans.push(Span::styled(
+                    " ".repeat(usize::from(width).saturating_sub(rendered_width)),
+                    Style::default().bg(Color::DarkGray),
+                ));
             }
-            continue;
+            lines.push(Line::from(spans));
+            offset += line_len;
         }
-        if item.role == Role::Tool && item.text.starts_with("apply_patch ") {
-            lines.extend(patch_lines(
-                item.text.strip_prefix("apply_patch ").unwrap_or(&item.text),
-            ));
+        item_ranges.push((item_index, item_start..lines.len()));
+        if items.get(item_index + 1).is_none_or(|next| {
+            !matches!(item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
+        }) {
             lines.push(Line::default());
-            offset += item.text.len() + 1;
-            continue;
-        }
-        let display = if item.role == Role::ToolResult && !expanded_tools.contains(&item_index) {
-            summarize_result(&item.text)
-        } else {
-            item.text.clone()
-        };
-        for source_line in display.lines() {
-            let mut current = Vec::new();
-            for (byte, character) in source_line.char_indices() {
-                let selected = selection.is_some_and(|(start, end)| {
-                    let absolute = offset + byte;
-                    absolute >= start && absolute < end
-                });
-                let style = if selected {
-                    Style::default().bg(Color::Blue)
-                } else {
-                    Style::default()
-                };
-                current.push(Span::styled(character.to_string(), style));
-            }
-            lines.push(Line::from(current));
-            offset += source_line.len() + 1;
-        }
-        if !item.text.ends_with('\n') {
-            offset = offset.saturating_sub(1);
         }
         offset += 1;
-        if item.role == Role::ToolResult {
-            tool_ranges.push((item_index, item_start..lines.len()));
+    }
+    (lines, item_ranges)
+}
+
+fn displayed_item_lines(
+    item: &TranscriptItem,
+    item_index: usize,
+    expanded_tools: &HashSet<usize>,
+    width: u16,
+) -> Vec<DisplayedLine> {
+    let content_width = usize::from(width.saturating_sub(2)).max(1);
+    if let TranscriptItem::Message { author, text } = item {
+        let background = (*author == Author::User).then_some(Color::DarkGray);
+        let mut first_event_line = true;
+        return render_markdown(text)
+            .into_iter()
+            .flat_map(|line| {
+                wrap_line(line, content_width)
+                    .into_iter()
+                    .enumerate()
+                    .collect::<Vec<_>>()
+            })
+            .map(|(wrap_index, mut line)| {
+                if let Some(background) = background {
+                    line.style = line.style.bg(background);
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(background);
+                    }
+                }
+                let displayed = DisplayedLine {
+                    marker: first_event_line.then_some('•'),
+                    line,
+                    continuation: wrap_index != 0,
+                };
+                first_event_line = false;
+                displayed
+            })
+            .collect();
+    }
+    let mut logical_lines = match item {
+        TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
+        TranscriptItem::ToolResult { result } => {
+            let result = format_tool_value(result);
+            let display = if expanded_tools.contains(&item_index) {
+                result
+            } else {
+                summarize_result(&result)
+            };
+            display
+                .lines()
+                .map(|line| (None, Line::from(line.to_owned())))
+                .collect()
+        }
+        TranscriptItem::ApprovalRequest { tool } => {
+            vec![(Some('?'), Line::from(format!("{tool} approval")))]
+        }
+        TranscriptItem::ApprovalResponse { allowed } => vec![(
+            Some(if *allowed { '✓' } else { '✗' }),
+            Line::from(if *allowed { "approved" } else { "denied" }),
+        )],
+        TranscriptItem::Message { .. } => unreachable!(),
+    };
+    if logical_lines.is_empty() {
+        logical_lines.push((None, Line::default()));
+    }
+    logical_lines
+        .into_iter()
+        .flat_map(|(marker, line)| {
+            wrap_line(line, content_width)
+                .into_iter()
+                .enumerate()
+                .map(move |(index, line)| DisplayedLine {
+                    marker: (index == 0).then_some(marker).flatten(),
+                    line,
+                    continuation: index != 0,
+                })
+        })
+        .collect()
+}
+
+fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
+    let style = match item {
+        TranscriptItem::Message {
+            author: Author::User,
+            ..
+        } => Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+        TranscriptItem::Message {
+            author: Author::Assistant,
+            ..
+        } => Style::default().fg(Color::Cyan),
+        TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
+        TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
+        TranscriptItem::ApprovalRequest { .. } => Style::default().fg(Color::Yellow),
+        TranscriptItem::ApprovalResponse { allowed: true } => Style::default().fg(Color::Green),
+        TranscriptItem::ApprovalResponse { allowed: false } => Style::default().fg(Color::Red),
+    };
+    if selected {
+        style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn tool_call_lines(
+    name: &str,
+    arguments: Option<&serde_json::Value>,
+) -> Vec<(Option<char>, Line<'static>)> {
+    let object = arguments.and_then(serde_json::Value::as_object);
+    match name {
+        "exec_command" => {
+            let runner = object
+                .and_then(|arguments| arguments.get("runner"))
+                .and_then(serde_json::Value::as_str);
+            let cwd = object
+                .and_then(|arguments| arguments.get("cwd"))
+                .and_then(serde_json::Value::as_str);
+            let location = match (cwd, runner) {
+                (Some(cwd), Some(runner)) => format!("{cwd} · {runner}"),
+                (Some(cwd), None) => cwd.to_owned(),
+                (None, Some(runner)) => runner.to_owned(),
+                (None, None) => ".".to_owned(),
+            };
+            let command = object
+                .and_then(|arguments| arguments.get("command"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            vec![
+                (Some('┌'), Line::from(location)),
+                (Some('$'), Line::from(command.to_owned())),
+            ]
+        }
+        "apply_patch" => {
+            let input = arguments
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let runner = input
+                .lines()
+                .find_map(|line| line.strip_prefix("*** Environment ID: "));
+            let patch = input
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("*** Begin Patch")
+                        && !line.starts_with("*** Environment ID:")
+                        && !line.starts_with("*** End Patch")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut lines = runner
+                .map(|runner| (Some('┌'), Line::from(runner.to_owned())))
+                .into_iter()
+                .collect::<Vec<_>>();
+            lines.push((Some('±'), Line::from("apply patch")));
+            lines.extend(patch_lines(&patch).into_iter().map(|line| (None, line)));
+            lines
+        }
+        "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
+        "wait_process" => vec![(
+            Some('…'),
+            Line::from(format!(
+                "wait process #{}",
+                tool_argument(object, "process_handle")
+            )),
+        )],
+        "write_process" => vec![
+            (
+                Some('›'),
+                Line::from(format!(
+                    "write process #{}",
+                    tool_argument(object, "process_handle")
+                )),
+            ),
+            (
+                None,
+                Line::from(
+                    object
+                        .and_then(|arguments| arguments.get("input"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+            ),
+        ],
+        "stop_process" => vec![(
+            Some('■'),
+            Line::from(format!(
+                "stop process #{}",
+                tool_argument(object, "process_handle")
+            )),
+        )],
+        _ => {
+            let mut lines = vec![(
+                Some('◆'),
+                Line::from(if arguments.is_some() {
+                    name.to_owned()
+                } else {
+                    format!("{name}…")
+                }),
+            )];
+            if let Some(arguments) = object {
+                lines.extend(arguments.iter().map(|(key, value)| {
+                    (
+                        None,
+                        Line::from(format!("{key}: {}", format_tool_value(value))),
+                    )
+                }));
+            }
+            lines
         }
     }
-    (lines, tool_ranges)
+}
+
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut rows = vec![Line::default()];
+    let mut row_width = 0;
+    for span in line.spans {
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if row_width > 0 && row_width + character_width > width {
+                rows.push(Line::default());
+                row_width = 0;
+            }
+            rows.last_mut()
+                .unwrap()
+                .spans
+                .push(Span::styled(character.to_string(), span.style));
+            row_width += character_width;
+        }
+    }
+    for row in &mut rows {
+        row.style = line.style;
+        row.alignment = line.alignment;
+    }
+    rows
+}
+
+fn highlight_selection(
+    line: Line<'static>,
+    offset: usize,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
+    let mut span_offset = offset;
+    let spans = line
+        .spans
+        .into_iter()
+        .flat_map(|span| {
+            let start = span_offset;
+            span_offset += span.content.len();
+            span.content
+                .char_indices()
+                .map(move |(byte, character)| {
+                    let absolute = start + byte;
+                    let style = if selection.is_some_and(|(selection_start, end)| {
+                        absolute >= selection_start && absolute < end
+                    }) {
+                        span.style.bg(Color::Blue)
+                    } else {
+                        span.style
+                    };
+                    Span::styled(character.to_string(), style)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
 }
 
 fn render_markdown(text: &str) -> Vec<Line<'static>> {
@@ -1493,52 +1851,69 @@ async fn load_transcript(
 }
 
 fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
-    let (role, text) = match event.kind.as_str() {
-        "user_message" => (
-            Role::User,
-            event.payload.get("content")?.as_str()?.to_owned(),
-        ),
-        "assistant_message" => (
-            Role::Assistant,
-            event.payload.get("content")?.as_str()?.to_owned(),
-        ),
-        "tool_call" => (
-            Role::Tool,
-            match event
-                .payload
-                .get("input")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(input) => format!("{} {}", event.payload.get("name")?.as_str()?, input),
-                None => format!(
-                    "{} {}",
-                    event.payload.get("name")?.as_str()?,
-                    event.payload.get("arguments")?
-                ),
-            },
-        ),
-        "tool_result" => (
-            Role::ToolResult,
-            match event.payload.get("result")? {
-                serde_json::Value::String(result) => result.clone(),
-                result => serde_json::to_string_pretty(result).ok()?,
-            },
-        ),
-        "approval_request" => (
-            Role::ApprovalRequest,
-            format!(
-                "{} {}",
-                event.payload.get("tool")?.as_str()?,
-                event.payload.get("arguments")?
-            ),
-        ),
-        "approval_response" => (
-            Role::ApprovalResponse,
-            event.payload.get("decision")?.as_str()?.to_owned(),
-        ),
+    match event.kind.as_str() {
+        "user_message" => Some(TranscriptItem::message(
+            Author::User,
+            sanitize(event.payload.get("content")?.as_str()?),
+        )),
+        "assistant_message" => Some(TranscriptItem::message(
+            Author::Assistant,
+            sanitize(event.payload.get("content")?.as_str()?),
+        )),
+        "tool_call" => Some(TranscriptItem::ToolCall {
+            name: sanitize(event.payload.get("name")?.as_str()?),
+            arguments: Some(sanitize_value(
+                event
+                    .payload
+                    .get("input")
+                    .cloned()
+                    .or_else(|| event.payload.get("arguments").cloned())?,
+            )),
+        }),
+        "tool_result" => Some(TranscriptItem::ToolResult {
+            result: sanitize_value(event.payload.get("result")?.clone()),
+        }),
+        "approval_request" => Some(TranscriptItem::ApprovalRequest {
+            tool: sanitize(event.payload.get("tool")?.as_str()?),
+        }),
+        "approval_response" => Some(TranscriptItem::ApprovalResponse {
+            allowed: event.payload.get("decision")?.as_str()? == "allow",
+        }),
         _ => return None,
-    };
-    Some(TranscriptItem::new(role, sanitize(&text)))
+    }
+}
+
+fn sanitize_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(value) => serde_json::Value::String(sanitize(&value)),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(sanitize_value).collect())
+        }
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (sanitize(&key), sanitize_value(value)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn tool_argument(
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> String {
+    arguments
+        .and_then(|arguments| arguments.get(key))
+        .map(format_tool_value)
+        .unwrap_or_default()
+}
+
+fn format_tool_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        value => serde_json::to_string_pretty(value).unwrap(),
+    }
 }
 
 pub(crate) fn sanitize(input: &str) -> String {

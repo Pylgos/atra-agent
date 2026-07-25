@@ -42,15 +42,7 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
-            ControllerResponse::ToolCallDelta { item_id, delta } => {
-                updates
-                    .send(TurnUpdate::ToolCallDelta {
-                        thread_id,
-                        item_id,
-                        delta,
-                    })
-                    .ok();
-            }
+            ControllerResponse::ToolCallDelta { .. } => {}
             ControllerResponse::TurnEvent { event } => {
                 updates.send(TurnUpdate::Event { thread_id, event }).ok();
             }
