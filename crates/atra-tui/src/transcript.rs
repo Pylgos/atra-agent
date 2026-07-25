@@ -19,6 +19,9 @@ pub(crate) enum TranscriptItem {
         author: Author,
         text: String,
     },
+    ReasoningSummary {
+        text: String,
+    },
     ToolCall {
         name: String,
         arguments: Option<serde_json::Value>,
@@ -43,10 +46,12 @@ impl TranscriptItem {
     }
 
     pub(crate) fn append_message(&mut self, content: &str) {
-        let Self::Message { text, .. } = self else {
-            unreachable!()
+        match self {
+            Self::Message { text, .. } | Self::ReasoningSummary { text } => {
+                text.push_str(content);
+            }
+            _ => unreachable!(),
         };
-        text.push_str(content);
     }
 
     pub(crate) fn is_tool_result(&self) -> bool {
@@ -71,6 +76,14 @@ impl TranscriptItem {
                 ..
             }
         )
+    }
+
+    pub(crate) fn is_reasoning_summary(&self) -> bool {
+        matches!(self, Self::ReasoningSummary { .. })
+    }
+
+    pub(crate) fn is_empty_reasoning_summary(&self) -> bool {
+        matches!(self, Self::ReasoningSummary { text } if text.is_empty())
     }
 }
 
@@ -108,6 +121,14 @@ impl TranscriptEntry {
     pub(crate) fn is_assistant_message(&self) -> bool {
         self.item.is_assistant_message()
     }
+
+    pub(crate) fn is_reasoning_summary(&self) -> bool {
+        self.item.is_reasoning_summary()
+    }
+
+    pub(crate) fn is_empty_reasoning_summary(&self) -> bool {
+        self.item.is_empty_reasoning_summary()
+    }
 }
 
 pub(crate) struct RenderedItem {
@@ -133,6 +154,16 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             Author::Assistant,
             sanitize(event.payload.get("content")?.as_str()?),
         )),
+        "reasoning" => {
+            let summary = event.payload.pointer("/item/summary")?.as_array()?;
+            let text = summary
+                .iter()
+                .filter_map(|part| part.get("text")?.as_str())
+                .map(sanitize)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(TranscriptItem::ReasoningSummary { text })
+        }
         "tool_call" => Some(TranscriptItem::ToolCall {
             name: sanitize(event.payload.get("name")?.as_str()?),
             arguments: Some(sanitize_value(

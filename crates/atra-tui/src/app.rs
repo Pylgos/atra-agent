@@ -55,6 +55,13 @@ pub(crate) enum TurnUpdate {
         thread_id: i64,
         content: String,
     },
+    ReasoningSummaryDelta {
+        thread_id: i64,
+        content: String,
+    },
+    ReasoningSummaryPartAdded {
+        thread_id: i64,
+    },
     ToolCallStarted {
         thread_id: i64,
         item_id: String,
@@ -884,6 +891,33 @@ impl App {
                             sanitize(&content),
                         ));
                     }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ReasoningSummaryDelta { thread_id, content } => {
+                if self.thread_id == Some(thread_id) {
+                    let content = sanitize(&content);
+                    if self
+                        .transcript
+                        .last()
+                        .is_some_and(TranscriptEntry::is_reasoning_summary)
+                    {
+                        self.transcript.last_mut().unwrap().append_message(&content);
+                    } else {
+                        self.transcript.push(TranscriptEntry::new(
+                            TranscriptItem::ReasoningSummary { text: content },
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ReasoningSummaryPartAdded { thread_id } => {
+                if self.thread_id == Some(thread_id)
+                    && let Some(entry) = self.transcript.last_mut()
+                    && entry.is_reasoning_summary()
+                    && !entry.is_empty_reasoning_summary()
+                {
+                    entry.append_message("\n\n");
                 }
                 return Ok(());
             }

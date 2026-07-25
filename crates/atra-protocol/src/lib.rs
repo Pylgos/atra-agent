@@ -107,6 +107,10 @@ pub enum ControllerResponse {
     TurnDelta {
         content: String,
     },
+    ReasoningSummaryDelta {
+        content: String,
+    },
+    ReasoningSummaryPartAdded,
     ToolCallStarted {
         item_id: String,
         name: String,

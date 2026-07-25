@@ -18,6 +18,7 @@ use codex_login::{
     default_client::create_client,
 };
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{
     ContentItem, FunctionCallOutputPayload, ResponseInputItem, ResponseItem,
 };
@@ -582,6 +583,20 @@ async fn read_completion(
                         .is_ok();
                 }
             }
+            ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                if let Some(updates) = updates {
+                    visible_output |= updates
+                        .send(ModelStreamEvent::ReasoningSummaryDelta(delta))
+                        .is_ok();
+                }
+            }
+            ResponseEvent::ReasoningSummaryPartAdded { .. } => {
+                if let Some(updates) = updates {
+                    visible_output |= updates
+                        .send(ModelStreamEvent::ReasoningSummaryPartAdded)
+                        .is_ok();
+                }
+            }
             ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
                 id: Some(item_id),
                 name,
@@ -752,7 +767,7 @@ fn reasoning(reasoning_effort: &str) -> Result<Reasoning> {
                 .parse()
                 .map_err(|error: String| anyhow::anyhow!(error))?,
         ),
-        summary: None,
+        summary: Some(ReasoningSummary::Detailed),
         context: None,
     })
 }

@@ -33,6 +33,16 @@ pub(super) async fn request_stream(
             ControllerResponse::TurnDelta { content } => {
                 updates.send(TurnUpdate::Delta { thread_id, content }).ok();
             }
+            ControllerResponse::ReasoningSummaryDelta { content } => {
+                updates
+                    .send(TurnUpdate::ReasoningSummaryDelta { thread_id, content })
+                    .ok();
+            }
+            ControllerResponse::ReasoningSummaryPartAdded => {
+                updates
+                    .send(TurnUpdate::ReasoningSummaryPartAdded { thread_id })
+                    .ok();
+            }
             ControllerResponse::ToolCallStarted { item_id, name } => {
                 updates
                     .send(TurnUpdate::ToolCallStarted {

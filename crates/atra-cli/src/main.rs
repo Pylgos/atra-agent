@@ -1069,6 +1069,8 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ThreadList { .. }
         | ControllerResponse::ModelList { .. }
         | ControllerResponse::TurnDelta { .. }
+        | ControllerResponse::ReasoningSummaryDelta { .. }
+        | ControllerResponse::ReasoningSummaryPartAdded
         | ControllerResponse::ToolCallStarted { .. }
         | ControllerResponse::ToolCallDelta { .. }
         | ControllerResponse::TurnEvent { .. }

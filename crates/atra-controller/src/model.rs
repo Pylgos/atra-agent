@@ -36,6 +36,8 @@ pub(crate) enum ModelResponse {
 
 pub(crate) enum ModelStreamEvent {
     AssistantDelta(String),
+    ReasoningSummaryDelta(String),
+    ReasoningSummaryPartAdded,
     ToolCallStarted { item_id: String, name: String },
     ToolCallDelta { item_id: String, delta: String },
     ThreadEvent(ThreadEvent),

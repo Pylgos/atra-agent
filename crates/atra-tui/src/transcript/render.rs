@@ -276,6 +276,31 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
             })
             .collect();
     }
+    if let TranscriptItem::ReasoningSummary { text } = item {
+        let mut first_event_line = true;
+        return render_markdown(text)
+            .into_iter()
+            .flat_map(|mut line| {
+                line.style = line.style.fg(Color::DarkGray);
+                for span in &mut line.spans {
+                    span.style = span.style.fg(Color::DarkGray);
+                }
+                wrap_line(line, content_width)
+                    .into_iter()
+                    .enumerate()
+                    .collect::<Vec<_>>()
+            })
+            .map(|(wrap_index, line)| {
+                let displayed = DisplayedLine {
+                    marker: first_event_line.then_some('·'),
+                    line,
+                    continuation: wrap_index != 0,
+                };
+                first_event_line = false;
+                displayed
+            })
+            .collect();
+    }
     let mut logical_lines = match item {
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
         TranscriptItem::ToolResult { artifacts } => artifacts
@@ -297,7 +322,7 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
             }
             vec![(Some('✗'), Line::from(message))]
         }
-        TranscriptItem::Message { .. } => unreachable!(),
+        TranscriptItem::Message { .. } | TranscriptItem::ReasoningSummary { .. } => unreachable!(),
     };
     if logical_lines.is_empty() {
         logical_lines.push((None, Line::default()));
@@ -327,6 +352,7 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
             author: Author::Assistant,
             ..
         } => Style::default().fg(Color::Cyan),
+        TranscriptItem::ReasoningSummary { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::ToolDenied { .. } => Style::default().fg(Color::Red),
