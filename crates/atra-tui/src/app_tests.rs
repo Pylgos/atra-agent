@@ -1,4 +1,10 @@
+use std::collections::HashSet;
+
 use super::*;
+use crate::transcript::{
+    layout_transcript, prepare_transcript, transcript_lines, transcript_ranges, transcript_text,
+};
+use ratatui::{Terminal, layout::Rect, text::Line};
 
 #[test]
 fn sanitizes_terminal_control_sequences() {
@@ -48,40 +54,15 @@ fn transcript_render_is_stable() {
             input
         },
         command_input: InputBuffer::new(Vec::new(), false),
-        command_open: false,
-        help_open: false,
+        overlay: Overlay::None,
         word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
         activity: None,
-        approval: None,
-        renaming: false,
-        model_picker: None,
-        thread_picker: None,
         new_thread_model: None,
         login_required: false,
-        selection_start: None,
-        selection_end: None,
-        transcript_layout: TranscriptLayout { rows: Vec::new() },
-        turn_pending: false,
+        view: ViewState::default(),
+        layout: ViewLayout::default(),
+        turn: TurnState::Idle,
         metrics_stale: false,
-        transcript_mode: TranscriptMode::Coding,
-        focus: FocusPane::Input,
-        transcript_scroll: 0,
-        detail_scroll: 0,
-        selected_request: None,
-        raw_request: false,
-        expanded_tools: HashSet::new(),
-        selected_item: None,
-        transcript_area: Rect::default(),
-        transcript_scrollbar_area: Rect::default(),
-        transcript_max_scroll: 0,
-        transcript_scrollbar_thumb_start: 0,
-        transcript_scrollbar_thumb_len: 0,
-        transcript_scrollbar_drag_offset: None,
-        input_area: Rect::default(),
-        request_list_area: Rect::default(),
-        detail_area: Rect::default(),
-        item_areas: Vec::new(),
-        transcript_item_ranges: Vec::new(),
     };
 
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -162,4 +143,35 @@ fn collapsed_tool_result_keeps_edges_and_can_expand() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(expanded.contains("two\n  three\n  four"));
+}
+
+#[test]
+fn approval_response_updates_the_matching_request() {
+    let mut transcript = Vec::new();
+    push_transcript_item(
+        &mut transcript,
+        TranscriptItem::Approval {
+            id: 7,
+            tool: Some("exec_command".to_owned()),
+            allowed: None,
+        },
+    );
+    push_transcript_item(
+        &mut transcript,
+        TranscriptItem::Approval {
+            id: 7,
+            tool: None,
+            allowed: Some(false),
+        },
+    );
+
+    assert_eq!(transcript.len(), 1);
+    assert!(matches!(
+        transcript[0].item,
+        TranscriptItem::Approval {
+            id: 7,
+            allowed: Some(false),
+            ..
+        }
+    ));
 }

@@ -12,9 +12,12 @@ use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{
-    Activity, App, COMMAND_HELP, FocusPane, ModelPicker, ThreadPicker, TranscriptMode,
-    layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
+use crate::{
+    app::{Activity, App, COMMAND_HELP},
+    state::{FocusPane, ModelPicker, Overlay, ThreadPicker, TranscriptMode},
+    transcript::{
+        layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
+    },
 };
 
 fn quota_delta(first: &Value, current: &Value) -> Option<f64> {
@@ -62,7 +65,7 @@ fn format_window_duration(minutes: i64) -> String {
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = if self.approval.is_some() {
+        let input_height = if matches!(self.overlay, Overlay::Approval(_)) {
             3
         } else {
             (self
@@ -83,16 +86,16 @@ impl App {
                 Constraint::Length(1),
             ])
             .areas(frame.area());
-        self.input_area = input;
-        self.transcript_area = main;
-        match self.transcript_mode {
+        self.layout.input_area = input;
+        self.layout.transcript_area = main;
+        match self.view.transcript_mode {
             TranscriptMode::Coding => self.render_coding_transcript(frame, main),
             TranscriptMode::Debug => self.render_debug_transcript(frame, main),
         }
 
-        let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.approval
+        let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.overlay
         {
-            Some(approval) => match &approval.deny_reason {
+            Overlay::Approval(approval) => match &approval.deny_reason {
                 Some(reason) => (
                     "Deny reason (optional)",
                     Some(Line::from("Enter: deny · Esc: back").right_aligned()),
@@ -102,14 +105,14 @@ impl App {
                 ),
                 None => ("Approval required", None, "[y] Allow  [n] Deny", 0, false),
             },
-            None if self.renaming => (
+            Overlay::Rename => (
                 "Thread name",
                 None,
                 self.message_input.value.as_str(),
                 self.message_input.cursor,
                 true,
             ),
-            None => (
+            _ => (
                 "Message",
                 Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
                 self.message_input.value.as_str(),
@@ -146,7 +149,7 @@ impl App {
                 ),
             input,
         );
-        if self.command_open {
+        if matches!(self.overlay, Overlay::Command) {
             frame.render_widget(
                 Paragraph::new(format!("/{}", self.command_input.value)),
                 activity_area,
@@ -165,10 +168,10 @@ impl App {
             frame.render_widget(Paragraph::new(message.as_str()).style(style), activity_area);
         }
         frame.render_widget(Paragraph::new(self.status_line()), status);
-        if !self.command_open
-            && self.model_picker.is_none()
-            && self.thread_picker.is_none()
-            && self.focus == FocusPane::Input
+        if !matches!(
+            self.overlay,
+            Overlay::Command | Overlay::ModelPicker(_) | Overlay::ThreadPicker(_)
+        ) && self.view.focus == FocusPane::Input
             && show_cursor
         {
             frame.set_cursor_position((
@@ -176,22 +179,22 @@ impl App {
                 input.y + 1 + cursor_row as u16 - vertical_scroll,
             ));
         }
-        if let Some(picker) = &self.model_picker {
+        if let Overlay::ModelPicker(picker) = &self.overlay {
             render_model_picker(frame, picker);
         }
-        if let Some(picker) = &self.thread_picker {
+        if let Overlay::ThreadPicker(picker) = &self.overlay {
             render_thread_picker(frame, picker, &self.threads);
         }
-        if self.help_open {
+        if matches!(self.overlay, Overlay::Help) {
             render_command_help(frame);
         }
     }
 
     fn focus_border_style(&self, pane: FocusPane) -> Style {
-        if self.approval.is_none()
-            && self.model_picker.is_none()
-            && self.thread_picker.is_none()
-            && self.focus == pane
+        if !matches!(
+            self.overlay,
+            Overlay::Approval(_) | Overlay::ModelPicker(_) | Overlay::ThreadPicker(_)
+        ) && self.view.focus == pane
         {
             Style::default().fg(Color::Cyan)
         } else {
@@ -362,28 +365,28 @@ impl App {
     }
 
     fn render_coding_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.request_list_area = Rect::default();
-        self.detail_area = Rect::default();
+        self.layout.request_list_area = Rect::default();
+        self.layout.detail_area = Rect::default();
         let block = Block::default()
             .title("Transcript")
             .borders(Borders::ALL)
             .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
-        prepare_transcript(&mut self.transcript, &self.expanded_tools, inner.width);
+        prepare_transcript(&mut self.transcript, &self.view.expanded_tools, inner.width);
         let (content_length, item_ranges) = transcript_ranges(&self.transcript);
         let max_scroll = content_length.saturating_sub(usize::from(inner.height));
-        self.transcript_max_scroll = max_scroll;
-        self.transcript_scroll = self.transcript_scroll.min(max_scroll);
-        let scroll = max_scroll.saturating_sub(self.transcript_scroll);
+        self.layout.transcript_max_scroll = max_scroll;
+        self.view.transcript_scroll = self.view.transcript_scroll.min(max_scroll);
+        let scroll = max_scroll.saturating_sub(self.view.transcript_scroll);
         let lines = transcript_lines(
             &self.transcript,
             self.selection_range(),
-            self.selected_item,
+            self.view.selected_item,
             inner.width,
             scroll..scroll + usize::from(inner.height),
         );
-        self.transcript_item_ranges = item_ranges.clone();
-        self.item_areas = item_ranges
+        self.layout.transcript_item_ranges = item_ranges.clone();
+        self.layout.item_areas = item_ranges
             .into_iter()
             .filter_map(|(index, rows)| {
                 let start = rows.start.saturating_sub(scroll);
@@ -400,10 +403,11 @@ impl App {
                 ))
             })
             .collect();
-        self.transcript_layout = layout_transcript(&self.transcript, inner, scroll);
+        self.layout.transcript = layout_transcript(&self.transcript, inner, scroll);
         frame.render_widget(Paragraph::new(lines).block(block), area);
         if max_scroll > 0 && inner.height > 2 {
-            self.transcript_scrollbar_area = Rect::new(area.right() - 1, inner.y, 1, inner.height);
+            self.layout.transcript_scrollbar_area =
+                Rect::new(area.right() - 1, inner.y, 1, inner.height);
             let scrollbar_position =
                 scroll.saturating_mul(content_length.saturating_sub(1)) / max_scroll;
             let track_height = inner.height.saturating_sub(2);
@@ -421,8 +425,8 @@ impl App {
             )
             .min(usize::from(track_height.saturating_sub(thumb_len)))
                 as u16;
-            self.transcript_scrollbar_thumb_start = thumb_start;
-            self.transcript_scrollbar_thumb_len = thumb_len;
+            self.layout.transcript_scrollbar_thumb_start = thumb_start;
+            self.layout.transcript_scrollbar_thumb_len = thumb_len;
             let mut scrollbar_state =
                 ScrollbarState::new(content_length).position(scrollbar_position);
             frame.render_stateful_widget(
@@ -434,35 +438,36 @@ impl App {
                 &mut scrollbar_state,
             );
         } else {
-            self.transcript_scrollbar_area = Rect::default();
-            self.transcript_scrollbar_drag_offset = None;
+            self.layout.transcript_scrollbar_area = Rect::default();
+            self.layout.transcript_scrollbar_drag_offset = None;
         }
     }
 
     fn render_debug_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.item_areas.clear();
-        self.transcript_scrollbar_area = Rect::default();
-        self.transcript_max_scroll = 0;
-        self.transcript_scrollbar_drag_offset = None;
+        self.layout.item_areas.clear();
+        self.layout.transcript_scrollbar_area = Rect::default();
+        self.layout.transcript_max_scroll = 0;
+        self.layout.transcript_scrollbar_drag_offset = None;
         let [requests, detail] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(27), Constraint::Min(20)])
             .areas(area);
-        self.request_list_area = requests;
-        self.detail_area = detail;
+        self.layout.request_list_area = requests;
+        self.layout.detail_area = detail;
         let request_events = self
             .events
             .iter()
             .filter(|event| event.kind == "model_request")
             .collect::<Vec<_>>();
-        if !request_events.is_empty() && self.selected_request.is_none() {
-            self.selected_request = Some(request_events.len() - 1);
+        if !request_events.is_empty() && self.view.selected_request.is_none() {
+            self.view.selected_request = Some(request_events.len() - 1);
         }
         let selected = self
+            .view
             .selected_request
             .unwrap_or(0)
             .min(request_events.len().saturating_sub(1));
-        self.selected_request = (!request_events.is_empty()).then_some(selected);
+        self.view.selected_request = (!request_events.is_empty()).then_some(selected);
         let request_lines = request_events
             .iter()
             .enumerate()
@@ -527,10 +532,10 @@ impl App {
         let max_scroll = lines
             .len()
             .saturating_sub(usize::from(detail.height.saturating_sub(2)));
-        self.detail_scroll = self.detail_scroll.min(max_scroll);
+        self.view.detail_scroll = self.view.detail_scroll.min(max_scroll);
         frame.render_widget(
             Paragraph::new(lines)
-                .scroll((self.detail_scroll as u16, 0))
+                .scroll((self.view.detail_scroll as u16, 0))
                 .block(
                     Block::default()
                         .title("Context · r raw/semantic")
@@ -553,7 +558,7 @@ impl App {
 
     fn request_detail_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
         let request = &event.payload["request"];
-        if self.raw_request {
+        if self.view.raw_request {
             return serde_json::to_string_pretty(request)
                 .unwrap_or_else(|_| request.to_string())
                 .lines()

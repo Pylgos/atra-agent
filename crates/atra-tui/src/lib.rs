@@ -13,7 +13,12 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 mod app;
 mod controller;
+mod history;
 mod input;
+mod layout;
+mod runtime;
+mod state;
+mod transcript;
 mod ui;
 
 pub async fn run(
@@ -22,10 +27,8 @@ pub async fn run(
     command_history_path: PathBuf,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let result = app::App::load(endpoint, message_history_path, command_history_path)
-        .await?
-        .run(&mut terminal.terminal)
-        .await;
+    let mut app = app::App::load(endpoint, message_history_path, command_history_path).await?;
+    let result = runtime::run(&mut app, &mut terminal.terminal).await;
     terminal.restore()?;
     result
 }
