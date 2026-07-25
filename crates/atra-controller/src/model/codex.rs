@@ -939,7 +939,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 "properties": {
                     "runner": {"type": "string"},
                     "command": {"type": "string"},
-                    "cwd": {"type": ["string", "null"]},
                     "background": {"type": "boolean"},
                     "timeout_ms": {"type": ["integer", "null"]},
                     "timeout_action": {

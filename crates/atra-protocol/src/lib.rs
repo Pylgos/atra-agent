@@ -61,7 +61,6 @@ pub enum ControllerRequest {
     ExecCommand {
         runner: String,
         command: String,
-        cwd: Option<String>,
         background: bool,
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
@@ -226,7 +225,6 @@ pub enum RunnerRequest {
     FinishInitialize,
     ExecCommand {
         command: String,
-        cwd: Option<String>,
         background: bool,
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,

@@ -170,8 +170,6 @@ enum RunnerCommand {
         #[arg(long)]
         command: String,
         #[arg(long)]
-        cwd: Option<String>,
-        #[arg(long)]
         background: bool,
         #[arg(long)]
         timeout_ms: Option<u64>,
@@ -534,7 +532,6 @@ async fn run(command: Command) -> Result<()> {
                 RunnerCommand::Exec {
                     name,
                     command,
-                    cwd,
                     background,
                     timeout_ms,
                     on_timeout,
@@ -545,7 +542,6 @@ async fn run(command: Command) -> Result<()> {
                 ControllerRequest::ExecCommand {
                     runner: name,
                     command,
-                    cwd,
                     background,
                     timeout_ms,
                     timeout_action: on_timeout.into(),

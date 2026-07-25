@@ -359,15 +359,7 @@ fn tool_call_lines(
             let runner = object
                 .and_then(|arguments| arguments.get("runner"))
                 .and_then(serde_json::Value::as_str);
-            let cwd = object
-                .and_then(|arguments| arguments.get("cwd"))
-                .and_then(serde_json::Value::as_str);
-            let location = match (cwd, runner) {
-                (Some(cwd), Some(runner)) => format!("{cwd} · {runner}"),
-                (Some(cwd), None) => cwd.to_owned(),
-                (None, Some(runner)) => runner.to_owned(),
-                (None, None) => ".".to_owned(),
-            };
+            let location = runner.unwrap_or(".").to_owned();
             let command = object
                 .and_then(|arguments| arguments.get("command"))
                 .and_then(serde_json::Value::as_str)

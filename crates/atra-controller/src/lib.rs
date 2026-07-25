@@ -327,7 +327,6 @@ impl State {
             ControllerRequest::ExecCommand {
                 runner,
                 command,
-                cwd,
                 background,
                 timeout_ms,
                 timeout_action,
@@ -335,7 +334,6 @@ impl State {
                 tracing::debug!(
                     runner,
                     %command,
-                    cwd = cwd.as_deref(),
                     background,
                     ?timeout_ms,
                     ?timeout_action,
@@ -345,7 +343,6 @@ impl State {
                     .await?
                     .request(RunnerRequest::ExecCommand {
                         command,
-                        cwd,
                         background,
                         timeout_ms,
                         timeout_action,
@@ -876,7 +873,6 @@ impl State {
                     .await?
                     .request_raw(RunnerRequest::ExecCommand {
                         command: arguments.command,
-                        cwd: arguments.cwd,
                         background: arguments.background,
                         timeout_ms: arguments.timeout_ms,
                         timeout_action: arguments.timeout_action,
@@ -1085,7 +1081,6 @@ impl State {
 struct ExecCommandArguments {
     runner: String,
     command: String,
-    cwd: Option<String>,
     #[serde(default)]
     background: bool,
     timeout_ms: Option<u64>,

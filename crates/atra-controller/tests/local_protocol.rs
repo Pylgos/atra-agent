@@ -166,7 +166,6 @@ async fn executes_a_foreground_command_through_a_runner() {
             ControllerRequest::ExecCommand {
                 runner: "test".to_owned(),
                 command: "printf out; printf err >&2; exit 7".to_owned(),
-                cwd: None,
                 background: false,
                 timeout_ms: None,
                 timeout_action: atra_protocol::TimeoutAction::ReturnRunning,

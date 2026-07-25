@@ -132,14 +132,13 @@ async fn handle_request(
         }
         RunnerRequest::ExecCommand {
             command,
-            cwd,
             background,
             timeout_ms,
             timeout_action,
         } => {
-            tracing::debug!(%command, cwd = cwd.as_deref(), "executing command");
+            tracing::debug!(%command, "executing command");
             let path = tools.lock().await.path();
-            let process = processes.start(command, cwd, path).await?;
+            let process = processes.start(command, path).await?;
             if background {
                 return Ok(RunnerResponse::ProcessStarted {
                     process_handle: process.handle.clone(),
@@ -303,12 +302,7 @@ struct ProcessManager {
 }
 
 impl ProcessManager {
-    async fn start(
-        &self,
-        command: String,
-        cwd: Option<String>,
-        path: Option<OsString>,
-    ) -> Result<Arc<ManagedProcess>> {
+    async fn start(&self, command: String, path: Option<OsString>) -> Result<Arc<ManagedProcess>> {
         let (output_reader, output_writer) =
             StdUnixStream::pair().context("failed to create command output stream")?;
         output_reader
@@ -328,9 +322,6 @@ impl ProcessManager {
             .kill_on_drop(true);
         if let Some(path) = path {
             child.env("PATH", path);
-        }
-        if let Some(cwd) = cwd {
-            child.current_dir(cwd);
         }
         let mut child = child
             .spawn()
