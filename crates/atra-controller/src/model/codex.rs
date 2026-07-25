@@ -560,7 +560,7 @@ async fn read_completion(
     mut stream: ResponseStream,
     updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
 ) -> std::result::Result<(ModelCompletion, LastResponse), CompletionReadError> {
-    let mut response = None;
+    let mut responses = Vec::new();
     let mut response_id = None;
     let mut response_items = Vec::new();
     let mut reasoning = Vec::new();
@@ -614,7 +614,7 @@ async fn read_completion(
                         report_fallback: true,
                     })?
                 {
-                    response = Some(item_response);
+                    responses.push(item_response);
                 }
             }
             ResponseEvent::Completed {
@@ -632,11 +632,15 @@ async fn read_completion(
         }
     }
 
-    let response = response.ok_or_else(|| CompletionReadError {
-        error: anyhow::anyhow!("Codex response ended without an assistant message or tool call"),
-        visible_output,
-        report_fallback: true,
-    })?;
+    if responses.is_empty() {
+        return Err(CompletionReadError {
+            error: anyhow::anyhow!(
+                "Codex response ended without an assistant message or tool call"
+            ),
+            visible_output,
+            report_fallback: true,
+        });
+    }
     let response_id = response_id.ok_or_else(|| CompletionReadError {
         error: anyhow::anyhow!("Codex response ended without a response ID"),
         visible_output,
@@ -644,7 +648,7 @@ async fn read_completion(
     })?;
     Ok((
         ModelCompletion {
-            response,
+            responses,
             reasoning,
             token_usage,
             rate_limits,
@@ -728,7 +732,7 @@ fn completion_request(
         input: model_input(events)?,
         tools: Some(tool_definitions()?),
         tool_choice: "auto".to_owned(),
-        parallel_tool_calls: false,
+        parallel_tool_calls: true,
         reasoning: Some(reasoning(reasoning_effort)?),
         store: false,
         stream: true,

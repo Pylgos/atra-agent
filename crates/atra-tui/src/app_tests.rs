@@ -47,7 +47,7 @@ fn transcript_render_is_stable() {
         thread_id: Some(2),
         transcript: items,
         events: Vec::new(),
-        tool_call_preview: None,
+        tool_call_previews: HashMap::new(),
         message_input: {
             let mut input = InputBuffer::new(Vec::new(), true);
             input.set("next".to_owned());

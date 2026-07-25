@@ -42,7 +42,7 @@ impl FakeProvider {
             *content = content.replace("{{tool_output}}", output);
         }
         Ok(ModelCompletion {
-            response,
+            responses: vec![response],
             reasoning: Vec::new(),
             token_usage: None,
             rate_limits: Vec::new(),

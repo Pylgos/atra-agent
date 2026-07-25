@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -91,7 +92,7 @@ pub(crate) struct App {
     pub(crate) thread_id: Option<i64>,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
-    pub(crate) tool_call_preview: Option<(String, usize)>,
+    pub(crate) tool_call_previews: HashMap<String, usize>,
     pub(crate) message_input: InputBuffer,
     pub(crate) command_input: InputBuffer,
     pub(crate) overlay: Overlay,
@@ -143,7 +144,7 @@ impl App {
             thread_id,
             transcript,
             events,
-            tool_call_preview: None,
+            tool_call_previews: HashMap::new(),
             message_input: InputBuffer::new(message_history, true),
             command_input: InputBuffer::new(command_history, false),
             overlay: Overlay::None,
@@ -461,7 +462,7 @@ impl App {
         self.thread_id = None;
         self.transcript.clear();
         self.events.clear();
-        self.tool_call_preview = None;
+        self.tool_call_previews.clear();
         self.message_input.clear();
         self.overlay = Overlay::None;
         self.new_thread_model = None;
@@ -898,7 +899,7 @@ impl App {
                             name: sanitize(&name),
                             arguments: None,
                         }));
-                    self.tool_call_preview = Some((item_id, index));
+                    self.tool_call_previews.insert(item_id, index);
                 }
                 return Ok(());
             }
@@ -935,8 +936,7 @@ impl App {
                     };
                     if matches!(item, TranscriptItem::ToolCall { .. })
                         && let Some(item_id) = item_id
-                        && let Some((preview_id, index)) = self.tool_call_preview.take()
-                        && preview_id == item_id
+                        && let Some(index) = self.tool_call_previews.remove(&item_id)
                     {
                         self.transcript[index].replace(item);
                         return Ok(());
@@ -947,7 +947,13 @@ impl App {
             }
             TurnUpdate::Completed(Ok(completion)) => completion,
             TurnUpdate::Completed(Err(error)) => {
-                if let Some((_, index)) = self.tool_call_preview.take() {
+                let mut preview_indices = self
+                    .tool_call_previews
+                    .drain()
+                    .map(|(_, index)| index)
+                    .collect::<Vec<_>>();
+                preview_indices.sort_unstable_by(|left, right| right.cmp(left));
+                for index in preview_indices {
                     self.transcript.remove(index);
                 }
                 self.turn = TurnState::Idle;
@@ -972,7 +978,7 @@ impl App {
                 self.thread_id = Some(thread_id);
                 self.transcript = transcript;
                 self.events = events;
-                self.tool_call_preview = None;
+                self.tool_call_previews.clear();
                 self.overlay = Overlay::None;
                 self.clear_selection();
                 self.reset_view();

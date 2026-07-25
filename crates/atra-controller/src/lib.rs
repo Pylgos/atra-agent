@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -578,7 +578,23 @@ impl State {
                 .context("failed to save rate limits")?;
             }
 
-            match completion.response {
+            if let Some(response) = self
+                .execute_model_responses(thread_id, completion.responses.into(), updates)
+                .await?
+            {
+                return Ok(response);
+            }
+        }
+    }
+
+    async fn execute_model_responses(
+        &self,
+        thread_id: i64,
+        mut responses: VecDeque<ModelResponse>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<Option<ControllerResponse>> {
+        while let Some(response) = responses.pop_front() {
+            match response {
                 ModelResponse::AssistantMessage { content } => {
                     self.store
                         .append(
@@ -588,7 +604,7 @@ impl State {
                         )
                         .await
                         .context("failed to save assistant message")?;
-                    return Ok(ControllerResponse::TurnCompleted { content });
+                    return Ok(Some(ControllerResponse::TurnCompleted { content }));
                 }
                 ModelResponse::ToolCall {
                     name,
@@ -618,11 +634,12 @@ impl State {
                                     call_id,
                                     ToolArguments::ExecCommand(arguments),
                                     false,
+                                    &mut responses,
                                     updates,
                                 )
                                 .await?
                             {
-                                return Ok(response);
+                                return Ok(Some(response));
                             }
                         }
                         "apply_patch" => {
@@ -635,11 +652,12 @@ impl State {
                                     call_id,
                                     ToolArguments::ApplyPatch(arguments),
                                     false,
+                                    &mut responses,
                                     updates,
                                 )
                                 .await?
                             {
-                                return Ok(response);
+                                return Ok(Some(response));
                             }
                         }
                         "list_runners" => {
@@ -682,11 +700,12 @@ impl State {
                                     call_id,
                                     ToolArguments::WaitProcess(arguments),
                                     false,
+                                    &mut responses,
                                     updates,
                                 )
                                 .await?
                             {
-                                return Ok(response);
+                                return Ok(Some(response));
                             }
                         }
                         "write_process" => {
@@ -700,11 +719,12 @@ impl State {
                                     call_id,
                                     ToolArguments::WriteProcess(arguments),
                                     false,
+                                    &mut responses,
                                     updates,
                                 )
                                 .await?
                             {
-                                return Ok(response);
+                                return Ok(Some(response));
                             }
                         }
                         "stop_process" => {
@@ -717,11 +737,12 @@ impl State {
                                     call_id,
                                     ToolArguments::StopProcess(arguments),
                                     false,
+                                    &mut responses,
                                     updates,
                                 )
                                 .await?
                             {
-                                return Ok(response);
+                                return Ok(Some(response));
                             }
                         }
                         _ => bail!("model requested unsupported tool {name}"),
@@ -758,15 +779,17 @@ impl State {
                             Some(call_id),
                             ToolArguments::ApplyPatch(arguments),
                             true,
+                            &mut responses,
                             updates,
                         )
                         .await?
                     {
-                        return Ok(response);
+                        return Ok(Some(response));
                     }
                 }
             }
         }
+        Ok(None)
     }
 
     async fn route_tool(
@@ -776,6 +799,7 @@ impl State {
         call_id: Option<String>,
         arguments: ToolArguments,
         custom: bool,
+        remaining_responses: &mut VecDeque<ModelResponse>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<Option<ControllerResponse>> {
         let runner = self.runner(arguments.runner()).await?;
@@ -803,6 +827,7 @@ impl State {
                     call_id,
                     arguments,
                     custom,
+                    remaining_responses: std::mem::take(remaining_responses),
                 },
             );
             return Ok(Some(ControllerResponse::ApprovalRequired {
@@ -869,6 +894,12 @@ impl State {
             updates,
         )
         .await?;
+        if let Some(response) = self
+            .execute_model_responses(pending.thread_id, pending.remaining_responses, updates)
+            .await?
+        {
+            return Ok(response);
+        }
         self.continue_turn(pending.thread_id, updates).await
     }
 
@@ -1214,6 +1245,7 @@ struct PendingApproval {
     call_id: Option<String>,
     arguments: ToolArguments,
     custom: bool,
+    remaining_responses: VecDeque<ModelResponse>,
 }
 
 fn return_running() -> TimeoutAction {

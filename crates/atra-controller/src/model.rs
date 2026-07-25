@@ -42,7 +42,7 @@ pub(crate) enum ModelStreamEvent {
 }
 
 pub(crate) struct ModelCompletion {
-    pub response: ModelResponse,
+    pub responses: Vec<ModelResponse>,
     pub reasoning: Vec<ResponseItem>,
     pub token_usage: Option<TokenUsage>,
     pub rate_limits: Vec<RateLimitSnapshot>,
