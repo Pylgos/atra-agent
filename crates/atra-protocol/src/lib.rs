@@ -71,17 +71,17 @@ pub enum ControllerRequest {
     },
     WaitProcess {
         runner: String,
-        process_handle: u64,
+        process_handle: String,
         timeout_ms: u64,
     },
     WriteProcess {
         runner: String,
-        process_handle: u64,
+        process_handle: String,
         input: Vec<u8>,
     },
     StopProcess {
         runner: String,
-        process_handle: u64,
+        process_handle: String,
     },
 }
 
@@ -133,10 +133,10 @@ pub enum ControllerResponse {
     Launched,
     AlreadyRunning,
     ProcessStarted {
-        process_handle: u64,
+        process_handle: String,
     },
     ProcessRunning {
-        process_handle: u64,
+        process_handle: String,
         output: String,
     },
     ProcessFinished {
@@ -233,15 +233,15 @@ pub enum RunnerRequest {
         patch: String,
     },
     WaitProcess {
-        process_handle: u64,
+        process_handle: String,
         timeout_ms: u64,
     },
     WriteProcess {
-        process_handle: u64,
+        process_handle: String,
         input: Vec<u8>,
     },
     StopProcess {
-        process_handle: u64,
+        process_handle: String,
     },
 }
 
@@ -254,10 +254,10 @@ pub enum RunnerResponse {
     },
     ToolInstalled,
     ProcessStarted {
-        process_handle: u64,
+        process_handle: String,
     },
     ProcessRunning {
-        process_handle: u64,
+        process_handle: String,
         output: String,
     },
     ProcessFinished {

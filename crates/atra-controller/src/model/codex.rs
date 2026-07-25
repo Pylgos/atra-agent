@@ -561,7 +561,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 "type": "object",
                 "properties": {
                     "runner": {"type": "string"},
-                    "process_handle": {"type": "integer"},
+                    "process_handle": {"type": "string"},
                     "timeout_ms": {"type": "integer"}
                 },
                 "required": ["runner", "process_handle", "timeout_ms"],
@@ -577,7 +577,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 "type": "object",
                 "properties": {
                     "runner": {"type": "string"},
-                    "process_handle": {"type": "integer"},
+                    "process_handle": {"type": "string"},
                     "input": {"type": "string"}
                 },
                 "required": ["runner", "process_handle", "input"],
@@ -593,7 +593,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 "type": "object",
                 "properties": {
                     "runner": {"type": "string"},
-                    "process_handle": {"type": "integer"}
+                    "process_handle": {"type": "string"}
                 },
                 "required": ["runner", "process_handle"],
                 "additionalProperties": false

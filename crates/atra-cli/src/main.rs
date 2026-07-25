@@ -185,7 +185,7 @@ enum RunnerCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
-        process_handle: u64,
+        process_handle: String,
         #[arg(long)]
         timeout_ms: u64,
     },
@@ -193,7 +193,7 @@ enum RunnerCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
-        process_handle: u64,
+        process_handle: String,
         #[arg(long)]
         text: String,
     },
@@ -201,7 +201,7 @@ enum RunnerCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
-        process_handle: u64,
+        process_handle: String,
     },
 }
 
@@ -669,7 +669,7 @@ fn display_process_response(response: ControllerResponse) -> Result<()> {
             output,
         } => {
             print!("{output}");
-            eprintln!("process {process_handle} is still running");
+            eprintln!("process {process_handle:?} is still running");
             Ok(())
         }
         ControllerResponse::ProcessFinished { output, exit_code } => {

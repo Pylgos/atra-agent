@@ -530,6 +530,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atra-id"
+version = "0.1.0"
+dependencies = [
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "atra-platform"
 version = "0.1.0"
 dependencies = [
@@ -554,6 +561,7 @@ name = "atra-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atra-id",
  "atra-protocol",
  "base64 0.22.1",
  "clap",

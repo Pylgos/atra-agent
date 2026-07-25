@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -142,7 +142,7 @@ async fn handle_request(
             let process = processes.start(command, cwd, path).await?;
             if background {
                 return Ok(RunnerResponse::ProcessStarted {
-                    process_handle: process.handle,
+                    process_handle: process.handle.clone(),
                 });
             }
             processes
@@ -176,14 +176,14 @@ async fn handle_request(
             timeout_ms,
         } => {
             processes
-                .wait(process_handle, Duration::from_millis(timeout_ms))
+                .wait(&process_handle, Duration::from_millis(timeout_ms))
                 .await
         }
         RunnerRequest::WriteProcess {
             process_handle,
             input,
-        } => processes.write(process_handle, input).await,
-        RunnerRequest::StopProcess { process_handle } => processes.stop(process_handle).await,
+        } => processes.write(&process_handle, input).await,
+        RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
     }
 }
 
@@ -299,8 +299,7 @@ async fn install_tool(name: &str, digest: &str, blob: &str) -> Result<PathBuf> {
 
 #[derive(Default)]
 struct ProcessManager {
-    next_handle: AtomicU64,
-    processes: Mutex<HashMap<u64, Arc<ManagedProcess>>>,
+    processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
 }
 
 impl ProcessManager {
@@ -348,9 +347,15 @@ impl ProcessManager {
                 .context("command PID is out of range")?,
         )
         .context("command PID was zero")?;
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut processes = self.processes.lock().await;
+        let handle = loop {
+            let handle = atra_id::generate();
+            if !processes.contains_key(&handle) {
+                break handle;
+            }
+        };
         let process = Arc::new(ManagedProcess {
-            handle,
+            handle: handle.clone(),
             os_pid,
             child: Mutex::new(child),
             stdin: Mutex::new(Some(stdin)),
@@ -358,10 +363,8 @@ impl ProcessManager {
             output_closed: AtomicBool::new(false),
             changed: Notify::new(),
         });
-        self.processes
-            .lock()
-            .await
-            .insert(handle, Arc::clone(&process));
+        processes.insert(handle.clone(), Arc::clone(&process));
+        drop(processes);
 
         let output_process = Arc::clone(&process);
         tokio::spawn(async move {
@@ -381,7 +384,7 @@ impl ProcessManager {
                     }
                     Err(error) => {
                         tracing::warn!(
-                            process_handle = output_process.handle,
+                            process_handle = %output_process.handle,
                             %error,
                             "failed to read command output"
                         );
@@ -393,7 +396,7 @@ impl ProcessManager {
             output_process.changed.notify_waiters();
         });
 
-        tracing::info!(process_handle = handle, "process started");
+        tracing::info!(process_handle = %handle, "process started");
         Ok(process)
     }
 
@@ -420,11 +423,11 @@ impl ProcessManager {
                 Some(deadline) if Instant::now() >= deadline => {
                     return match timeout_action {
                         TimeoutAction::ReturnRunning => Ok(RunnerResponse::ProcessRunning {
-                            process_handle: process.handle,
+                            process_handle: process.handle.clone(),
                             output: String::from_utf8_lossy(&output).into_owned(),
                         }),
                         TimeoutAction::Terminate => {
-                            let mut stopped = self.stop(process.handle).await?;
+                            let mut stopped = self.stop(&process.handle).await?;
                             if let RunnerResponse::ProcessStopped {
                                 output: stopped_output,
                             } = &mut stopped
@@ -454,7 +457,7 @@ impl ProcessManager {
         }
     }
 
-    async fn wait(&self, handle: u64, timeout: Duration) -> Result<RunnerResponse> {
+    async fn wait(&self, handle: &str, timeout: Duration) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
         let deadline = Instant::now() + timeout;
         loop {
@@ -462,7 +465,7 @@ impl ProcessManager {
             if let Some(exit_code) = process.finished().await? {
                 let mut output = output;
                 output.extend(process.take_output().await);
-                self.processes.lock().await.remove(&handle);
+                self.processes.lock().await.remove(handle);
                 return Ok(RunnerResponse::ProcessFinished {
                     output: String::from_utf8_lossy(&output).into_owned(),
                     exit_code,
@@ -470,7 +473,7 @@ impl ProcessManager {
             }
             if !output.is_empty() || Instant::now() >= deadline {
                 return Ok(RunnerResponse::ProcessRunning {
-                    process_handle: handle,
+                    process_handle: handle.to_owned(),
                     output: String::from_utf8_lossy(&output).into_owned(),
                 });
             }
@@ -482,15 +485,15 @@ impl ProcessManager {
         }
     }
 
-    async fn write(&self, handle: u64, input: Vec<u8>) -> Result<RunnerResponse> {
+    async fn write(&self, handle: &str, input: Vec<u8>) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
         tracing::info!(
-            process_handle = handle,
+            process_handle = %handle,
             input_bytes = input.len(),
             "writing process input"
         );
         tracing::trace!(
-            process_handle = handle,
+            process_handle = %handle,
             input = %String::from_utf8_lossy(&input),
             "process input"
         );
@@ -504,7 +507,7 @@ impl ProcessManager {
         Ok(RunnerResponse::InputWritten)
     }
 
-    async fn stop(&self, handle: u64) -> Result<RunnerResponse> {
+    async fn stop(&self, handle: &str) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
         let _ = kill_process_group(process.os_pid, Signal::TERM);
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -524,25 +527,25 @@ impl ProcessManager {
             }
         }
         let output = process.take_output().await;
-        self.processes.lock().await.remove(&handle);
-        tracing::info!(process_handle = handle, "process stopped");
+        self.processes.lock().await.remove(handle);
+        tracing::info!(process_handle = %handle, "process stopped");
         Ok(RunnerResponse::ProcessStopped {
             output: String::from_utf8_lossy(&output).into_owned(),
         })
     }
 
-    async fn process(&self, handle: u64) -> Result<Arc<ManagedProcess>> {
+    async fn process(&self, handle: &str) -> Result<Arc<ManagedProcess>> {
         self.processes
             .lock()
             .await
-            .get(&handle)
+            .get(handle)
             .cloned()
             .with_context(|| format!("process handle {handle} is not managed by this runner"))
     }
 }
 
 struct ManagedProcess {
-    handle: u64,
+    handle: String,
     os_pid: Pid,
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,

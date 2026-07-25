@@ -181,8 +181,8 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "IFS= read -r line; printf 'received:%s\\n' \"$line\"; sleep 30",
         )
         .await;
-    system.write("one", interactive, "hello\n").await;
-    let waited = system.wait("one", interactive, 1_000).await;
+    system.write("one", &interactive, "hello\n").await;
+    let waited = system.wait("one", &interactive, 1_000).await;
     assert!(waited.status.success(), "{waited:?}");
     assert_eq!(waited.stdout, b"received:hello\n");
     assert!(
@@ -190,7 +190,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .unwrap()
             .contains("is still running")
     );
-    system.stop_process("one", interactive).await;
+    system.stop_process("one", &interactive).await;
 
     let sleeper = system.background("one", "sleep 30").await;
     let mut wait = system
@@ -201,7 +201,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "--name",
             "one",
             "--process-handle",
-            &sleeper.to_string(),
+            &sleeper,
             "--timeout-ms",
             "300",
         ])
@@ -219,7 +219,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(concurrent.status.success(), "{concurrent:?}");
     assert_eq!(concurrent.stdout, b"concurrent");
     assert!(wait.wait().await.unwrap().success());
-    system.stop_process("one", sleeper).await;
+    system.stop_process("one", &sleeper).await;
 
     let returned = system
         .atra()
@@ -242,12 +242,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert_eq!(returned.stdout, b"partial");
     let returned_handle = String::from_utf8(returned.stderr)
         .unwrap()
-        .split_whitespace()
-        .nth(1)
+        .strip_prefix("process \"")
+        .and_then(|message| message.strip_suffix("\" is still running\n"))
         .unwrap()
-        .parse()
-        .unwrap();
-    system.stop_process("one", returned_handle).await;
+        .to_owned();
+    system.stop_process("one", &returned_handle).await;
 
     let terminated = system
         .atra()
@@ -287,7 +286,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let abandoned = system
         .background("two", "sleep 30 & printf '%s\\n' \"$!\"; wait")
         .await;
-    let abandoned_output = system.wait("two", abandoned, 1_000).await;
+    let abandoned_output = system.wait("two", &abandoned, 1_000).await;
     assert!(abandoned_output.status.success(), "{abandoned_output:?}");
     let abandoned_pid = Pid::from_raw(
         String::from_utf8(abandoned_output.stdout)
@@ -634,7 +633,7 @@ impl TestSystem {
             .await
     }
 
-    async fn background(&self, runner: &str, command: &str) -> u64 {
+    async fn background(&self, runner: &str, command: &str) -> String {
         let output = self
             .atra()
             .args([
@@ -650,17 +649,13 @@ impl TestSystem {
             .await
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     async fn wait(
         &self,
         runner: &str,
-        process_handle: u64,
+        process_handle: &str,
         timeout_ms: u64,
     ) -> std::process::Output {
         self.atra()
@@ -670,7 +665,7 @@ impl TestSystem {
                 "--name",
                 runner,
                 "--process-handle",
-                &process_handle.to_string(),
+                process_handle,
                 "--timeout-ms",
                 &timeout_ms.to_string(),
             ])
@@ -679,7 +674,7 @@ impl TestSystem {
             .unwrap()
     }
 
-    async fn write(&self, runner: &str, process_handle: u64, text: &str) {
+    async fn write(&self, runner: &str, process_handle: &str, text: &str) {
         let output = self
             .atra()
             .args([
@@ -688,7 +683,7 @@ impl TestSystem {
                 "--name",
                 runner,
                 "--process-handle",
-                &process_handle.to_string(),
+                process_handle,
                 "--text",
                 text,
             ])
@@ -698,7 +693,7 @@ impl TestSystem {
         assert!(output.status.success(), "{output:?}");
     }
 
-    async fn stop_process(&self, runner: &str, process_handle: u64) {
+    async fn stop_process(&self, runner: &str, process_handle: &str) {
         let output = self
             .atra()
             .args([
@@ -707,7 +702,7 @@ impl TestSystem {
                 "--name",
                 runner,
                 "--process-handle",
-                &process_handle.to_string(),
+                process_handle,
             ])
             .output()
             .await

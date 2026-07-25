@@ -1068,21 +1068,21 @@ struct ApplyPatchArguments {
 #[derive(Deserialize, serde::Serialize)]
 struct WaitProcessArguments {
     runner: String,
-    process_handle: u64,
+    process_handle: String,
     timeout_ms: u64,
 }
 
 #[derive(Deserialize, serde::Serialize)]
 struct WriteProcessArguments {
     runner: String,
-    process_handle: u64,
+    process_handle: String,
     input: String,
 }
 
 #[derive(Deserialize, serde::Serialize)]
 struct StopProcessArguments {
     runner: String,
-    process_handle: u64,
+    process_handle: String,
 }
 
 fn parse_apply_patch_input(patch: String) -> Result<ApplyPatchArguments> {
