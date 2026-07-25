@@ -21,7 +21,8 @@ fn transcript_render_is_stable() {
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App {
         endpoint: PathBuf::new(),
-        history_path: PathBuf::new(),
+        message_history_path: PathBuf::new(),
+        command_history_path: PathBuf::new(),
         threads: vec![
             Thread {
                 id: 2,
@@ -41,22 +42,25 @@ fn transcript_render_is_stable() {
         transcript: items,
         events: Vec::new(),
         tool_call_preview: None,
-        input: "next".to_owned(),
-        input_cursor: 4,
-        input_history: Vec::new(),
-        history_index: None,
-        history_draft: String::new(),
+        message_input: {
+            let mut input = InputBuffer::new(Vec::new(), true);
+            input.set("next".to_owned());
+            input
+        },
+        command_input: InputBuffer::new(Vec::new(), false),
+        command_open: false,
+        help_open: false,
         word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
         status: "Ready".to_owned(),
         approval: None,
         renaming: false,
         model_picker: None,
+        thread_picker: None,
         new_thread_model: None,
         login_required: false,
         selection_start: None,
         selection_end: None,
         transcript_layout: TranscriptLayout { rows: Vec::new() },
-        sidebar: Rect::default(),
         turn_pending: false,
         transcript_mode: TranscriptMode::Coding,
         focus: FocusPane::Input,

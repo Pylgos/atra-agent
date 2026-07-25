@@ -4,22 +4,28 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
     },
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, FocusPane, ModelPicker, TranscriptMode, layout_transcript, prepare_transcript, sanitize,
-    transcript_lines, transcript_ranges,
+    App, COMMAND_HELP, FocusPane, ModelPicker, ThreadPicker, TranscriptMode, layout_transcript,
+    prepare_transcript, sanitize, transcript_lines, transcript_ranges,
 };
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = (self.input.bytes().filter(|byte| *byte == b'\n').count() as u16 + 3)
-            .min(frame.area().height.saturating_sub(5).max(3));
-        let [main, input, status] = Layout::default()
+        let input_height = (self
+            .message_input
+            .value
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u16
+            + 3)
+        .min(frame.area().height.saturating_sub(5).max(3));
+        let [main, input, command] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(4),
@@ -27,37 +33,11 @@ impl App {
                 Constraint::Length(1),
             ])
             .areas(frame.area());
-        let [sidebar, transcript] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(18), Constraint::Min(20)])
-            .areas(main);
-        self.sidebar = sidebar;
         self.input_area = input;
-
-        let threads = std::iter::once(ListItem::new("+ New thread"))
-            .chain(self.threads.iter().map(|thread| {
-                let marker = if Some(thread.id) == self.thread_id {
-                    "●"
-                } else {
-                    " "
-                };
-                let display_name = thread
-                    .display_name
-                    .as_deref()
-                    .map(|name| sanitize(name).replace(['\n', '\t'], " "))
-                    .unwrap_or_else(|| "Untitled thread".to_owned());
-                ListItem::new(format!("{marker} {}", display_name))
-            }))
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(threads).block(Block::default().title("Threads").borders(Borders::ALL)),
-            sidebar,
-        );
-
-        self.transcript_area = transcript;
+        self.transcript_area = main;
         match self.transcript_mode {
-            TranscriptMode::Coding => self.render_coding_transcript(frame, transcript),
-            TranscriptMode::Debug => self.render_debug_transcript(frame, transcript),
+            TranscriptMode::Coding => self.render_coding_transcript(frame, main),
+            TranscriptMode::Debug => self.render_debug_transcript(frame, main),
         }
 
         let input_title = if self.renaming {
@@ -68,7 +48,13 @@ impl App {
                 None => "Message".to_owned(),
             }
         };
-        let input_before_cursor = &self.input[..self.input_cursor];
+        let input_hint = (!self.renaming && self.approval.is_none())
+            .then(|| Line::from("Enter: newline · Ctrl-G: send").right_aligned());
+        let mut input_block = Block::default().title(input_title);
+        if let Some(hint) = input_hint {
+            input_block = input_block.title_bottom(hint);
+        }
+        let input_before_cursor = &self.message_input.value[..self.message_input.cursor];
         let cursor_row = input_before_cursor
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -84,18 +70,34 @@ impl App {
         let vertical_scroll =
             cursor_row.saturating_sub(visible_input_height.saturating_sub(1)) as u16;
         frame.render_widget(
-            Paragraph::new(self.input.as_str())
+            Paragraph::new(self.message_input.value.as_str())
                 .scroll((vertical_scroll, horizontal_scroll))
                 .block(
-                    Block::default()
-                        .title(input_title)
+                    input_block
                         .borders(Borders::ALL)
                         .border_style(self.focus_border_style(FocusPane::Input)),
                 ),
             input,
         );
-        frame.render_widget(Paragraph::new(self.status.as_str()), status);
-        if self.approval.is_none() && self.model_picker.is_none() && self.focus == FocusPane::Input
+        if self.command_open {
+            frame.render_widget(
+                Paragraph::new(format!("/{}", self.command_input.value)),
+                command,
+            );
+            frame.set_cursor_position((
+                command.x
+                    + self.command_input.value[..self.command_input.cursor].width() as u16
+                    + 1,
+                command.y,
+            ));
+        } else {
+            frame.render_widget(Paragraph::new(self.status.as_str()), command);
+        }
+        if !self.command_open
+            && self.approval.is_none()
+            && self.model_picker.is_none()
+            && self.thread_picker.is_none()
+            && self.focus == FocusPane::Input
         {
             frame.set_cursor_position((
                 input.x + 1 + cursor_column as u16 - horizontal_scroll,
@@ -105,10 +107,20 @@ impl App {
         if let Some(picker) = &self.model_picker {
             render_model_picker(frame, picker);
         }
+        if let Some(picker) = &self.thread_picker {
+            render_thread_picker(frame, picker, &self.threads);
+        }
+        if self.help_open {
+            render_command_help(frame);
+        }
     }
 
     fn focus_border_style(&self, pane: FocusPane) -> Style {
-        if self.approval.is_none() && self.model_picker.is_none() && self.focus == pane {
+        if self.approval.is_none()
+            && self.model_picker.is_none()
+            && self.thread_picker.is_none()
+            && self.focus == pane
+        {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
@@ -449,6 +461,46 @@ fn value_or_dash(value: &serde_json::Value) -> String {
     }
 }
 
+fn render_thread_picker(
+    frame: &mut Frame<'_>,
+    picker: &ThreadPicker,
+    threads: &[atra_protocol::Thread],
+) {
+    let width = frame.area().width.saturating_sub(8).min(72);
+    let height = (threads.len() as u16 + 2)
+        .min(frame.area().height.saturating_sub(4))
+        .max(3);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    let items = threads
+        .iter()
+        .map(|thread| {
+            let display_name = thread
+                .display_name
+                .as_deref()
+                .map(|name| sanitize(name).replace(['\n', '\t'], " "))
+                .unwrap_or_else(|| "Untitled thread".to_owned());
+            ListItem::new(display_name)
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("● ").block(
+            Block::default()
+                .title("Select thread")
+                .title_bottom(Line::from("Enter switches · Esc cancels").right_aligned())
+                .borders(Borders::ALL),
+        ),
+        area,
+        &mut state,
+    );
+}
+
 pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
     let width = frame.area().width.saturating_sub(8).min(72);
     let height = frame.area().height.saturating_sub(4).min(18);
@@ -511,4 +563,39 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
             area,
         );
     }
+}
+
+fn render_command_help(frame: &mut Frame<'_>) {
+    let width = frame.area().width.saturating_sub(4).min(58);
+    let height = (COMMAND_HELP.len() as u16 + 4).min(frame.area().height);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    let lines = COMMAND_HELP
+        .iter()
+        .map(|(command, description)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{command:<9}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::raw(*description),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Commands")
+                .title_bottom(Line::from("Esc/Enter closes").right_aligned())
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
 }

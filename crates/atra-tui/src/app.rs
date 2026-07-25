@@ -26,7 +26,19 @@ use tokio::sync::mpsc;
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use unicode_width::UnicodeWidthChar;
 
-use crate::controller::{request, request_stream};
+use crate::{
+    controller::{request, request_stream},
+    input::{InputAction, InputBuffer},
+};
+
+pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
+    ("/view", "Switch between coding and debug views"),
+    ("/thread", "Select a thread"),
+    ("/new", "Start a new thread"),
+    ("/model", "Select the model and reasoning effort"),
+    ("/help", "Show this command list"),
+    ("/exit", "Exit Atra"),
+];
 
 #[derive(Clone)]
 pub(crate) enum TranscriptItem {
@@ -160,6 +172,10 @@ pub(crate) struct ModelPicker {
     pub(crate) selecting_effort: bool,
 }
 
+pub(crate) struct ThreadPicker {
+    pub(crate) selected: usize,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionPoint {
     offset: usize,
@@ -212,29 +228,29 @@ pub(crate) enum TurnUpdate {
 
 pub(crate) struct App {
     pub(crate) endpoint: PathBuf,
-    pub(crate) history_path: PathBuf,
+    pub(crate) message_history_path: PathBuf,
+    pub(crate) command_history_path: PathBuf,
     pub(crate) threads: Vec<Thread>,
     pub(crate) models: Vec<Model>,
     pub(crate) thread_id: Option<i64>,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
     pub(crate) tool_call_preview: Option<(String, usize)>,
-    pub(crate) input: String,
-    pub(crate) input_cursor: usize,
-    pub(crate) input_history: Vec<String>,
-    pub(crate) history_index: Option<usize>,
-    pub(crate) history_draft: String,
+    pub(crate) message_input: InputBuffer,
+    pub(crate) command_input: InputBuffer,
+    pub(crate) command_open: bool,
+    pub(crate) help_open: bool,
     pub(crate) word_segmenter: WordSegmenterBorrowed<'static>,
     pub(crate) status: String,
     pub(crate) approval: Option<Approval>,
     pub(crate) renaming: bool,
     pub(crate) model_picker: Option<ModelPicker>,
+    pub(crate) thread_picker: Option<ThreadPicker>,
     pub(crate) new_thread_model: Option<(String, String)>,
     pub(crate) login_required: bool,
     pub(crate) selection_start: Option<SelectionPoint>,
     pub(crate) selection_end: Option<SelectionPoint>,
     pub(crate) transcript_layout: TranscriptLayout,
-    pub(crate) sidebar: Rect,
     pub(crate) turn_pending: bool,
     pub(crate) transcript_mode: TranscriptMode,
     pub(crate) focus: FocusPane,
@@ -258,7 +274,11 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(super) async fn load(endpoint: PathBuf, history_path: PathBuf) -> Result<Self> {
+    pub(super) async fn load(
+        endpoint: PathBuf,
+        message_history_path: PathBuf,
+        command_history_path: PathBuf,
+    ) -> Result<Self> {
         let threads = match request(&endpoint, ControllerRequest::ThreadList).await? {
             ControllerResponse::ThreadList { threads } => threads,
             ControllerResponse::Error { message } => bail!("{message}"),
@@ -280,36 +300,38 @@ impl App {
             ControllerResponse::Error { .. } => Vec::new(),
             response => bail!("controller returned an unexpected response: {response:?}"),
         };
+        let message_history = load_history(&message_history_path)?;
+        let command_history = load_history(&command_history_path)?;
         Ok(Self {
             endpoint,
-            input_history: load_history(&history_path)?,
-            history_path,
+            message_history_path,
+            command_history_path,
             threads,
             models,
             thread_id,
             transcript,
             events,
             tool_call_preview: None,
-            input: String::new(),
-            input_cursor: 0,
-            history_index: None,
-            history_draft: String::new(),
+            message_input: InputBuffer::new(message_history, true),
+            command_input: InputBuffer::new(command_history, false),
+            command_open: false,
+            help_open: false,
             word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
             status: if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
             } else {
-                "Enter newline · Ctrl-Enter sends · Ctrl-T view · Tab focus · Ctrl-N new · Ctrl-M model · Ctrl-C copies"
+                "/thread · /new · /model · Ctrl-P/Ctrl-/ command · Tab focus · Ctrl-C copies"
                     .to_owned()
             },
             approval: None,
             renaming: false,
             model_picker: None,
+            thread_picker: None,
             new_thread_model: None,
             login_required,
             selection_start: None,
             selection_end: None,
             transcript_layout: TranscriptLayout { rows: Vec::new() },
-            sidebar: Rect::default(),
             turn_pending: false,
             transcript_mode: TranscriptMode::Coding,
             focus: FocusPane::Input,
@@ -377,68 +399,83 @@ impl App {
         key: KeyEvent,
         turns: &mpsc::UnboundedSender<TurnUpdate>,
     ) -> Result<bool> {
+        if self.help_open {
+            let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
+            if toggle || matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                self.help_open = false;
+                self.status = "Ready".to_owned();
+            }
+            return Ok(false);
+        }
+
+        if self.command_open {
+            let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
+            if toggle || key.code == KeyCode::Esc {
+                self.command_open = false;
+                self.command_input.clear();
+                self.status = "Ready".to_owned();
+                return Ok(false);
+            }
+            if matches!(
+                self.command_input.handle_key(key, &self.word_segmenter),
+                InputAction::Submit
+            ) {
+                self.command_open = false;
+                let command = self.command_input.take();
+                return self.execute_command(&command).await;
+            }
+            return Ok(false);
+        }
+
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
             self.open_model_picker()?;
             return Ok(false);
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if key.code == KeyCode::Enter
+            if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'))
                 && self.approval.is_none()
                 && !self.renaming
                 && self.model_picker.is_none()
-                && self.focus == FocusPane::Input
-                && !self.input.trim().is_empty()
-                && !self.turn_pending
+                && self.thread_picker.is_none()
+                && !self.help_open
             {
-                self.send(turns)?;
+                self.command_input.clear();
+                self.command_open = true;
+                return Ok(false);
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char('g'))
+                && self.approval.is_none()
+                && !self.renaming
+                && self.model_picker.is_none()
+                && self.thread_picker.is_none()
+                && self.focus == FocusPane::Input
+                && !self.message_input.value.trim().is_empty()
+            {
+                if self.message_input.value.starts_with('/') {
+                    let command = self.message_input.take();
+                    return self.execute_command(&command).await;
+                } else if !self.turn_pending {
+                    self.send(turns)?;
+                }
                 return Ok(false);
             }
             match key.code {
-                KeyCode::Char('q') => return Ok(true),
-                KeyCode::Char('t') => {
-                    self.transcript_mode = match self.transcript_mode {
-                        TranscriptMode::Coding => TranscriptMode::Debug,
-                        TranscriptMode::Debug => TranscriptMode::Coding,
-                    };
-                    self.focus = FocusPane::Input;
-                    self.clear_selection();
-                    self.status = match self.transcript_mode {
-                        TranscriptMode::Coding => "Coding transcript".to_owned(),
-                        TranscriptMode::Debug => "LLM request inspector".to_owned(),
-                    };
-                }
-                KeyCode::Char('n') => {
-                    self.thread_id = None;
-                    self.transcript.clear();
-                    self.events.clear();
-                    self.tool_call_preview = None;
-                    self.input.clear();
-                    self.input_cursor = 0;
-                    self.reset_history_navigation();
-                    self.approval = None;
-                    self.renaming = false;
-                    self.model_picker = None;
-                    self.new_thread_model = None;
-                    self.clear_selection();
-                    self.reset_view();
-                }
                 KeyCode::Char('r') if self.thread_id.is_some() => {
                     self.renaming = true;
                     self.model_picker = None;
+                    self.thread_picker = None;
                     self.focus = FocusPane::Input;
-                    self.input = self
+                    let display_name = self
                         .threads
                         .iter()
                         .find(|thread| Some(thread.id) == self.thread_id)
                         .and_then(|thread| thread.display_name.clone())
                         .unwrap_or_default();
-                    self.input_cursor = self.input.len();
-                    self.reset_history_navigation();
+                    self.message_input.set(display_name);
                     self.status = "Enter saves the thread name · Esc cancels".to_owned();
-                }
-                KeyCode::Char('m') => {
-                    self.open_model_picker()?;
                 }
                 KeyCode::Char('l') if self.login_required => {
                     self.status = "Complete Codex login in your browser…".to_owned();
@@ -463,28 +500,18 @@ impl App {
                     self.copy_selection()?
                 }
                 KeyCode::Char('c') => {
-                    if !self.input.is_empty() {
-                        let input = std::mem::take(&mut self.input);
-                        self.record_history(input)?;
+                    if !self.message_input.value.is_empty() {
+                        let input = self.message_input.take();
+                        Self::record_history(
+                            &self.message_history_path,
+                            &mut self.message_input,
+                            input,
+                        )?;
                     }
-                    self.input_cursor = 0;
-                    self.reset_history_navigation();
                 }
-                KeyCode::Char('a') => self.input_cursor = 0,
-                KeyCode::Char('e') => self.input_cursor = self.input.len(),
-                KeyCode::Char('u') => {
-                    self.input.drain(..self.input_cursor);
-                    self.input_cursor = 0;
-                    self.reset_history_navigation();
+                _ => {
+                    self.message_input.handle_key(key, &self.word_segmenter);
                 }
-                KeyCode::Char('k') => {
-                    self.input.truncate(self.input_cursor);
-                    self.reset_history_navigation();
-                }
-                KeyCode::Char('w') | KeyCode::Backspace => self.delete_word_backward(),
-                KeyCode::Left => self.move_word_backward(),
-                KeyCode::Right => self.move_word_forward(),
-                _ => {}
             }
             return Ok(false);
         }
@@ -515,21 +542,17 @@ impl App {
 
         if self.renaming {
             match key.code {
-                KeyCode::Enter if !self.input.trim().is_empty() => self.rename().await?,
-                KeyCode::Backspace => self.delete_backward(),
-                KeyCode::Delete => self.delete_forward(),
-                KeyCode::Left => self.move_backward(),
-                KeyCode::Right => self.move_forward(),
-                KeyCode::Home => self.input_cursor = 0,
-                KeyCode::End => self.input_cursor = self.input.len(),
-                KeyCode::Char(character) => self.insert(character),
+                KeyCode::Enter if !self.message_input.value.trim().is_empty() => {
+                    self.rename().await?
+                }
                 KeyCode::Esc => {
                     self.renaming = false;
-                    self.input.clear();
-                    self.input_cursor = 0;
+                    self.message_input.clear();
                     self.status = "Ready".to_owned();
                 }
-                _ => {}
+                _ => {
+                    self.message_input.handle_key(key, &self.word_segmenter);
+                }
             }
             return Ok(false);
         }
@@ -588,30 +611,94 @@ impl App {
             return Ok(false);
         }
 
+        if let Some(picker) = &mut self.thread_picker {
+            match key.code {
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    picker.selected = (picker.selected + 1).min(self.threads.len() - 1);
+                }
+                KeyCode::Enter => {
+                    let thread_id = self.threads[picker.selected].id;
+                    self.thread_picker = None;
+                    self.select_thread(thread_id).await?;
+                }
+                KeyCode::Esc => {
+                    self.thread_picker = None;
+                    self.status = "Ready".to_owned();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if self.focus != FocusPane::Input {
             self.handle_pane_key(key);
             return Ok(false);
         }
 
-        match key.code {
-            KeyCode::Enter => self.insert('\n'),
-            KeyCode::Backspace => self.delete_backward(),
-            KeyCode::Delete => self.delete_forward(),
-            KeyCode::Left => self.move_backward(),
-            KeyCode::Right => self.move_forward(),
-            KeyCode::Home => self.input_cursor = 0,
-            KeyCode::End => self.input_cursor = self.input.len(),
-            KeyCode::Up => self.previous_history(),
-            KeyCode::Down => self.next_history(),
-            KeyCode::Char(character) => self.insert(character),
-            KeyCode::Esc => self.clear_selection(),
-            _ => {}
+        if key.code == KeyCode::Esc {
+            self.clear_selection();
+        } else {
+            self.message_input.handle_key(key, &self.word_segmenter);
         }
         Ok(false)
     }
 
+    async fn execute_command(&mut self, command: &str) -> Result<bool> {
+        let command = command.strip_prefix('/').unwrap_or(command);
+        if !command.is_empty() {
+            Self::record_history(
+                &self.command_history_path,
+                &mut self.command_input,
+                command.to_owned(),
+            )?;
+        }
+        match command {
+            "view" => {
+                self.transcript_mode = match self.transcript_mode {
+                    TranscriptMode::Coding => TranscriptMode::Debug,
+                    TranscriptMode::Debug => TranscriptMode::Coding,
+                };
+                self.focus = FocusPane::Input;
+                self.clear_selection();
+                self.status = match self.transcript_mode {
+                    TranscriptMode::Coding => "Coding transcript".to_owned(),
+                    TranscriptMode::Debug => "LLM request inspector".to_owned(),
+                };
+            }
+            "thread" => self.open_thread_picker(),
+            "new" => self.start_new_thread(),
+            "model" => self.open_model_picker()?,
+            "help" => {
+                self.help_open = true;
+                self.status = "Command help".to_owned();
+            }
+            "exit" => return Ok(true),
+            "" => self.status = "Ready".to_owned(),
+            command => self.status = format!("Unknown command: /{command}"),
+        }
+        Ok(false)
+    }
+
+    fn start_new_thread(&mut self) {
+        self.thread_id = None;
+        self.transcript.clear();
+        self.events.clear();
+        self.tool_call_preview = None;
+        self.message_input.clear();
+        self.approval = None;
+        self.renaming = false;
+        self.model_picker = None;
+        self.thread_picker = None;
+        self.new_thread_model = None;
+        self.clear_selection();
+        self.reset_view();
+        self.status = "New thread".to_owned();
+    }
+
     fn open_model_picker(&mut self) -> Result<()> {
         self.renaming = false;
+        self.thread_picker = None;
         if self.models.is_empty() {
             self.status = "No models are available".to_owned();
             return Ok(());
@@ -646,7 +733,39 @@ impl App {
         Ok(())
     }
 
+    fn open_thread_picker(&mut self) {
+        self.renaming = false;
+        self.model_picker = None;
+        if self.threads.is_empty() {
+            self.status = "No threads are available".to_owned();
+            return;
+        }
+        let selected = self
+            .threads
+            .iter()
+            .position(|thread| Some(thread.id) == self.thread_id)
+            .unwrap_or(0);
+        self.thread_picker = Some(ThreadPicker { selected });
+        self.status = "Select thread · Enter switches · Esc cancels".to_owned();
+    }
+
+    async fn select_thread(&mut self, thread_id: i64) -> Result<()> {
+        self.thread_id = Some(thread_id);
+        (self.transcript, self.events) = load_transcript(&self.endpoint, thread_id).await?;
+        self.tool_call_preview = None;
+        self.approval = None;
+        self.renaming = false;
+        self.model_picker = None;
+        self.clear_selection();
+        self.reset_view();
+        self.status = "Thread selected".to_owned();
+        Ok(())
+    }
+
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.help_open || self.thread_picker.is_some() {
+            return Ok(());
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left)
                 if self
@@ -729,35 +848,6 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.sidebar.contains((mouse.column, mouse.row).into())
-            && mouse.row > self.sidebar.y
-        {
-            let index = usize::from(mouse.row - self.sidebar.y - 1);
-            if index == 0 {
-                self.thread_id = None;
-                self.transcript.clear();
-                self.events.clear();
-                self.tool_call_preview = None;
-                self.approval = None;
-                self.renaming = false;
-                self.model_picker = None;
-                self.new_thread_model = None;
-                self.clear_selection();
-                self.reset_view();
-            } else if let Some(thread) = self.threads.get(index - 1) {
-                self.thread_id = Some(thread.id);
-                (self.transcript, self.events) = load_transcript(&self.endpoint, thread.id).await?;
-                self.tool_call_preview = None;
-                self.approval = None;
-                self.renaming = false;
-                self.model_picker = None;
-                self.clear_selection();
-                self.reset_view();
-            }
-            return Ok(());
-        }
-
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self
                 .request_list_area
                 .contains((mouse.column, mouse.row).into())
@@ -836,10 +926,12 @@ impl App {
     }
 
     fn send(&mut self, turns: &mpsc::UnboundedSender<TurnUpdate>) -> Result<()> {
-        let message = std::mem::take(&mut self.input);
-        self.input_cursor = 0;
-        self.record_history(message.clone())?;
-        self.reset_history_navigation();
+        let message = self.message_input.take();
+        Self::record_history(
+            &self.message_history_path,
+            &mut self.message_input,
+            message.clone(),
+        )?;
         self.transcript
             .push(TranscriptEntry::message(Author::User, sanitize(&message)));
         self.turn_pending = true;
@@ -922,38 +1014,35 @@ impl App {
         Ok(())
     }
 
-    fn record_history(&mut self, input: String) -> Result<()> {
+    fn record_history(
+        history_path: &Path,
+        input_buffer: &mut InputBuffer,
+        input: String,
+    ) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(&self.history_path)
-            .with_context(|| {
-                format!("failed to open TUI history {}", self.history_path.display())
-            })?;
+            .open(history_path)
+            .with_context(|| format!("failed to open TUI history {}", history_path.display()))?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| {
                 format!(
                     "failed to set TUI history permissions {}",
-                    self.history_path.display()
+                    history_path.display()
                 )
             })?;
         let mut line = serde_json::to_vec(&input).context("failed to encode TUI history")?;
         line.push(b'\n');
-        file.write_all(&line).with_context(|| {
-            format!(
-                "failed to write TUI history {}",
-                self.history_path.display()
-            )
-        })?;
-        self.input_history.push(input);
+        file.write_all(&line)
+            .with_context(|| format!("failed to write TUI history {}", history_path.display()))?;
+        input_buffer.record_history(input);
         Ok(())
     }
 
     async fn rename(&mut self) -> Result<()> {
         let thread_id = self.thread_id.context("no thread is selected")?;
-        let display_name = std::mem::take(&mut self.input);
-        self.input_cursor = 0;
+        let display_name = self.message_input.take();
         match request(
             &self.endpoint,
             ControllerRequest::ThreadRename {

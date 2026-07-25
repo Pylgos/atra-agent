@@ -16,9 +16,13 @@ mod controller;
 mod input;
 mod ui;
 
-pub async fn run(endpoint: PathBuf, history_path: PathBuf) -> Result<()> {
+pub async fn run(
+    endpoint: PathBuf,
+    message_history_path: PathBuf,
+    command_history_path: PathBuf,
+) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let result = app::App::load(endpoint, history_path)
+    let result = app::App::load(endpoint, message_history_path, command_history_path)
         .await?
         .run(&mut terminal.terminal)
         .await;
