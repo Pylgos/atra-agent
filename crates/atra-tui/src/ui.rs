@@ -11,16 +11,19 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, FocusPane, ModelPicker, TranscriptMode, layout_transcript, sanitize, transcript_lines,
+    App, FocusPane, ModelPicker, TranscriptMode, layout_transcript, prepare_transcript, sanitize,
+    transcript_lines, transcript_ranges,
 };
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
+        let input_height = (self.input.bytes().filter(|byte| *byte == b'\n').count() as u16 + 3)
+            .min(frame.area().height.saturating_sub(5).max(3));
         let [main, input, status] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(4),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .areas(frame.area());
@@ -65,13 +68,24 @@ impl App {
                 None => "Message".to_owned(),
             }
         };
-        let cursor_column = self.input[..self.input_cursor].width();
+        let input_before_cursor = &self.input[..self.input_cursor];
+        let cursor_row = input_before_cursor
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let cursor_column = input_before_cursor
+            .rsplit_once('\n')
+            .map_or(input_before_cursor, |(_, line)| line)
+            .width();
         let visible_input_width = usize::from(input.width.saturating_sub(2));
+        let visible_input_height = usize::from(input.height.saturating_sub(2));
         let horizontal_scroll =
             cursor_column.saturating_sub(visible_input_width.saturating_sub(1)) as u16;
+        let vertical_scroll =
+            cursor_row.saturating_sub(visible_input_height.saturating_sub(1)) as u16;
         frame.render_widget(
             Paragraph::new(self.input.as_str())
-                .scroll((0, horizontal_scroll))
+                .scroll((vertical_scroll, horizontal_scroll))
                 .block(
                     Block::default()
                         .title(input_title)
@@ -85,7 +99,7 @@ impl App {
         {
             frame.set_cursor_position((
                 input.x + 1 + cursor_column as u16 - horizontal_scroll,
-                input.y + 1,
+                input.y + 1 + cursor_row as u16 - vertical_scroll,
             ));
         }
         if let Some(picker) = &self.model_picker {
@@ -109,24 +123,25 @@ impl App {
             .borders(Borders::ALL)
             .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
-        let (lines, item_ranges) = transcript_lines(
-            &self.transcript,
-            self.selection_range(),
-            &self.expanded_tools,
-            self.selected_item,
-            inner.width,
-        );
-        let content_length = lines.len();
+        prepare_transcript(&mut self.transcript, &self.expanded_tools, inner.width);
+        let (content_length, item_ranges) = transcript_ranges(&self.transcript);
         let max_scroll = content_length.saturating_sub(usize::from(inner.height));
         self.transcript_max_scroll = max_scroll;
         self.transcript_scroll = self.transcript_scroll.min(max_scroll);
-        let scroll = max_scroll.saturating_sub(self.transcript_scroll) as u16;
+        let scroll = max_scroll.saturating_sub(self.transcript_scroll);
+        let lines = transcript_lines(
+            &self.transcript,
+            self.selection_range(),
+            self.selected_item,
+            inner.width,
+            scroll..scroll + usize::from(inner.height),
+        );
         self.transcript_item_ranges = item_ranges.clone();
         self.item_areas = item_ranges
             .into_iter()
             .filter_map(|(index, rows)| {
-                let start = rows.start.saturating_sub(usize::from(scroll));
-                let end = rows.end.saturating_sub(usize::from(scroll));
+                let start = rows.start.saturating_sub(scroll);
+                let end = rows.end.saturating_sub(scroll);
                 (start < usize::from(inner.height) && end > 0).then_some((
                     index,
                     Rect::new(
@@ -139,13 +154,12 @@ impl App {
                 ))
             })
             .collect();
-        self.transcript_layout =
-            layout_transcript(&self.transcript, &self.expanded_tools, inner, scroll);
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
+        self.transcript_layout = layout_transcript(&self.transcript, inner, scroll);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
         if max_scroll > 0 && inner.height > 2 {
             self.transcript_scrollbar_area = Rect::new(area.right() - 1, inner.y, 1, inner.height);
             let scrollbar_position =
-                usize::from(scroll).saturating_mul(content_length.saturating_sub(1)) / max_scroll;
+                scroll.saturating_mul(content_length.saturating_sub(1)) / max_scroll;
             let track_height = inner.height.saturating_sub(2);
             let denominator = content_length
                 .saturating_sub(1)

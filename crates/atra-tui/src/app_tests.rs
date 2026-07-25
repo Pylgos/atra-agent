@@ -11,8 +11,8 @@ fn sanitizes_terminal_control_sequences() {
 #[test]
 fn transcript_render_is_stable() {
     let items = vec![
-        TranscriptItem::message(Author::User, "hello".to_owned()),
-        TranscriptItem::message(
+        TranscriptEntry::message(Author::User, "hello".to_owned()),
+        TranscriptEntry::message(
             Author::Assistant,
             "a deliberately wrapped response".to_owned(),
         ),
@@ -55,10 +55,7 @@ fn transcript_render_is_stable() {
         login_required: false,
         selection_start: None,
         selection_end: None,
-        transcript_layout: TranscriptLayout {
-            text: String::new(),
-            rows: Vec::new(),
-        },
+        transcript_layout: TranscriptLayout { rows: Vec::new() },
         sidebar: Rect::default(),
         turn_pending: false,
         transcript_mode: TranscriptMode::Coding,
@@ -89,35 +86,38 @@ fn transcript_render_is_stable() {
 
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
-    let items = vec![TranscriptItem::ToolResult {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
         result: serde_json::Value::String("abcdefgh\nsecond".to_owned()),
-    }];
+    })];
 
-    let layout = layout_transcript(&items, &HashSet::new(), Rect::new(1, 1, 4, 8), 0);
+    prepare_transcript(&mut items, &HashSet::new(), 4);
+    let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0);
 
-    assert_eq!(layout.text, "abcdefgh\nsecond\n");
+    let text = transcript_text(&items);
+    assert_eq!(text, "abcdefgh\nsecond\n");
     assert_eq!(layout.rows[0].cells, vec![0, 1]);
-    assert_eq!(&layout.text[0..8], "abcdefgh");
+    assert_eq!(&text[0..8], "abcdefgh");
 }
 
 #[test]
 fn markdown_and_partial_patch_render_before_completion() {
-    let items = vec![
-        TranscriptItem::message(
+    let mut items = vec![
+        TranscriptEntry::message(
             Author::Assistant,
             "# Result\n\n| File | State |\n|---|---|\n| a.rs | **changed** |\n\n```rust\nfn main() {}\n```"
                 .to_owned(),
         ),
-        TranscriptItem::ToolCall {
+        TranscriptEntry::new(TranscriptItem::ToolCall {
             name: "apply_patch".to_owned(),
             arguments: Some(serde_json::Value::String(
                 "*** Begin Patch\n*** Environment ID: local\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
                     .to_owned(),
             )),
-        },
+        }),
     ];
 
-    let (lines, _) = transcript_lines(&items, None, &HashSet::new(), None, 80);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
+    let lines = transcript_lines(&items, None, None, 80, 0..usize::MAX);
     let rendered = lines
         .iter()
         .map(Line::to_string)
@@ -133,11 +133,12 @@ fn markdown_and_partial_patch_render_before_completion() {
 
 #[test]
 fn collapsed_tool_result_keeps_edges_and_can_expand() {
-    let items = vec![TranscriptItem::ToolResult {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
         result: serde_json::Value::String("status\none\ntwo\nthree\nfour\nfive\nsix".to_owned()),
-    }];
+    })];
 
-    let (collapsed, ranges) = transcript_lines(&items, None, &HashSet::new(), Some(0), 80);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
+    let collapsed = transcript_lines(&items, None, Some(0), 80, 0..usize::MAX);
     let collapsed = collapsed
         .iter()
         .map(Line::to_string)
@@ -146,9 +147,10 @@ fn collapsed_tool_result_keeps_edges_and_can_expand() {
     assert!(collapsed.contains("status\n  one"));
     assert!(collapsed.contains("3 lines omitted"));
     assert!(collapsed.contains("five\n  six"));
-    assert_eq!(ranges.len(), 1);
+    assert_eq!(transcript_ranges(&items).1.len(), 1);
 
-    let (expanded, _) = transcript_lines(&items, None, &HashSet::from([0]), Some(0), 80);
+    prepare_transcript(&mut items, &HashSet::from([0]), 80);
+    let expanded = transcript_lines(&items, None, Some(0), 80, 0..usize::MAX);
     let expanded = expanded
         .iter()
         .map(Line::to_string)

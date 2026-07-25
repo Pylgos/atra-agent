@@ -86,6 +86,48 @@ impl TranscriptItem {
     }
 }
 
+pub(crate) struct TranscriptEntry {
+    item: TranscriptItem,
+    rendered: Option<RenderedItem>,
+}
+
+impl TranscriptEntry {
+    fn new(item: TranscriptItem) -> Self {
+        Self {
+            item,
+            rendered: None,
+        }
+    }
+
+    fn message(author: Author, text: String) -> Self {
+        Self::new(TranscriptItem::message(author, text))
+    }
+
+    fn append_message(&mut self, content: &str) {
+        self.item.append_message(content);
+        self.rendered = None;
+    }
+
+    fn replace(&mut self, item: TranscriptItem) {
+        self.item = item;
+        self.rendered = None;
+    }
+
+    fn is_tool_result(&self) -> bool {
+        self.item.is_tool_result()
+    }
+
+    fn is_assistant_message(&self) -> bool {
+        self.item.is_assistant_message()
+    }
+}
+
+struct RenderedItem {
+    width: u16,
+    expanded: bool,
+    lines: Vec<DisplayedLine>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptMode {
     Coding,
@@ -131,10 +173,10 @@ pub(crate) struct MappedRow {
 }
 
 pub(crate) struct TranscriptLayout {
-    text: String,
     rows: Vec<MappedRow>,
 }
 
+#[derive(Clone)]
 struct DisplayedLine {
     marker: Option<char>,
     line: Line<'static>,
@@ -174,7 +216,7 @@ pub(crate) struct App {
     pub(crate) threads: Vec<Thread>,
     pub(crate) models: Vec<Model>,
     pub(crate) thread_id: Option<i64>,
-    pub(crate) transcript: Vec<TranscriptItem>,
+    pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
     pub(crate) tool_call_preview: Option<(String, usize)>,
     pub(crate) input: String,
@@ -256,7 +298,7 @@ impl App {
             status: if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
             } else {
-                "Enter sends · Ctrl-T view · Tab focus · Ctrl-N new · Ctrl-M model · Ctrl-C copies"
+                "Enter newline · Ctrl-Enter sends · Ctrl-T view · Tab focus · Ctrl-N new · Ctrl-M model · Ctrl-C copies"
                     .to_owned()
             },
             approval: None,
@@ -266,10 +308,7 @@ impl App {
             login_required,
             selection_start: None,
             selection_end: None,
-            transcript_layout: TranscriptLayout {
-                text: String::new(),
-                rows: Vec::new(),
-            },
+            transcript_layout: TranscriptLayout { rows: Vec::new() },
             sidebar: Rect::default(),
             turn_pending: false,
             transcript_mode: TranscriptMode::Coding,
@@ -344,6 +383,17 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Enter
+                && self.approval.is_none()
+                && !self.renaming
+                && self.model_picker.is_none()
+                && self.focus == FocusPane::Input
+                && !self.input.trim().is_empty()
+                && !self.turn_pending
+            {
+                self.send(turns)?;
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Char('q') => return Ok(true),
                 KeyCode::Char('t') => {
@@ -544,9 +594,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Enter if !self.input.trim().is_empty() && !self.turn_pending => {
-                self.send(turns)?
-            }
+            KeyCode::Enter => self.insert('\n'),
             KeyCode::Backspace => self.delete_backward(),
             KeyCode::Delete => self.delete_forward(),
             KeyCode::Left => self.move_backward(),
@@ -793,7 +841,7 @@ impl App {
         self.record_history(message.clone())?;
         self.reset_history_navigation();
         self.transcript
-            .push(TranscriptItem::message(Author::User, sanitize(&message)));
+            .push(TranscriptEntry::message(Author::User, sanitize(&message)));
         self.turn_pending = true;
         self.status = "Waiting for Atra Controller…".to_owned();
         let endpoint = self.endpoint.clone();
@@ -1020,7 +1068,7 @@ impl App {
                 if self.thread_id.is_none()
                     && self.transcript.last().is_some_and(|item| {
                         matches!(
-                            item,
+                            &item.item,
                             TranscriptItem::Message {
                                 author: Author::User,
                                 text,
@@ -1044,14 +1092,14 @@ impl App {
                     if self
                         .transcript
                         .last()
-                        .is_some_and(TranscriptItem::is_assistant_message)
+                        .is_some_and(TranscriptEntry::is_assistant_message)
                     {
                         self.transcript
                             .last_mut()
                             .unwrap()
                             .append_message(&sanitize(&content));
                     } else {
-                        self.transcript.push(TranscriptItem::message(
+                        self.transcript.push(TranscriptEntry::message(
                             Author::Assistant,
                             sanitize(&content),
                         ));
@@ -1066,10 +1114,11 @@ impl App {
             } => {
                 if self.thread_id == Some(thread_id) {
                     let index = self.transcript.len();
-                    self.transcript.push(TranscriptItem::ToolCall {
-                        name: sanitize(&name),
-                        arguments: None,
-                    });
+                    self.transcript
+                        .push(TranscriptEntry::new(TranscriptItem::ToolCall {
+                            name: sanitize(&name),
+                            arguments: None,
+                        }));
                     self.tool_call_preview = Some((item_id, index));
                 }
                 return Ok(());
@@ -1090,10 +1139,10 @@ impl App {
                         && let Some((preview_id, index)) = self.tool_call_preview.take()
                         && preview_id == item_id
                     {
-                        self.transcript[index] = item;
+                        self.transcript[index].replace(item);
                         return Ok(());
                     }
-                    self.transcript.push(item);
+                    self.transcript.push(TranscriptEntry::new(item));
                 }
                 return Ok(());
             }
@@ -1114,7 +1163,7 @@ impl App {
                     if self
                         .transcript
                         .last()
-                        .is_some_and(TranscriptItem::is_assistant_message) =>
+                        .is_some_and(TranscriptEntry::is_assistant_message) =>
                 {
                     self.status = "Ready".to_owned();
                 }
@@ -1129,7 +1178,7 @@ impl App {
     fn accept_turn_response(&mut self, response: ControllerResponse) -> Result<()> {
         match response {
             ControllerResponse::TurnCompleted { content } => {
-                self.transcript.push(TranscriptItem::message(
+                self.transcript.push(TranscriptEntry::message(
                     Author::Assistant,
                     sanitize(&content),
                 ));
@@ -1181,7 +1230,8 @@ impl App {
         let Some((start, end)) = self.selection_range() else {
             return Ok(());
         };
-        let text = &self.transcript_layout.text[start..end];
+        let text = transcript_text(&self.transcript);
+        let text = &text[start..end];
         write!(
             io::stdout(),
             "\x1b]52;c;{}\x07",
@@ -1333,52 +1383,73 @@ impl App {
 }
 
 pub(crate) fn layout_transcript(
-    items: &[TranscriptItem],
-    expanded_tools: &HashSet<usize>,
+    entries: &[TranscriptEntry],
     area: Rect,
-    scroll: u16,
+    scroll: usize,
 ) -> TranscriptLayout {
-    let mut text = String::new();
     let mut rows = Vec::new();
-    let mut virtual_y = 0_u16;
-    for (item_index, item) in items.iter().enumerate() {
+    let mut virtual_y = 0;
+    let mut offset = 0;
+    for (item_index, entry) in entries.iter().enumerate() {
         let mut first_line = true;
-        for displayed in displayed_item_lines(item, item_index, expanded_tools, area.width) {
+        for displayed in &entry.rendered.as_ref().unwrap().lines {
             if !first_line && !displayed.continuation {
-                text.push('\n');
+                offset += 1;
             }
             first_line = false;
-            let line = displayed.line;
-            let content = line
+            let line = &displayed.line;
+            let content_start = offset;
+            let content_len = line
                 .spans
                 .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            let content_start = text.len();
-            text.push_str(&content);
-            let mut cells = Vec::new();
-            for (byte, character) in content.char_indices() {
-                let character_width = character.width().unwrap_or(0);
-                cells.extend(std::iter::repeat_n(content_start + byte, character_width));
-            }
-            if virtual_y >= scroll && virtual_y - scroll < area.height {
+                .map(|span| span.content.len())
+                .sum::<usize>();
+            if virtual_y >= scroll && virtual_y - scroll < usize::from(area.height) {
+                let mut cells = Vec::new();
+                let mut span_start = content_start;
+                for span in &line.spans {
+                    for (byte, character) in span.content.char_indices() {
+                        let character_width = character.width().unwrap_or(0);
+                        cells.extend(std::iter::repeat_n(span_start + byte, character_width));
+                    }
+                    span_start += span.content.len();
+                }
                 rows.push(MappedRow {
                     x: area.x + 2,
-                    y: area.y + virtual_y - scroll,
+                    y: area.y + (virtual_y - scroll) as u16,
                     cells,
-                    end: content_start + content.len(),
+                    end: content_start + content_len,
                 });
             }
+            offset += content_len;
             virtual_y += 1;
         }
-        text.push('\n');
-        if items.get(item_index + 1).is_none_or(|next| {
-            !matches!(item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
+        offset += 1;
+        if entries.get(item_index + 1).is_none_or(|next| {
+            !matches!(entry.item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
         }) {
             virtual_y += 1;
         }
     }
-    TranscriptLayout { text, rows }
+    TranscriptLayout { rows }
+}
+
+fn transcript_text(entries: &[TranscriptEntry]) -> String {
+    let mut text = String::new();
+    for entry in entries {
+        let mut first_line = true;
+        for displayed in &entry.rendered.as_ref().unwrap().lines {
+            if !first_line && !displayed.continuation {
+                text.push('\n');
+            }
+            first_line = false;
+            for span in &displayed.line.spans {
+                text.push_str(&span.content);
+            }
+        }
+        text.push('\n');
+    }
+    text
 }
 
 #[derive(Clone)]
@@ -1425,19 +1496,19 @@ impl StyleSheet for AtraMarkdownStyle {
 }
 
 pub(crate) fn transcript_lines(
-    items: &[TranscriptItem],
+    entries: &[TranscriptEntry],
     selection: Option<(usize, usize)>,
-    expanded_tools: &HashSet<usize>,
     selected_item: Option<usize>,
     width: u16,
-) -> (Vec<Line<'static>>, Vec<(usize, std::ops::Range<usize>)>) {
+    visible: std::ops::Range<usize>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut item_ranges = Vec::new();
     let mut offset = 0;
-    for (item_index, item) in items.iter().enumerate() {
-        let item_start = lines.len();
+    let mut row = 0;
+    for (item_index, entry) in entries.iter().enumerate() {
+        let item = &entry.item;
         let mut first_line = true;
-        for displayed in displayed_item_lines(item, item_index, expanded_tools, width) {
+        for displayed in &entry.rendered.as_ref().unwrap().lines {
             if !first_line && !displayed.continuation {
                 offset += 1;
             }
@@ -1452,46 +1523,86 @@ pub(crate) fn transcript_lines(
                 .iter()
                 .map(|span| span.content.len())
                 .sum::<usize>();
-            let gutter_style = if item.is_user_message() {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let mut spans = vec![
-                Span::styled(
-                    marker.unwrap_or(' ').to_string(),
-                    marker_style(item, selected_item == Some(item_index)),
-                ),
-                Span::styled(" ", gutter_style),
-            ];
-            spans.extend(highlight_selection(line, offset, selection).spans);
-            if item.is_user_message() {
-                let rendered_width = spans.iter().map(Span::width).sum::<usize>();
-                spans.push(Span::styled(
-                    " ".repeat(usize::from(width).saturating_sub(rendered_width)),
-                    Style::default().bg(Color::DarkGray),
-                ));
+            if visible.contains(&row) {
+                let gutter_style = if item.is_user_message() {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        marker.unwrap_or(' ').to_string(),
+                        marker_style(item, selected_item == Some(item_index)),
+                    ),
+                    Span::styled(" ", gutter_style),
+                ];
+                spans.extend(highlight_selection(line.clone(), offset, selection).spans);
+                if item.is_user_message() {
+                    let rendered_width = spans.iter().map(Span::width).sum::<usize>();
+                    spans.push(Span::styled(
+                        " ".repeat(usize::from(width).saturating_sub(rendered_width)),
+                        Style::default().bg(Color::DarkGray),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
             offset += line_len;
+            row += 1;
         }
-        item_ranges.push((item_index, item_start..lines.len()));
-        if items.get(item_index + 1).is_none_or(|next| {
+        if entries.get(item_index + 1).is_none_or(|next| {
             !matches!(item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
         }) {
-            lines.push(Line::default());
+            if visible.contains(&row) {
+                lines.push(Line::default());
+            }
+            row += 1;
         }
         offset += 1;
     }
-    (lines, item_ranges)
+    lines
 }
 
-fn displayed_item_lines(
-    item: &TranscriptItem,
-    item_index: usize,
+pub(crate) fn transcript_ranges(
+    entries: &[TranscriptEntry],
+) -> (usize, Vec<(usize, std::ops::Range<usize>)>) {
+    let mut row = 0;
+    let mut ranges = Vec::with_capacity(entries.len());
+    for (item_index, entry) in entries.iter().enumerate() {
+        let start = row;
+        row += entry.rendered.as_ref().unwrap().lines.len();
+        ranges.push((item_index, start..row));
+        if entries.get(item_index + 1).is_none_or(|next| {
+            !matches!(entry.item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
+        }) {
+            row += 1;
+        }
+    }
+    (row, ranges)
+}
+
+pub(crate) fn prepare_transcript(
+    entries: &mut [TranscriptEntry],
     expanded_tools: &HashSet<usize>,
     width: u16,
-) -> Vec<DisplayedLine> {
+) {
+    for (item_index, entry) in entries.iter_mut().enumerate() {
+        let expanded = expanded_tools.contains(&item_index);
+        if entry
+            .rendered
+            .as_ref()
+            .is_some_and(|rendered| rendered.width == width && rendered.expanded == expanded)
+        {
+            continue;
+        }
+        entry.rendered = Some(RenderedItem {
+            width,
+            expanded,
+            lines: displayed_item_lines(&entry.item, expanded, width),
+        });
+    }
+}
+
+fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Vec<DisplayedLine> {
     let content_width = usize::from(width.saturating_sub(2)).max(1);
     if let TranscriptItem::Message { author, text } = item {
         let background = (*author == Author::User).then_some(Color::DarkGray);
@@ -1525,7 +1636,7 @@ fn displayed_item_lines(
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
         TranscriptItem::ToolResult { result } => {
             let result = format_tool_value(result);
-            let display = if expanded_tools.contains(&item_index) {
+            let display = if expanded {
                 result
             } else {
                 summarize_result(&result)
@@ -1697,17 +1808,27 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut rows = vec![Line::default()];
     let mut row_width = 0;
     for span in line.spans {
+        let mut chunk = String::new();
         for character in span.content.chars() {
             let character_width = character.width().unwrap_or(0);
             if row_width > 0 && row_width + character_width > width {
+                if !chunk.is_empty() {
+                    rows.last_mut()
+                        .unwrap()
+                        .spans
+                        .push(Span::styled(std::mem::take(&mut chunk), span.style));
+                }
                 rows.push(Line::default());
                 row_width = 0;
             }
+            chunk.push(character);
+            row_width += character_width;
+        }
+        if !chunk.is_empty() {
             rows.last_mut()
                 .unwrap()
                 .spans
-                .push(Span::styled(character.to_string(), span.style));
-            row_width += character_width;
+                .push(Span::styled(chunk, span.style));
         }
     }
     for row in &mut rows {
@@ -1722,6 +1843,9 @@ fn highlight_selection(
     offset: usize,
     selection: Option<(usize, usize)>,
 ) -> Line<'static> {
+    let Some((selection_start, selection_end)) = selection else {
+        return line;
+    };
     let mut span_offset = offset;
     let spans = line
         .spans
@@ -1729,20 +1853,32 @@ fn highlight_selection(
         .flat_map(|span| {
             let start = span_offset;
             span_offset += span.content.len();
-            span.content
-                .char_indices()
-                .map(move |(byte, character)| {
-                    let absolute = start + byte;
-                    let style = if selection.is_some_and(|(selection_start, end)| {
-                        absolute >= selection_start && absolute < end
-                    }) {
+            let mut spans = Vec::new();
+            let mut chunk = String::new();
+            let mut selected = None;
+            for (byte, character) in span.content.char_indices() {
+                let character_selected =
+                    start + byte >= selection_start && start + byte < selection_end;
+                if selected.is_some_and(|selected| selected != character_selected) {
+                    let style = if selected.unwrap() {
                         span.style.bg(Color::Blue)
                     } else {
                         span.style
                     };
-                    Span::styled(character.to_string(), style)
-                })
-                .collect::<Vec<_>>()
+                    spans.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                selected = Some(character_selected);
+                chunk.push(character);
+            }
+            if let Some(selected) = selected {
+                let style = if selected {
+                    span.style.bg(Color::Blue)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(chunk, style));
+            }
+            spans
         })
         .collect();
     Line {
@@ -1839,10 +1975,15 @@ fn load_history(path: &Path) -> Result<Vec<String>> {
 async fn load_transcript(
     endpoint: &Path,
     thread_id: i64,
-) -> Result<(Vec<TranscriptItem>, Vec<ThreadEvent>)> {
+) -> Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)> {
     match request(endpoint, ControllerRequest::ThreadEvents { thread_id }).await? {
         ControllerResponse::ThreadEvents { events } => Ok((
-            events.iter().cloned().filter_map(event_to_item).collect(),
+            events
+                .iter()
+                .cloned()
+                .filter_map(event_to_item)
+                .map(TranscriptEntry::new)
+                .collect(),
             events,
         )),
         ControllerResponse::Error { message } => bail!("{message}"),
