@@ -858,7 +858,14 @@ impl State {
                     })
                     .await?;
                 return Ok(serde_json::Value::String(match response {
-                    RunnerResponse::PatchApplied { output } => output,
+                    RunnerResponse::PatchResult {
+                        success: true,
+                        message,
+                    } => message,
+                    RunnerResponse::PatchResult {
+                        success: false,
+                        message,
+                    } => format!("apply_patch failed:\n{message}"),
                     RunnerResponse::Error { message } => bail!("{message}"),
                     _ => bail!("runner returned an invalid apply_patch response"),
                 }));
@@ -1397,7 +1404,14 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::ProcessStopped { output } => {
             Ok(ControllerResponse::ProcessStopped { output })
         }
-        RunnerResponse::PatchApplied { output } => Ok(ControllerResponse::PatchApplied { output }),
+        RunnerResponse::PatchResult {
+            success: true,
+            message,
+        } => Ok(ControllerResponse::PatchApplied { output: message }),
+        RunnerResponse::PatchResult {
+            success: false,
+            message,
+        } => bail!("{message}"),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }
@@ -1436,7 +1450,7 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
         | RunnerResponse::ToolInstalled
         | RunnerResponse::InputWritten
         | RunnerResponse::ProcessStopped { .. }
-        | RunnerResponse::PatchApplied { .. } => {
+        | RunnerResponse::PatchResult { .. } => {
             bail!("runner returned an invalid tool response")
         }
     }

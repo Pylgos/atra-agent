@@ -271,8 +271,9 @@ pub enum RunnerResponse {
     ProcessStopped {
         output: String,
     },
-    PatchApplied {
-        output: String,
+    PatchResult {
+        success: bool,
+        message: String,
     },
     Error {
         message: String,
