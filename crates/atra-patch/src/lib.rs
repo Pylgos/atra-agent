@@ -1,10 +1,13 @@
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 
 const BEGIN: &str = "*** Begin Patch";
 const END: &str = "*** End Patch";
@@ -14,77 +17,308 @@ const UPDATE: &str = "*** Update File: ";
 const MOVE: &str = "*** Move to: ";
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PatchChange {
-    Added { path: PathBuf },
-    Deleted { path: PathBuf },
-    Updated { path: PathBuf },
-    Moved { from: PathBuf, to: PathBuf },
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ApplyPatchResult {
+    ParseError { error: String },
+    Operations { results: Vec<PatchOperationResult> },
 }
 
-pub fn apply(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
-    let operations = parse(patch)?;
-    if operations.is_empty() {
-        bail!("No files were modified.");
-    }
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PatchOperationResult {
+    Added {
+        path: PathBuf,
+        outcome: PatchOperationOutcome,
+    },
+    Deleted {
+        path: PathBuf,
+        outcome: PatchOperationOutcome,
+    },
+    Updated {
+        path: PathBuf,
+        outcome: PatchOperationOutcome,
+    },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+        outcome: PatchOperationOutcome,
+    },
+}
 
-    let mut affected = Vec::new();
-    for operation in operations {
-        match operation {
-            Operation::Add { path, content } => {
-                let resolved = resolve(cwd, &path);
-                if let Some(parent) = resolved.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("Failed to create parent directories for {}", path.display())
-                    })?;
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PatchOperationOutcome {
+    Applied { diff: Result<FileDiff, String> },
+    Failed { error: String },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FileDiff {
+    pub old_path: Option<PathBuf>,
+    pub new_path: Option<PathBuf>,
+    pub hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+pub fn apply(patch: &str, cwd: &Path) -> ApplyPatchResult {
+    let operations = match parse(patch) {
+        Ok(operations) if !operations.is_empty() => operations,
+        Ok(_) => {
+            return ApplyPatchResult::ParseError {
+                error: "No files were modified.".to_owned(),
+            };
+        }
+        Err(error) => {
+            return ApplyPatchResult::ParseError {
+                error: format!("{error:#}"),
+            };
+        }
+    };
+    ApplyPatchResult::Operations {
+        results: operations
+            .into_iter()
+            .map(|operation| apply_operation(operation, cwd))
+            .collect(),
+    }
+}
+
+fn apply_operation(operation: Operation, cwd: &Path) -> PatchOperationResult {
+    match operation {
+        Operation::Add { path, content } => {
+            let resolved = resolve(cwd, &path);
+            let outcome = apply_add(&resolved, &content)
+                .map(|()| file_diff(None, Some(path.clone()), "", &content))
+                .into();
+            PatchOperationResult::Added { path, outcome }
+        }
+        Operation::Delete { path } => {
+            let resolved = resolve(cwd, &path);
+            let diff = fs::read_to_string(&resolved)
+                .map(|original| file_diff(Some(path.clone()), None, &original, ""))
+                .map_err(|error| format!("Failed to read {} for diff: {error}", path.display()));
+            let outcome = match fs::remove_file(&resolved) {
+                Ok(()) => PatchOperationOutcome::Applied { diff },
+                Err(error) => PatchOperationOutcome::Failed {
+                    error: format!("Failed to delete file {}: {error}", path.display()),
+                },
+            };
+            PatchOperationResult::Deleted { path, outcome }
+        }
+        Operation::Update {
+            path,
+            move_path,
+            chunks,
+        } => match move_path {
+            Some(destination) => {
+                let outcome = apply_move(cwd, &path, &destination, &chunks);
+                PatchOperationResult::Moved {
+                    from: path,
+                    to: destination,
+                    outcome,
                 }
-                fs::write(&resolved, content)
-                    .with_context(|| format!("Failed to write file {}", path.display()))?;
-                affected.push(PatchChange::Added { path });
             }
-            Operation::Delete { path } => {
-                let resolved = resolve(cwd, &path);
-                fs::remove_file(&resolved)
-                    .with_context(|| format!("Failed to delete file {}", path.display()))?;
-                affected.push(PatchChange::Deleted { path });
+            None => {
+                let outcome = apply_update(cwd, &path, &chunks);
+                PatchOperationResult::Updated { path, outcome }
             }
-            Operation::Update {
-                path,
-                move_path,
-                chunks,
-            } => {
-                let resolved = resolve(cwd, &path);
-                let original = fs::read_to_string(&resolved)
-                    .with_context(|| format!("Failed to read file to update {}", path.display()))?;
-                let content = update_content(&original, &path, &chunks)?;
-                if let Some(destination) = move_path {
-                    let resolved_destination = resolve(cwd, &destination);
-                    if let Some(parent) = resolved_destination.parent() {
-                        fs::create_dir_all(parent).with_context(|| {
-                            format!(
-                                "Failed to create parent directories for {}",
-                                destination.display()
-                            )
-                        })?;
-                    }
-                    fs::write(&resolved_destination, content).with_context(|| {
-                        format!("Failed to write file {}", destination.display())
-                    })?;
-                    fs::remove_file(&resolved)
-                        .with_context(|| format!("Failed to remove original {}", path.display()))?;
-                    affected.push(PatchChange::Moved {
-                        from: path,
-                        to: destination,
-                    });
-                } else {
-                    fs::write(&resolved, content)
-                        .with_context(|| format!("Failed to write file {}", path.display()))?;
-                    affected.push(PatchChange::Updated { path });
-                }
-            }
+        },
+    }
+}
+
+impl From<Result<FileDiff>> for PatchOperationOutcome {
+    fn from(result: Result<FileDiff>) -> Self {
+        match result {
+            Ok(diff) => Self::Applied { diff: Ok(diff) },
+            Err(error) => Self::Failed {
+                error: format!("{error:#}"),
+            },
         }
     }
-    Ok(affected)
+}
+
+fn apply_add(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().context("add path has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create parent directories for {}", path.display()))?;
+    atomic_write(path, content, None, false)
+        .with_context(|| format!("Failed to write file {}", path.display()))
+}
+
+fn apply_update(cwd: &Path, path: &Path, chunks: &[Chunk]) -> PatchOperationOutcome {
+    let resolved = resolve(cwd, path);
+    let result = (|| {
+        let original = fs::read_to_string(&resolved)
+            .with_context(|| format!("Failed to read file to update {}", path.display()))?;
+        let permissions = fs::metadata(&resolved)
+            .with_context(|| format!("Failed to read metadata for {}", path.display()))?
+            .permissions();
+        let content = update_content(&original, path, chunks)?;
+        atomic_write(&resolved, &content, Some(permissions), true)
+            .with_context(|| format!("Failed to write file {}", path.display()))?;
+        Ok(file_diff(
+            Some(path.to_owned()),
+            Some(path.to_owned()),
+            &original,
+            &content,
+        ))
+    })();
+    result.into()
+}
+
+fn apply_move(
+    cwd: &Path,
+    path: &Path,
+    destination: &Path,
+    chunks: &[Chunk],
+) -> PatchOperationOutcome {
+    let resolved = resolve(cwd, path);
+    let resolved_destination = resolve(cwd, destination);
+    let result = (|| {
+        let original = fs::read_to_string(&resolved)
+            .with_context(|| format!("Failed to read file to update {}", path.display()))?;
+        let permissions = fs::metadata(&resolved)
+            .with_context(|| format!("Failed to read metadata for {}", path.display()))?
+            .permissions();
+        let content = update_content(&original, path, chunks)?;
+        if resolved == resolved_destination {
+            atomic_write(&resolved, &content, Some(permissions), true)
+                .with_context(|| format!("Failed to write file {}", path.display()))?;
+        } else {
+            let parent = resolved_destination
+                .parent()
+                .context("move destination has no parent directory")?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create parent directories for {}",
+                    destination.display()
+                )
+            })?;
+            atomic_write(&resolved_destination, &content, Some(permissions), false)
+                .with_context(|| format!("Failed to write file {}", destination.display()))?;
+            if let Err(error) = fs::remove_file(&resolved) {
+                let rollback = fs::remove_file(&resolved_destination);
+                let message = match rollback {
+                    Ok(()) => format!("Failed to remove original {}: {error}", path.display()),
+                    Err(rollback) => format!(
+                        "Failed to remove original {}: {error}; failed to remove destination {} during rollback: {rollback}",
+                        path.display(),
+                        destination.display()
+                    ),
+                };
+                bail!("{message}");
+            }
+        }
+        Ok(file_diff(
+            Some(path.to_owned()),
+            Some(destination.to_owned()),
+            &original,
+            &content,
+        ))
+    })();
+    result.into()
+}
+
+fn atomic_write(
+    path: &Path,
+    content: &str,
+    permissions: Option<fs::Permissions>,
+    overwrite: bool,
+) -> Result<()> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create temporary file in {}", parent.display()))?;
+    temporary
+        .write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write temporary file for {}", path.display()))?;
+    temporary
+        .as_file()
+        .set_permissions(permissions.unwrap_or_else(|| fs::Permissions::from_mode(0o644)))
+        .with_context(|| format!("Failed to set permissions for {}", path.display()))?;
+    if overwrite {
+        temporary.persist(path)
+    } else {
+        temporary.persist_noclobber(path)
+    }
+    .map_err(|error| error.error)
+    .with_context(|| format!("Failed to replace {}", path.display()))?;
+    Ok(())
+}
+
+fn file_diff(
+    old_path: Option<PathBuf>,
+    new_path: Option<PathBuf>,
+    old: &str,
+    new: &str,
+) -> FileDiff {
+    let diff = TextDiff::from_lines(old, new);
+    let hunks = diff
+        .grouped_ops(3)
+        .into_iter()
+        .map(|operations| {
+            let old_start = operations.first().unwrap().old_range().start;
+            let new_start = operations.first().unwrap().new_range().start;
+            let old_end = operations.last().unwrap().old_range().end;
+            let new_end = operations.last().unwrap().new_range().end;
+            let lines = operations
+                .into_iter()
+                .flat_map(|operation| diff.iter_changes(&operation))
+                .map(|change| DiffLine {
+                    kind: match change.tag() {
+                        ChangeTag::Equal => DiffLineKind::Context,
+                        ChangeTag::Insert => DiffLineKind::Added,
+                        ChangeTag::Delete => DiffLineKind::Removed,
+                    },
+                    old_line: change.old_index().map(|index| index + 1),
+                    new_line: change.new_index().map(|index| index + 1),
+                    text: change.value().trim_end_matches(['\r', '\n']).to_owned(),
+                })
+                .collect();
+            DiffHunk {
+                old_start: if old_end == old_start {
+                    old_start
+                } else {
+                    old_start + 1
+                },
+                old_count: old_end - old_start,
+                new_start: if new_end == new_start {
+                    new_start
+                } else {
+                    new_start + 1
+                },
+                new_count: new_end - new_start,
+                lines,
+            }
+        })
+        .collect();
+    FileDiff {
+        old_path,
+        new_path,
+        hunks,
+    }
 }
 
 fn resolve(cwd: &Path, path: &Path) -> PathBuf {

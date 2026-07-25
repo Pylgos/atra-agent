@@ -8,12 +8,14 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 atra-client.workspace = true
+atra-patch.workspace = true
 atra-protocol.workspace = true
 base64.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 icu_segmenter.workspace = true
 ratatui.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
 tokio.workspace = true

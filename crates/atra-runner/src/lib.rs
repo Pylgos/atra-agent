@@ -158,12 +158,7 @@ async fn handle_request(
             let result = tokio::task::spawn_blocking(move || apply(&patch, &cwd))
                 .await
                 .context("patch task failed")?;
-            Ok(match result {
-                Ok(changes) => RunnerResponse::PatchApplied { changes },
-                Err(error) => RunnerResponse::PatchFailed {
-                    message: format!("{error:#}"),
-                },
-            })
+            Ok(RunnerResponse::PatchCompleted { result })
         }
         RunnerRequest::WaitProcess {
             process_handle,

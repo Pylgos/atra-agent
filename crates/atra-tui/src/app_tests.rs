@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::transcript::{
-    layout_transcript, prepare_transcript, transcript_lines, transcript_ranges, transcript_text,
+    ToolArtifact, layout_transcript, prepare_transcript, transcript_lines, transcript_text,
 };
 use ratatui::{Terminal, layout::Rect, text::Line};
 
@@ -73,7 +73,14 @@ fn transcript_render_is_stable() {
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
-        result: serde_json::Value::String("abcdefgh\nsecond".to_owned()),
+        artifacts: vec![ToolArtifact {
+            kind: "command_execution".to_owned(),
+            data: serde_json::json!({
+                "state": "finished",
+                "output": "abcdefgh\nsecond",
+                "exit_code": 0,
+            }),
+        }],
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 4);
@@ -115,34 +122,6 @@ fn markdown_and_partial_patch_render_before_completion() {
     assert!(rendered.contains("fn main() {}"));
     assert!(rendered.contains("*** Update File: src/main.rs"));
     assert!(rendered.contains("+new"));
-}
-
-#[test]
-fn collapsed_tool_result_keeps_edges_and_can_expand() {
-    let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
-        result: serde_json::Value::String("status\none\ntwo\nthree\nfour\nfive\nsix".to_owned()),
-    })];
-
-    prepare_transcript(&mut items, &HashSet::new(), 80);
-    let collapsed = transcript_lines(&items, None, Some(0), 80, 0..usize::MAX);
-    let collapsed = collapsed
-        .iter()
-        .map(Line::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(collapsed.contains("status\n  one"));
-    assert!(collapsed.contains("3 lines omitted"));
-    assert!(collapsed.contains("five\n  six"));
-    assert_eq!(transcript_ranges(&items).1.len(), 1);
-
-    prepare_transcript(&mut items, &HashSet::from([0]), 80);
-    let expanded = transcript_lines(&items, None, Some(0), 80, 0..usize::MAX);
-    let expanded = expanded
-        .iter()
-        .map(Line::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(expanded.contains("two\n  three\n  four"));
 }
 
 #[test]

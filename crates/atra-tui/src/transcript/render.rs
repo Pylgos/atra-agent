@@ -1,10 +1,14 @@
 use std::{collections::HashSet, sync::LazyLock};
 
+use atra_patch::{
+    ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use serde::Deserialize;
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, ThemeSet},
@@ -18,6 +22,9 @@ use crate::{
     layout::{MappedRow, TranscriptLayout},
     transcript::{Author, DisplayedLine, RenderedItem, TranscriptEntry, TranscriptItem},
 };
+
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 pub(crate) fn layout_transcript(
     entries: &[TranscriptEntry],
@@ -239,7 +246,7 @@ pub(crate) fn prepare_transcript(
     }
 }
 
-fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Vec<DisplayedLine> {
+fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> Vec<DisplayedLine> {
     let content_width = usize::from(width.saturating_sub(2)).max(1);
     if let TranscriptItem::Message { author, text } = item {
         let background = (*author == Author::User).then_some(Color::DarkGray);
@@ -271,18 +278,17 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
     }
     let mut logical_lines = match item {
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
-        TranscriptItem::ToolResult { result } => {
-            let result = format_tool_value(result);
-            let display = if expanded {
-                result
-            } else {
-                summarize_result(&result)
-            };
-            display
-                .lines()
-                .map(|line| (None, Line::from(line.to_owned())))
-                .collect()
-        }
+        TranscriptItem::ToolResult { artifacts } => artifacts
+            .iter()
+            .filter_map(|artifact| match artifact.kind.as_str() {
+                "command_execution" => command_execution_lines(&artifact.data),
+                "patch_operations" => patch_operation_lines(&artifact.data),
+                "process_input" => process_input_lines(&artifact.data),
+                "runner_list" => runner_list_lines(&artifact.data),
+                _ => None,
+            })
+            .flatten()
+            .collect(),
         TranscriptItem::Approval { tool, allowed, .. } => {
             let decision = allowed.map(|allowed| if allowed { "approved" } else { "denied" });
             let message = match (tool, decision) {
@@ -454,40 +460,15 @@ fn tool_call_lines(
 }
 
 fn bash_lines(command: &str) -> Vec<Line<'static>> {
-    static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-    static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
-
     let syntax = SYNTAX_SET
         .find_syntax_by_token("bash")
         .expect("syntect includes bash syntax");
     let mut highlighter = HighlightLines::new(syntax, &THEME_SET.themes["base16-ocean.dark"]);
     let mut lines = LinesWithEndings::from(command)
         .map(|line| {
-            let spans = highlighter
-                .highlight_line(line, &SYNTAX_SET)
-                .expect("bundled bash syntax is valid")
-                .into_iter()
-                .filter_map(|(style, text)| {
-                    let text = text.trim_end_matches(['\r', '\n']);
-                    (!text.is_empty()).then(|| {
-                        let mut ratatui_style = Style::default().fg(Color::Rgb(
-                            style.foreground.r,
-                            style.foreground.g,
-                            style.foreground.b,
-                        ));
-                        if style.font_style.contains(FontStyle::BOLD) {
-                            ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
-                        }
-                        if style.font_style.contains(FontStyle::ITALIC) {
-                            ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
-                        }
-                        if style.font_style.contains(FontStyle::UNDERLINE) {
-                            ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
-                        }
-                        Span::styled(text.to_owned(), ratatui_style)
-                    })
-                })
-                .collect::<Vec<_>>();
+            let spans =
+                highlighted_spans(&mut highlighter, line.trim_end_matches(['\r', '\n']), None)
+                    .expect("bundled bash syntax is valid");
             Line::from(spans)
         })
         .collect::<Vec<_>>();
@@ -598,18 +579,334 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn summarize_result(result: &str) -> String {
-    let lines = result.lines().collect::<Vec<_>>();
-    if lines.len() <= 5 {
-        return result.to_owned();
+#[derive(Deserialize)]
+struct CommandExecution {
+    state: String,
+    #[serde(default)]
+    output: String,
+    exit_code: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct ProcessInput {
+    process_handle: String,
+    bytes_written: usize,
+}
+
+#[derive(Deserialize)]
+struct RunnerList {
+    runners: Vec<Runner>,
+}
+
+#[derive(Deserialize)]
+struct Runner {
+    name: String,
+    description: String,
+}
+
+fn process_input_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let input: ProcessInput = serde_json::from_value(data.clone()).ok()?;
+    Some(vec![(
+        Some('✓'),
+        Line::from(Span::styled(
+            format!(
+                "input written to process #{} · {} bytes",
+                input.process_handle, input.bytes_written
+            ),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+    )])
+}
+
+fn runner_list_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let runners: RunnerList = serde_json::from_value(data.clone()).ok()?;
+    if runners.runners.is_empty() {
+        return Some(vec![(
+            Some('◇'),
+            Line::from(Span::styled(
+                "no runners available",
+                Style::default().fg(Color::DarkGray),
+            )),
+        )]);
     }
-    format!(
-        "{}\n{}\n… {} lines omitted …\n{}\n{}",
-        lines[0],
-        lines[1],
-        lines.len() - 4,
-        lines[lines.len() - 2],
-        lines[lines.len() - 1]
+    Some(
+        runners
+            .runners
+            .into_iter()
+            .map(|runner| {
+                (
+                    Some('◆'),
+                    Line::from(vec![
+                        Span::styled(
+                            runner.name,
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(" · {}", runner.description)),
+                    ]),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn command_execution_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let command: CommandExecution = serde_json::from_value(data.clone()).ok()?;
+    let (marker, label, style) = match command.state.as_str() {
+        "started" => ('›', "started".to_owned(), Style::default().fg(Color::Cyan)),
+        "running" => (
+            '…',
+            "running".to_owned(),
+            Style::default().fg(Color::Yellow),
+        ),
+        "finished" => {
+            let exit_code = command
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let style = if command.exit_code == Some(0) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            ('✓', format!("finished · exit {exit_code}"), style)
+        }
+        "timed_out" => ('!', "timed out".to_owned(), Style::default().fg(Color::Red)),
+        "stopped" => (
+            '■',
+            "stopped".to_owned(),
+            Style::default().fg(Color::Yellow),
+        ),
+        _ => return None,
+    };
+    let mut lines = vec![(
+        Some(marker),
+        Line::from(Span::styled(label, style.add_modifier(Modifier::BOLD))),
+    )];
+    lines.extend(command.output.lines().map(|output| {
+        (
+            None,
+            Line::from(Span::styled(
+                output.to_owned(),
+                Style::default().fg(Color::Gray),
+            )),
+        )
+    }));
+    Some(lines)
+}
+
+fn patch_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let result: ApplyPatchResult = serde_json::from_value(data.clone()).ok()?;
+    let results = match result {
+        ApplyPatchResult::ParseError { error } => {
+            let mut lines = vec![(
+                Some('✗'),
+                Line::from(Span::styled(
+                    "patch parse failed",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+            )];
+            lines.extend(
+                error
+                    .lines()
+                    .map(|line| (None, Line::from(line.to_owned()))),
+            );
+            return Some(lines);
+        }
+        ApplyPatchResult::Operations { results } => results,
+    };
+    let mut rendered = Vec::new();
+    for result in results {
+        let (label, outcome) = match result {
+            PatchOperationResult::Added { path, outcome } => {
+                (format!("A {}", path.display()), outcome)
+            }
+            PatchOperationResult::Deleted { path, outcome } => {
+                (format!("D {}", path.display()), outcome)
+            }
+            PatchOperationResult::Updated { path, outcome } => {
+                (format!("M {}", path.display()), outcome)
+            }
+            PatchOperationResult::Moved { from, to, outcome } => {
+                (format!("R {} → {}", from.display(), to.display()), outcome)
+            }
+        };
+        match outcome {
+            PatchOperationOutcome::Applied { diff: Ok(diff) } => {
+                rendered.extend(file_diff_lines(&diff));
+            }
+            PatchOperationOutcome::Applied { diff: Err(_) } => rendered.push((
+                Some('✓'),
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            )),
+            PatchOperationOutcome::Failed { error } => {
+                rendered.push((
+                    Some('✗'),
+                    Line::from(Span::styled(
+                        label,
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                ));
+                rendered.extend(
+                    error
+                        .lines()
+                        .map(|line| (None, Line::from(line.to_owned()))),
+                );
+            }
+        }
+    }
+    Some(rendered)
+}
+
+fn file_diff_lines(diff: &FileDiff) -> Vec<(Option<char>, Line<'static>)> {
+    let line_number_width = diff
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .flat_map(|line| [line.old_line, line.new_line])
+        .flatten()
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .len()
+        .max(1);
+    let mut rendered = Vec::new();
+    let label = match (&diff.old_path, &diff.new_path) {
+        (None, Some(path)) => format!("A {}", path.display()),
+        (Some(path), None) => format!("D {}", path.display()),
+        (Some(old), Some(new)) if old == new => format!("M {}", old.display()),
+        (Some(old), Some(new)) => format!("R {} → {}", old.display(), new.display()),
+        (None, None) => unreachable!(),
+    };
+    rendered.push((
+        Some('±'),
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ));
+    for hunk in &diff.hunks {
+        let syntax = diff
+            .new_path
+            .as_ref()
+            .or(diff.old_path.as_ref())
+            .and_then(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| SYNTAX_SET.find_syntax_by_extension(name))
+                    .or_else(|| {
+                        path.extension()
+                            .and_then(|extension| extension.to_str())
+                            .and_then(|extension| SYNTAX_SET.find_syntax_by_extension(extension))
+                    })
+            });
+        let mut old_highlighter = syntax
+            .map(|syntax| HighlightLines::new(syntax, &THEME_SET.themes["base16-ocean.dark"]));
+        let mut new_highlighter = syntax
+            .map(|syntax| HighlightLines::new(syntax, &THEME_SET.themes["base16-ocean.dark"]));
+        rendered.push((
+            None,
+            Line::from(Span::styled(
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                ),
+                Style::default().fg(Color::Magenta),
+            )),
+        ));
+        for line in &hunk.lines {
+            let old_line = line
+                .old_line
+                .map(|line| line.to_string())
+                .unwrap_or_default();
+            let new_line = line
+                .new_line
+                .map(|line| line.to_string())
+                .unwrap_or_default();
+            let gutter = format!("{old_line:>line_number_width$} {new_line:>line_number_width$} ");
+            let (sign, diff_style, code_spans) = match line.kind {
+                DiffLineKind::Context => {
+                    if let Some(highlighter) = old_highlighter.as_mut() {
+                        let _ = highlighted_spans(highlighter, &line.text, None);
+                    }
+                    let spans = new_highlighter
+                        .as_mut()
+                        .and_then(|highlighter| highlighted_spans(highlighter, &line.text, None));
+                    (' ', Style::default(), spans)
+                }
+                DiffLineKind::Added => {
+                    let background = Color::Rgb(20, 45, 35);
+                    let spans = new_highlighter.as_mut().and_then(|highlighter| {
+                        highlighted_spans(highlighter, &line.text, Some(background))
+                    });
+                    ('+', Style::default().fg(Color::Green).bg(background), spans)
+                }
+                DiffLineKind::Removed => {
+                    let background = Color::Rgb(50, 25, 30);
+                    let spans = old_highlighter.as_mut().and_then(|highlighter| {
+                        highlighted_spans(highlighter, &line.text, Some(background))
+                    });
+                    ('-', Style::default().fg(Color::Red).bg(background), spans)
+                }
+            };
+            let code_spans =
+                code_spans.unwrap_or_else(|| vec![Span::styled(line.text.clone(), diff_style)]);
+            let mut spans = vec![
+                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(sign.to_string(), diff_style),
+            ];
+            spans.extend(code_spans);
+            rendered.push((None, Line::from(spans)));
+        }
+    }
+    rendered
+}
+
+fn highlighted_spans(
+    highlighter: &mut HighlightLines<'_>,
+    text: &str,
+    background: Option<Color>,
+) -> Option<Vec<Span<'static>>> {
+    let line = format!("{text}\n");
+    Some(
+        highlighter
+            .highlight_line(&line, &SYNTAX_SET)
+            .ok()?
+            .into_iter()
+            .filter_map(|(style, text)| {
+                let text = text.trim_end_matches(['\r', '\n']);
+                (!text.is_empty()).then(|| {
+                    let mut ratatui_style = Style::default().fg(Color::Rgb(
+                        style.foreground.r,
+                        style.foreground.g,
+                        style.foreground.b,
+                    ));
+                    if let Some(background) = background {
+                        ratatui_style = ratatui_style.bg(background);
+                    }
+                    if style.font_style.contains(FontStyle::BOLD) {
+                        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+                    }
+                    if style.font_style.contains(FontStyle::ITALIC) {
+                        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+                    }
+                    if style.font_style.contains(FontStyle::UNDERLINE) {
+                        ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    Span::styled(text.to_owned(), ratatui_style)
+                })
+            })
+            .collect(),
     )
 }
 

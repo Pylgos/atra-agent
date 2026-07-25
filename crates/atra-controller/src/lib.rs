@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use atra_patch::PatchChange;
+use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformBundle;
 use atra_protocol::{
     ApprovalPolicy, ControllerRequest, ControllerResponse, Runner as RunnerInfo, RunnerRequest,
@@ -649,7 +649,7 @@ impl State {
                                 format!(
                                     "Available runners:\n{}",
                                     runners
-                                        .into_iter()
+                                        .iter()
                                         .map(|runner| {
                                             format!("- {}: {}", runner.name, runner.description)
                                         })
@@ -661,7 +661,11 @@ impl State {
                                 thread_id,
                                 &name,
                                 call_id.as_deref(),
-                                serde_json::Value::String(result),
+                                ToolOutcome::with_artifact(
+                                    result,
+                                    "runner_list",
+                                    json!({ "runners": runners }),
+                                ),
                                 false,
                                 updates,
                             )
@@ -853,7 +857,7 @@ impl State {
                 Some(reason) => format!("user denied the tool call: {reason}"),
                 None => "user denied the tool call".to_owned(),
             };
-            serde_json::Value::String(output)
+            ToolOutcome::text(output)
         };
         self.save_tool_result(
             pending.thread_id,
@@ -867,10 +871,11 @@ impl State {
         self.continue_turn(pending.thread_id, updates).await
     }
 
-    async fn execute(&self, arguments: ToolArguments) -> Result<serde_json::Value> {
-        let response = match arguments {
+    async fn execute(&self, arguments: ToolArguments) -> Result<ToolOutcome> {
+        match arguments {
             ToolArguments::ExecCommand(arguments) => {
-                self.runner(&arguments.runner)
+                let response = self
+                    .runner(&arguments.runner)
                     .await?
                     .request_raw(RunnerRequest::ExecCommand {
                         command: arguments.command,
@@ -878,7 +883,13 @@ impl State {
                         timeout_ms: arguments.timeout_ms,
                         timeout_action: arguments.timeout_action,
                     })
-                    .await?
+                    .await?;
+                let artifact = command_artifact(&response)?;
+                Ok(ToolOutcome::with_artifact(
+                    format_exec_response(response)?,
+                    "command_execution",
+                    artifact,
+                ))
             }
             ToolArguments::ApplyPatch(arguments) => {
                 let response = self
@@ -888,14 +899,19 @@ impl State {
                         patch: arguments.patch,
                     })
                     .await?;
-                return Ok(serde_json::Value::String(match response {
-                    RunnerResponse::PatchApplied { changes } => format_patch_result(&changes),
-                    RunnerResponse::PatchFailed { message } => {
-                        format!("apply_patch failed:\n{message}")
+                Ok(match response {
+                    RunnerResponse::PatchCompleted { result } => {
+                        let output = format_patch_result(&result);
+                        ToolOutcome::with_optional_artifact(
+                            output,
+                            serde_json::to_value(result)
+                                .ok()
+                                .map(|data| ("patch_operations", data)),
+                        )
                     }
                     RunnerResponse::Error { message } => bail!("{message}"),
                     _ => bail!("runner returned an invalid apply_patch response"),
-                }));
+                })
             }
             ToolArguments::WaitProcess(arguments) => {
                 let response = self
@@ -906,25 +922,36 @@ impl State {
                         timeout_ms: arguments.timeout_ms,
                     })
                     .await?;
-                return Ok(serde_json::Value::String(format_process_response(
-                    "wait_process",
-                    response,
-                )?));
+                let artifact = command_artifact(&response)?;
+                Ok(ToolOutcome::with_artifact(
+                    format_process_response("wait_process", response)?,
+                    "command_execution",
+                    artifact,
+                ))
             }
             ToolArguments::WriteProcess(arguments) => {
+                let input = arguments.input.into_bytes();
+                let artifact = json!({
+                    "process_handle": arguments.process_handle,
+                    "bytes_written": input.len(),
+                });
                 let response = self
                     .runner(&arguments.runner)
                     .await?
                     .request_raw(RunnerRequest::WriteProcess {
                         process_handle: arguments.process_handle,
-                        input: arguments.input.into_bytes(),
+                        input,
                     })
                     .await?;
-                return Ok(serde_json::Value::String(match response {
-                    RunnerResponse::InputWritten => "Input written.".to_owned(),
+                Ok(match response {
+                    RunnerResponse::InputWritten => ToolOutcome::with_artifact(
+                        "Input written.".to_owned(),
+                        "process_input",
+                        artifact,
+                    ),
                     RunnerResponse::Error { message } => bail!("{message}"),
                     _ => bail!("runner returned an invalid write_process response"),
-                }));
+                })
             }
             ToolArguments::StopProcess(arguments) => {
                 let response = self
@@ -934,13 +961,14 @@ impl State {
                         process_handle: arguments.process_handle,
                     })
                     .await?;
-                return Ok(serde_json::Value::String(format_process_response(
-                    "stop_process",
-                    response,
-                )?));
+                let artifact = command_artifact(&response)?;
+                Ok(ToolOutcome::with_artifact(
+                    format_process_response("stop_process", response)?,
+                    "command_execution",
+                    artifact,
+                ))
             }
-        };
-        Ok(serde_json::Value::String(format_exec_response(response)?))
+        }
     }
 
     async fn save_tool_result(
@@ -948,7 +976,7 @@ impl State {
         thread_id: i64,
         name: &str,
         call_id: Option<&str>,
-        result: serde_json::Value,
+        outcome: ToolOutcome,
         custom: bool,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<()> {
@@ -959,7 +987,8 @@ impl State {
                 "type": custom.then_some("custom"),
                 "name": name,
                 "call_id": call_id,
-                "result": result,
+                "result": outcome.result,
+                "artifacts": outcome.artifacts,
             }),
             updates,
         )
@@ -1133,6 +1162,37 @@ enum ToolArguments {
     WaitProcess(WaitProcessArguments),
     WriteProcess(WriteProcessArguments),
     StopProcess(StopProcessArguments),
+}
+
+struct ToolOutcome {
+    result: serde_json::Value,
+    artifacts: Vec<serde_json::Value>,
+}
+
+impl ToolOutcome {
+    fn text(result: String) -> Self {
+        Self {
+            result: serde_json::Value::String(result),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn with_artifact(result: String, kind: &str, data: serde_json::Value) -> Self {
+        Self {
+            result: serde_json::Value::String(result),
+            artifacts: vec![json!({
+                "kind": kind,
+                "data": data,
+            })],
+        }
+    }
+
+    fn with_optional_artifact(result: String, artifact: Option<(&str, serde_json::Value)>) -> Self {
+        match artifact {
+            Some((kind, data)) => Self::with_artifact(result, kind, data),
+            None => Self::text(result),
+        }
+    }
 }
 
 impl ToolArguments {
@@ -1430,10 +1490,9 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::ProcessStopped { output } => {
             Ok(ControllerResponse::ProcessStopped { output })
         }
-        RunnerResponse::PatchApplied { changes } => Ok(ControllerResponse::PatchApplied {
-            output: format_patch_result(&changes),
+        RunnerResponse::PatchCompleted { result } => Ok(ControllerResponse::PatchApplied {
+            output: format_patch_result(&result),
         }),
-        RunnerResponse::PatchFailed { message } => bail!("{message}"),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }
@@ -1472,26 +1531,92 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
         | RunnerResponse::ToolInstalled
         | RunnerResponse::InputWritten
         | RunnerResponse::ProcessStopped { .. }
-        | RunnerResponse::PatchApplied { .. }
-        | RunnerResponse::PatchFailed { .. } => {
+        | RunnerResponse::PatchCompleted { .. } => {
             bail!("runner returned an invalid tool response")
         }
     }
 }
 
-fn format_patch_result(changes: &[PatchChange]) -> String {
-    let mut output = String::from("Success. Updated the following files:\n");
-    for change in changes {
-        match change {
-            PatchChange::Added { path } => output.push_str(&format!("A {}\n", path.display())),
-            PatchChange::Deleted { path } => output.push_str(&format!("D {}\n", path.display())),
-            PatchChange::Updated { path } => output.push_str(&format!("M {}\n", path.display())),
-            PatchChange::Moved { from, to } => {
-                output.push_str(&format!("R {} -> {}\n", from.display(), to.display()));
+fn format_patch_result(result: &ApplyPatchResult) -> String {
+    let results = match result {
+        ApplyPatchResult::ParseError { error } => {
+            return format!("apply_patch failed:\n{error}");
+        }
+        ApplyPatchResult::Operations { results } => results,
+    };
+    let failed = results.iter().any(|result| {
+        matches!(
+            result,
+            PatchOperationResult::Added {
+                outcome: PatchOperationOutcome::Failed { .. },
+                ..
+            } | PatchOperationResult::Deleted {
+                outcome: PatchOperationOutcome::Failed { .. },
+                ..
+            } | PatchOperationResult::Updated {
+                outcome: PatchOperationOutcome::Failed { .. },
+                ..
+            } | PatchOperationResult::Moved {
+                outcome: PatchOperationOutcome::Failed { .. },
+                ..
+            }
+        )
+    });
+    let mut output = if failed {
+        String::from("apply_patch completed with errors:\n")
+    } else {
+        String::from("Success. Updated the following files:\n")
+    };
+    for result in results {
+        let (label, outcome) = match result {
+            PatchOperationResult::Added { path, outcome } => {
+                (format!("A {}", path.display()), outcome)
+            }
+            PatchOperationResult::Deleted { path, outcome } => {
+                (format!("D {}", path.display()), outcome)
+            }
+            PatchOperationResult::Updated { path, outcome } => {
+                (format!("M {}", path.display()), outcome)
+            }
+            PatchOperationResult::Moved { from, to, outcome } => {
+                (format!("R {} -> {}", from.display(), to.display()), outcome)
+            }
+        };
+        match outcome {
+            PatchOperationOutcome::Applied { .. } => output.push_str(&format!("{label}\n")),
+            PatchOperationOutcome::Failed { error } => {
+                output.push_str(&format!("{label}: {error}\n"));
             }
         }
     }
     output
+}
+
+fn command_artifact(response: &RunnerResponse) -> Result<serde_json::Value> {
+    Ok(match response {
+        RunnerResponse::ProcessStarted { .. } => json!({
+            "state": "started",
+        }),
+        RunnerResponse::ProcessRunning { output, .. } => json!({
+            "state": "running",
+            "output": output,
+        }),
+        RunnerResponse::ProcessFinished { output, exit_code } => json!({
+            "state": "finished",
+            "output": output,
+            "exit_code": exit_code,
+        }),
+        RunnerResponse::ProcessTimedOut { output } => json!({
+            "state": "timed_out",
+            "output": output,
+        }),
+        RunnerResponse::ProcessStopped { output } => json!({
+            "state": "stopped",
+            "output": output,
+        }),
+        RunnerResponse::Error { message } => bail!("{message}"),
+        _ => bail!("runner returned an invalid command response"),
+    })
 }
 
 fn format_process_response(tool: &str, response: RunnerResponse) -> Result<String> {

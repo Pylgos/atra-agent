@@ -24,13 +24,19 @@ pub(crate) enum TranscriptItem {
         arguments: Option<serde_json::Value>,
     },
     ToolResult {
-        result: serde_json::Value,
+        artifacts: Vec<ToolArtifact>,
     },
     Approval {
         id: u64,
         tool: Option<String>,
         allowed: Option<bool>,
     },
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolArtifact {
+    pub(crate) kind: String,
+    pub(crate) data: serde_json::Value,
 }
 
 impl TranscriptItem {
@@ -140,7 +146,18 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             )),
         }),
         "tool_result" => Some(TranscriptItem::ToolResult {
-            result: sanitize_value(event.payload.get("result")?.clone()),
+            artifacts: event
+                .payload
+                .get("artifacts")?
+                .as_array()?
+                .iter()
+                .filter_map(|artifact| {
+                    Some(ToolArtifact {
+                        kind: sanitize(artifact.get("kind")?.as_str()?),
+                        data: sanitize_value(artifact.get("data")?.clone()),
+                    })
+                })
+                .collect(),
         }),
         "approval_request" => Some(TranscriptItem::Approval {
             id: event.payload.get("approval_id")?.as_u64()?,
