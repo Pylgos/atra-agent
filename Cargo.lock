@@ -508,6 +508,7 @@ name = "atra-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atra-patch",
  "atra-platform",
  "atra-protocol",
  "base64 0.22.1",
@@ -537,6 +538,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atra-patch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "atra-platform"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +562,7 @@ dependencies = [
 name = "atra-protocol"
 version = "0.1.0"
 dependencies = [
+ "atra-patch",
  "serde",
  "serde_json",
 ]
@@ -562,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atra-id",
+ "atra-patch",
  "atra-protocol",
  "base64 0.22.1",
  "clap",

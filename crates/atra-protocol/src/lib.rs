@@ -1,3 +1,4 @@
+use atra_patch::PatchChange;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -271,8 +272,10 @@ pub enum RunnerResponse {
     ProcessStopped {
         output: String,
     },
-    PatchResult {
-        success: bool,
+    PatchApplied {
+        changes: Vec<PatchChange>,
+    },
+    PatchFailed {
         message: String,
     },
     Error {

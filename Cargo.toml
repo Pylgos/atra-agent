@@ -4,6 +4,7 @@ members = [
     "crates/atra-client",
     "crates/atra-controller",
     "crates/atra-id",
+    "crates/atra-patch",
     "crates/atra-platform",
     "crates/atra-protocol",
     "crates/atra-runner",
@@ -20,6 +21,7 @@ rust-version = "1.96"
 anyhow = "1.0.100"
 atra-controller = { path = "crates/atra-controller" }
 atra-id = { path = "crates/atra-id" }
+atra-patch = { path = "crates/atra-patch" }
 atra-client = { path = "crates/atra-client" }
 atra-platform = { path = "crates/atra-platform" }
 atra-protocol = { path = "crates/atra-protocol" }

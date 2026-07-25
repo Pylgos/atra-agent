@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use atra_patch::apply;
 use atra_protocol::{
     RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, TimeoutAction,
 };
@@ -28,8 +29,6 @@ use tokio::{
     sync::{Mutex, Notify},
     time::{Instant, sleep, sleep_until},
 };
-
-mod patch;
 
 pub async fn run_stdio() -> Result<()> {
     serve(BufReader::new(io::stdin()), io::stdout()).await
@@ -156,16 +155,12 @@ async fn handle_request(
             tracing::info!(patch_bytes = patch.len(), "applying patch");
             tracing::trace!(%patch, "patch content");
             let cwd = std::env::current_dir().context("failed to determine runner cwd")?;
-            let result = tokio::task::spawn_blocking(move || patch::apply(&patch, &cwd))
+            let result = tokio::task::spawn_blocking(move || apply(&patch, &cwd))
                 .await
                 .context("patch task failed")?;
             Ok(match result {
-                Ok(message) => RunnerResponse::PatchResult {
-                    success: true,
-                    message,
-                },
-                Err(error) => RunnerResponse::PatchResult {
-                    success: false,
+                Ok(changes) => RunnerResponse::PatchApplied { changes },
+                Err(error) => RunnerResponse::PatchFailed {
                     message: format!("{error:#}"),
                 },
             })

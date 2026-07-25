@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use atra_patch::PatchChange;
 use atra_platform::PlatformBundle;
 use atra_protocol::{
     ApprovalPolicy, ControllerRequest, ControllerResponse, Runner as RunnerInfo, RunnerRequest,
@@ -888,14 +889,10 @@ impl State {
                     })
                     .await?;
                 return Ok(serde_json::Value::String(match response {
-                    RunnerResponse::PatchResult {
-                        success: true,
-                        message,
-                    } => message,
-                    RunnerResponse::PatchResult {
-                        success: false,
-                        message,
-                    } => format!("apply_patch failed:\n{message}"),
+                    RunnerResponse::PatchApplied { changes } => format_patch_result(&changes),
+                    RunnerResponse::PatchFailed { message } => {
+                        format!("apply_patch failed:\n{message}")
+                    }
                     RunnerResponse::Error { message } => bail!("{message}"),
                     _ => bail!("runner returned an invalid apply_patch response"),
                 }));
@@ -1433,14 +1430,10 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::ProcessStopped { output } => {
             Ok(ControllerResponse::ProcessStopped { output })
         }
-        RunnerResponse::PatchResult {
-            success: true,
-            message,
-        } => Ok(ControllerResponse::PatchApplied { output: message }),
-        RunnerResponse::PatchResult {
-            success: false,
-            message,
-        } => bail!("{message}"),
+        RunnerResponse::PatchApplied { changes } => Ok(ControllerResponse::PatchApplied {
+            output: format_patch_result(&changes),
+        }),
+        RunnerResponse::PatchFailed { message } => bail!("{message}"),
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }
@@ -1479,10 +1472,26 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
         | RunnerResponse::ToolInstalled
         | RunnerResponse::InputWritten
         | RunnerResponse::ProcessStopped { .. }
-        | RunnerResponse::PatchResult { .. } => {
+        | RunnerResponse::PatchApplied { .. }
+        | RunnerResponse::PatchFailed { .. } => {
             bail!("runner returned an invalid tool response")
         }
     }
+}
+
+fn format_patch_result(changes: &[PatchChange]) -> String {
+    let mut output = String::from("Success. Updated the following files:\n");
+    for change in changes {
+        match change {
+            PatchChange::Added { path } => output.push_str(&format!("A {}\n", path.display())),
+            PatchChange::Deleted { path } => output.push_str(&format!("D {}\n", path.display())),
+            PatchChange::Updated { path } => output.push_str(&format!("M {}\n", path.display())),
+            PatchChange::Moved { from, to } => {
+                output.push_str(&format!("R {} -> {}\n", from.display(), to.display()));
+            }
+        }
+    }
+    output
 }
 
 fn format_process_response(tool: &str, response: RunnerResponse) -> Result<String> {

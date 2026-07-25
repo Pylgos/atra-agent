@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 const BEGIN: &str = "*** Begin Patch";
 const END: &str = "*** End Patch";
@@ -12,7 +13,16 @@ const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
 const MOVE: &str = "*** Move to: ";
 
-pub fn apply(patch: &str, cwd: &Path) -> Result<String> {
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PatchChange {
+    Added { path: PathBuf },
+    Deleted { path: PathBuf },
+    Updated { path: PathBuf },
+    Moved { from: PathBuf, to: PathBuf },
+}
+
+pub fn apply(patch: &str, cwd: &Path) -> Result<Vec<PatchChange>> {
     let operations = parse(patch)?;
     if operations.is_empty() {
         bail!("No files were modified.");
@@ -30,13 +40,13 @@ pub fn apply(patch: &str, cwd: &Path) -> Result<String> {
                 }
                 fs::write(&resolved, content)
                     .with_context(|| format!("Failed to write file {}", path.display()))?;
-                affected.push(('A', path));
+                affected.push(PatchChange::Added { path });
             }
             Operation::Delete { path } => {
                 let resolved = resolve(cwd, &path);
                 fs::remove_file(&resolved)
                     .with_context(|| format!("Failed to delete file {}", path.display()))?;
-                affected.push(('D', path));
+                affected.push(PatchChange::Deleted { path });
             }
             Operation::Update {
                 path,
@@ -62,20 +72,19 @@ pub fn apply(patch: &str, cwd: &Path) -> Result<String> {
                     })?;
                     fs::remove_file(&resolved)
                         .with_context(|| format!("Failed to remove original {}", path.display()))?;
+                    affected.push(PatchChange::Moved {
+                        from: path,
+                        to: destination,
+                    });
                 } else {
                     fs::write(&resolved, content)
                         .with_context(|| format!("Failed to write file {}", path.display()))?;
+                    affected.push(PatchChange::Updated { path });
                 }
-                affected.push(('M', path));
             }
         }
     }
-
-    let mut output = String::from("Success. Updated the following files:\n");
-    for (kind, path) in affected {
-        output.push_str(&format!("{kind} {}\n", path.display()));
-    }
-    Ok(output)
+    Ok(affected)
 }
 
 fn resolve(cwd: &Path, path: &Path) -> PathBuf {
