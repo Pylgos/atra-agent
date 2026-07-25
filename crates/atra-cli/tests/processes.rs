@@ -24,7 +24,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(turn.status.success(), "{turn:?}");
     assert_eq!(
         turn.stdout,
-        b"observed atra exec_command: process finished with exit code 0\nmodel-output\n"
+        b"observed model-output\natra exec_command: process finished with exit code 0\n"
     );
 
     let denied_thread = system.create_thread().await;
@@ -69,7 +69,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(allowed.status.success(), "{allowed:?}");
     assert_eq!(
         allowed.stdout,
-        b"approved atra exec_command: process finished with exit code 0\napproved-output\n"
+        b"approved approved-output\natra exec_command: process finished with exit code 0\n"
     );
 
     fs::write(
@@ -337,12 +337,12 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         events[3].payload["result"],
-        serde_json::json!("atra exec_command: process finished with exit code 0\nmodel-output")
+        serde_json::json!("model-output\natra exec_command: process finished with exit code 0")
     );
     assert_eq!(
         events[5].payload["content"],
         serde_json::json!(
-            "observed atra exec_command: process finished with exit code 0\nmodel-output"
+            "observed model-output\natra exec_command: process finished with exit code 0"
         )
     );
     let denied_events = system.events(denied_thread).await;
@@ -397,7 +397,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         allowed_events[5].payload["result"],
-        serde_json::json!("atra exec_command: process finished with exit code 0\napproved-output")
+        serde_json::json!("approved-output\natra exec_command: process finished with exit code 0")
     );
 }
 

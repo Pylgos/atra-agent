@@ -1425,24 +1425,24 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
             process_handle,
             output,
         } => Ok(format!(
-            "atra exec_command: process {process_handle} is still running\n{output}"
+            "{output}\natra exec_command: process {process_handle} is still running"
         )),
         RunnerResponse::ProcessFinished {
             output,
             exit_code: Some(0),
         } => Ok(format!(
-            "atra exec_command: process finished with exit code 0\n{output}"
+            "{output}\natra exec_command: process finished with exit code 0"
         )),
         RunnerResponse::ProcessFinished { output, exit_code } => {
             let exit_code = exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
             Ok(format!(
-                "atra exec_command: process finished with exit code {exit_code}\n{output}"
+                "{output}\natra exec_command: process finished with exit code {exit_code}"
             ))
         }
         RunnerResponse::ProcessTimedOut { output } => {
-            Ok(format!("atra exec_command: process timed out\n{output}"))
+            Ok(format!("{output}\natra exec_command: process timed out"))
         }
         RunnerResponse::Error { message } => bail!("{message}"),
         RunnerResponse::Ready
