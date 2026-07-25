@@ -424,7 +424,10 @@ impl State {
                 .thread_model(thread_id)
                 .await
                 .context("failed to load thread model")?;
-            let prompt_cache_key = format!("{}-{thread_id}", self.prompt_cache_namespace);
+            let prompt_cache_key = format!(
+                "{:x}",
+                Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
+            );
             let selected_model = self
                 .provider
                 .models()
