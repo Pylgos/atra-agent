@@ -1,9 +1,16 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use codex_api::{
-    AuthProvider, CompactClient, CompactionInput, Compression, ModelsClient, Reasoning,
-    ResponseEvent, ResponsesApiRequest, ResponsesApiTools, ResponsesClient, ResponsesOptions,
+    ApiError, AuthProvider, CompactClient, CompactionInput, Compression, ModelsClient, Reasoning,
+    ResponseCreateWsRequest, ResponseEvent, ResponseStream, ResponsesApiRequest, ResponsesApiTools,
+    ResponsesClient, ResponsesOptions, ResponsesWebsocketClient, ResponsesWebsocketConnection,
+    ResponsesWsRequest, TransportError,
 };
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
@@ -18,7 +25,7 @@ use codex_protocol::openai_models::ModelVisibility;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use serde_json::{json, value::RawValue};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use atra_protocol::Model;
 
@@ -27,10 +34,65 @@ use crate::storage::{Event, EventKind};
 
 const INSTRUCTIONS: &str = "You are Atra Agent. Use the provided tools when needed. \
 Return a final answer after completing the user's request.";
+const WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct CodexProvider {
     auth: Arc<AuthManager>,
     models: RwLock<Option<Vec<Model>>>,
+    sessions: Mutex<HashMap<String, Arc<CodexSession>>>,
+}
+
+struct CodexSession {
+    responses: ResponsesClient<codex_api::ReqwestTransport>,
+    compact: CompactClient<codex_api::ReqwestTransport>,
+    websocket: ResponsesWebsocketClient,
+    websocket_state: Mutex<WebsocketState>,
+    http_client_factory: HttpClientFactory,
+    session_id: String,
+    last_used_at: StdMutex<Instant>,
+}
+
+impl CodexSession {
+    fn touch(&self) {
+        *self
+            .last_used_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+    }
+
+    fn is_idle(&self, now: Instant) -> bool {
+        now.duration_since(
+            *self
+                .last_used_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) >= SESSION_IDLE_TTL
+    }
+}
+
+#[derive(Default)]
+struct WebsocketState {
+    connection: Option<ResponsesWebsocketConnection>,
+    last_request: Option<ResponsesApiRequest>,
+    last_response: Option<LastResponse>,
+    fallback_active: bool,
+}
+
+struct LastResponse {
+    id: String,
+    items: Vec<ResponseItem>,
+}
+
+pub(crate) struct CodexTurn {
+    session: Arc<CodexSession>,
+    turn_state: Arc<OnceLock<String>>,
+}
+
+struct CompletionReadError {
+    error: Error,
+    visible_output: bool,
+    report_fallback: bool,
 }
 
 impl CodexProvider {
@@ -52,6 +114,7 @@ impl CodexProvider {
                 .await,
             ),
             models: RwLock::new(None),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -66,6 +129,7 @@ impl CodexProvider {
     pub(super) async fn reload_auth(&self) {
         self.auth.reload().await;
         *self.models.write().await = None;
+        self.sessions.lock().await.clear();
     }
 
     pub(super) async fn logout(&self) -> Result<()> {
@@ -74,6 +138,7 @@ impl CodexProvider {
             .await
             .context("failed to log out of Codex")?;
         *self.models.write().await = None;
+        self.sessions.lock().await.clear();
         Ok(())
     }
 
@@ -157,91 +222,57 @@ impl CodexProvider {
         Ok(models)
     }
 
-    pub(super) async fn complete(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-        prompt_cache_key: &str,
-    ) -> Result<ModelCompletion> {
+    pub(super) async fn start_turn(&self, session_id: String) -> Result<CodexTurn> {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, session| !session.is_idle(now));
+        if let Some(session) = sessions.get(&session_id) {
+            session.touch();
+            return Ok(CodexTurn {
+                session: session.clone(),
+                turn_state: Arc::new(OnceLock::new()),
+            });
+        }
+        drop(sessions);
         let auth = self
             .auth
             .auth()
             .await
             .filter(CodexAuth::is_chatgpt_auth)
             .context("Codex login required; run `atra codex login`")?;
-        let request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
         let provider = ModelProviderInfo::create_openai_provider(None)
             .to_api_provider(Some(auth.auth_mode()))
             .context("failed to configure Codex model endpoint")?;
         let api_auth = Arc::new(BearerAuth::new(&auth)?);
-        let client = ResponsesClient::new(
-            codex_api::ReqwestTransport::from_http_client(create_client()),
-            provider,
-            api_auth,
-        );
-        let mut stream = client
-            .stream_request(
-                request,
-                ResponsesOptions {
-                    extra_headers: HeaderMap::new(),
-                    compression: Compression::None,
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("Codex request failed")?;
-
-        let mut response = None;
-        let mut reasoning = Vec::new();
-        let mut token_usage = None;
-        while let Some(event) = stream.next().await {
-            match event.context("Codex response stream failed")? {
-                ResponseEvent::OutputTextDelta(delta) => {
-                    if let Some(updates) = updates {
-                        updates.send(ModelStreamEvent::AssistantDelta(delta)).ok();
-                    }
-                }
-                ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
-                    id: Some(item_id),
-                    name,
-                    ..
-                }) => {
-                    if let Some(updates) = updates {
-                        updates
-                            .send(ModelStreamEvent::ToolCallStarted {
-                                item_id: item_id.to_string(),
-                                name,
-                            })
-                            .ok();
-                    }
-                }
-                ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
-                    if let Some(updates) = updates {
-                        updates
-                            .send(ModelStreamEvent::ToolCallDelta { item_id, delta })
-                            .ok();
-                    }
-                }
-                ResponseEvent::OutputItemDone(item) => {
-                    if matches!(item, ResponseItem::Reasoning { .. }) {
-                        reasoning.push(item);
-                    } else if let Some(item_response) = response_from_item(item)? {
-                        response = Some(item_response);
-                    }
-                }
-                ResponseEvent::Completed {
-                    token_usage: usage, ..
-                } => token_usage = usage,
-                _ => {}
-            }
-        }
-        Ok(ModelCompletion {
-            response: response
-                .context("Codex response ended without an assistant message or tool call")?,
-            reasoning,
-            token_usage,
+        let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let session = Arc::new(CodexSession {
+            responses: ResponsesClient::new(
+                codex_api::ReqwestTransport::from_http_client(create_client()),
+                provider.clone(),
+                api_auth.clone(),
+            ),
+            compact: CompactClient::new(
+                codex_api::ReqwestTransport::from_http_client(create_client()),
+                provider.clone(),
+                api_auth.clone(),
+            ),
+            websocket: ResponsesWebsocketClient::new(provider.clone(), api_auth),
+            websocket_state: Mutex::new(WebsocketState::default()),
+            http_client_factory,
+            session_id,
+            last_used_at: StdMutex::new(now),
+        });
+        let mut sessions = self.sessions.lock().await;
+        let session = if let Some(cached) = sessions.get(&session.session_id) {
+            cached.touch();
+            cached.clone()
+        } else {
+            sessions.insert(session.session_id.clone(), session.clone());
+            session
+        };
+        Ok(CodexTurn {
+            session,
+            turn_state: Arc::new(OnceLock::new()),
         })
     }
 
@@ -282,6 +313,197 @@ impl CodexProvider {
         })
         .context("failed to encode Codex compaction snapshot")
     }
+}
+
+impl CodexTurn {
+    pub(super) async fn complete(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        prompt_cache_key: &str,
+    ) -> Result<ModelCompletion> {
+        self.session.touch();
+        let mut request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
+        request.client_metadata = Some(HashMap::from([
+            ("session_id".to_owned(), self.session.session_id.clone()),
+            ("thread_id".to_owned(), self.session.session_id.clone()),
+        ]));
+        match self.complete_websocket(&request, updates).await {
+            Ok(completion) => Ok(completion),
+            Err(failure) if !failure.visible_output => {
+                if failure.report_fallback {
+                    tracing::warn!(
+                        error = %format!("{:#}", failure.error),
+                        session_id = %self.session.session_id,
+                        "Codex websocket failed before emitting output; falling back to SSE"
+                    );
+                }
+                self.complete_sse(request, updates).await
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    async fn complete_websocket(
+        &self,
+        request: &ResponsesApiRequest,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> std::result::Result<ModelCompletion, CompletionReadError> {
+        let mut state = self.session.websocket_state.lock().await;
+        if state.fallback_active {
+            return Err(CompletionReadError {
+                error: anyhow::anyhow!("websocket fallback is active for this session"),
+                visible_output: false,
+                report_fallback: false,
+            });
+        }
+
+        let closed = match state.connection.as_ref() {
+            Some(connection) => connection.is_closed().await,
+            None => true,
+        };
+        if closed {
+            state.connection = None;
+            state.last_request = None;
+            state.last_response = None;
+        }
+
+        if state.connection.is_none() {
+            let headers = self
+                .websocket_headers()
+                .map_err(|error| CompletionReadError {
+                    error,
+                    visible_output: false,
+                    report_fallback: true,
+                })?;
+            match self
+                .session
+                .websocket
+                .connect(
+                    &self.session.http_client_factory,
+                    headers,
+                    HeaderMap::new(),
+                    Some(self.turn_state.clone()),
+                    None,
+                )
+                .await
+            {
+                Ok(connection) => {
+                    state.connection = Some(connection);
+                }
+                Err(error) => {
+                    state.fallback_active = is_upgrade_required(&error);
+                    return Err(CompletionReadError {
+                        error: Error::new(error).context("failed to connect Codex websocket"),
+                        visible_output: false,
+                        report_fallback: true,
+                    });
+                }
+            }
+        }
+
+        let incremental = websocket_incremental_input(
+            state.last_request.as_ref(),
+            state.last_response.as_ref(),
+            request,
+        );
+        let previous_response_id = incremental.as_ref().and_then(|_| {
+            state
+                .last_response
+                .as_ref()
+                .map(|response| response.id.clone())
+        });
+        let input = incremental.as_deref().unwrap_or(&request.input);
+        let mut client_metadata = request.client_metadata.clone().unwrap_or_default();
+        if let Some(turn_state) = self.turn_state.get() {
+            client_metadata.insert("x-codex-turn-state".to_owned(), turn_state.clone());
+        }
+        let ws_request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            previous_response_id,
+            input,
+            client_metadata: Some(client_metadata),
+            ..ResponseCreateWsRequest::from(request)
+        });
+        let connection = state
+            .connection
+            .as_ref()
+            .expect("connection was established");
+        let stream = match connection
+            .stream_request(
+                ws_request,
+                state.last_request.is_some(),
+                Some(self.turn_state.clone()),
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                state.connection = None;
+                state.last_request = None;
+                state.last_response = None;
+                state.fallback_active = is_upgrade_required(&error);
+                return Err(CompletionReadError {
+                    error: Error::new(error).context("failed to start Codex websocket request"),
+                    visible_output: false,
+                    report_fallback: true,
+                });
+            }
+        };
+
+        match read_completion(stream, updates).await {
+            Ok((completion, response)) => {
+                state.last_request = Some(request.clone());
+                state.last_response = Some(response);
+                Ok(completion)
+            }
+            Err(failure) => {
+                state.connection = None;
+                state.last_request = None;
+                state.last_response = None;
+                Err(failure)
+            }
+        }
+    }
+
+    async fn complete_sse(
+        &self,
+        request: ResponsesApiRequest,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ModelCompletion> {
+        let stream = self
+            .session
+            .responses
+            .stream_request(
+                request,
+                ResponsesOptions {
+                    session_id: Some(self.session.session_id.clone()),
+                    thread_id: Some(self.session.session_id.clone()),
+                    compression: Compression::None,
+                    turn_state: Some(self.turn_state.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Codex request failed")?;
+        read_completion(stream, updates)
+            .await
+            .map(|(completion, _)| completion)
+            .map_err(|failure| failure.error)
+    }
+
+    fn websocket_headers(&self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let session_id = HeaderValue::from_str(&self.session.session_id)
+            .context("model session ID is not a valid header value")?;
+        headers.insert("session-id", session_id.clone());
+        headers.insert("thread-id", session_id.clone());
+        headers.insert("x-client-request-id", session_id);
+        headers.insert("originator", HeaderValue::from_static("atra"));
+        headers.insert("openai-beta", HeaderValue::from_static(WEBSOCKET_BETA));
+        Ok(headers)
+    }
 
     pub(super) async fn compact(
         &self,
@@ -290,22 +512,21 @@ impl CodexProvider {
         events: &[Event],
         prompt_cache_key: &str,
     ) -> Result<Vec<ResponseItem>> {
-        let auth = self
-            .auth
-            .auth()
-            .await
-            .filter(CodexAuth::is_chatgpt_auth)
-            .context("Codex login required; run `atra codex login`")?;
-        let provider = ModelProviderInfo::create_openai_provider(None)
-            .to_api_provider(Some(auth.auth_mode()))
-            .context("failed to configure Codex compaction endpoint")?;
-        let client = CompactClient::new(
-            codex_api::ReqwestTransport::from_http_client(create_client()),
-            provider,
-            Arc::new(BearerAuth::new(&auth)?),
-        );
+        self.session.touch();
+        let mut state = self.session.websocket_state.lock().await;
+        state.connection = None;
+        state.last_request = None;
+        state.last_response = None;
+        drop(state);
         let input = model_input(events)?;
-        client
+        let mut headers = HeaderMap::new();
+        let session_id = HeaderValue::from_str(&self.session.session_id)
+            .context("model session ID is not a valid header value")?;
+        headers.insert("session-id", session_id.clone());
+        headers.insert("thread-id", session_id.clone());
+        headers.insert("x-client-request-id", session_id);
+        self.session
+            .compact
             .compact_input(
                 &CompactionInput {
                     model,
@@ -318,13 +539,176 @@ impl CodexProvider {
                     prompt_cache_key: Some(prompt_cache_key),
                     text: None,
                 },
-                HeaderMap::new(),
+                headers,
                 Duration::from_secs(300),
-                None,
+                Some(self.turn_state.as_ref()),
             )
             .await
             .context("Codex compaction failed")
     }
+}
+
+fn is_upgrade_required(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Transport(TransportError::Http { status, .. })
+            if *status == http::StatusCode::UPGRADE_REQUIRED
+    )
+}
+
+async fn read_completion(
+    mut stream: ResponseStream,
+    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+) -> std::result::Result<(ModelCompletion, LastResponse), CompletionReadError> {
+    let mut response = None;
+    let mut response_id = None;
+    let mut response_items = Vec::new();
+    let mut reasoning = Vec::new();
+    let mut token_usage = None;
+    let mut visible_output = false;
+
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|error| CompletionReadError {
+            error: Error::new(error).context("Codex response stream failed"),
+            visible_output,
+            report_fallback: true,
+        })?;
+        match event {
+            ResponseEvent::OutputTextDelta(delta) => {
+                if let Some(updates) = updates {
+                    visible_output |= updates
+                        .send(ModelStreamEvent::AssistantDelta(delta))
+                        .is_ok();
+                }
+            }
+            ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
+                id: Some(item_id),
+                name,
+                ..
+            }) => {
+                if let Some(updates) = updates {
+                    visible_output |= updates
+                        .send(ModelStreamEvent::ToolCallStarted {
+                            item_id: item_id.to_string(),
+                            name,
+                        })
+                        .is_ok();
+                }
+            }
+            ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
+                if let Some(updates) = updates {
+                    visible_output |= updates
+                        .send(ModelStreamEvent::ToolCallDelta { item_id, delta })
+                        .is_ok();
+                }
+            }
+            ResponseEvent::OutputItemDone(item) => {
+                response_items.push(item.clone());
+                if matches!(item, ResponseItem::Reasoning { .. }) {
+                    reasoning.push(item);
+                } else if let Some(item_response) =
+                    response_from_item(item).map_err(|error| CompletionReadError {
+                        error,
+                        visible_output,
+                        report_fallback: true,
+                    })?
+                {
+                    response = Some(item_response);
+                }
+            }
+            ResponseEvent::Completed {
+                response_id: id,
+                token_usage: usage,
+                ..
+            } => {
+                response_id = Some(id);
+                token_usage = usage;
+            }
+            _ => {}
+        }
+    }
+
+    let response = response.ok_or_else(|| CompletionReadError {
+        error: anyhow::anyhow!("Codex response ended without an assistant message or tool call"),
+        visible_output,
+        report_fallback: true,
+    })?;
+    let response_id = response_id.ok_or_else(|| CompletionReadError {
+        error: anyhow::anyhow!("Codex response ended without a response ID"),
+        visible_output,
+        report_fallback: true,
+    })?;
+    Ok((
+        ModelCompletion {
+            response,
+            reasoning,
+            token_usage,
+        },
+        LastResponse {
+            id: response_id,
+            items: response_items,
+        },
+    ))
+}
+
+fn websocket_incremental_input(
+    previous_request: Option<&ResponsesApiRequest>,
+    previous_response: Option<&LastResponse>,
+    request: &ResponsesApiRequest,
+) -> Option<Vec<ResponseItem>> {
+    let previous_request = previous_request?;
+    let previous_response = previous_response?;
+    if !request_properties_match(previous_request, request) {
+        return None;
+    }
+
+    let baseline_len = previous_request
+        .input
+        .len()
+        .checked_add(previous_response.items.len())?;
+    if request.input.len() < baseline_len {
+        return None;
+    }
+    let (prefix, incremental) = request.input.split_at(baseline_len);
+    let (request_prefix, response_prefix) = prefix.split_at(previous_request.input.len());
+    if request_prefix != previous_request.input
+        || !response_prefix
+            .iter()
+            .zip(&previous_response.items)
+            .all(|(current, previous)| response_items_equal(current, previous))
+    {
+        return None;
+    }
+    Some(incremental.to_vec())
+}
+
+fn request_properties_match(previous: &ResponsesApiRequest, current: &ResponsesApiRequest) -> bool {
+    let Ok(mut previous) = serde_json::to_value(previous) else {
+        return false;
+    };
+    let Ok(mut current) = serde_json::to_value(current) else {
+        return false;
+    };
+    for request in [&mut previous, &mut current] {
+        if let Some(request) = request.as_object_mut() {
+            request.remove("input");
+            request.remove("client_metadata");
+        }
+    }
+    previous == current
+}
+
+fn response_items_equal(current: &ResponseItem, previous: &ResponseItem) -> bool {
+    if current == previous {
+        return true;
+    }
+    let mut current = current.clone();
+    current.set_id(None);
+    current.clear_internal_chat_message_metadata_passthrough();
+    let mut previous = previous.clone();
+    previous.set_id(None);
+    previous.clear_internal_chat_message_metadata_passthrough();
+    current == previous
 }
 
 fn completion_request(

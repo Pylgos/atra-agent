@@ -435,6 +435,11 @@ impl State {
         thread_id: i64,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
+        let prompt_cache_key = format!(
+            "{:x}",
+            Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
+        );
+        let model_session = self.provider.start_turn(&prompt_cache_key).await?;
         loop {
             let mut events = self
                 .store
@@ -446,10 +451,6 @@ impl State {
                 .thread_model(thread_id)
                 .await
                 .context("failed to load thread model")?;
-            let prompt_cache_key = format!(
-                "{:x}",
-                Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
-            );
             let selected_model = self
                 .provider
                 .models()
@@ -499,8 +500,7 @@ impl State {
                 )
                 .await
                 .context("failed to save compaction request")?;
-                let items = self
-                    .provider
+                let items = model_session
                     .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
                     .await?;
                 if !items.is_empty() {
@@ -537,8 +537,7 @@ impl State {
                 )
                 .await
                 .context("failed to save model request")?;
-            let completion = self
-                .provider
+            let completion = model_session
                 .complete(
                     &model,
                     &reasoning_effort,

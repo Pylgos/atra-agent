@@ -11,8 +11,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, COMMAND_HELP, FocusPane, ModelPicker, ThreadPicker, TranscriptMode, layout_transcript,
-    prepare_transcript, sanitize, transcript_lines, transcript_ranges,
+    Activity, App, COMMAND_HELP, FocusPane, ModelPicker, ThreadPicker, TranscriptMode,
+    layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
 };
 
 impl App {
@@ -24,12 +24,13 @@ impl App {
             .filter(|byte| *byte == b'\n')
             .count() as u16
             + 3)
-        .min(frame.area().height.saturating_sub(5).max(3));
-        let [main, input, command] = Layout::default()
+        .min(frame.area().height.saturating_sub(6).max(3));
+        let [main, input, activity_area, status] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(4),
                 Constraint::Length(input_height),
+                Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .areas(frame.area());
@@ -82,17 +83,22 @@ impl App {
         if self.command_open {
             frame.render_widget(
                 Paragraph::new(format!("/{}", self.command_input.value)),
-                command,
+                activity_area,
             );
             frame.set_cursor_position((
-                command.x
+                activity_area.x
                     + self.command_input.value[..self.command_input.cursor].width() as u16
                     + 1,
-                command.y,
+                activity_area.y,
             ));
-        } else {
-            frame.render_widget(Paragraph::new(self.status.as_str()), command);
+        } else if let Some(activity) = &self.activity {
+            let (message, style) = match activity {
+                Activity::Info(message) => (message, Style::default().fg(Color::Yellow)),
+                Activity::Error(message) => (message, Style::default().fg(Color::Red)),
+            };
+            frame.render_widget(Paragraph::new(message.as_str()).style(style), activity_area);
         }
+        frame.render_widget(Paragraph::new(self.status_line()), status);
         if !self.command_open
             && self.approval.is_none()
             && self.model_picker.is_none()
@@ -125,6 +131,65 @@ impl App {
         } else {
             Style::default()
         }
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        let selected = self
+            .threads
+            .iter()
+            .find(|thread| Some(thread.id) == self.thread_id)
+            .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
+            .or_else(|| {
+                self.new_thread_model
+                    .as_ref()
+                    .map(|(model, effort)| (model.as_str(), effort.as_str()))
+            });
+        let Some((model, effort)) = selected else {
+            return Line::from("model — · context — · cache —");
+        };
+        let usage = (!self.metrics_stale)
+            .then(|| {
+                self.events.iter().rev().find_map(|event| {
+                    if event.kind == "model_request"
+                        && event.payload["kind"] == "response"
+                        && event
+                            .payload
+                            .pointer("/request/model")
+                            .and_then(|value| value.as_str())
+                            == Some(model)
+                    {
+                        self.usage_for(event.sequence).map(|usage| (event, usage))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .flatten();
+        let (context, cache) = usage.map_or_else(
+            || ("—".to_owned(), "—".to_owned()),
+            |(request, usage)| {
+                let input = usage["input_tokens"].as_f64().unwrap_or_default();
+                let context = request.payload["context_window"]
+                    .as_f64()
+                    .filter(|window| *window > 0.0)
+                    .map_or_else(
+                        || "—".to_owned(),
+                        |window| format!("{:.0}%", input / window * 100.0),
+                    );
+                let cache = if input > 0.0 {
+                    format!(
+                        "{:.0}%",
+                        usage["cached_input_tokens"].as_f64().unwrap_or_default() / input * 100.0
+                    )
+                } else {
+                    "—".to_owned()
+                };
+                (context, cache)
+            },
+        );
+        Line::from(format!(
+            "{model} ({effort}) · context {context} · cache {cache}"
+        ))
     }
 
     fn render_coding_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {

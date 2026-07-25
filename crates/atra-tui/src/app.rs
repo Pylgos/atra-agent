@@ -204,6 +204,11 @@ pub(crate) struct TurnCompletion {
     response: ControllerResponse,
 }
 
+pub(crate) enum Activity {
+    Info(String),
+    Error(String),
+}
+
 pub(crate) enum TurnUpdate {
     Started {
         message: String,
@@ -241,7 +246,7 @@ pub(crate) struct App {
     pub(crate) command_open: bool,
     pub(crate) help_open: bool,
     pub(crate) word_segmenter: WordSegmenterBorrowed<'static>,
-    pub(crate) status: String,
+    pub(crate) activity: Option<Activity>,
     pub(crate) approval: Option<Approval>,
     pub(crate) renaming: bool,
     pub(crate) model_picker: Option<ModelPicker>,
@@ -252,6 +257,7 @@ pub(crate) struct App {
     pub(crate) selection_end: Option<SelectionPoint>,
     pub(crate) transcript_layout: TranscriptLayout,
     pub(crate) turn_pending: bool,
+    pub(crate) metrics_stale: bool,
     pub(crate) transcript_mode: TranscriptMode,
     pub(crate) focus: FocusPane,
     pub(crate) transcript_scroll: usize,
@@ -317,12 +323,12 @@ impl App {
             command_open: false,
             help_open: false,
             word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
-            status: if login_required {
+            activity: Some(Activity::Info(if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
             } else {
                 "/thread · /new · /model · Ctrl-P/Ctrl-/ command · Tab focus · Ctrl-C copies"
                     .to_owned()
-            },
+            })),
             approval: None,
             renaming: false,
             model_picker: None,
@@ -333,6 +339,7 @@ impl App {
             selection_end: None,
             transcript_layout: TranscriptLayout { rows: Vec::new() },
             turn_pending: false,
+            metrics_stale: false,
             transcript_mode: TranscriptMode::Coding,
             focus: FocusPane::Input,
             transcript_scroll: 0,
@@ -404,7 +411,7 @@ impl App {
                 && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
             if toggle || matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 self.help_open = false;
-                self.status = "Ready".to_owned();
+                self.activity = None;
             }
             return Ok(false);
         }
@@ -415,7 +422,7 @@ impl App {
             if toggle || key.code == KeyCode::Esc {
                 self.command_open = false;
                 self.command_input.clear();
-                self.status = "Ready".to_owned();
+                self.activity = None;
                 return Ok(false);
             }
             if matches!(
@@ -475,17 +482,21 @@ impl App {
                         .and_then(|thread| thread.display_name.clone())
                         .unwrap_or_default();
                     self.message_input.set(display_name);
-                    self.status = "Enter saves the thread name · Esc cancels".to_owned();
+                    self.activity = Some(Activity::Info(
+                        "Enter saves the thread name · Esc cancels".to_owned(),
+                    ));
                 }
                 KeyCode::Char('l') if self.login_required => {
-                    self.status = "Complete Codex login in your browser…".to_owned();
+                    self.activity = Some(Activity::Info(
+                        "Complete Codex login in your browser…".to_owned(),
+                    ));
                     match request(&self.endpoint, ControllerRequest::CodexLogin).await? {
                         ControllerResponse::CodexLoggedIn { .. } => {
                             self.login_required = false;
-                            self.status = "Codex login complete".to_owned();
+                            self.activity = Some(Activity::Info("Codex login complete".to_owned()));
                         }
                         ControllerResponse::Error { message } => {
-                            self.status = sanitize(&message);
+                            self.activity = Some(Activity::Error(sanitize(&message)));
                         }
                         response => {
                             bail!("controller returned an unexpected response: {response:?}")
@@ -548,7 +559,7 @@ impl App {
                 KeyCode::Esc => {
                     self.renaming = false;
                     self.message_input.clear();
-                    self.status = "Ready".to_owned();
+                    self.activity = None;
                 }
                 _ => {
                     self.message_input.handle_key(key, &self.word_segmenter);
@@ -593,17 +604,19 @@ impl App {
                 KeyCode::Enter if picker.selecting_effort => self.change_model().await?,
                 KeyCode::Enter => {
                     picker.selecting_effort = true;
-                    self.status =
-                        "Select reasoning effort · Enter applies · Esc goes back".to_owned();
+                    self.activity = Some(Activity::Info(
+                        "Select reasoning effort · Enter applies · Esc goes back".to_owned(),
+                    ));
                 }
                 KeyCode::Esc => {
                     if picker.selecting_effort {
                         picker.selecting_effort = false;
-                        self.status =
-                            "Select model · Enter chooses effort · Esc cancels".to_owned();
+                        self.activity = Some(Activity::Info(
+                            "Select model · Enter chooses effort · Esc cancels".to_owned(),
+                        ));
                     } else {
                         self.model_picker = None;
-                        self.status = "Ready".to_owned();
+                        self.activity = None;
                     }
                 }
                 _ => {}
@@ -624,7 +637,7 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.thread_picker = None;
-                    self.status = "Ready".to_owned();
+                    self.activity = None;
                 }
                 _ => {}
             }
@@ -661,21 +674,26 @@ impl App {
                 };
                 self.focus = FocusPane::Input;
                 self.clear_selection();
-                self.status = match self.transcript_mode {
-                    TranscriptMode::Coding => "Coding transcript".to_owned(),
-                    TranscriptMode::Debug => "LLM request inspector".to_owned(),
-                };
+                self.activity = Some(Activity::Info(
+                    match self.transcript_mode {
+                        TranscriptMode::Coding => "Coding transcript",
+                        TranscriptMode::Debug => "LLM request inspector",
+                    }
+                    .to_owned(),
+                ));
             }
             "thread" => self.open_thread_picker(),
             "new" => self.start_new_thread(),
             "model" => self.open_model_picker()?,
             "help" => {
                 self.help_open = true;
-                self.status = "Command help".to_owned();
+                self.activity = Some(Activity::Info("Command help".to_owned()));
             }
             "exit" => return Ok(true),
-            "" => self.status = "Ready".to_owned(),
-            command => self.status = format!("Unknown command: /{command}"),
+            "" => self.activity = None,
+            command => {
+                self.activity = Some(Activity::Error(format!("Unknown command: /{command}")))
+            }
         }
         Ok(false)
     }
@@ -693,14 +711,15 @@ impl App {
         self.new_thread_model = None;
         self.clear_selection();
         self.reset_view();
-        self.status = "New thread".to_owned();
+        self.metrics_stale = false;
+        self.activity = Some(Activity::Info("New thread".to_owned()));
     }
 
     fn open_model_picker(&mut self) -> Result<()> {
         self.renaming = false;
         self.thread_picker = None;
         if self.models.is_empty() {
-            self.status = "No models are available".to_owned();
+            self.activity = Some(Activity::Info("No models are available".to_owned()));
             return Ok(());
         }
         let selected = self
@@ -729,7 +748,9 @@ impl App {
             effort_index,
             selecting_effort: false,
         });
-        self.status = "Select model · Enter chooses effort · Esc cancels".to_owned();
+        self.activity = Some(Activity::Info(
+            "Select model · Enter chooses effort · Esc cancels".to_owned(),
+        ));
         Ok(())
     }
 
@@ -737,7 +758,7 @@ impl App {
         self.renaming = false;
         self.model_picker = None;
         if self.threads.is_empty() {
-            self.status = "No threads are available".to_owned();
+            self.activity = Some(Activity::Info("No threads are available".to_owned()));
             return;
         }
         let selected = self
@@ -746,7 +767,9 @@ impl App {
             .position(|thread| Some(thread.id) == self.thread_id)
             .unwrap_or(0);
         self.thread_picker = Some(ThreadPicker { selected });
-        self.status = "Select thread · Enter switches · Esc cancels".to_owned();
+        self.activity = Some(Activity::Info(
+            "Select thread · Enter switches · Esc cancels".to_owned(),
+        ));
     }
 
     async fn select_thread(&mut self, thread_id: i64) -> Result<()> {
@@ -758,7 +781,8 @@ impl App {
         self.model_picker = None;
         self.clear_selection();
         self.reset_view();
-        self.status = "Thread selected".to_owned();
+        self.metrics_stale = false;
+        self.activity = Some(Activity::Info("Thread selected".to_owned()));
         Ok(())
     }
 
@@ -935,7 +959,7 @@ impl App {
         self.transcript
             .push(TranscriptEntry::message(Author::User, sanitize(&message)));
         self.turn_pending = true;
-        self.status = "Waiting for Atra Controller…".to_owned();
+        self.activity = Some(Activity::Info("Waiting for Atra Controller…".to_owned()));
         let endpoint = self.endpoint.clone();
         let existing_thread_id = self.thread_id;
         let new_thread_model = self.new_thread_model.take();
@@ -1061,7 +1085,7 @@ impl App {
                     thread.display_name = Some(display_name);
                 }
                 self.renaming = false;
-                self.status = "Thread renamed".to_owned();
+                self.activity = Some(Activity::Info("Thread renamed".to_owned()));
                 Ok(())
             }
             ControllerResponse::Error { message } => bail!("{message}"),
@@ -1084,7 +1108,8 @@ impl App {
         let Some(thread_id) = self.thread_id else {
             self.new_thread_model = Some((model, reasoning_effort));
             self.model_picker = None;
-            self.status = "Model selected for new thread".to_owned();
+            self.metrics_stale = true;
+            self.activity = Some(Activity::Info("Model selected for new thread".to_owned()));
             return Ok(());
         };
         match request(
@@ -1107,7 +1132,8 @@ impl App {
                     thread.reasoning_effort = reasoning_effort;
                 }
                 self.model_picker = None;
-                self.status = "Thread model changed".to_owned();
+                self.metrics_stale = true;
+                self.activity = Some(Activity::Info("Thread model changed".to_owned()));
                 Ok(())
             }
             ControllerResponse::Error { message } => bail!("{message}"),
@@ -1131,7 +1157,7 @@ impl App {
         };
         self.approval = None;
         self.turn_pending = true;
-        self.status = "Waiting for Atra Controller…".to_owned();
+        self.activity = Some(Activity::Info("Waiting for Atra Controller…".to_owned()));
         let endpoint = self.endpoint.clone();
         let thread_id = self.thread_id.expect("approval belongs to a thread");
         let turns = turns.clone();
@@ -1214,6 +1240,26 @@ impl App {
             }
             TurnUpdate::Event { thread_id, event } => {
                 if self.thread_id == Some(thread_id) {
+                    let usage_matches_selected_model = event.kind == "token_usage"
+                        && event.payload["request_sequence"]
+                            .as_i64()
+                            .and_then(|sequence| {
+                                self.events.iter().find(|event| event.sequence == sequence)
+                            })
+                            .and_then(|event| event.payload.pointer("/request/model"))
+                            .and_then(serde_json::Value::as_str)
+                            .zip(
+                                self.threads
+                                    .iter()
+                                    .find(|thread| thread.id == thread_id)
+                                    .map(|thread| thread.model.as_str()),
+                            )
+                            .is_some_and(|(request_model, selected_model)| {
+                                request_model == selected_model
+                            });
+                    if usage_matches_selected_model {
+                        self.metrics_stale = false;
+                    }
                     self.events.push(event.clone());
                     let item_id = event
                         .payload
@@ -1241,7 +1287,7 @@ impl App {
                     self.transcript.remove(index);
                 }
                 self.turn_pending = false;
-                self.status = sanitize(&format!("{error:#}"));
+                self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                 return Ok(());
             }
         };
@@ -1254,12 +1300,12 @@ impl App {
                         .last()
                         .is_some_and(TranscriptEntry::is_assistant_message) =>
                 {
-                    self.status = "Ready".to_owned();
+                    self.activity = None;
                 }
                 response => self.accept_turn_response(response)?,
             }
         } else {
-            self.status = "Ready".to_owned();
+            self.activity = None;
         }
         Ok(())
     }
@@ -1271,7 +1317,7 @@ impl App {
                     Author::Assistant,
                     sanitize(&content),
                 ));
-                self.status = "Ready".to_owned();
+                self.activity = None;
             }
             ControllerResponse::ApprovalRequired {
                 approval_id,
@@ -1283,10 +1329,12 @@ impl App {
                     id: approval_id,
                     description: sanitize(&format!("{tool} {arguments}")),
                 });
-                self.status = "Approval required: y allow · n deny".to_owned();
+                self.activity = Some(Activity::Info(
+                    "Approval required: y allow · n deny".to_owned(),
+                ));
             }
             ControllerResponse::Error { message } => {
-                self.status = sanitize(&message);
+                self.activity = Some(Activity::Error(sanitize(&message)));
             }
             response => bail!("controller returned an unexpected response: {response:?}"),
         }
@@ -1328,7 +1376,7 @@ impl App {
         )
         .context("failed to write OSC 52 clipboard sequence")?;
         io::stdout().flush().context("failed to flush OSC 52")?;
-        self.status = "Copied selection".to_owned();
+        self.activity = Some(Activity::Info("Copied selection".to_owned()));
         Ok(())
     }
 

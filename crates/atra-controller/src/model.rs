@@ -52,6 +52,11 @@ pub(crate) enum Provider {
     Codex(CodexProvider),
 }
 
+pub(crate) enum TurnSession<'a> {
+    Fake(&'a FakeProvider),
+    Codex(codex::CodexTurn),
+}
+
 impl Provider {
     pub(crate) fn fake(path: &Path) -> Result<Self> {
         Ok(Self::Fake(FakeProvider::load(path)?))
@@ -98,21 +103,12 @@ impl Provider {
         }
     }
 
-    pub(crate) async fn complete(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
-        prompt_cache_key: &str,
-    ) -> Result<ModelCompletion> {
+    pub(crate) async fn start_turn(&self, session_id: &str) -> Result<TurnSession<'_>> {
         match self {
-            Self::Fake(provider) => provider.complete(events).await,
-            Self::Codex(provider) => {
-                provider
-                    .complete(model, reasoning_effort, events, updates, prompt_cache_key)
-                    .await
-            }
+            Self::Fake(provider) => Ok(TurnSession::Fake(provider)),
+            Self::Codex(provider) => Ok(TurnSession::Codex(
+                provider.start_turn(session_id.to_owned()).await?,
+            )),
         }
     }
 
@@ -136,23 +132,6 @@ impl Provider {
         }
     }
 
-    pub(crate) async fn compact(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<Vec<ResponseItem>> {
-        match self {
-            Self::Fake(_) => Ok(Vec::new()),
-            Self::Codex(provider) => {
-                provider
-                    .compact(model, reasoning_effort, events, prompt_cache_key)
-                    .await
-            }
-        }
-    }
-
     pub(crate) fn compaction_snapshot(
         &self,
         model: &str,
@@ -170,6 +149,43 @@ impl Provider {
             })),
             Self::Codex(provider) => {
                 provider.compaction_snapshot(model, reasoning_effort, events, prompt_cache_key)
+            }
+        }
+    }
+}
+
+impl TurnSession<'_> {
+    pub(crate) async fn complete(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
+        prompt_cache_key: &str,
+    ) -> Result<ModelCompletion> {
+        match self {
+            Self::Fake(provider) => provider.complete(events).await,
+            Self::Codex(session) => {
+                session
+                    .complete(model, reasoning_effort, events, updates, prompt_cache_key)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn compact(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<Vec<ResponseItem>> {
+        match self {
+            Self::Fake(_) => Ok(Vec::new()),
+            Self::Codex(session) => {
+                session
+                    .compact(model, reasoning_effort, events, prompt_cache_key)
+                    .await
             }
         }
     }
