@@ -72,69 +72,6 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         b"approved approved-output\natra exec_command: process finished with exit code 0\n"
     );
 
-    fs::write(
-        system.workspace.path().join("patch-target.txt"),
-        "alpha\n  old spacing\nmiddle one\nmiddle two\nomega\n",
-    )
-    .unwrap();
-    fs::write(system.workspace.path().join("delete-me.txt"), "obsolete\n").unwrap();
-    fs::write(system.workspace.path().join("move-me.txt"), "old tail\n").unwrap();
-    let patch = "*** Begin Patch\n\
-*** Update File: patch-target.txt\n\
-@@\n\
--old spacing\n\
-+new spacing\n\
-@ start 3\n\
--middle one\n\
-@ end 4\n\
--middle two\n\
-+middle replacement\n\
-*** Add File: added.txt\n\
-+added\n\
-*** Delete File: delete-me.txt\n\
-*** Update File: move-me.txt\n\
-*** Move to: moved.txt\n\
-@@\n\
--old tail\n\
-+new tail\n\
-*** End of File\n\
-\n\
-*** End Patch\n";
-    let patched = system.apply_patch("one", patch).await;
-    assert!(patched.status.success(), "{patched:?}");
-    assert_eq!(
-        fs::read_to_string(system.workspace.path().join("patch-target.txt")).unwrap(),
-        "alpha\nnew spacing\nmiddle replacement\nomega\n"
-    );
-    assert_eq!(
-        fs::read_to_string(system.workspace.path().join("added.txt")).unwrap(),
-        "added\n"
-    );
-    assert!(!system.workspace.path().join("delete-me.txt").exists());
-    assert!(!system.workspace.path().join("move-me.txt").exists());
-    assert_eq!(
-        fs::read_to_string(system.workspace.path().join("moved.txt")).unwrap(),
-        "new tail\n"
-    );
-    let partial = system
-        .apply_patch(
-            "one",
-            "*** Begin Patch\n\
-*** Add File: applied-before-error.txt\n\
-+kept\n\
-*** Update File: missing.txt\n\
-@@\n\
--missing\n\
-+changed\n\
-*** End Patch\n",
-        )
-        .await;
-    assert!(!partial.status.success(), "{partial:?}");
-    assert_eq!(
-        fs::read_to_string(system.workspace.path().join("applied-before-error.txt")).unwrap(),
-        "kept\n"
-    );
-
     let patch_thread = system.create_thread().await;
     let pending = system
         .send_message(patch_thread, "request an approved patch")
@@ -553,24 +490,6 @@ impl TestSystem {
             .trim()
             .parse()
             .unwrap()
-    }
-
-    async fn apply_patch(&self, runner: &str, patch: &str) -> std::process::Output {
-        let mut child = self
-            .atra()
-            .args(["runner", "apply-patch", "--name", runner])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        use tokio::io::AsyncWriteExt;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(patch.as_bytes())
-            .await
-            .unwrap();
-        child.wait_with_output().await.unwrap()
     }
 
     async fn send_message(&self, thread: i64, message: &str) -> std::process::Output {

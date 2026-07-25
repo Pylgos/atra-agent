@@ -14,7 +14,7 @@ use rustix::process::getuid;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::UnixStream,
     process::Command as TokioCommand,
     time::{Instant, sleep},
@@ -175,10 +175,6 @@ enum RunnerCommand {
         timeout_ms: Option<u64>,
         #[arg(long, value_enum, default_value_t = OnTimeout::ReturnRunning)]
         on_timeout: OnTimeout,
-    },
-    ApplyPatch {
-        #[arg(long)]
-        name: String,
     },
     Wait {
         #[arg(long)]
@@ -558,31 +554,6 @@ async fn run(command: Command) -> Result<()> {
                 atra_tui::run(endpoint, message_history, command_history).await
             } else {
                 Ok(())
-            }
-        }
-        Command::Runner {
-            command: RunnerCommand::ApplyPatch { name },
-        } => {
-            let mut patch = String::new();
-            tokio::io::stdin()
-                .read_to_string(&mut patch)
-                .await
-                .context("failed to read patch from stdin")?;
-            match send_controller_request(
-                &endpoint,
-                ControllerRequest::ApplyPatch {
-                    runner: name,
-                    patch,
-                },
-            )
-            .await?
-            {
-                ControllerResponse::PatchApplied { output } => {
-                    print!("{output}");
-                    Ok(())
-                }
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
             }
         }
         Command::Runner {
@@ -1090,8 +1061,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ProcessFinished { .. }
         | ControllerResponse::ProcessTimedOut { .. }
         | ControllerResponse::InputWritten
-        | ControllerResponse::ProcessStopped { .. }
-        | ControllerResponse::PatchApplied { .. } => {
+        | ControllerResponse::ProcessStopped { .. } => {
             bail!("controller returned an unexpected process response")
         }
         ControllerResponse::Error { message } => bail!("{message}"),

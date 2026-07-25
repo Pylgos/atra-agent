@@ -351,13 +351,6 @@ impl State {
                     })
                     .await
             }
-            ControllerRequest::ApplyPatch { runner, patch } => {
-                tracing::debug!(runner, "applying patch");
-                self.runner(&runner)
-                    .await?
-                    .request(RunnerRequest::ApplyPatch { patch })
-                    .await
-            }
             ControllerRequest::WaitProcess {
                 runner,
                 process_handle,
@@ -1530,9 +1523,9 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::ProcessStopped { output } => Ok(ControllerResponse::ProcessStopped {
             output: format_command_output(&output),
         }),
-        RunnerResponse::PatchCompleted { result } => Ok(ControllerResponse::PatchApplied {
-            output: format_patch_result(&result),
-        }),
+        RunnerResponse::PatchCompleted { .. } => {
+            bail!("runner returned an unexpected patch response")
+        }
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }

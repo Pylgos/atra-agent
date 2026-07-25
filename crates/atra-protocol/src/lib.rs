@@ -68,10 +68,6 @@ pub enum ControllerRequest {
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
     },
-    ApplyPatch {
-        runner: String,
-        patch: String,
-    },
     WaitProcess {
         runner: String,
         process_handle: String,
@@ -155,9 +151,6 @@ pub enum ControllerResponse {
     },
     InputWritten,
     ProcessStopped {
-        output: String,
-    },
-    PatchApplied {
         output: String,
     },
     Error {
