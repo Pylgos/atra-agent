@@ -4,7 +4,7 @@ use crate::storage::Event;
 use anyhow::Result;
 use atra_protocol::{Model, ThreadEvent};
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
 use serde::Deserialize;
 
 use self::{codex::CodexProvider, fake::FakeProvider};
@@ -45,6 +45,7 @@ pub(crate) struct ModelCompletion {
     pub response: ModelResponse,
     pub reasoning: Vec<ResponseItem>,
     pub token_usage: Option<TokenUsage>,
+    pub rate_limits: Vec<RateLimitSnapshot>,
 }
 
 pub(crate) enum Provider {

@@ -21,6 +21,7 @@ pub(crate) enum EventKind {
     Compaction,
     ModelRequest,
     TokenUsage,
+    RateLimits,
 }
 
 impl EventKind {
@@ -36,6 +37,7 @@ impl EventKind {
             Self::Compaction => "compaction",
             Self::ModelRequest => "model_request",
             Self::TokenUsage => "token_usage",
+            Self::RateLimits => "rate_limits",
         }
     }
 }

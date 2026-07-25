@@ -8,12 +8,57 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState,
     },
 };
+use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     Activity, App, COMMAND_HELP, FocusPane, ModelPicker, ThreadPicker, TranscriptMode,
     layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
 };
+
+fn quota_delta(first: &Value, current: &Value) -> Option<f64> {
+    (first["resets_at"] == current["resets_at"]).then(|| {
+        current["used_percent"].as_f64().unwrap_or_default()
+            - first["used_percent"].as_f64().unwrap_or_default()
+    })
+}
+
+fn format_quota_window(window: &Value, delta: Option<f64>) -> (String, Option<(String, f64)>) {
+    let label = window["window_minutes"].as_i64().map_or_else(
+        || "?".to_owned(),
+        |minutes| {
+            if minutes == 7 * 24 * 60 {
+                "weekly".to_owned()
+            } else {
+                format_window_duration(minutes)
+            }
+        },
+    );
+    let remaining = (100.0 - window["used_percent"].as_f64().unwrap_or_default()).clamp(0.0, 100.0);
+    let reset = window["resets_at"]
+        .as_i64()
+        .and_then(|reset| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+            Some(format_window_duration((reset - now).max(0) / 60))
+        })
+        .unwrap_or_else(|| "?".to_owned());
+    let content = format!("{label} {remaining:.0}%/{reset}");
+    let delta = delta
+        .filter(|delta| *delta > 0.0)
+        .map(|delta| (label, delta));
+    (content, delta)
+}
+
+fn format_window_duration(minutes: i64) -> String {
+    if minutes >= 24 * 60 {
+        format!("{:.0}d", minutes as f64 / (24 * 60) as f64)
+    } else if minutes >= 60 {
+        format!("{:.0}h", minutes as f64 / 60.0)
+    } else {
+        format!("{minutes}m")
+    }
+}
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
@@ -187,9 +232,110 @@ impl App {
                 (context, cache)
             },
         );
-        Line::from(format!(
-            "{model} ({effort}) · context {context} · cache {cache}"
-        ))
+        let mut spans = vec![
+            Span::styled(
+                format!("{model} ({effort})"),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                format!("context {context}"),
+                Style::default().fg(Color::Blue),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                format!("cache {cache}"),
+                Style::default().fg(Color::LightMagenta),
+            ),
+        ];
+        spans.extend(self.quota_status());
+        Line::from(spans)
+    }
+
+    fn quota_status(&self) -> Vec<Span<'static>> {
+        let snapshots = self
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "rate_limits")
+            .and_then(|event| event.payload["snapshots"].as_array());
+        let Some(snapshot) = snapshots.and_then(|snapshots| {
+            snapshots
+                .iter()
+                .rev()
+                .find(|snapshot| snapshot["limit_id"] == "codex")
+                .or_else(|| snapshots.last())
+        }) else {
+            return Vec::new();
+        };
+        let first_snapshot = self
+            .events
+            .iter()
+            .find(|event| event.kind == "rate_limits")
+            .and_then(|event| event.payload["snapshots"].as_array())
+            .and_then(|snapshots| {
+                snapshots
+                    .iter()
+                    .find(|candidate| candidate["limit_id"] == snapshot["limit_id"])
+                    .or_else(|| snapshots.first())
+            });
+        let windows = ["primary", "secondary"]
+            .into_iter()
+            .filter_map(|name| {
+                let current = snapshot.get(name)?;
+                (!current.is_null()).then(|| {
+                    let delta = first_snapshot
+                        .and_then(|first| first.get(name))
+                        .and_then(|first| quota_delta(first, current));
+                    format_quota_window(current, delta)
+                })
+            })
+            .collect::<Vec<_>>();
+        let credits = snapshot
+            .pointer("/credits/balance")
+            .and_then(Value::as_str)
+            .filter(|balance| balance.parse::<f64>().is_ok_and(|balance| balance > 0.0));
+        if windows.is_empty() && credits.is_none() {
+            return Vec::new();
+        }
+        let mut spans = vec![Span::raw(" · ")];
+        let mut has_detail = false;
+        let mut deltas = Vec::new();
+        for (index, (window, delta)) in windows.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" · "));
+            }
+            let color = if index == 0 {
+                Color::Cyan
+            } else {
+                Color::Green
+            };
+            spans.push(Span::styled(window, Style::default().fg(color)));
+            deltas.extend(delta);
+            has_detail = true;
+        }
+        if !deltas.is_empty() {
+            spans.push(Span::raw(" · "));
+            let deltas = deltas
+                .into_iter()
+                .map(|(label, delta)| format!("{label} +{delta:.1}pt"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            spans.push(Span::styled(
+                format!("thread {deltas}"),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        if let Some(balance) = credits {
+            if has_detail {
+                spans.push(Span::raw(" · "));
+            }
+            spans.push(Span::styled(
+                format!("credits {balance}"),
+                Style::default().fg(Color::Blue),
+            ));
+        }
+        spans
     }
 
     fn render_coding_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {

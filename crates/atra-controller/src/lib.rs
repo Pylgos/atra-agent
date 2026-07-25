@@ -565,6 +565,19 @@ impl State {
                 .await
                 .context("failed to save token usage")?;
             }
+            if !completion.rate_limits.is_empty() {
+                self.append_event(
+                    thread_id,
+                    EventKind::RateLimits,
+                    json!({
+                        "request_sequence": request_sequence,
+                        "snapshots": completion.rate_limits,
+                    }),
+                    updates,
+                )
+                .await
+                .context("failed to save rate limits")?;
+            }
 
             match completion.response {
                 ModelResponse::AssistantMessage { content } => {

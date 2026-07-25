@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -21,6 +22,12 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 use tokio::sync::mpsc;
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
@@ -1856,10 +1863,14 @@ fn tool_call_lines(
                 .and_then(|arguments| arguments.get("command"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            vec![
-                (Some('┌'), Line::from(location)),
-                (Some('$'), Line::from(command.to_owned())),
-            ]
+            let mut lines = vec![(Some('┌'), Line::from(location))];
+            lines.extend(
+                bash_lines(command)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| ((index == 0).then_some('$'), line)),
+            );
+            lines
         }
         "apply_patch" => {
             let input = arguments
@@ -1939,6 +1950,50 @@ fn tool_call_lines(
             lines
         }
     }
+}
+
+fn bash_lines(command: &str) -> Vec<Line<'static>> {
+    static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+    static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+    let syntax = SYNTAX_SET
+        .find_syntax_by_token("bash")
+        .expect("syntect includes bash syntax");
+    let mut highlighter = HighlightLines::new(syntax, &THEME_SET.themes["base16-ocean.dark"]);
+    let mut lines = LinesWithEndings::from(command)
+        .map(|line| {
+            let spans = highlighter
+                .highlight_line(line, &SYNTAX_SET)
+                .expect("bundled bash syntax is valid")
+                .into_iter()
+                .filter_map(|(style, text)| {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    (!text.is_empty()).then(|| {
+                        let mut ratatui_style = Style::default().fg(Color::Rgb(
+                            style.foreground.r,
+                            style.foreground.g,
+                            style.foreground.b,
+                        ));
+                        if style.font_style.contains(FontStyle::BOLD) {
+                            ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+                        }
+                        if style.font_style.contains(FontStyle::ITALIC) {
+                            ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+                        }
+                        if style.font_style.contains(FontStyle::UNDERLINE) {
+                            ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        Span::styled(text.to_owned(), ratatui_style)
+                    })
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines
 }
 
 fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {

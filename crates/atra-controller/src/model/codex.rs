@@ -565,6 +565,7 @@ async fn read_completion(
     let mut response_items = Vec::new();
     let mut reasoning = Vec::new();
     let mut token_usage = None;
+    let mut rate_limits = Vec::new();
     let mut visible_output = false;
 
     while let Some(event) = stream.next().await {
@@ -624,6 +625,9 @@ async fn read_completion(
                 response_id = Some(id);
                 token_usage = usage;
             }
+            ResponseEvent::RateLimits(snapshot) => {
+                rate_limits.push(snapshot);
+            }
             _ => {}
         }
     }
@@ -643,6 +647,7 @@ async fn read_completion(
             response,
             reasoning,
             token_usage,
+            rate_limits,
         },
         LastResponse {
             id: response_id,
@@ -852,7 +857,8 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                     | EventKind::ApprovalResponse
                     | EventKind::Compaction
                     | EventKind::ModelRequest
-                    | EventKind::TokenUsage => return None,
+                    | EventKind::TokenUsage
+                    | EventKind::RateLimits => return None,
                 };
                 Some(Ok(item))
             })

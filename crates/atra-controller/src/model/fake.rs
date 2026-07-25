@@ -45,6 +45,7 @@ impl FakeProvider {
             response,
             reasoning: Vec::new(),
             token_usage: None,
+            rate_limits: Vec::new(),
         })
     }
 }

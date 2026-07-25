@@ -589,6 +589,7 @@ dependencies = [
  "insta",
  "ratatui",
  "serde_json",
+ "syntect",
  "tokio",
  "tui-markdown",
  "unicode-width 0.2.2",
