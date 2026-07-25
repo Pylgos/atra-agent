@@ -60,11 +60,10 @@ pub(crate) enum TranscriptItem {
     ToolResult {
         result: serde_json::Value,
     },
-    ApprovalRequest {
-        tool: String,
-    },
-    ApprovalResponse {
-        allowed: bool,
+    Approval {
+        id: u64,
+        tool: Option<String>,
+        allowed: Option<bool>,
     },
 }
 
@@ -169,7 +168,7 @@ pub(crate) enum Author {
 
 pub(crate) struct Approval {
     pub(crate) id: u64,
-    pub(crate) description: String,
+    pub(crate) deny_reason: Option<InputBuffer>,
 }
 
 pub(crate) struct ModelPicker {
@@ -443,6 +442,35 @@ impl App {
             return Ok(false);
         }
 
+        if let Some(approval) = &mut self.approval {
+            if let Some(reason) = &mut approval.deny_reason {
+                match key.code {
+                    KeyCode::Enter => {
+                        let id = approval.id;
+                        let reason = reason.take();
+                        let reason = (!reason.trim().is_empty()).then_some(reason);
+                        self.resolve_approval(id, false, reason, turns);
+                    }
+                    KeyCode::Esc => approval.deny_reason = None,
+                    _ => {
+                        reason.handle_key(key, &self.word_segmenter);
+                    }
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        let id = approval.id;
+                        self.resolve_approval(id, true, None, turns);
+                    }
+                    KeyCode::Char('n') => {
+                        approval.deny_reason = Some(InputBuffer::new(Vec::new(), false));
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+
         if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('m') {
             self.open_model_picker()?;
             return Ok(false);
@@ -540,21 +568,6 @@ impl App {
         }
         if key.code == KeyCode::BackTab {
             self.cycle_focus(true);
-            return Ok(false);
-        }
-
-        if let Some(approval) = &self.approval {
-            match key.code {
-                KeyCode::Char('y') => {
-                    let id = approval.id;
-                    self.resolve_approval(id, true, turns);
-                }
-                KeyCode::Char('n') => {
-                    let id = approval.id;
-                    self.resolve_approval(id, false, turns);
-                }
-                _ => {}
-            }
             return Ok(false);
         }
 
@@ -1152,6 +1165,7 @@ impl App {
         &mut self,
         approval_id: u64,
         allowed: bool,
+        reason: Option<String>,
         turns: &mpsc::UnboundedSender<TurnUpdate>,
     ) {
         let request_message = if allowed {
@@ -1159,7 +1173,7 @@ impl App {
         } else {
             ControllerRequest::ApprovalDeny {
                 approval_id,
-                reason: None,
+                reason,
             }
         };
         self.approval = None;
@@ -1284,7 +1298,7 @@ impl App {
                         self.transcript[index].replace(item);
                         return Ok(());
                     }
-                    self.transcript.push(TranscriptEntry::new(item));
+                    push_transcript_item(&mut self.transcript, item);
                 }
                 return Ok(());
             }
@@ -1326,19 +1340,12 @@ impl App {
                 ));
                 self.activity = None;
             }
-            ControllerResponse::ApprovalRequired {
-                approval_id,
-                tool,
-                arguments,
-                ..
-            } => {
+            ControllerResponse::ApprovalRequired { approval_id, .. } => {
                 self.approval = Some(Approval {
                     id: approval_id,
-                    description: sanitize(&format!("{tool} {arguments}")),
+                    deny_reason: None,
                 });
-                self.activity = Some(Activity::Info(
-                    "Approval required: y allow · n deny".to_owned(),
-                ));
+                self.activity = None;
             }
             ControllerResponse::Error { message } => {
                 self.activity = Some(Activity::Error(sanitize(&message)));
@@ -1790,13 +1797,23 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
                 .map(|line| (None, Line::from(line.to_owned())))
                 .collect()
         }
-        TranscriptItem::ApprovalRequest { tool } => {
-            vec![(Some('?'), Line::from(format!("{tool} approval")))]
+        TranscriptItem::Approval { tool, allowed, .. } => {
+            let decision = allowed.map(|allowed| if allowed { "approved" } else { "denied" });
+            let message = match (tool, decision) {
+                (Some(tool), Some(decision)) => format!("{tool} {decision}"),
+                (Some(tool), None) => format!("{tool} approval"),
+                (None, Some(decision)) => decision.to_owned(),
+                (None, None) => unreachable!(),
+            };
+            vec![(
+                Some(match allowed {
+                    Some(true) => '✓',
+                    Some(false) => '✗',
+                    None => '?',
+                }),
+                Line::from(message),
+            )]
         }
-        TranscriptItem::ApprovalResponse { allowed } => vec![(
-            Some(if *allowed { '✓' } else { '✗' }),
-            Line::from(if *allowed { "approved" } else { "denied" }),
-        )],
         TranscriptItem::Message { .. } => unreachable!(),
     };
     if logical_lines.is_empty() {
@@ -1829,9 +1846,15 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         } => Style::default().fg(Color::Cyan),
         TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
-        TranscriptItem::ApprovalRequest { .. } => Style::default().fg(Color::Yellow),
-        TranscriptItem::ApprovalResponse { allowed: true } => Style::default().fg(Color::Green),
-        TranscriptItem::ApprovalResponse { allowed: false } => Style::default().fg(Color::Red),
+        TranscriptItem::Approval { allowed: None, .. } => Style::default().fg(Color::Yellow),
+        TranscriptItem::Approval {
+            allowed: Some(true),
+            ..
+        } => Style::default().fg(Color::Green),
+        TranscriptItem::Approval {
+            allowed: Some(false),
+            ..
+        } => Style::default().fg(Color::Red),
     };
     if selected {
         style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -2169,15 +2192,13 @@ async fn load_transcript(
     thread_id: i64,
 ) -> Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)> {
     match request(endpoint, ControllerRequest::ThreadEvents { thread_id }).await? {
-        ControllerResponse::ThreadEvents { events } => Ok((
-            events
-                .iter()
-                .cloned()
-                .filter_map(event_to_item)
-                .map(TranscriptEntry::new)
-                .collect(),
-            events,
-        )),
+        ControllerResponse::ThreadEvents { events } => {
+            let mut transcript = Vec::new();
+            for item in events.iter().cloned().filter_map(event_to_item) {
+                push_transcript_item(&mut transcript, item);
+            }
+            Ok((transcript, events))
+        }
         ControllerResponse::Error { message } => bail!("{message}"),
         response => bail!("controller returned an unexpected response: {response:?}"),
     }
@@ -2206,14 +2227,39 @@ fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
         "tool_result" => Some(TranscriptItem::ToolResult {
             result: sanitize_value(event.payload.get("result")?.clone()),
         }),
-        "approval_request" => Some(TranscriptItem::ApprovalRequest {
-            tool: sanitize(event.payload.get("tool")?.as_str()?),
+        "approval_request" => Some(TranscriptItem::Approval {
+            id: event.payload.get("approval_id")?.as_u64()?,
+            tool: Some(sanitize(event.payload.get("tool")?.as_str()?)),
+            allowed: None,
         }),
-        "approval_response" => Some(TranscriptItem::ApprovalResponse {
-            allowed: event.payload.get("decision")?.as_str()? == "allow",
+        "approval_response" => Some(TranscriptItem::Approval {
+            id: event.payload.get("approval_id")?.as_u64()?,
+            tool: None,
+            allowed: Some(event.payload.get("decision")?.as_str()? == "allow"),
         }),
         _ => return None,
     }
+}
+
+fn push_transcript_item(transcript: &mut Vec<TranscriptEntry>, item: TranscriptItem) {
+    if let TranscriptItem::Approval {
+        id,
+        tool: None,
+        allowed: Some(allowed),
+    } = &item
+        && let Some(entry) = transcript.last_mut()
+        && let TranscriptItem::Approval {
+            id: request_id,
+            tool: Some(_),
+            allowed: request_allowed @ None,
+        } = &mut entry.item
+        && request_id == id
+    {
+        *request_allowed = Some(*allowed);
+        entry.rendered = None;
+        return;
+    }
+    transcript.push(TranscriptEntry::new(item));
 }
 
 fn sanitize_value(value: serde_json::Value) -> serde_json::Value {

@@ -62,14 +62,18 @@ fn format_window_duration(minutes: i64) -> String {
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = (self
-            .message_input
-            .value
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u16
-            + 3)
-        .min(frame.area().height.saturating_sub(6).max(3));
+        let input_height = if self.approval.is_some() {
+            3
+        } else {
+            (self
+                .message_input
+                .value
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u16
+                + 3)
+            .min(frame.area().height.saturating_sub(6).max(3))
+        };
         let [main, input, activity_area, status] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -86,21 +90,38 @@ impl App {
             TranscriptMode::Debug => self.render_debug_transcript(frame, main),
         }
 
-        let input_title = if self.renaming {
-            "Thread name".to_owned()
-        } else {
-            match &self.approval {
-                Some(approval) => format!("Approval: {}", approval.description),
-                None => "Message".to_owned(),
-            }
+        let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.approval
+        {
+            Some(approval) => match &approval.deny_reason {
+                Some(reason) => (
+                    "Deny reason (optional)",
+                    Some(Line::from("Enter: deny · Esc: back").right_aligned()),
+                    reason.value.as_str(),
+                    reason.cursor,
+                    true,
+                ),
+                None => ("Approval required", None, "[y] Allow  [n] Deny", 0, false),
+            },
+            None if self.renaming => (
+                "Thread name",
+                None,
+                self.message_input.value.as_str(),
+                self.message_input.cursor,
+                true,
+            ),
+            None => (
+                "Message",
+                Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
+                self.message_input.value.as_str(),
+                self.message_input.cursor,
+                true,
+            ),
         };
-        let input_hint = (!self.renaming && self.approval.is_none())
-            .then(|| Line::from("Enter: newline · Ctrl-G: send").right_aligned());
         let mut input_block = Block::default().title(input_title);
-        if let Some(hint) = input_hint {
-            input_block = input_block.title_bottom(hint);
+        if let Some(input_hint) = input_hint {
+            input_block = input_block.title_bottom(input_hint);
         }
-        let input_before_cursor = &self.message_input.value[..self.message_input.cursor];
+        let input_before_cursor = &input_value[..input_cursor];
         let cursor_row = input_before_cursor
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -116,7 +137,7 @@ impl App {
         let vertical_scroll =
             cursor_row.saturating_sub(visible_input_height.saturating_sub(1)) as u16;
         frame.render_widget(
-            Paragraph::new(self.message_input.value.as_str())
+            Paragraph::new(input_value)
                 .scroll((vertical_scroll, horizontal_scroll))
                 .block(
                     input_block
@@ -145,10 +166,10 @@ impl App {
         }
         frame.render_widget(Paragraph::new(self.status_line()), status);
         if !self.command_open
-            && self.approval.is_none()
             && self.model_picker.is_none()
             && self.thread_picker.is_none()
             && self.focus == FocusPane::Input
+            && show_cursor
         {
             frame.set_cursor_position((
                 input.x + 1 + cursor_column as u16 - horizontal_scroll,
@@ -235,7 +256,9 @@ impl App {
         let mut spans = vec![
             Span::styled(
                 format!("{model} ({effort})"),
-                Style::default().fg(Color::Yellow),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
             ),
             Span::raw(" · "),
             Span::styled(
