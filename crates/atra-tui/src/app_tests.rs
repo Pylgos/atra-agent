@@ -87,9 +87,10 @@ fn layout_mapping_does_not_insert_soft_wraps() {
     let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0);
 
     let text = transcript_text(&items);
-    assert_eq!(text, "abcdefgh\nsecond\n");
+    assert_eq!(text, "finished · exit 0\nabcdefgh\nsecond\n");
     assert_eq!(layout.rows[0].cells, vec![0, 1]);
-    assert_eq!(&text[0..8], "abcdefgh");
+    let output_start = text.find("abcdefgh").unwrap();
+    assert_eq!(&text[output_start..output_start + 8], "abcdefgh");
 }
 
 #[test]
