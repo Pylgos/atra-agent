@@ -83,7 +83,7 @@ impl CodexProvider {
             .context("failed to configure Codex model endpoint")?;
         let request_url = ModelsClient::<codex_api::ReqwestTransport>::request_url(
             &provider,
-            env!("CARGO_PKG_VERSION"),
+            &codex_models_manager::client_version_to_whole(),
         );
         let client = ModelsClient::new(
             codex_api::ReqwestTransport::from_http_client(create_client()),
