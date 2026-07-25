@@ -26,6 +26,7 @@ impl App {
             .constraints([Constraint::Length(18), Constraint::Min(20)])
             .areas(main);
         self.sidebar = sidebar;
+        self.input_area = input;
 
         let threads = std::iter::once(ListItem::new("+ New thread"))
             .chain(self.threads.iter().map(|thread| {
@@ -68,7 +69,12 @@ impl App {
         frame.render_widget(
             Paragraph::new(self.input.as_str())
                 .scroll((0, horizontal_scroll))
-                .block(Block::default().title(input_title).borders(Borders::ALL)),
+                .block(
+                    Block::default()
+                        .title(input_title)
+                        .borders(Borders::ALL)
+                        .border_style(self.focus_border_style(FocusPane::Input)),
+                ),
             input,
         );
         frame.render_widget(Paragraph::new(self.status.as_str()), status);
@@ -84,15 +90,21 @@ impl App {
         }
     }
 
+    fn focus_border_style(&self, pane: FocusPane) -> Style {
+        if self.approval.is_none() && self.model_picker.is_none() && self.focus == pane {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        }
+    }
+
     fn render_coding_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.request_list_area = Rect::default();
         self.detail_area = Rect::default();
-        let title = if self.focus == FocusPane::Transcript {
-            "Transcript · focused"
-        } else {
-            "Transcript"
-        };
-        let block = Block::default().title(title).borders(Borders::ALL);
+        let block = Block::default()
+            .title("Transcript")
+            .borders(Borders::ALL)
+            .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
         let (lines, tool_ranges) = transcript_lines(
             &self.transcript,
@@ -210,12 +222,9 @@ impl App {
         frame.render_widget(
             Paragraph::new(request_lines).block(
                 Block::default()
-                    .title(if self.focus == FocusPane::Requests {
-                        "LLM requests · focused"
-                    } else {
-                        "LLM requests"
-                    })
-                    .borders(Borders::ALL),
+                    .title("LLM requests")
+                    .borders(Borders::ALL)
+                    .border_style(self.focus_border_style(FocusPane::Requests)),
             ),
             requests,
         );
@@ -233,12 +242,9 @@ impl App {
                 .scroll((self.detail_scroll as u16, 0))
                 .block(
                     Block::default()
-                        .title(if self.focus == FocusPane::Detail {
-                            "Context · focused · r raw/semantic"
-                        } else {
-                            "Context · r raw/semantic"
-                        })
-                        .borders(Borders::ALL),
+                        .title("Context · r raw/semantic")
+                        .borders(Borders::ALL)
+                        .border_style(self.focus_border_style(FocusPane::Detail)),
                 ),
             detail,
         );

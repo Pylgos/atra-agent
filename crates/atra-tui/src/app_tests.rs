@@ -71,6 +71,7 @@ fn transcript_render_is_stable() {
         expanded_tools: HashSet::new(),
         selected_tool: None,
         transcript_area: Rect::default(),
+        input_area: Rect::default(),
         request_list_area: Rect::default(),
         detail_area: Rect::default(),
         tool_areas: Vec::new(),

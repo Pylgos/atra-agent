@@ -187,6 +187,7 @@ pub(crate) struct App {
     pub(crate) expanded_tools: HashSet<usize>,
     pub(crate) selected_tool: Option<usize>,
     pub(crate) transcript_area: Rect,
+    pub(crate) input_area: Rect,
     pub(crate) request_list_area: Rect,
     pub(crate) detail_area: Rect,
     pub(crate) tool_areas: Vec<(usize, Rect)>,
@@ -259,6 +260,7 @@ impl App {
             expanded_tools: HashSet::new(),
             selected_tool: None,
             transcript_area: Rect::default(),
+            input_area: Rect::default(),
             request_list_area: Rect::default(),
             detail_area: Rect::default(),
             tool_areas: Vec::new(),
@@ -347,6 +349,7 @@ impl App {
                 KeyCode::Char('r') if self.thread_id.is_some() => {
                     self.renaming = true;
                     self.model_picker = None;
+                    self.focus = FocusPane::Input;
                     self.input = self
                         .threads
                         .iter()
@@ -592,6 +595,13 @@ impl App {
             }
             _ => {}
         }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.input_area.contains((mouse.column, mouse.row).into())
+        {
+            self.focus = FocusPane::Input;
+            return Ok(());
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.sidebar.contains((mouse.column, mouse.row).into())
             && mouse.row > self.sidebar.y
