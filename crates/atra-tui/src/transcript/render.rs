@@ -289,22 +289,13 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
             })
             .flatten()
             .collect(),
-        TranscriptItem::Approval { tool, allowed, .. } => {
-            let decision = allowed.map(|allowed| if allowed { "approved" } else { "denied" });
-            let message = match (tool, decision) {
-                (Some(tool), Some(decision)) => format!("{tool} {decision}"),
-                (Some(tool), None) => format!("{tool} approval"),
-                (None, Some(decision)) => decision.to_owned(),
-                (None, None) => unreachable!(),
-            };
-            vec![(
-                Some(match allowed {
-                    Some(true) => '✓',
-                    Some(false) => '✗',
-                    None => '?',
-                }),
-                Line::from(message),
-            )]
+        TranscriptItem::ToolDenied { reason } => {
+            let mut message = "denied".to_owned();
+            if let Some(reason) = reason {
+                message.push_str(": ");
+                message.push_str(reason);
+            }
+            vec![(Some('✗'), Line::from(message))]
         }
         TranscriptItem::Message { .. } => unreachable!(),
     };
@@ -338,15 +329,7 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         } => Style::default().fg(Color::Cyan),
         TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
-        TranscriptItem::Approval { allowed: None, .. } => Style::default().fg(Color::Yellow),
-        TranscriptItem::Approval {
-            allowed: Some(true),
-            ..
-        } => Style::default().fg(Color::Green),
-        TranscriptItem::Approval {
-            allowed: Some(false),
-            ..
-        } => Style::default().fg(Color::Red),
+        TranscriptItem::ToolDenied { .. } => Style::default().fg(Color::Red),
     };
     if selected {
         style.add_modifier(Modifier::REVERSED | Modifier::BOLD)

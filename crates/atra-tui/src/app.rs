@@ -941,7 +941,7 @@ impl App {
                         self.transcript[index].replace(item);
                         return Ok(());
                     }
-                    push_transcript_item(&mut self.transcript, item);
+                    self.transcript.push(TranscriptEntry::new(item));
                 }
                 return Ok(());
             }
@@ -1270,34 +1270,13 @@ pub(super) async fn load_transcript(
         ControllerResponse::ThreadEvents { events } => {
             let mut transcript = Vec::new();
             for item in events.iter().cloned().filter_map(item_from_event) {
-                push_transcript_item(&mut transcript, item);
+                transcript.push(TranscriptEntry::new(item));
             }
             Ok((transcript, events))
         }
         ControllerResponse::Error { message } => bail!("{message}"),
         response => bail!("controller returned an unexpected response: {response:?}"),
     }
-}
-
-fn push_transcript_item(transcript: &mut Vec<TranscriptEntry>, item: TranscriptItem) {
-    if let TranscriptItem::Approval {
-        id,
-        tool: None,
-        allowed: Some(allowed),
-    } = &item
-        && let Some(entry) = transcript.last_mut()
-        && let TranscriptItem::Approval {
-            id: request_id,
-            tool: Some(_),
-            allowed: request_allowed @ None,
-        } = &mut entry.item
-        && request_id == id
-    {
-        *request_allowed = Some(*allowed);
-        entry.rendered = None;
-        return;
-    }
-    transcript.push(TranscriptEntry::new(item));
 }
 
 #[cfg(test)]

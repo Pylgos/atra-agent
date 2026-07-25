@@ -123,34 +123,3 @@ fn markdown_and_partial_patch_render_before_completion() {
     assert!(rendered.contains("*** Update File: src/main.rs"));
     assert!(rendered.contains("+new"));
 }
-
-#[test]
-fn approval_response_updates_the_matching_request() {
-    let mut transcript = Vec::new();
-    push_transcript_item(
-        &mut transcript,
-        TranscriptItem::Approval {
-            id: 7,
-            tool: Some("exec_command".to_owned()),
-            allowed: None,
-        },
-    );
-    push_transcript_item(
-        &mut transcript,
-        TranscriptItem::Approval {
-            id: 7,
-            tool: None,
-            allowed: Some(false),
-        },
-    );
-
-    assert_eq!(transcript.len(), 1);
-    assert!(matches!(
-        transcript[0].item,
-        TranscriptItem::Approval {
-            id: 7,
-            allowed: Some(false),
-            ..
-        }
-    ));
-}

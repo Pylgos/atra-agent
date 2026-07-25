@@ -26,10 +26,8 @@ pub(crate) enum TranscriptItem {
     ToolResult {
         artifacts: Vec<ToolArtifact>,
     },
-    Approval {
-        id: u64,
-        tool: Option<String>,
-        allowed: Option<bool>,
+    ToolDenied {
+        reason: Option<String>,
     },
 }
 
@@ -159,16 +157,11 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 })
                 .collect(),
         }),
-        "approval_request" => Some(TranscriptItem::Approval {
-            id: event.payload.get("approval_id")?.as_u64()?,
-            tool: Some(sanitize(event.payload.get("tool")?.as_str()?)),
-            allowed: None,
-        }),
-        "approval_response" => Some(TranscriptItem::Approval {
-            id: event.payload.get("approval_id")?.as_u64()?,
-            tool: None,
-            allowed: Some(event.payload.get("decision")?.as_str()? == "allow"),
-        }),
+        "approval_response" if event.payload.get("decision")?.as_str()? == "deny" => {
+            Some(TranscriptItem::ToolDenied {
+                reason: event.payload.get("reason")?.as_str().map(sanitize),
+            })
+        }
         _ => None,
     }
 }
