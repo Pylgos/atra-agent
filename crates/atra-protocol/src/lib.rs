@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use atra_patch::ApplyPatchResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -259,18 +261,18 @@ pub enum RunnerResponse {
     },
     ProcessRunning {
         process_handle: String,
-        output: String,
+        output: CommandOutput,
     },
     ProcessFinished {
-        output: String,
+        output: CommandOutput,
         exit_code: Option<i32>,
     },
     ProcessTimedOut {
-        output: String,
+        output: CommandOutput,
     },
     InputWritten,
     ProcessStopped {
-        output: String,
+        output: CommandOutput,
     },
     PatchCompleted {
         result: ApplyPatchResult,
@@ -278,4 +280,11 @@ pub enum RunnerResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CommandOutput {
+    pub content: String,
+    pub omitted_bytes: usize,
+    pub full_output_path: PathBuf,
 }

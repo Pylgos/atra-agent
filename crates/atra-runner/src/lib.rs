@@ -17,7 +17,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, TimeoutAction,
+    CommandOutput, RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
+    TimeoutAction,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rustix::process::{Pid, Signal, kill_process_group};
@@ -75,7 +76,7 @@ async fn serve(
     )
     .await?;
 
-    let processes = Arc::new(ProcessManager::default());
+    let processes = Arc::new(ProcessManager::new()?);
     loop {
         line.clear();
         if reader
@@ -286,12 +287,20 @@ async fn install_tool(name: &str, digest: &str, blob: &str) -> Result<PathBuf> {
     .context("tool install task failed")?
 }
 
-#[derive(Default)]
 struct ProcessManager {
     processes: Mutex<HashMap<String, Arc<ManagedProcess>>>,
+    output_directory: tempfile::TempDir,
 }
 
 impl ProcessManager {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            processes: Mutex::new(HashMap::new()),
+            output_directory: tempfile::tempdir()
+                .context("failed to create command output directory")?,
+        })
+    }
+
     async fn start(&self, command: String, path: Option<OsString>) -> Result<Arc<ManagedProcess>> {
         let (output_reader, output_writer) =
             StdUnixStream::pair().context("failed to create command output stream")?;
@@ -335,12 +344,16 @@ impl ProcessManager {
                 break handle;
             }
         };
+        let full_output_path = self.output_directory.path().join(&handle);
+        let full_output = std::fs::File::create(&full_output_path)
+            .context("failed to create full command output file")?;
         let process = Arc::new(ManagedProcess {
             handle: handle.clone(),
             os_pid,
             child: Mutex::new(child),
             stdin: Mutex::new(Some(stdin)),
-            output: Mutex::new(Vec::new()),
+            output: Mutex::new(OutputBuffer::default()),
+            full_output_path,
             output_closed: AtomicBool::new(false),
             changed: Notify::new(),
         });
@@ -349,6 +362,7 @@ impl ProcessManager {
 
         let output_process = Arc::clone(&process);
         tokio::spawn(async move {
+            let mut full_output = tokio::fs::File::from_std(full_output);
             let mut reader = UnixStream::from_std(output_reader)
                 .expect("nonblocking command output stream should be valid");
             let mut buffer = [0_u8; 8192];
@@ -356,11 +370,15 @@ impl ProcessManager {
                 match reader.read(&mut buffer).await {
                     Ok(0) => break,
                     Ok(length) => {
-                        output_process
-                            .output
-                            .lock()
-                            .await
-                            .extend_from_slice(&buffer[..length]);
+                        if let Err(error) = full_output.write_all(&buffer[..length]).await {
+                            tracing::warn!(
+                                process_handle = %output_process.handle,
+                                %error,
+                                "failed to save full command output"
+                            );
+                            break;
+                        }
+                        output_process.output.lock().await.append(&buffer[..length]);
                         output_process.changed.notify_waiters();
                     }
                     Err(error) => {
@@ -388,14 +406,12 @@ impl ProcessManager {
         timeout_action: TimeoutAction,
     ) -> Result<RunnerResponse> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let mut output = Vec::new();
         loop {
-            output.extend(process.take_output().await);
             if let Some(exit_code) = process.finished().await? {
-                output.extend(process.take_output().await);
+                let output = process.take_output().await;
                 self.processes.lock().await.remove(&process.handle);
                 return Ok(RunnerResponse::ProcessFinished {
-                    output: String::from_utf8_lossy(&output).into_owned(),
+                    output: output.finish(process.full_output_path.clone()),
                     exit_code,
                 });
             }
@@ -405,20 +421,17 @@ impl ProcessManager {
                     return match timeout_action {
                         TimeoutAction::ReturnRunning => Ok(RunnerResponse::ProcessRunning {
                             process_handle: process.handle.clone(),
-                            output: String::from_utf8_lossy(&output).into_owned(),
+                            output: process
+                                .take_output()
+                                .await
+                                .finish(process.full_output_path.clone()),
                         }),
-                        TimeoutAction::Terminate => {
-                            let mut stopped = self.stop(&process.handle).await?;
-                            if let RunnerResponse::ProcessStopped {
-                                output: stopped_output,
-                            } = &mut stopped
-                            {
-                                output.extend(stopped_output.as_bytes());
+                        TimeoutAction::Terminate => match self.stop(&process.handle).await? {
+                            RunnerResponse::ProcessStopped { output } => {
+                                Ok(RunnerResponse::ProcessTimedOut { output })
                             }
-                            Ok(RunnerResponse::ProcessTimedOut {
-                                output: String::from_utf8_lossy(&output).into_owned(),
-                            })
-                        }
+                            _ => unreachable!("stop always returns ProcessStopped"),
+                        },
                     };
                 }
                 Some(deadline) => {
@@ -445,17 +458,17 @@ impl ProcessManager {
             let output = process.take_output().await;
             if let Some(exit_code) = process.finished().await? {
                 let mut output = output;
-                output.extend(process.take_output().await);
+                output.append_output(process.take_output().await);
                 self.processes.lock().await.remove(handle);
                 return Ok(RunnerResponse::ProcessFinished {
-                    output: String::from_utf8_lossy(&output).into_owned(),
+                    output: output.finish(process.full_output_path.clone()),
                     exit_code,
                 });
             }
-            if !output.is_empty() || Instant::now() >= deadline {
+            if !output.bytes.is_empty() || output.omitted_bytes != 0 || Instant::now() >= deadline {
                 return Ok(RunnerResponse::ProcessRunning {
                     process_handle: handle.to_owned(),
-                    output: String::from_utf8_lossy(&output).into_owned(),
+                    output: output.finish(process.full_output_path.clone()),
                 });
             }
             tokio::select! {
@@ -511,7 +524,7 @@ impl ProcessManager {
         self.processes.lock().await.remove(handle);
         tracing::info!(process_handle = %handle, "process stopped");
         Ok(RunnerResponse::ProcessStopped {
-            output: String::from_utf8_lossy(&output).into_owned(),
+            output: output.finish(process.full_output_path.clone()),
         })
     }
 
@@ -530,13 +543,14 @@ struct ManagedProcess {
     os_pid: Pid,
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
-    output: Mutex<Vec<u8>>,
+    output: Mutex<OutputBuffer>,
+    full_output_path: PathBuf,
     output_closed: AtomicBool,
     changed: Notify,
 }
 
 impl ManagedProcess {
-    async fn take_output(&self) -> Vec<u8> {
+    async fn take_output(&self) -> OutputBuffer {
         std::mem::take(&mut *self.output.lock().await)
     }
 
@@ -550,6 +564,57 @@ impl ManagedProcess {
         Ok(status
             .filter(|_| self.output_closed.load(Ordering::Acquire))
             .map(|status| status.code()))
+    }
+}
+
+const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct OutputBuffer {
+    bytes: Vec<u8>,
+    omitted_bytes: usize,
+}
+
+impl OutputBuffer {
+    fn append(&mut self, bytes: &[u8]) {
+        let total_len = self.bytes.len() + bytes.len();
+        if total_len <= MAX_BUFFER_BYTES {
+            self.bytes.extend_from_slice(bytes);
+            return;
+        }
+
+        let head_len = MAX_BUFFER_BYTES / 2;
+        let tail_len = MAX_BUFFER_BYTES - head_len;
+        let old = std::mem::take(&mut self.bytes);
+        self.bytes = Vec::with_capacity(MAX_BUFFER_BYTES);
+
+        let old_head_len = head_len.min(old.len());
+        self.bytes.extend_from_slice(&old[..old_head_len]);
+        self.bytes
+            .extend_from_slice(&bytes[..head_len - old_head_len]);
+
+        if bytes.len() >= tail_len {
+            self.bytes
+                .extend_from_slice(&bytes[bytes.len() - tail_len..]);
+        } else {
+            self.bytes
+                .extend_from_slice(&old[old.len() - (tail_len - bytes.len())..]);
+            self.bytes.extend_from_slice(bytes);
+        }
+        self.omitted_bytes += total_len - MAX_BUFFER_BYTES;
+    }
+
+    fn append_output(&mut self, output: Self) {
+        self.omitted_bytes += output.omitted_bytes;
+        self.append(&output.bytes);
+    }
+
+    fn finish(self, full_output_path: PathBuf) -> CommandOutput {
+        CommandOutput {
+            content: String::from_utf8_lossy(&self.bytes).into_owned(),
+            omitted_bytes: self.omitted_bytes,
+            full_output_path,
+        }
     }
 }
 

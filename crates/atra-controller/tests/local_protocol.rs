@@ -150,7 +150,8 @@ async fn executes_a_foreground_command_through_a_runner() {
                         "IFS= read -r command; ",
                         "printf '%s\\n' ",
                         "'{\"request_id\":1,\"status\":\"process_finished\",",
-                        "\"output\":\"outerr\",\"exit_code\":7}'"
+                        "\"output\":{\"content\":\"outerr\",\"omitted_bytes\":0,",
+                        "\"full_output_path\":\"/tmp/full-output\"},\"exit_code\":7}'"
                     )
                     .to_owned(),
                 ],

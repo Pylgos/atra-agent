@@ -15,8 +15,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformBundle;
 use atra_protocol::{
-    ApprovalPolicy, ControllerRequest, ControllerResponse, Runner as RunnerInfo, RunnerRequest,
-    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
+    ApprovalPolicy, CommandOutput, ControllerRequest, ControllerResponse, Runner as RunnerInfo,
+    RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, ThreadEvent,
+    TimeoutAction,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
@@ -1477,19 +1478,26 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
             output,
         } => Ok(ControllerResponse::ProcessRunning {
             process_handle,
-            output,
+            output: format_command_output(&output),
         }),
         RunnerResponse::ProcessFinished { output, exit_code } => {
-            tracing::info!(?exit_code, output_bytes = output.len(), "process finished");
-            Ok(ControllerResponse::ProcessFinished { output, exit_code })
+            tracing::info!(
+                ?exit_code,
+                output_bytes = output.content.len(),
+                "process finished"
+            );
+            Ok(ControllerResponse::ProcessFinished {
+                output: format_command_output(&output),
+                exit_code,
+            })
         }
-        RunnerResponse::ProcessTimedOut { output } => {
-            Ok(ControllerResponse::ProcessTimedOut { output })
-        }
+        RunnerResponse::ProcessTimedOut { output } => Ok(ControllerResponse::ProcessTimedOut {
+            output: format_command_output(&output),
+        }),
         RunnerResponse::InputWritten => Ok(ControllerResponse::InputWritten),
-        RunnerResponse::ProcessStopped { output } => {
-            Ok(ControllerResponse::ProcessStopped { output })
-        }
+        RunnerResponse::ProcessStopped { output } => Ok(ControllerResponse::ProcessStopped {
+            output: format_command_output(&output),
+        }),
         RunnerResponse::PatchCompleted { result } => Ok(ControllerResponse::PatchApplied {
             output: format_patch_result(&result),
         }),
@@ -1506,25 +1514,29 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
             process_handle,
             output,
         } => Ok(format!(
-            "{output}\natra exec_command: process {process_handle} is still running"
+            "{}\natra exec_command: process {process_handle} is still running",
+            format_command_output(&output)
         )),
         RunnerResponse::ProcessFinished {
             output,
             exit_code: Some(0),
         } => Ok(format!(
-            "{output}\natra exec_command: process finished with exit code 0"
+            "{}\natra exec_command: process finished with exit code 0",
+            format_command_output(&output)
         )),
         RunnerResponse::ProcessFinished { output, exit_code } => {
             let exit_code = exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
             Ok(format!(
-                "{output}\natra exec_command: process finished with exit code {exit_code}"
+                "{}\natra exec_command: process finished with exit code {exit_code}",
+                format_command_output(&output)
             ))
         }
-        RunnerResponse::ProcessTimedOut { output } => {
-            Ok(format!("{output}\natra exec_command: process timed out"))
-        }
+        RunnerResponse::ProcessTimedOut { output } => Ok(format!(
+            "{}\natra exec_command: process timed out",
+            format_command_output(&output)
+        )),
         RunnerResponse::Error { message } => bail!("{message}"),
         RunnerResponse::Ready
         | RunnerResponse::ToolsRequired { .. }
@@ -1599,20 +1611,20 @@ fn command_artifact(response: &RunnerResponse) -> Result<serde_json::Value> {
         }),
         RunnerResponse::ProcessRunning { output, .. } => json!({
             "state": "running",
-            "output": output,
+            "output": format_command_output(output),
         }),
         RunnerResponse::ProcessFinished { output, exit_code } => json!({
             "state": "finished",
-            "output": output,
+            "output": format_command_output(output),
             "exit_code": exit_code,
         }),
         RunnerResponse::ProcessTimedOut { output } => json!({
             "state": "timed_out",
-            "output": output,
+            "output": format_command_output(output),
         }),
         RunnerResponse::ProcessStopped { output } => json!({
             "state": "stopped",
-            "output": output,
+            "output": format_command_output(output),
         }),
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("runner returned an invalid command response"),
@@ -1638,7 +1650,52 @@ fn format_process_response(tool: &str, response: RunnerResponse) -> Result<Strin
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("runner returned an invalid {tool} response"),
     };
-    Ok(format!("atra {tool}: {description}\n{output}"))
+    Ok(format!(
+        "atra {tool}: {description}\n{}",
+        format_command_output(&output)
+    ))
+}
+
+const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;
+
+fn format_command_output(output: &CommandOutput) -> String {
+    if output.omitted_bytes == 0 && output.content.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return output.content.clone();
+    }
+
+    let head_end = floor_char_boundary(
+        &output.content,
+        (MAX_TOOL_OUTPUT_BYTES / 2).min(output.content.len()),
+    );
+    let tail_start = ceil_char_boundary(
+        &output.content,
+        output
+            .content
+            .len()
+            .saturating_sub(MAX_TOOL_OUTPUT_BYTES - MAX_TOOL_OUTPUT_BYTES / 2),
+    )
+    .max(head_end);
+    let omitted_bytes = output.omitted_bytes + tail_start.saturating_sub(head_end);
+    format!(
+        "{}\n\n... {omitted_bytes} bytes omitted; full output: {} ...\n\n{}",
+        &output.content[..head_end],
+        output.full_output_path.display(),
+        &output.content[tail_start..]
+    )
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn current_platform_bundle() -> Result<Option<PathBuf>> {
