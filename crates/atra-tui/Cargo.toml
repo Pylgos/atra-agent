@@ -16,6 +16,7 @@ icu_segmenter.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tui-markdown.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

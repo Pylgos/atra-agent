@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -424,13 +425,17 @@ impl State {
                 .await
                 .context("failed to load thread model")?;
             let prompt_cache_key = format!("{}-{thread_id}", self.prompt_cache_namespace);
-            let auto_compact_token_limit = self
+            let selected_model = self
                 .provider
                 .models()
                 .await?
                 .into_iter()
-                .find(|candidate| candidate.id == model)
-                .and_then(|model| model.auto_compact_token_limit);
+                .find(|candidate| candidate.id == model);
+            let context_window = selected_model
+                .as_ref()
+                .and_then(|model| model.context_window);
+            let auto_compact_token_limit =
+                selected_model.and_then(|model| model.auto_compact_token_limit);
             let active_history_start = events
                 .iter()
                 .rposition(|event| event.kind == EventKind::Compaction)
@@ -439,11 +444,36 @@ impl State {
                 .iter()
                 .rev()
                 .find(|event| event.kind == EventKind::TokenUsage)
-                .and_then(|event| event.payload["total_tokens"].as_i64());
+                .and_then(|event| {
+                    event.payload["usage"]["total_tokens"]
+                        .as_i64()
+                        .or_else(|| event.payload["total_tokens"].as_i64())
+                });
             if active_tokens
                 .zip(auto_compact_token_limit)
                 .is_some_and(|(tokens, limit)| tokens >= limit)
             {
+                let request = self.provider.compaction_snapshot(
+                    &model,
+                    &reasoning_effort,
+                    &events,
+                    &prompt_cache_key,
+                )?;
+                self.append_event(
+                    thread_id,
+                    EventKind::ModelRequest,
+                    json!({
+                        "kind": "compaction",
+                        "started_at_ms": unix_time_ms(),
+                        "request": request,
+                        "context_window": context_window,
+                        "auto_compact_token_limit": auto_compact_token_limit,
+                        "compacted": active_history_start > 0,
+                    }),
+                    updates,
+                )
+                .await
+                .context("failed to save compaction request")?;
                 let items = self
                     .provider
                     .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
@@ -460,6 +490,28 @@ impl State {
                         .context("failed to reload compacted model history")?;
                 }
             }
+            let request = self.provider.completion_snapshot(
+                &model,
+                &reasoning_effort,
+                &events,
+                &prompt_cache_key,
+            )?;
+            let request_sequence = self
+                .append_event(
+                    thread_id,
+                    EventKind::ModelRequest,
+                    json!({
+                        "kind": "response",
+                        "started_at_ms": unix_time_ms(),
+                        "request": request,
+                        "context_window": context_window,
+                        "auto_compact_token_limit": auto_compact_token_limit,
+                        "compacted": events.iter().any(|event| event.kind == EventKind::Compaction),
+                    }),
+                    updates,
+                )
+                .await
+                .context("failed to save model request")?;
             let completion = self
                 .provider
                 .complete(
@@ -477,14 +529,17 @@ impl State {
                     .context("failed to save encrypted reasoning")?;
             }
             if let Some(usage) = completion.token_usage {
-                self.store
-                    .append(
-                        thread_id,
-                        EventKind::TokenUsage,
-                        serde_json::to_value(usage).context("failed to encode token usage")?,
-                    )
-                    .await
-                    .context("failed to save token usage")?;
+                self.append_event(
+                    thread_id,
+                    EventKind::TokenUsage,
+                    json!({
+                        "request_sequence": request_sequence,
+                        "usage": usage,
+                    }),
+                    updates,
+                )
+                .await
+                .context("failed to save token usage")?;
             }
 
             match completion.response {
@@ -882,7 +937,7 @@ impl State {
         kind: EventKind,
         payload: serde_json::Value,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> tokio_rusqlite::Result<i64> {
         let sequence = self.store.append(thread_id, kind, payload.clone()).await?;
         if let Some(updates) = updates {
             updates
@@ -893,7 +948,7 @@ impl State {
                 }))
                 .ok();
         }
-        Ok(())
+        Ok(sequence)
     }
 
     async fn launch_runner(
@@ -1066,6 +1121,13 @@ struct PendingApproval {
 
 fn return_running() -> TimeoutAction {
     TimeoutAction::ReturnRunning
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is before the Unix epoch")
+        .as_millis()
 }
 
 struct Runner {

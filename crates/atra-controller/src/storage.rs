@@ -19,6 +19,7 @@ pub(crate) enum EventKind {
     ApprovalResponse,
     Reasoning,
     Compaction,
+    ModelRequest,
     TokenUsage,
 }
 
@@ -33,6 +34,7 @@ impl EventKind {
             Self::ApprovalResponse => "approval_response",
             Self::Reasoning => "reasoning",
             Self::Compaction => "compaction",
+            Self::ModelRequest => "model_request",
             Self::TokenUsage => "token_usage",
         }
     }

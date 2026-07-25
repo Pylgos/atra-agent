@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -22,6 +23,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use tokio::sync::mpsc;
+use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use unicode_width::UnicodeWidthChar;
 
 use crate::controller::{request, request_stream};
@@ -30,6 +32,39 @@ use crate::controller::{request, request_stream};
 pub(crate) struct TranscriptItem {
     role: Role,
     text: String,
+    markdown: Option<Vec<Line<'static>>>,
+}
+
+impl TranscriptItem {
+    fn new(role: Role, text: String) -> Self {
+        let markdown = matches!(role, Role::User | Role::Assistant).then(|| render_markdown(&text));
+        Self {
+            role,
+            text,
+            markdown,
+        }
+    }
+
+    fn append(&mut self, text: &str) {
+        self.text.push_str(text);
+        if self.markdown.is_some() {
+            self.markdown = Some(render_markdown(&self.text));
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptMode {
+    Coding,
+    Debug,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusPane {
+    Input,
+    Transcript,
+    Requests,
+    Detail,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +158,7 @@ pub(crate) struct App {
     pub(crate) models: Vec<Model>,
     pub(crate) thread_id: Option<i64>,
     pub(crate) transcript: Vec<TranscriptItem>,
+    pub(crate) events: Vec<ThreadEvent>,
     pub(crate) tool_call_preview: Option<(String, usize)>,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
@@ -141,6 +177,19 @@ pub(crate) struct App {
     pub(crate) transcript_layout: TranscriptLayout,
     pub(crate) sidebar: Rect,
     pub(crate) turn_pending: bool,
+    pub(crate) transcript_mode: TranscriptMode,
+    pub(crate) focus: FocusPane,
+    pub(crate) transcript_scroll: usize,
+    pub(crate) transcript_horizontal_scroll: usize,
+    pub(crate) detail_scroll: usize,
+    pub(crate) selected_request: Option<usize>,
+    pub(crate) raw_request: bool,
+    pub(crate) expanded_tools: HashSet<usize>,
+    pub(crate) selected_tool: Option<usize>,
+    pub(crate) transcript_area: Rect,
+    pub(crate) request_list_area: Rect,
+    pub(crate) detail_area: Rect,
+    pub(crate) tool_areas: Vec<(usize, Rect)>,
 }
 
 impl App {
@@ -151,9 +200,9 @@ impl App {
             response => bail!("controller returned an unexpected response: {response:?}"),
         };
         let thread_id = threads.first().map(|thread| thread.id);
-        let transcript = match thread_id {
+        let (transcript, events) = match thread_id {
             Some(thread_id) => load_transcript(&endpoint, thread_id).await?,
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         let login_required = match request(&endpoint, ControllerRequest::CodexLoginStatus).await? {
             ControllerResponse::CodexLoginRequired => true,
@@ -174,6 +223,7 @@ impl App {
             models,
             thread_id,
             transcript,
+            events,
             tool_call_preview: None,
             input: String::new(),
             input_cursor: 0,
@@ -183,7 +233,7 @@ impl App {
             status: if login_required {
                 "Codex login required · Ctrl-L login".to_owned()
             } else {
-                "Enter sends · Ctrl-N new · Ctrl-R rename · Ctrl-M/Alt-M model · Ctrl-C copies"
+                "Enter sends · Ctrl-T view · Tab focus · Ctrl-N new · Ctrl-M model · Ctrl-C copies"
                     .to_owned()
             },
             approval: None,
@@ -199,6 +249,19 @@ impl App {
             },
             sidebar: Rect::default(),
             turn_pending: false,
+            transcript_mode: TranscriptMode::Coding,
+            focus: FocusPane::Input,
+            transcript_scroll: 0,
+            transcript_horizontal_scroll: 0,
+            detail_scroll: 0,
+            selected_request: None,
+            raw_request: false,
+            expanded_tools: HashSet::new(),
+            selected_tool: None,
+            transcript_area: Rect::default(),
+            request_list_area: Rect::default(),
+            detail_area: Rect::default(),
+            tool_areas: Vec::new(),
         })
     }
 
@@ -254,9 +317,22 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('q') => return Ok(true),
+                KeyCode::Char('t') => {
+                    self.transcript_mode = match self.transcript_mode {
+                        TranscriptMode::Coding => TranscriptMode::Debug,
+                        TranscriptMode::Debug => TranscriptMode::Coding,
+                    };
+                    self.focus = FocusPane::Input;
+                    self.clear_selection();
+                    self.status = match self.transcript_mode {
+                        TranscriptMode::Coding => "Coding transcript".to_owned(),
+                        TranscriptMode::Debug => "LLM request inspector".to_owned(),
+                    };
+                }
                 KeyCode::Char('n') => {
                     self.thread_id = None;
                     self.transcript.clear();
+                    self.events.clear();
                     self.tool_call_preview = None;
                     self.input.clear();
                     self.input_cursor = 0;
@@ -266,6 +342,7 @@ impl App {
                     self.model_picker = None;
                     self.new_thread_model = None;
                     self.clear_selection();
+                    self.reset_view();
                 }
                 KeyCode::Char('r') if self.thread_id.is_some() => {
                     self.renaming = true;
@@ -329,6 +406,15 @@ impl App {
                 KeyCode::Right => self.move_word_forward(),
                 _ => {}
             }
+            return Ok(false);
+        }
+
+        if key.code == KeyCode::Tab {
+            self.cycle_focus(false);
+            return Ok(false);
+        }
+        if key.code == KeyCode::BackTab {
+            self.cycle_focus(true);
             return Ok(false);
         }
 
@@ -422,6 +508,11 @@ impl App {
             return Ok(false);
         }
 
+        if self.focus != FocusPane::Input {
+            self.handle_pane_key(key);
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Enter if !self.input.trim().is_empty() && !self.turn_pending => {
                 self.send(turns)?
@@ -478,6 +569,29 @@ impl App {
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.detail_area.contains((mouse.column, mouse.row).into()) {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(3);
+                    self.focus = FocusPane::Detail;
+                } else {
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(3);
+                    self.focus = FocusPane::Transcript;
+                }
+                return Ok(());
+            }
+            MouseEventKind::ScrollDown => {
+                if self.detail_area.contains((mouse.column, mouse.row).into()) {
+                    self.detail_scroll = self.detail_scroll.saturating_add(3);
+                    self.focus = FocusPane::Detail;
+                } else {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
+                    self.focus = FocusPane::Transcript;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.sidebar.contains((mouse.column, mouse.row).into())
             && mouse.row > self.sidebar.y
@@ -486,21 +600,58 @@ impl App {
             if index == 0 {
                 self.thread_id = None;
                 self.transcript.clear();
+                self.events.clear();
                 self.tool_call_preview = None;
                 self.approval = None;
                 self.renaming = false;
                 self.model_picker = None;
                 self.new_thread_model = None;
                 self.clear_selection();
+                self.reset_view();
             } else if let Some(thread) = self.threads.get(index - 1) {
                 self.thread_id = Some(thread.id);
-                self.transcript = load_transcript(&self.endpoint, thread.id).await?;
+                (self.transcript, self.events) = load_transcript(&self.endpoint, thread.id).await?;
                 self.tool_call_preview = None;
                 self.approval = None;
                 self.renaming = false;
                 self.model_picker = None;
                 self.clear_selection();
+                self.reset_view();
             }
+            return Ok(());
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .request_list_area
+                .contains((mouse.column, mouse.row).into())
+        {
+            let row = usize::from(mouse.row.saturating_sub(self.request_list_area.y + 1)) / 3;
+            if row < self.request_count() {
+                self.selected_request = Some(row);
+                self.detail_scroll = 0;
+            }
+            self.focus = FocusPane::Requests;
+            return Ok(());
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.detail_area.contains((mouse.column, mouse.row).into())
+        {
+            self.focus = FocusPane::Detail;
+            return Ok(());
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((index, _)) = self
+                .tool_areas
+                .iter()
+                .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
+        {
+            let index = *index;
+            self.selected_tool = Some(index);
+            if !self.expanded_tools.remove(&index) {
+                self.expanded_tools.insert(index);
+            }
+            self.focus = FocusPane::Transcript;
             return Ok(());
         }
 
@@ -524,10 +675,8 @@ impl App {
         self.input_cursor = 0;
         self.record_history(message.clone())?;
         self.reset_history_navigation();
-        self.transcript.push(TranscriptItem {
-            role: Role::User,
-            text: sanitize(&message),
-        });
+        self.transcript
+            .push(TranscriptItem::new(Role::User, sanitize(&message)));
         self.turn_pending = true;
         self.status = "Waiting for Atra Controller…".to_owned();
         let endpoint = self.endpoint.clone();
@@ -777,13 +926,10 @@ impl App {
                         self.transcript
                             .last_mut()
                             .unwrap()
-                            .text
-                            .push_str(&sanitize(&content));
+                            .append(&sanitize(&content));
                     } else {
-                        self.transcript.push(TranscriptItem {
-                            role: Role::Assistant,
-                            text: sanitize(&content),
-                        });
+                        self.transcript
+                            .push(TranscriptItem::new(Role::Assistant, sanitize(&content)));
                     }
                 }
                 return Ok(());
@@ -795,10 +941,10 @@ impl App {
             } => {
                 if self.thread_id == Some(thread_id) {
                     let index = self.transcript.len();
-                    self.transcript.push(TranscriptItem {
-                        role: Role::Tool,
-                        text: format!("{} ", sanitize(&name)),
-                    });
+                    self.transcript.push(TranscriptItem::new(
+                        Role::Tool,
+                        format!("{} ", sanitize(&name)),
+                    ));
                     self.tool_call_preview = Some((item_id, index));
                 }
                 return Ok(());
@@ -812,12 +958,13 @@ impl App {
                     && let Some((preview_id, index)) = &self.tool_call_preview
                     && preview_id == &item_id
                 {
-                    self.transcript[*index].text.push_str(&sanitize(&delta));
+                    self.transcript[*index].append(&sanitize(&delta));
                 }
                 return Ok(());
             }
             TurnUpdate::Event { thread_id, event } => {
                 if self.thread_id == Some(thread_id) {
+                    self.events.push(event.clone());
                     let item_id = event
                         .payload
                         .get("item_id")
@@ -870,10 +1017,8 @@ impl App {
     fn accept_turn_response(&mut self, response: ControllerResponse) -> Result<()> {
         match response {
             ControllerResponse::TurnCompleted { content } => {
-                self.transcript.push(TranscriptItem {
-                    role: Role::Assistant,
-                    text: sanitize(&content),
-                });
+                self.transcript
+                    .push(TranscriptItem::new(Role::Assistant, sanitize(&content)));
                 self.status = "Ready".to_owned();
             }
             ControllerResponse::ApprovalRequired {
@@ -938,12 +1083,147 @@ impl App {
         self.selection_start = None;
         self.selection_end = None;
     }
+
+    fn reset_view(&mut self) {
+        self.transcript_scroll = 0;
+        self.transcript_horizontal_scroll = 0;
+        self.detail_scroll = 0;
+        self.selected_request = None;
+        self.raw_request = false;
+        self.expanded_tools.clear();
+        self.selected_tool = None;
+        self.focus = FocusPane::Input;
+    }
+
+    fn cycle_focus(&mut self, reverse: bool) {
+        let panes: &[FocusPane] = match self.transcript_mode {
+            TranscriptMode::Coding => &[FocusPane::Input, FocusPane::Transcript],
+            TranscriptMode::Debug => &[FocusPane::Input, FocusPane::Requests, FocusPane::Detail],
+        };
+        let current = panes
+            .iter()
+            .position(|pane| *pane == self.focus)
+            .unwrap_or(0);
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(panes.len() - 1)
+        } else {
+            (current + 1) % panes.len()
+        };
+        self.focus = panes[next];
+    }
+
+    fn handle_pane_key(&mut self, key: KeyEvent) {
+        match self.focus {
+            FocusPane::Transcript => match key.code {
+                KeyCode::Left => {
+                    self.transcript_horizontal_scroll =
+                        self.transcript_horizontal_scroll.saturating_sub(4)
+                }
+                KeyCode::Right => {
+                    self.transcript_horizontal_scroll =
+                        self.transcript_horizontal_scroll.saturating_add(4)
+                }
+                KeyCode::Home => self.transcript_horizontal_scroll = 0,
+                KeyCode::PageUp => {
+                    self.transcript_scroll = self
+                        .transcript_scroll
+                        .saturating_add(usize::from(self.transcript_area.height))
+                }
+                KeyCode::PageDown => {
+                    self.transcript_scroll = self
+                        .transcript_scroll
+                        .saturating_sub(usize::from(self.transcript_area.height))
+                }
+                KeyCode::Up => self.select_tool(false),
+                KeyCode::Down => self.select_tool(true),
+                KeyCode::Enter => {
+                    if let Some(index) = self.selected_tool
+                        && !self.expanded_tools.remove(&index)
+                    {
+                        self.expanded_tools.insert(index);
+                    }
+                }
+                KeyCode::End => self.transcript_scroll = 0,
+                _ => {}
+            },
+            FocusPane::Requests => match key.code {
+                KeyCode::Up => {
+                    let selected = self.selected_request.unwrap_or(self.request_count());
+                    self.selected_request = Some(selected.saturating_sub(1));
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Down => {
+                    let last = self.request_count().saturating_sub(1);
+                    self.selected_request = Some(
+                        self.selected_request
+                            .unwrap_or(last)
+                            .saturating_add(1)
+                            .min(last),
+                    );
+                    self.detail_scroll = 0;
+                }
+                _ => {}
+            },
+            FocusPane::Detail => match key.code {
+                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                KeyCode::PageUp => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_sub(usize::from(self.detail_area.height))
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_add(usize::from(self.detail_area.height))
+                }
+                KeyCode::Char('r') => {
+                    self.raw_request = !self.raw_request;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::End => self.detail_scroll = 0,
+                _ => {}
+            },
+            FocusPane::Input => {}
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| event.kind == "model_request")
+            .count()
+    }
+
+    fn select_tool(&mut self, forward: bool) {
+        let tools = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (item.role == Role::ToolResult).then_some(index))
+            .collect::<Vec<_>>();
+        if tools.is_empty() {
+            self.selected_tool = None;
+            return;
+        }
+        let current = self
+            .selected_tool
+            .and_then(|selected| tools.iter().position(|index| *index == selected));
+        let next = match (current, forward) {
+            (Some(index), true) => (index + 1).min(tools.len() - 1),
+            (Some(index), false) => index.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => tools.len() - 1,
+        };
+        self.selected_tool = Some(tools[next]);
+    }
 }
 
 pub(crate) fn layout_transcript(
     items: &[TranscriptItem],
     area: Rect,
     scroll: u16,
+    horizontal_scroll: u16,
 ) -> TranscriptLayout {
     let mut text = String::new();
     let mut rows = Vec::new();
@@ -956,31 +1236,18 @@ pub(crate) fn layout_transcript(
             let content = source_line.strip_suffix('\n').unwrap_or(source_line);
             let content_start =
                 item_start + source_line.as_ptr() as usize - item.text.as_ptr() as usize;
-            let mut width = 0;
             let mut cells = Vec::new();
             for (byte, character) in content.char_indices() {
                 let character_width = character.width().unwrap_or(0);
-                if width + character_width > usize::from(area.width) && !cells.is_empty() {
-                    if virtual_y >= scroll && virtual_y - scroll < area.height {
-                        rows.push(MappedRow {
-                            x: area.x,
-                            y: area.y + virtual_y - scroll,
-                            cells,
-                            end: content_start + byte,
-                        });
-                    }
-                    cells = Vec::new();
-                    width = 0;
-                    virtual_y += 1;
-                }
                 cells.extend(std::iter::repeat_n(content_start + byte, character_width));
-                width += character_width;
             }
             if virtual_y >= scroll && virtual_y - scroll < area.height {
+                let start = usize::from(horizontal_scroll).min(cells.len());
+                let end = (start + usize::from(area.width)).min(cells.len());
                 rows.push(MappedRow {
                     x: area.x,
                     y: area.y + virtual_y - scroll,
-                    cells,
+                    cells: cells[start..end].to_vec(),
                     end: content_start + content.len(),
                 });
             }
@@ -991,30 +1258,107 @@ pub(crate) fn layout_transcript(
     TranscriptLayout { text, rows }
 }
 
-pub(crate) fn transcript_lines<'a>(
-    items: &'a [TranscriptItem],
-    width: u16,
-    selection: Option<(usize, usize)>,
-) -> Vec<Line<'a>> {
-    let mut lines = Vec::new();
-    let mut offset = 0;
-    for item in items {
-        lines.push(Line::from(Span::styled(
-            item.role.label(),
-            Style::default()
+#[derive(Clone)]
+struct AtraMarkdownStyle;
+
+impl StyleSheet for AtraMarkdownStyle {
+    fn heading(&self, level: u8) -> Style {
+        match level {
+            1 => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            2 => Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+            _ => Style::default().add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(Color::LightCyan)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+}
+
+pub(crate) fn transcript_lines<'a>(
+    items: &'a [TranscriptItem],
+    selection: Option<(usize, usize)>,
+    expanded_tools: &HashSet<usize>,
+    selected_tool: Option<usize>,
+) -> (Vec<Line<'a>>, Vec<(usize, std::ops::Range<usize>)>) {
+    let mut lines = Vec::new();
+    let mut tool_ranges = Vec::new();
+    let mut offset = 0;
+    for (item_index, item) in items.iter().enumerate() {
+        let item_start = lines.len();
+        lines.push(Line::from(Span::styled(
+            item.role.label(),
+            if selected_tool == Some(item_index) {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            },
         )));
-        for source_line in item.text.lines() {
-            let mut current = Vec::new();
-            let mut current_width = 0;
-            for (byte, character) in source_line.char_indices() {
-                let character_width = character.width().unwrap_or(0);
-                if current_width + character_width > usize::from(width) && !current.is_empty() {
-                    lines.push(Line::from(current));
-                    current = Vec::new();
-                    current_width = 0;
+        if matches!(item.role, Role::User | Role::Assistant) {
+            lines.extend(item.markdown.as_ref().unwrap().iter().map(|line| {
+                Line {
+                    style: line.style,
+                    alignment: line.alignment,
+                    spans: line
+                        .spans
+                        .iter()
+                        .map(|span| Span::styled(span.content.as_ref(), span.style))
+                        .collect(),
                 }
+            }));
+            offset += item.text.len() + 1;
+            if item.role == Role::ToolResult {
+                tool_ranges.push((item_index, item_start..lines.len()));
+            }
+            continue;
+        }
+        if item.role == Role::Tool && item.text.starts_with("apply_patch ") {
+            lines.extend(patch_lines(
+                item.text.strip_prefix("apply_patch ").unwrap_or(&item.text),
+            ));
+            lines.push(Line::default());
+            offset += item.text.len() + 1;
+            continue;
+        }
+        let display = if item.role == Role::ToolResult && !expanded_tools.contains(&item_index) {
+            summarize_result(&item.text)
+        } else {
+            item.text.clone()
+        };
+        for source_line in display.lines() {
+            let mut current = Vec::new();
+            for (byte, character) in source_line.char_indices() {
                 let selected = selection.is_some_and(|(start, end)| {
                     let absolute = offset + byte;
                     absolute >= start && absolute < end
@@ -1025,7 +1369,6 @@ pub(crate) fn transcript_lines<'a>(
                     Style::default()
                 };
                 current.push(Span::styled(character.to_string(), style));
-                current_width += character_width;
             }
             lines.push(Line::from(current));
             offset += source_line.len() + 1;
@@ -1034,8 +1377,71 @@ pub(crate) fn transcript_lines<'a>(
             offset = offset.saturating_sub(1);
         }
         offset += 1;
+        if item.role == Role::ToolResult {
+            tool_ranges.push((item_index, item_start..lines.len()));
+        }
     }
-    lines
+    (lines, tool_ranges)
+}
+
+fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    let options = MarkdownOptions::new(AtraMarkdownStyle);
+    from_str_with_options(text, &options)
+        .lines
+        .into_iter()
+        .map(|line| Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans: line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .collect(),
+        })
+        .collect()
+}
+
+fn summarize_result(result: &str) -> String {
+    let lines = result.lines().collect::<Vec<_>>();
+    if lines.len() <= 5 {
+        return result.to_owned();
+    }
+    format!(
+        "{}\n{}\n… {} lines omitted …\n{}\n{}",
+        lines[0],
+        lines[1],
+        lines.len() - 4,
+        lines[lines.len() - 2],
+        lines[lines.len() - 1]
+    )
+}
+
+fn patch_lines(patch: &str) -> Vec<Line<'static>> {
+    patch
+        .lines()
+        .map(|line| {
+            let style = if line.starts_with("*** Add File:")
+                || line.starts_with("*** Update File:")
+                || line.starts_with("*** Delete File:")
+                || line.starts_with("*** Move to:")
+            {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if line.starts_with("@@") {
+                Style::default().fg(Color::Magenta)
+            } else if line.starts_with('+') {
+                Style::default().fg(Color::Green)
+            } else if line.starts_with('-') {
+                Style::default().fg(Color::Red)
+            } else if line.starts_with("***") {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(line.to_owned(), style))
+        })
+        .collect()
 }
 
 fn load_history(path: &Path) -> Result<Vec<String>> {
@@ -1062,12 +1468,15 @@ fn load_history(path: &Path) -> Result<Vec<String>> {
         .collect()
 }
 
-async fn load_transcript(endpoint: &Path, thread_id: i64) -> Result<Vec<TranscriptItem>> {
+async fn load_transcript(
+    endpoint: &Path,
+    thread_id: i64,
+) -> Result<(Vec<TranscriptItem>, Vec<ThreadEvent>)> {
     match request(endpoint, ControllerRequest::ThreadEvents { thread_id }).await? {
-        ControllerResponse::ThreadEvents { events } => Ok(events
-            .into_iter()
-            .filter_map(event_to_item)
-            .collect::<Vec<_>>()),
+        ControllerResponse::ThreadEvents { events } => Ok((
+            events.iter().cloned().filter_map(event_to_item).collect(),
+            events,
+        )),
         ControllerResponse::Error { message } => bail!("{message}"),
         response => bail!("controller returned an unexpected response: {response:?}"),
     }
@@ -1119,10 +1528,7 @@ fn event_to_item(event: ThreadEvent) -> Option<TranscriptItem> {
         ),
         _ => return None,
     };
-    Some(TranscriptItem {
-        role,
-        text: sanitize(&text),
-    })
+    Some(TranscriptItem::new(role, sanitize(&text)))
 }
 
 pub(crate) fn sanitize(input: &str) -> String {

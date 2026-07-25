@@ -328,17 +328,19 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "user_message",
+            "model_request",
             "tool_call",
             "tool_result",
+            "model_request",
             "assistant_message"
         ]
     );
     assert_eq!(
-        events[2].payload["result"],
+        events[3].payload["result"],
         serde_json::json!("atra exec_command: process finished with exit code 0\nmodel-output")
     );
     assert_eq!(
-        events[3].payload["content"],
+        events[5].payload["content"],
         serde_json::json!(
             "observed atra exec_command: process finished with exit code 0\nmodel-output"
         )
@@ -351,15 +353,17 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "user_message",
+            "model_request",
             "tool_call",
             "approval_request",
             "approval_response",
             "tool_result",
+            "model_request",
             "assistant_message",
         ]
     );
     assert_eq!(
-        denied_events[3].payload,
+        denied_events[4].payload,
         serde_json::json!({
             "approval_id": denied_approval_id,
             "decision": "deny",
@@ -374,15 +378,17 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "user_message",
+            "model_request",
             "tool_call",
             "approval_request",
             "approval_response",
             "tool_result",
+            "model_request",
             "assistant_message",
         ]
     );
     assert_eq!(
-        allowed_events[3].payload,
+        allowed_events[4].payload,
         serde_json::json!({
             "approval_id": allowed_approval_id,
             "decision": "allow",
@@ -390,7 +396,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         })
     );
     assert_eq!(
-        allowed_events[4].payload["result"],
+        allowed_events[5].payload["result"],
         serde_json::json!("atra exec_command: process finished with exit code 0\napproved-output")
     );
 }

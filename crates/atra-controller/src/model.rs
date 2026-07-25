@@ -109,6 +109,26 @@ impl Provider {
         }
     }
 
+    pub(crate) fn completion_snapshot(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Fake(_) => Ok(serde_json::json!({
+                "provider": "fake",
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "events": events,
+            })),
+            Self::Codex(provider) => {
+                provider.completion_snapshot(model, reasoning_effort, events, prompt_cache_key)
+            }
+        }
+    }
+
     pub(crate) async fn compact(
         &self,
         model: &str,
@@ -122,6 +142,27 @@ impl Provider {
                 provider
                     .compact(model, reasoning_effort, events, prompt_cache_key)
                     .await
+            }
+        }
+    }
+
+    pub(crate) fn compaction_snapshot(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Fake(_) => Ok(serde_json::json!({
+                "provider": "fake",
+                "kind": "compaction",
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "events": events,
+            })),
+            Self::Codex(provider) => {
+                provider.compaction_snapshot(model, reasoning_effort, events, prompt_cache_key)
             }
         }
     }

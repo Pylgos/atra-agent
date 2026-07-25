@@ -19,7 +19,7 @@ use tokio::{
     process::Command as TokioCommand,
     time::{Instant, sleep},
 };
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 
 mod controller_client;
 mod platform;
@@ -237,23 +237,28 @@ impl From<OnTimeout> for TimeoutAction {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let command = Cli::parse().command;
+    let log_writer = if matches!(&command, Command::Tui) {
+        BoxMakeWriter::new(std::io::sink)
+    } else {
+        BoxMakeWriter::new(std::io::stderr)
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
+        .with_writer(log_writer)
         .compact()
         .init();
 
-    if let Err(error) = run().await {
+    if let Err(error) = run(command).await {
         eprintln!("atra: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
-    let command = Cli::parse().command;
+async fn run(command: Command) -> Result<()> {
     if let Command::Runner {
         command: RunnerCommand::Run { stdio },
     } = &command

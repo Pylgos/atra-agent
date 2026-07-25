@@ -162,7 +162,7 @@ pub enum ControllerResponse {
     },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThreadEvent {
     pub sequence: i64,
     pub kind: String,

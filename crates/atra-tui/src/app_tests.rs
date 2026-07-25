@@ -11,14 +11,11 @@ fn sanitizes_terminal_control_sequences() {
 #[test]
 fn transcript_render_is_stable() {
     let items = vec![
-        TranscriptItem {
-            role: Role::User,
-            text: "hello".to_owned(),
-        },
-        TranscriptItem {
-            role: Role::Assistant,
-            text: "a deliberately wrapped response".to_owned(),
-        },
+        TranscriptItem::new(Role::User, "hello".to_owned()),
+        TranscriptItem::new(
+            Role::Assistant,
+            "a deliberately wrapped response".to_owned(),
+        ),
     ];
     let backend = ratatui::backend::TestBackend::new(42, 10);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -42,6 +39,7 @@ fn transcript_render_is_stable() {
         models: Vec::new(),
         thread_id: Some(2),
         transcript: items,
+        events: Vec::new(),
         tool_call_preview: None,
         input: "next".to_owned(),
         input_cursor: 4,
@@ -63,6 +61,19 @@ fn transcript_render_is_stable() {
         },
         sidebar: Rect::default(),
         turn_pending: false,
+        transcript_mode: TranscriptMode::Coding,
+        focus: FocusPane::Input,
+        transcript_scroll: 0,
+        transcript_horizontal_scroll: 0,
+        detail_scroll: 0,
+        selected_request: None,
+        raw_request: false,
+        expanded_tools: HashSet::new(),
+        selected_tool: None,
+        transcript_area: Rect::default(),
+        request_list_area: Rect::default(),
+        detail_area: Rect::default(),
+        tool_areas: Vec::new(),
     };
 
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -72,15 +83,70 @@ fn transcript_render_is_stable() {
 
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
-    let items = vec![TranscriptItem {
-        role: Role::Assistant,
-        text: "abcdefgh\nsecond".to_owned(),
-    }];
+    let items = vec![TranscriptItem::new(
+        Role::Assistant,
+        "abcdefgh\nsecond".to_owned(),
+    )];
 
-    let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0);
+    let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0, 0);
 
     assert_eq!(layout.text, "abcdefgh\nsecond\n");
     assert_eq!(layout.rows[0].cells, vec![0, 1, 2, 3]);
-    assert_eq!(layout.rows[1].cells, vec![4, 5, 6, 7]);
     assert_eq!(&layout.text[0..8], "abcdefgh");
+}
+
+#[test]
+fn markdown_and_partial_patch_render_before_completion() {
+    let items = vec![
+        TranscriptItem::new(
+            Role::Assistant,
+            "# Result\n\n| File | State |\n|---|---|\n| a.rs | **changed** |\n\n```rust\nfn main() {}\n```"
+                .to_owned(),
+        ),
+        TranscriptItem::new(
+            Role::Tool,
+            "apply_patch *** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new"
+                .to_owned(),
+        ),
+    ];
+
+    let (lines, _) = transcript_lines(&items, None, &HashSet::new(), None);
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Result"));
+    assert!(rendered.contains("changed"));
+    assert!(rendered.contains("fn main() {}"));
+    assert!(rendered.contains("*** Update File: src/main.rs"));
+    assert!(rendered.contains("+new"));
+}
+
+#[test]
+fn collapsed_tool_result_keeps_edges_and_can_expand() {
+    let items = vec![TranscriptItem::new(
+        Role::ToolResult,
+        "status\none\ntwo\nthree\nfour\nfive\nsix".to_owned(),
+    )];
+
+    let (collapsed, ranges) = transcript_lines(&items, None, &HashSet::new(), Some(0));
+    let collapsed = collapsed
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(collapsed.contains("status\none"));
+    assert!(collapsed.contains("3 lines omitted"));
+    assert!(collapsed.contains("five\nsix"));
+    assert_eq!(ranges.len(), 1);
+
+    let (expanded, _) = transcript_lines(&items, None, &HashSet::from([0]), Some(0));
+    let expanded = expanded
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(expanded.contains("two\nthree\nfour"));
 }

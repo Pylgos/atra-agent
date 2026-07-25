@@ -162,31 +162,7 @@ impl CodexProvider {
             .await
             .filter(CodexAuth::is_chatgpt_auth)
             .context("Codex login required; run `atra codex login`")?;
-        let request = ResponsesApiRequest {
-            model: model.to_owned(),
-            instructions: INSTRUCTIONS.to_owned(),
-            input: model_input(events)?,
-            tools: Some(tool_definitions()?),
-            tool_choice: "auto".to_owned(),
-            parallel_tool_calls: false,
-            reasoning: Some(Reasoning {
-                effort: Some(
-                    reasoning_effort
-                        .parse()
-                        .map_err(|error: String| anyhow::anyhow!(error))?,
-                ),
-                summary: None,
-                context: None,
-            }),
-            store: false,
-            stream: true,
-            stream_options: None,
-            include: vec!["reasoning.encrypted_content".to_owned()],
-            service_tier: None,
-            prompt_cache_key: Some(prompt_cache_key.to_owned()),
-            text: None,
-            client_metadata: None,
-        };
+        let request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
         let provider = ModelProviderInfo::create_openai_provider(None)
             .to_api_provider(Some(auth.auth_mode()))
             .context("failed to configure Codex model endpoint")?;
@@ -260,6 +236,44 @@ impl CodexProvider {
         })
     }
 
+    pub(super) fn completion_snapshot(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<serde_json::Value> {
+        serde_json::to_value(completion_request(
+            model,
+            reasoning_effort,
+            events,
+            prompt_cache_key,
+        )?)
+        .context("failed to encode Codex request snapshot")
+    }
+
+    pub(super) fn compaction_snapshot(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+        events: &[Event],
+        prompt_cache_key: &str,
+    ) -> Result<serde_json::Value> {
+        let input = model_input(events)?;
+        serde_json::to_value(CompactionInput {
+            model,
+            input: &input,
+            instructions: INSTRUCTIONS,
+            tools: Some(tool_definitions()?),
+            parallel_tool_calls: false,
+            reasoning: Some(reasoning(reasoning_effort)?),
+            service_tier: None,
+            prompt_cache_key: Some(prompt_cache_key),
+            text: None,
+        })
+        .context("failed to encode Codex compaction snapshot")
+    }
+
     pub(super) async fn compact(
         &self,
         model: &str,
@@ -290,15 +304,7 @@ impl CodexProvider {
                     instructions: INSTRUCTIONS,
                     tools: Some(tool_definitions()?),
                     parallel_tool_calls: false,
-                    reasoning: Some(Reasoning {
-                        effort: Some(
-                            reasoning_effort
-                                .parse()
-                                .map_err(|error: String| anyhow::anyhow!(error))?,
-                        ),
-                        summary: None,
-                        context: None,
-                    }),
+                    reasoning: Some(reasoning(reasoning_effort)?),
                     service_tier: None,
                     prompt_cache_key: Some(prompt_cache_key),
                     text: None,
@@ -310,6 +316,43 @@ impl CodexProvider {
             .await
             .context("Codex compaction failed")
     }
+}
+
+fn completion_request(
+    model: &str,
+    reasoning_effort: &str,
+    events: &[Event],
+    prompt_cache_key: &str,
+) -> Result<ResponsesApiRequest> {
+    Ok(ResponsesApiRequest {
+        model: model.to_owned(),
+        instructions: INSTRUCTIONS.to_owned(),
+        input: model_input(events)?,
+        tools: Some(tool_definitions()?),
+        tool_choice: "auto".to_owned(),
+        parallel_tool_calls: false,
+        reasoning: Some(reasoning(reasoning_effort)?),
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: vec!["reasoning.encrypted_content".to_owned()],
+        service_tier: None,
+        prompt_cache_key: Some(prompt_cache_key.to_owned()),
+        text: None,
+        client_metadata: None,
+    })
+}
+
+fn reasoning(reasoning_effort: &str) -> Result<Reasoning> {
+    Ok(Reasoning {
+        effort: Some(
+            reasoning_effort
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error))?,
+        ),
+        summary: None,
+        context: None,
+    })
 }
 
 struct BearerAuth {
@@ -415,6 +458,7 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                     EventKind::ApprovalRequest
                     | EventKind::ApprovalResponse
                     | EventKind::Compaction
+                    | EventKind::ModelRequest
                     | EventKind::TokenUsage => return None,
                 };
                 Some(Ok(item))
@@ -568,4 +612,45 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
     ]);
     let raw = RawValue::from_string(tools.to_string()).context("failed to encode tool schemas")?;
     Ok(Arc::<RawValue>::from(raw).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn request_snapshot_contains_exact_context_and_omits_observer_events() {
+        let events = vec![
+            Event {
+                sequence: 0,
+                kind: EventKind::UserMessage,
+                payload: json!({"content": "hello"}),
+            },
+            Event {
+                sequence: 1,
+                kind: EventKind::ModelRequest,
+                payload: json!({"request": "observer-only"}),
+            },
+        ];
+
+        let request = completion_request("model", "medium", &events, "cache").unwrap();
+        let snapshot = serde_json::to_value(request).unwrap();
+
+        assert_eq!(snapshot["model"], "model");
+        assert_eq!(snapshot["prompt_cache_key"], "cache");
+        assert_eq!(snapshot["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot.pointer("/input/0/content/0/text"),
+            Some(&json!("hello"))
+        );
+        assert!(
+            snapshot["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "apply_patch")
+        );
+    }
 }
