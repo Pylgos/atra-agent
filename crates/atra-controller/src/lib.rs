@@ -21,7 +21,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
     AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthRouteConfig, CLIENT_ID, ServerOptions,
-    run_login_server,
+    default_client::set_default_originator, run_login_server,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -42,6 +42,7 @@ use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
 use storage::{EventKind, Store};
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
+    let _ = set_default_originator("atra".to_owned());
     fs::create_dir_all(auth_home)
         .with_context(|| format!("failed to create auth directory {}", auth_home.display()))?;
     fs::set_permissions(auth_home, fs::Permissions::from_mode(0o700)).with_context(|| {
@@ -70,6 +71,7 @@ pub async fn codex_login(auth_home: &Path) -> Result<()> {
 }
 
 pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<()> {
+    let _ = set_default_originator("atra".to_owned());
     let store = Store::open(database)
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
