@@ -21,7 +21,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
     AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthRouteConfig, CLIENT_ID, ServerOptions,
-    default_client::set_default_originator, run_login_server,
+    default_client::set_default_originator, logout_with_revoke, run_login_server,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -68,6 +68,22 @@ pub async fn codex_login(auth_home: &Path) -> Result<()> {
         .block_until_done()
         .await
         .context("Codex login failed")
+}
+
+pub async fn codex_logout(auth_home: &Path) -> Result<()> {
+    let _ = set_default_originator("atra".to_owned());
+    let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+        OutboundProxyPolicy::ReqwestDefault,
+    ));
+    logout_with_revoke(
+        auth_home,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+        &route,
+    )
+    .await
+    .context("failed to log out of Codex")?;
+    Ok(())
 }
 
 pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<()> {
@@ -280,6 +296,10 @@ impl State {
                 codex_login(&self.auth_home).await?;
                 self.provider.reload_auth().await;
                 self.codex_login_status().await
+            }
+            ControllerRequest::CodexLogout => {
+                self.provider.logout().await?;
+                Ok(ControllerResponse::CodexLoggedOut)
             }
             ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
             ControllerRequest::ApprovalAllow { approval_id } => {

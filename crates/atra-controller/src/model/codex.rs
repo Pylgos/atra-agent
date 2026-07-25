@@ -68,6 +68,15 @@ impl CodexProvider {
         *self.models.write().await = None;
     }
 
+    pub(super) async fn logout(&self) -> Result<()> {
+        self.auth
+            .logout_with_revoke()
+            .await
+            .context("failed to log out of Codex")?;
+        *self.models.write().await = None;
+        Ok(())
+    }
+
     pub(super) async fn models(&self) -> Result<Vec<Model>> {
         if let Some(models) = self.models.read().await.as_ref() {
             return Ok(models.clone());

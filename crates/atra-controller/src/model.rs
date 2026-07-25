@@ -74,6 +74,13 @@ impl Provider {
         }
     }
 
+    pub(crate) async fn logout(&self) -> Result<()> {
+        if let Self::Codex(provider) = self {
+            provider.logout().await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn models(&self) -> Result<Vec<Model>> {
         match self {
             Self::Fake(_) => Ok(vec![Model {

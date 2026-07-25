@@ -42,6 +42,7 @@ pub enum ControllerRequest {
         thread_id: i64,
     },
     CodexLogin,
+    CodexLogout,
     CodexLoginStatus,
     ApprovalAllow {
         approval_id: u64,
@@ -160,6 +161,7 @@ pub enum ControllerResponse {
     CodexLoggedIn {
         email: Option<String>,
     },
+    CodexLoggedOut,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -85,6 +85,7 @@ enum WorkspaceCommand {
 #[derive(Subcommand)]
 enum CodexCommand {
     Login,
+    Logout,
     Status,
 }
 
@@ -286,6 +287,23 @@ async fn run(command: Command) -> Result<()> {
         } => {
             atra_controller::codex_login(&codex_auth_home()?).await?;
             println!("logged in");
+            Ok(())
+        }
+        Command::Codex {
+            command: CodexCommand::Logout,
+        } => {
+            match send_controller_request(&endpoint, ControllerRequest::CodexLogout).await {
+                Ok(ControllerResponse::CodexLoggedOut) => {}
+                Ok(ControllerResponse::Error { message }) => bail!("{message}"),
+                Ok(response) => {
+                    bail!("controller returned an unexpected response: {response:?}")
+                }
+                Err(error) if controller_not_running(&error) => {
+                    atra_controller::codex_logout(&codex_auth_home()?).await?;
+                }
+                Err(error) => return Err(error),
+            }
+            println!("logged out");
             Ok(())
         }
         Command::Codex {
@@ -1063,7 +1081,8 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ThreadEvents { .. }
         | ControllerResponse::RunnerList { .. }
         | ControllerResponse::CodexLoginRequired
-        | ControllerResponse::CodexLoggedIn { .. } => {
+        | ControllerResponse::CodexLoggedIn { .. }
+        | ControllerResponse::CodexLoggedOut => {
             bail!("controller returned an unexpected thread response")
         }
         ControllerResponse::Launched => println!("launched"),
