@@ -17,6 +17,7 @@
 - 課金を避けるため、自動 test では実際の provider を使わない。integration test から Cargo を再帰起動しない。
 - 同じ要件を満たすなら、概念と永続状態が少ない設計を選ぶ。
 - 場当たり的な機能追加は避け、リファクタリングを積極的に行う。
+- prompt caching を維持するため、通常動作で会話の event 列を更新、削除、再配置せず append-only にする。compaction、rewind、checkpoint restore など履歴の置換自体を目的とする明示的な操作だけを例外とする。
 
 ## Workflow
 
