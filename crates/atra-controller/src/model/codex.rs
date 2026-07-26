@@ -844,6 +844,25 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                             phase: None,
                         })
                     }
+                    EventKind::Skills => {
+                        let transition = event.payload["transition"].as_str()?;
+                        let text = match transition {
+                            "initial" => event.payload["content"].as_str()?.to_owned(),
+                            "replacement" => format!(
+                                "This skills list replaces all previously provided skills.\n\n{}",
+                                event.payload["content"].as_str()?
+                            ),
+                            "removal" => {
+                                "The previously provided skills are no longer available.".to_owned()
+                            }
+                            _ => return None,
+                        };
+                        ResponseItem::from(ResponseInputItem::Message {
+                            role: "user".to_owned(),
+                            content: vec![ContentItem::InputText { text }],
+                            phase: None,
+                        })
+                    }
                     EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
                         role: "user".to_owned(),
                         content: vec![ContentItem::InputText {

@@ -19,7 +19,7 @@ use atra_protocol::{
     Runner as RunnerInfo, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
     RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
-use atra_store::TreeManifest;
+use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
@@ -39,6 +39,7 @@ use tokio::{
 
 mod connection;
 mod model;
+mod skills;
 #[allow(dead_code)]
 mod storage;
 
@@ -107,6 +108,11 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         None => Provider::codex(auth_home.to_owned()).await,
     };
     let platform = current_platform()?.map(Arc::new);
+    let data_home = xdg::BaseDirectories::new()
+        .get_data_home()
+        .context("cannot determine the XDG data directory")?;
+    let skill_store =
+        AtraStore::open(data_home.join("atra")).context("failed to open skill object store")?;
 
     if endpoint.exists() {
         match UnixStream::connect(endpoint).await {
@@ -139,6 +145,9 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         thread_locks: StdMutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
         platform,
+        skill_store,
+        skill_generation: Mutex::new(None),
+        data_home,
         auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
         workspace,
@@ -178,6 +187,9 @@ pub(crate) struct State {
     thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
     next_approval_id: AtomicU64,
     platform: Option<Arc<PlatformStore>>,
+    skill_store: AtraStore,
+    skill_generation: Mutex<Option<Arc<skills::SkillGeneration>>>,
+    data_home: PathBuf,
     auth_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
@@ -499,7 +511,7 @@ impl State {
                         background,
                         timeout_ms,
                         timeout_action,
-                        environment: runner.environment.clone(),
+                        environment: runner.environment.lock().await.clone(),
                     })
                     .await
             }
@@ -561,6 +573,7 @@ impl State {
     ) -> Result<ControllerResponse> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
+        self.sync_skills(thread_id, updates).await?;
         self.store
             .name_thread_if_unnamed(thread_id, message.clone())
             .await
@@ -584,6 +597,7 @@ impl State {
     ) -> Result<ControllerResponse> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
+        self.sync_skills(thread_id, updates).await?;
         let events = self
             .store
             .events(thread_id)
@@ -822,6 +836,7 @@ impl State {
                             thread_id,
                             json!({ "items": items }),
                             workspace_event,
+                            skill_event(&events),
                         )
                         .await
                         .context("failed to replace history after compaction")?;
@@ -937,6 +952,65 @@ impl State {
             .await
             .context("failed to save workspace instructions")?;
         Ok(())
+    }
+
+    async fn sync_skills(
+        &self,
+        thread_id: i64,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<()> {
+        let generation = self.collect_skill_generation().await?;
+
+        let runners = self.runners.lock().await;
+        for (name, runner) in runners.iter() {
+            runner
+                .sync_skills(&self.skill_store, &generation)
+                .await
+                .with_context(|| format!("failed to synchronize skills to runner {name}"))?;
+        }
+        drop(runners);
+        *self.skill_generation.lock().await = Some(Arc::clone(&generation));
+
+        let events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load skill state")?;
+        let previous = current_skills(&events);
+        if previous.tracked && previous.content == generation.prompt {
+            return Ok(());
+        }
+        if !previous.tracked && generation.prompt.is_none() {
+            return Ok(());
+        }
+        let transition = match (&previous.content, &generation.prompt) {
+            (_, None) => "removal",
+            (Some(_), Some(_)) => "replacement",
+            (None, Some(_)) => "initial",
+        };
+        self.append_event(
+            thread_id,
+            EventKind::Skills,
+            json!({
+                "content": generation.prompt,
+                "transition": transition,
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save skills")?;
+        Ok(())
+    }
+
+    async fn collect_skill_generation(&self) -> Result<Arc<skills::SkillGeneration>> {
+        let workspace = self.workspace.clone();
+        let data_home = self.data_home.clone();
+        let store = self.skill_store.clone();
+        Ok(Arc::new(
+            tokio::task::spawn_blocking(move || skills::collect(&workspace, &data_home, &store))
+                .await
+                .context("skill collection task failed")??,
+        ))
     }
 
     async fn read_workspace_instructions(&self) -> Result<Option<String>> {
@@ -1288,7 +1362,7 @@ impl State {
                             background: true,
                             timeout_ms: arguments.timeout_ms,
                             timeout_action: arguments.timeout_action,
-                            environment: runner.environment.clone(),
+                            environment: runner.environment.lock().await.clone(),
                         })
                         .await?
                 } else {
@@ -1303,7 +1377,7 @@ impl State {
                     let response = runner
                         .request_raw(RunnerRequest::StartCommand {
                             command: arguments.command,
-                            environment: runner.environment.clone(),
+                            environment: runner.environment.lock().await.clone(),
                         })
                         .await?;
                     let RunnerResponse::ProcessStarted { process_handle } = response else {
@@ -1539,15 +1613,18 @@ impl State {
         }
 
         let runner = Arc::new(
-            Runner::start(
-                &name,
-                description,
-                approval,
-                command,
-                self.platform.as_deref(),
-            )
-            .await?,
+            Runner::start(&name, description, approval, command, self.platform.clone()).await?,
         );
+        let cached_generation = self.skill_generation.lock().await.clone();
+        let generation = match cached_generation {
+            Some(generation) => generation,
+            None => {
+                let generation = self.collect_skill_generation().await?;
+                *self.skill_generation.lock().await = Some(Arc::clone(&generation));
+                generation
+            }
+        };
+        runner.sync_skills(&self.skill_store, &generation).await?;
         runners.insert(name, runner);
         Ok(ControllerResponse::Launched)
     }
@@ -1605,6 +1682,33 @@ fn workspace_instructions(events: &[storage::Event]) -> WorkspaceInstructions {
                 tracked: true,
             },
         )
+}
+
+fn current_skills(events: &[storage::Event]) -> WorkspaceInstructions {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::Skills)
+        .map_or(
+            WorkspaceInstructions {
+                content: None,
+                tracked: false,
+            },
+            |event| WorkspaceInstructions {
+                content: event.payload["content"].as_str().map(str::to_owned),
+                tracked: true,
+            },
+        )
+}
+
+fn skill_event(events: &[storage::Event]) -> Option<serde_json::Value> {
+    let skills = current_skills(events);
+    skills.tracked.then(|| {
+        json!({
+            "content": skills.content,
+            "transition": if skills.content.is_some() { "initial" } else { "removal" },
+        })
+    })
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -1748,7 +1852,8 @@ struct Runner {
     config: Mutex<RunnerConfig>,
     child: Mutex<Child>,
     client: RunnerClient,
-    environment: CommandEnvironment,
+    environment: Mutex<CommandEnvironment>,
+    skill_digest: Mutex<Option<String>>,
 }
 
 struct RunnerConfig {
@@ -1763,7 +1868,7 @@ impl Runner {
         description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
-        platform: Option<&PlatformStore>,
+        platform: Option<Arc<PlatformStore>>,
     ) -> Result<Self> {
         tracing::info!(runner = name, executable = command[0], "starting runner");
         let mut child = Command::new(&command[0])
@@ -1822,7 +1927,7 @@ impl Runner {
         let mut environment = CommandEnvironment::default();
         if let Some(platform) = platform {
             let tools = platform.tools()?;
-            let path = deploy_tree(&client, platform, tools).await?;
+            let path = deploy_tree(&client, TreeObjects::Platform(platform), tools).await?;
             environment.prepend_path.push(format!("{path}/bin"));
         }
         if child
@@ -1842,7 +1947,8 @@ impl Runner {
             }),
             child: Mutex::new(child),
             client,
-            environment,
+            environment: Mutex::new(environment),
+            skill_digest: Mutex::new(None),
         })
     }
 
@@ -1857,11 +1963,44 @@ impl Runner {
     async fn approval(&self) -> ApprovalPolicy {
         self.config.lock().await.approval
     }
+
+    async fn sync_skills(
+        &self,
+        store: &AtraStore,
+        generation: &skills::SkillGeneration,
+    ) -> Result<()> {
+        let digest = generation.manifest.digest();
+        if self.skill_digest.lock().await.as_deref() == Some(&digest) {
+            return Ok(());
+        }
+        let mut environment = self.environment.lock().await;
+        if generation.manifest.entries.is_empty() {
+            environment.set.remove("ATRA_SKILLS");
+        } else {
+            let path = deploy_tree(
+                &self.client,
+                TreeObjects::Store(store.clone()),
+                generation.manifest.clone(),
+            )
+            .await?;
+            environment
+                .set
+                .insert("ATRA_SKILLS".to_owned(), format!("{path}/skills"));
+        }
+        *self.skill_digest.lock().await = Some(digest);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+enum TreeObjects {
+    Platform(Arc<PlatformStore>),
+    Store(AtraStore),
 }
 
 async fn deploy_tree(
     client: &RunnerClient,
-    platform: &PlatformStore,
+    objects: TreeObjects,
     manifest: TreeManifest,
 ) -> Result<String> {
     let expected_digest = manifest.digest();
@@ -1874,12 +2013,19 @@ async fn deploy_tree(
         {
             RunnerResponse::MissingObjects { digests } => {
                 for digest in digests {
-                    let platform = platform.clone();
+                    let objects = objects.clone();
                     let object_digest = digest.clone();
                     let (compressed, executable) = tokio::task::spawn_blocking(move || {
                         let mut encoder = zstd::Encoder::new(Vec::new(), 3)
                             .context("failed to compress object")?;
-                        let executable = platform.copy_object_to(&object_digest, &mut encoder)?;
+                        let executable = match objects {
+                            TreeObjects::Platform(platform) => {
+                                platform.copy_object_to(&object_digest, &mut encoder)?
+                            }
+                            TreeObjects::Store(store) => {
+                                store.copy_object_to(&object_digest, &mut encoder)?
+                            }
+                        };
                         let compressed = encoder.finish().context("failed to finish object")?;
                         Ok::<_, anyhow::Error>((compressed, executable))
                     })

@@ -12,6 +12,7 @@ use tokio_rusqlite::{
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EventKind {
     WorkspaceInstructions,
+    Skills,
     UserMessage,
     AssistantMessage,
     WebSearch,
@@ -28,6 +29,7 @@ impl EventKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::WorkspaceInstructions => "workspace_instructions",
+            Self::Skills => "skills",
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",
             Self::WebSearch => "web_search",
@@ -496,9 +498,13 @@ impl Store {
         thread_id: i64,
         items: Value,
         workspace_instructions: Option<Value>,
+        skills: Option<Value>,
     ) -> tokio_rusqlite::Result<()> {
         let items = serde_json::to_string(&items).map_err(to_sql_error)?;
         let workspace_instructions = workspace_instructions
+            .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
+            .transpose()?;
+        let skills = skills
             .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
             .transpose()?;
         self.connection
@@ -523,6 +529,20 @@ impl Store {
                             EventKind::WorkspaceInstructions.as_str(),
                             workspace_instructions
                         ],
+                    )?;
+                }
+                if let Some(skills) = skills {
+                    transaction.execute(
+                        "
+                        INSERT INTO events (thread_id, sequence, kind, payload)
+                        VALUES (
+                            ?1,
+                            COALESCE((SELECT MAX(sequence) + 1 FROM events WHERE thread_id = ?1), 0),
+                            ?2,
+                            ?3
+                        )
+                        ",
+                        params![thread_id, EventKind::Skills.as_str(), skills],
                     )?;
                 }
                 transaction.commit()

@@ -21,6 +21,23 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let mut system = TestSystem::start().await;
     system.launch("one", "allow").await;
     system.launch("two", "ask").await;
+    let relaunched = system
+        .atra()
+        .args([
+            "runner",
+            "launch",
+            "--name",
+            "one",
+            "--description",
+            "updated integration test runner",
+            "--approval",
+            "allow",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(relaunched.status.success(), "{relaunched:?}");
+    assert_eq!(relaunched.stdout, b"already running\n");
 
     let thread = system.create_thread().await;
     let turn = system
@@ -266,6 +283,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.kind.as_str())
             .collect::<Vec<_>>(),
         [
+            "skills",
             "user_message",
             "model_request",
             "tool_call",
@@ -275,11 +293,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        events[3].payload["result"],
+        events[4].payload["result"],
         serde_json::json!("model-output\natra exec_command: process finished with exit code 0")
     );
     assert_eq!(
-        events[5].payload["content"],
+        events[6].payload["content"],
         serde_json::json!(
             "observed model-output\natra exec_command: process finished with exit code 0"
         )
@@ -291,6 +309,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.kind.as_str())
             .collect::<Vec<_>>(),
         [
+            "skills",
             "user_message",
             "model_request",
             "tool_call",
@@ -300,7 +319,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        denied_events[3].payload["result"],
+        denied_events[4].payload["result"],
         serde_json::json!("user denied the tool call: not in this environment")
     );
     let allowed_events = system.events(allowed_thread).await;
@@ -310,6 +329,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.kind.as_str())
             .collect::<Vec<_>>(),
         [
+            "skills",
             "user_message",
             "model_request",
             "tool_call",
@@ -319,7 +339,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        allowed_events[3].payload["result"],
+        allowed_events[4].payload["result"],
         serde_json::json!("approved-output\natra exec_command: process finished with exit code 0")
     );
 }

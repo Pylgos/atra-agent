@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse, Thread};
+use atra_protocol::{ControllerRequest, ControllerResponse, Thread};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -81,6 +81,13 @@ async fn lists_threads_newest_first() {
     encoded_request.push(b'\n');
     stream.write_all(&encoded_request).await.unwrap();
     let mut responses = BufReader::new(stream).lines();
+    let skills =
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap();
+    assert!(matches!(
+        skills,
+        ControllerResponse::TurnEvent { event } if event.kind == "skills"
+    ));
     let event =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap();
@@ -111,82 +118,6 @@ async fn lists_threads_newest_first() {
                     reasoning_effort: "medium".to_owned(),
                 }
             ]
-        }
-    );
-}
-
-#[tokio::test]
-async fn launching_a_live_runner_is_idempotent() {
-    let controller = TestController::start().await;
-    let launch = || {
-        ControllerRequest::RunnerLaunch {
-            name: "test".to_owned(),
-            description: "test runner".to_owned(),
-            approval: ApprovalPolicy::Ask,
-            command: vec![
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                "IFS= read -r request; printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; cat >/dev/null"
-                    .to_owned(),
-            ],
-        }
-    };
-
-    assert_eq!(
-        request(&controller.endpoint, launch()).await,
-        ControllerResponse::Launched
-    );
-    assert_eq!(
-        request(&controller.endpoint, launch()).await,
-        ControllerResponse::AlreadyRunning
-    );
-}
-
-#[tokio::test]
-async fn executes_a_foreground_command_through_a_runner() {
-    let controller = TestController::start().await;
-    assert_eq!(
-        request(
-            &controller.endpoint,
-            ControllerRequest::RunnerLaunch {
-                name: "test".to_owned(),
-                description: "test runner".to_owned(),
-                approval: ApprovalPolicy::Allow,
-                command: vec![
-                    "/bin/sh".to_owned(),
-                    "-c".to_owned(),
-                    concat!(
-                        "IFS= read -r initialize; ",
-                        "printf '%s\\n' '{\"request_id\":0,\"status\":\"ready\"}'; ",
-                        "IFS= read -r command; ",
-                        "printf '%s\\n' ",
-                        "'{\"request_id\":1,\"status\":\"process_finished\",",
-                        "\"output\":{\"content\":\"outerr\",\"omitted_bytes\":0,",
-                        "\"full_output_path\":\"/tmp/full-output\"},\"exit_code\":7}'"
-                    )
-                    .to_owned(),
-                ],
-            },
-        )
-        .await,
-        ControllerResponse::Launched
-    );
-
-    assert_eq!(
-        request(
-            &controller.endpoint,
-            ControllerRequest::ExecCommand {
-                runner: "test".to_owned(),
-                command: "printf out; printf err >&2; exit 7".to_owned(),
-                background: false,
-                timeout_ms: None,
-                timeout_action: atra_protocol::TimeoutAction::ReturnRunning,
-            },
-        )
-        .await,
-        ControllerResponse::ProcessFinished {
-            output: "outerr".to_owned(),
-            exit_code: Some(7),
         }
     );
 }

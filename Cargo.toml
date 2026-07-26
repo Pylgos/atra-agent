@@ -68,6 +68,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tui-markdown = "0.3.9"
 unicode-width = "0.2.2"
 xdg = "3.0.0"
+yaml-rust = "0.4.5"
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 zstd = "0.13.3"
 
