@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+atra-id.workspace = true
 atra-patch.workspace = true
 atra-protocol.workspace = true
 atra-store.workspace = true

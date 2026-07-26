@@ -307,9 +307,9 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
         TranscriptItem::ToolResult { artifacts } => artifacts
             .iter()
             .filter_map(|artifact| match artifact.kind.as_str() {
+                "runner_operation" => runner_operation_lines(&artifact.data),
                 "command_execution" => command_execution_lines(&artifact.data),
                 "patch_operations" => patch_operation_lines(&artifact.data),
-                "process_input" => process_input_lines(&artifact.data),
                 "runner_list" => runner_list_lines(&artifact.data),
                 _ => None,
             })
@@ -398,6 +398,11 @@ fn tool_call_lines(
 ) -> Vec<(Option<char>, Line<'static>)> {
     let object = arguments.and_then(serde_json::Value::as_object);
     match name {
+        "runner" => runner_tool_lines(
+            arguments
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        ),
         "exec_command" => {
             let runner = object
                 .and_then(|arguments| arguments.get("runner"))
@@ -417,62 +422,33 @@ fn tool_call_lines(
             lines
         }
         "apply_patch" => {
-            let input = arguments
+            let runner = object
+                .and_then(|arguments| arguments.get("runner"))
+                .and_then(serde_json::Value::as_str);
+            let patch = arguments
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let runner = input
-                .lines()
-                .find_map(|line| line.strip_prefix("*** Runner: "));
-            let patch = input
-                .lines()
-                .filter(|line| {
-                    !line.starts_with("*** Begin Patch")
-                        && !line.starts_with("*** Runner:")
-                        && !line.starts_with("*** End Patch")
+                .or_else(|| {
+                    object
+                        .and_then(|arguments| arguments.get("patch"))
+                        .and_then(serde_json::Value::as_str)
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .unwrap_or_default();
             let mut lines = runner
                 .map(|runner| (Some('┌'), Line::from(runner.to_owned())))
                 .into_iter()
                 .collect::<Vec<_>>();
             lines.push((Some('±'), Line::from("apply patch")));
-            lines.extend(patch_lines(&patch).into_iter().map(|line| (None, line)));
+            lines.extend(patch_lines(patch).into_iter().map(|line| (None, line)));
             lines
         }
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
         "wait_process" => vec![(
             Some('…'),
-            Line::from(format!(
-                "wait process #{}",
-                tool_argument(object, "process_handle")
-            )),
+            Line::from(format!("wait #{}", tool_argument(object, "process_handle"))),
         )],
-        "write_process" => vec![
-            (
-                Some('›'),
-                Line::from(format!(
-                    "write process #{}",
-                    tool_argument(object, "process_handle")
-                )),
-            ),
-            (
-                None,
-                Line::from(
-                    object
-                        .and_then(|arguments| arguments.get("input"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                ),
-            ),
-        ],
         "stop_process" => vec![(
             Some('■'),
-            Line::from(format!(
-                "stop process #{}",
-                tool_argument(object, "process_handle")
-            )),
+            Line::from(format!("stop #{}", tool_argument(object, "process_handle"))),
         )],
         _ => {
             let mut lines = vec![(
@@ -493,6 +469,98 @@ fn tool_call_lines(
             }
             lines
         }
+    }
+}
+
+fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
+    let input = input.lines().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut operation = 0;
+    let mut lines = Vec::new();
+    while index < input.len() {
+        if let Some(runner) = input[index].strip_prefix("*** Runner ") {
+            if operation > 0 {
+                lines.push((None, Line::default()));
+            }
+            lines.push((Some('┌'), Line::from(runner.to_owned())));
+            index += 1;
+        } else if input[index] == "*** Command"
+            || input[index].starts_with("*** Background Command ")
+            || input[index].starts_with("*** Timed Command ")
+        {
+            let header = input[index];
+            operation += 1;
+            separate_operation(&mut lines, operation);
+            let label = if let Some(process_id) = header.strip_prefix("*** Background Command ") {
+                format!("Background Command {process_id}")
+            } else if let Some(timeout) = header.strip_prefix("*** Timed Command ") {
+                format!("Timed Command {timeout}")
+            } else {
+                "Command".to_owned()
+            };
+            lines.push((
+                Some('◆'),
+                Line::from(format!("Operation {operation} · {label}")),
+            ));
+            index += 1;
+            let end = input[index..]
+                .iter()
+                .position(|line| *line == "*** End")
+                .map_or(input.len(), |offset| index + offset);
+            lines.extend(
+                bash_lines(&input[index..end].join("\n"))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| ((index == 0).then_some('$'), line)),
+            );
+            index = (end + 1).min(input.len());
+        } else if let Some(process) = input[index].strip_prefix("*** Wait ") {
+            let (process_id, timeout) = process.split_once(' ').unwrap_or((process, ""));
+            operation += 1;
+            separate_operation(&mut lines, operation);
+            lines.push((
+                Some('…'),
+                Line::from(format!(
+                    "Operation {operation} · Wait {process_id} {timeout}"
+                )),
+            ));
+            index += 1;
+        } else if let Some(process_id) = input[index].strip_prefix("*** Stop ") {
+            operation += 1;
+            separate_operation(&mut lines, operation);
+            lines.push((
+                Some('■'),
+                Line::from(format!("Operation {operation} · Stop {process_id}")),
+            ));
+            index += 1;
+        } else if input[index] == "*** Patch" {
+            operation += 1;
+            separate_operation(&mut lines, operation);
+            index += 1;
+            let end = input[index..]
+                .iter()
+                .position(|line| *line == "*** End")
+                .map_or(input.len(), |offset| index + offset);
+            lines.push((
+                Some('±'),
+                Line::from(format!("Operation {operation} · Patch")),
+            ));
+            lines.extend(
+                patch_lines(&input[index..end].join("\n"))
+                    .into_iter()
+                    .map(|line| (None, line)),
+            );
+            index = (end + 1).min(input.len());
+        } else {
+            index += 1;
+        }
+    }
+    lines
+}
+
+fn separate_operation(lines: &mut Vec<(Option<char>, Line<'static>)>, operation: usize) {
+    if operation > 1 && !matches!(lines.last(), Some((Some('┌'), _))) {
+        lines.push((None, Line::default()));
     }
 }
 
@@ -625,12 +693,6 @@ struct CommandExecution {
 }
 
 #[derive(Deserialize)]
-struct ProcessInput {
-    process_handle: String,
-    bytes_written: usize,
-}
-
-#[derive(Deserialize)]
 struct RunnerList {
     runners: Vec<Runner>,
 }
@@ -639,22 +701,6 @@ struct RunnerList {
 struct Runner {
     name: String,
     description: String,
-}
-
-fn process_input_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
-    let input: ProcessInput = serde_json::from_value(data.clone()).ok()?;
-    Some(vec![(
-        Some('✓'),
-        Line::from(Span::styled(
-            format!(
-                "input written to process #{} · {} bytes",
-                input.process_handle, input.bytes_written
-            ),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )),
-    )])
 }
 
 fn runner_list_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
@@ -732,6 +778,50 @@ fn command_execution_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>
             )),
         )
     }));
+    Some(lines)
+}
+
+fn runner_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let operation = data.get("operation")?.as_u64()?;
+    let runner = data.get("runner")?.as_str()?;
+    let label = data.get("label")?.as_str()?;
+    let mut lines = Vec::new();
+    if operation > 1 {
+        lines.push((None, Line::default()));
+    }
+    lines.push((
+        Some('◆'),
+        Line::from(Span::styled(
+            format!("Operation {operation} · {runner} · {label}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ));
+
+    let artifacts = data.get("artifacts")?.as_array()?;
+    for artifact in artifacts {
+        let rendered = match artifact.get("kind")?.as_str()? {
+            "command_execution" => command_execution_lines(artifact.get("data")?),
+            "patch_operations" => patch_operation_lines(artifact.get("data")?),
+            _ => None,
+        };
+        if let Some(rendered) = rendered {
+            lines.extend(rendered);
+        }
+    }
+    if artifacts.is_empty() {
+        let result = data.get("result")?.as_str()?;
+        lines.extend(result.lines().map(|line| {
+            (
+                None,
+                Line::from(Span::styled(
+                    line.to_owned(),
+                    Style::default().fg(Color::Gray),
+                )),
+            )
+        }));
+    }
     Some(lines)
 }
 

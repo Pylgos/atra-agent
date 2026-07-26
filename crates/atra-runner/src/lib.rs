@@ -26,7 +26,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
-    process::{Child, ChildStdin, Command},
+    process::{Child, Command},
     sync::{Mutex, Notify},
     time::{Instant, sleep, sleep_until},
 };
@@ -194,10 +194,6 @@ async fn handle_request(
                 .wait(&process_handle, Duration::from_millis(timeout_ms))
                 .await
         }
-        RunnerRequest::WriteProcess {
-            process_handle,
-            input,
-        } => processes.write(&process_handle, input).await,
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
     }
 }
@@ -273,7 +269,7 @@ impl ProcessManager {
         let mut child = Command::new("bash");
         child
             .args(["-lc", &command])
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(output_writer)))
             .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
             .process_group(0)
@@ -298,13 +294,9 @@ impl ProcessManager {
                 env::join_paths(paths).context("command PATH contains an invalid path")?,
             );
         }
-        let mut child = child
+        let child = child
             .spawn()
             .context("failed to execute command with bash")?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("command stdin was not available")?;
         let os_pid = Pid::from_raw(
             child
                 .id()
@@ -327,7 +319,6 @@ impl ProcessManager {
             handle: handle.clone(),
             os_pid,
             child: Mutex::new(child),
-            stdin: Mutex::new(Some(stdin)),
             output: Mutex::new(OutputBuffer::default()),
             full_output_path,
             output_closed: AtomicBool::new(false),
@@ -455,28 +446,6 @@ impl ProcessManager {
         }
     }
 
-    async fn write(&self, handle: &str, input: Vec<u8>) -> Result<RunnerResponse> {
-        let process = self.process(handle).await?;
-        tracing::info!(
-            process_handle = %handle,
-            input_bytes = input.len(),
-            "writing process input"
-        );
-        tracing::trace!(
-            process_handle = %handle,
-            input = %String::from_utf8_lossy(&input),
-            "process input"
-        );
-        let mut stdin = process.stdin.lock().await;
-        stdin
-            .as_mut()
-            .context("process stdin is closed")?
-            .write_all(&input)
-            .await
-            .context("failed to write process stdin")?;
-        Ok(RunnerResponse::InputWritten)
-    }
-
     async fn stop(&self, handle: &str) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
         let _ = kill_process_group(process.os_pid, Signal::TERM);
@@ -518,7 +487,6 @@ struct ManagedProcess {
     handle: String,
     os_pid: Pid,
     child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
     output: Mutex<OutputBuffer>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,

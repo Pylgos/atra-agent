@@ -121,6 +121,18 @@ impl TranscriptEntry {
         self.rendered = None;
     }
 
+    pub(crate) fn append_tool_input(&mut self, content: &str) {
+        let TranscriptItem::ToolCall { arguments, .. } = &mut self.item else {
+            unreachable!();
+        };
+        match arguments {
+            Some(serde_json::Value::String(input)) => input.push_str(content),
+            None => *arguments = Some(serde_json::Value::String(content.to_owned())),
+            Some(_) => unreachable!(),
+        }
+        self.rendered = None;
+    }
+
     pub(crate) fn replace(&mut self, item: TranscriptItem) {
         self.item = item;
         self.rendered = None;

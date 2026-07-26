@@ -89,6 +89,9 @@ impl Overlay {
 
 pub(crate) struct Approval {
     pub(crate) id: u64,
+    pub(crate) runner: String,
+    pub(crate) label: String,
+    pub(crate) operation_index: Option<usize>,
     pub(crate) deny_reason: Option<InputBuffer>,
 }
 

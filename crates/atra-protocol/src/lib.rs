@@ -104,11 +104,6 @@ pub enum ControllerRequest {
         process_handle: String,
         timeout_ms: u64,
     },
-    WriteProcess {
-        runner: String,
-        process_handle: String,
-        input: Vec<u8>,
-    },
     StopProcess {
         runner: String,
         process_handle: String,
@@ -160,6 +155,8 @@ pub enum ControllerResponse {
         thread_id: i64,
         tool: String,
         arguments: Value,
+        operation_index: Option<usize>,
+        operation_label: Option<String>,
     },
     ThreadEvents {
         events: Vec<ThreadEvent>,
@@ -197,7 +194,6 @@ pub enum ControllerResponse {
     ProcessTimedOut {
         output: String,
     },
-    InputWritten,
     ProcessStopped {
         output: String,
     },
@@ -304,10 +300,6 @@ pub enum RunnerRequest {
         process_handle: String,
         timeout_ms: u64,
     },
-    WriteProcess {
-        process_handle: String,
-        input: Vec<u8>,
-    },
     StopProcess {
         process_handle: String,
     },
@@ -339,7 +331,6 @@ pub enum RunnerResponse {
     ProcessTimedOut {
         output: CommandOutput,
     },
-    InputWritten,
     ProcessStopped {
         output: CommandOutput,
     },

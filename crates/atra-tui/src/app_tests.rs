@@ -105,10 +105,10 @@ fn markdown_and_partial_patch_render_before_completion() {
         ),
         TranscriptEntry::new(TranscriptItem::ToolCall {
             name: "apply_patch".to_owned(),
-            arguments: Some(serde_json::Value::String(
-                "*** Begin Patch\n*** Runner: local\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
-                    .to_owned(),
-            )),
+            arguments: Some(serde_json::json!({
+                "runner": "local",
+                "patch": "*** Update File: src/main.rs\n@@\n-old\n+new",
+            })),
         }),
     ];
 

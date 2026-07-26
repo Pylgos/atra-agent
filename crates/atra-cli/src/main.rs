@@ -232,14 +232,6 @@ enum RunnerCommand {
         #[arg(long)]
         timeout_ms: u64,
     },
-    Write {
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        process_handle: String,
-        #[arg(long)]
-        text: String,
-    },
     Stop {
         #[arg(long)]
         name: String,
@@ -755,29 +747,6 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Runner {
             command:
-                RunnerCommand::Write {
-                    name,
-                    process_handle,
-                    text,
-                },
-        } => {
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::WriteProcess {
-                    runner: name,
-                    process_handle,
-                    input: text.into_bytes(),
-                },
-            )
-            .await?;
-            match response {
-                ControllerResponse::InputWritten => Ok(()),
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-        }
-        Command::Runner {
-            command:
                 RunnerCommand::Stop {
                     name,
                     process_handle,
@@ -1283,7 +1252,6 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ProcessRunning { .. }
         | ControllerResponse::ProcessFinished { .. }
         | ControllerResponse::ProcessTimedOut { .. }
-        | ControllerResponse::InputWritten
         | ControllerResponse::ProcessStopped { .. } => {
             bail!("controller returned an unexpected process response")
         }

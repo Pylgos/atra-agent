@@ -54,6 +54,8 @@ pub(crate) enum ModelStreamEvent {
         thread_id: i64,
         tool: String,
         arguments: serde_json::Value,
+        operation_index: Option<usize>,
+        operation_label: Option<String>,
     },
     ThreadEvent(ThreadEvent),
 }

@@ -87,11 +87,15 @@ async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) 
             thread_id,
             tool,
             arguments,
+            operation_index,
+            operation_label,
         } => ControllerResponse::ApprovalRequired {
             approval_id,
             thread_id,
             tool,
             arguments,
+            operation_index,
+            operation_label,
         },
         ModelStreamEvent::ThreadEvent(event) => ControllerResponse::TurnEvent { event },
     };

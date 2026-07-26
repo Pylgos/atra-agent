@@ -106,23 +106,38 @@ impl App {
         {
             Overlay::Approval(approval) => match &approval.deny_reason {
                 Some(reason) => (
-                    "Deny reason (optional)",
+                    "Deny reason (optional)".to_owned(),
                     Some(Line::from("Enter: deny · Esc: back").right_aligned()),
                     reason.value.as_str(),
                     reason.cursor,
                     true,
                 ),
-                None => ("Approval required", None, "[y] Allow  [n] Deny", 0, false),
+                None => {
+                    let operation = approval
+                        .operation_index
+                        .map(|index| format!("Operation {index} · "))
+                        .unwrap_or_default();
+                    let runner = (!approval.runner.is_empty())
+                        .then(|| format!("{} · ", approval.runner))
+                        .unwrap_or_default();
+                    (
+                        format!("Approval required · {operation}{runner}{}", approval.label),
+                        None,
+                        "[y] Allow  [n] Deny",
+                        0,
+                        false,
+                    )
+                }
             },
             Overlay::Rename => (
-                "Thread name",
+                "Thread name".to_owned(),
                 None,
                 self.message_input.value.as_str(),
                 self.message_input.cursor,
                 true,
             ),
             _ => (
-                "Message",
+                "Message".to_owned(),
                 Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
                 self.message_input.value.as_str(),
                 self.message_input.cursor,

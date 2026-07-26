@@ -50,19 +50,38 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
-            ControllerResponse::ToolCallDelta { .. } => {}
+            ControllerResponse::ToolCallDelta { item_id, delta } => {
+                updates
+                    .send(TurnUpdate::ToolCallDelta {
+                        thread_id,
+                        item_id,
+                        content: delta,
+                    })
+                    .ok();
+            }
             ControllerResponse::TurnEvent { event } => {
                 updates.send(TurnUpdate::Event { thread_id, event }).ok();
             }
             ControllerResponse::ApprovalRequired {
                 approval_id,
                 thread_id,
-                ..
+                tool,
+                arguments,
+                operation_index,
+                operation_label,
             } => {
+                let runner = arguments
+                    .get("runner")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
                 updates
                     .send(TurnUpdate::ApprovalRequired {
                         approval_id,
                         thread_id,
+                        runner,
+                        label: operation_label.unwrap_or(tool),
+                        operation_index,
                     })
                     .ok();
             }

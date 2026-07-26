@@ -9,8 +9,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
-const BEGIN: &str = "*** Begin Patch";
-const END: &str = "*** End Patch";
 const ADD: &str = "*** Add File: ";
 const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
@@ -360,38 +358,16 @@ enum Chunk {
 }
 
 fn parse(patch: &str) -> Result<Vec<Operation>> {
-    let lines: Vec<&str> = patch.trim().lines().collect();
-    let lines = unwrap_heredoc(&lines);
-    if lines.first().map(|line| line.trim()) != Some(BEGIN) {
-        bail!("The first line of the patch must be '{BEGIN}'");
-    }
-    if lines.last().map(|line| line.trim()) != Some(END) {
-        bail!("The last line of the patch must be '{END}'");
-    }
-
+    let lines: Vec<&str> = patch.lines().collect();
     let mut operations = Vec::new();
-    let mut index = 1;
-    if lines
-        .get(index)
-        .is_some_and(|line| line.trim().starts_with("*** Runner:"))
-    {
-        let runner = lines[index]
-            .trim()
-            .strip_prefix("*** Runner:")
-            .unwrap()
-            .trim();
-        if runner.is_empty() {
-            bail!("apply_patch runner cannot be empty");
-        }
-        index += 1;
-    }
+    let mut index = 0;
 
-    while index < lines.len() - 1 {
+    while index < lines.len() {
         let header = lines[index].trim();
         if let Some(path) = header.strip_prefix(ADD) {
             index += 1;
             let mut content = String::new();
-            while index < lines.len() - 1 && !is_operation_header(lines[index]) {
+            while index < lines.len() && !is_operation_header(lines[index]) {
                 let line = lines[index]
                     .strip_prefix('+')
                     .with_context(|| format!("invalid add-file line {}", index + 1))?;
@@ -420,7 +396,7 @@ fn parse(patch: &str) -> Result<Vec<Operation>> {
                 index += 1;
             }
             let mut chunks = Vec::new();
-            while index < lines.len() - 1 && !is_operation_header(lines[index]) {
+            while index < lines.len() && !is_operation_header(lines[index]) {
                 if lines[index].trim().is_empty()
                     && chunks
                         .last()
@@ -495,7 +471,7 @@ fn parse(patch: &str) -> Result<Vec<Operation>> {
                 let mut old = Vec::new();
                 let mut new = Vec::new();
                 let mut eof = false;
-                while index < lines.len() - 1 {
+                while index < lines.len() {
                     let line = lines[index];
                     if is_operation_header(line)
                         || line.trim_end() == "@@"
@@ -549,22 +525,9 @@ fn parse(patch: &str) -> Result<Vec<Operation>> {
     Ok(operations)
 }
 
-fn unwrap_heredoc<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
-    match lines {
-        [first, .., last]
-            if matches!(*first, "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
-                && last.ends_with("EOF")
-                && lines.len() >= 4 =>
-        {
-            &lines[1..lines.len() - 1]
-        }
-        _ => lines,
-    }
-}
-
 fn is_operation_header(line: &str) -> bool {
     let line = line.trim();
-    line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE) || line == END
+    line.starts_with(ADD) || line.starts_with(DELETE) || line.starts_with(UPDATE)
 }
 
 fn update_content(original: &str, path: &Path, chunks: &[Chunk]) -> Result<String> {

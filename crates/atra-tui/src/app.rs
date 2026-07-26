@@ -75,6 +75,11 @@ pub(crate) enum TurnUpdate {
         item_id: String,
         name: String,
     },
+    ToolCallDelta {
+        thread_id: i64,
+        item_id: String,
+        content: String,
+    },
     Event {
         thread_id: i64,
         event: ThreadEvent,
@@ -82,6 +87,9 @@ pub(crate) enum TurnUpdate {
     ApprovalRequired {
         approval_id: u64,
         thread_id: i64,
+        runner: String,
+        label: String,
+        operation_index: Option<usize>,
     },
     Completed(Result<TurnCompletion>),
     ApprovalResolved {
@@ -1255,6 +1263,18 @@ impl App {
                 }
                 return Ok(());
             }
+            TurnUpdate::ToolCallDelta {
+                thread_id,
+                item_id,
+                content,
+            } => {
+                if self.thread_id == Some(thread_id)
+                    && let Some(index) = self.tool_call_previews.get(&item_id)
+                {
+                    self.transcript[*index].append_tool_input(&sanitize(&content));
+                }
+                return Ok(());
+            }
             TurnUpdate::Event { thread_id, event } => {
                 if self.thread_id == Some(thread_id) {
                     let usage_matches_selected_model = event.kind == "token_usage"
@@ -1318,10 +1338,16 @@ impl App {
             TurnUpdate::ApprovalRequired {
                 approval_id,
                 thread_id,
+                runner,
+                label,
+                operation_index,
             } => {
                 if self.thread_id == Some(thread_id) {
                     self.overlay = Overlay::Approval(Approval {
                         id: approval_id,
+                        runner,
+                        label,
+                        operation_index,
                         deny_reason: None,
                     });
                     self.activity = None;
@@ -1352,6 +1378,9 @@ impl App {
                     Ok(ControllerResponse::Error { message }) => {
                         self.overlay = Overlay::Approval(Approval {
                             id: approval_id,
+                            runner: String::new(),
+                            label: String::new(),
+                            operation_index: None,
                             deny_reason: None,
                         });
                         self.activity = Some(Activity::Error(sanitize(&message)));
@@ -1362,6 +1391,9 @@ impl App {
                     Err(error) => {
                         self.overlay = Overlay::Approval(Approval {
                             id: approval_id,
+                            runner: String::new(),
+                            label: String::new(),
+                            operation_index: None,
                             deny_reason: None,
                         });
                         self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));

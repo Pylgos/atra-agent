@@ -129,13 +129,12 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     let interactive = system
         .background(
             "one",
-            "IFS= read -r line; printf 'received:%s\\n' \"$line\"; sleep 30",
+            "if IFS= read -r line; then printf 'received:%s\\n' \"$line\"; else printf 'stdin-eof\\n'; fi; sleep 30",
         )
         .await;
-    system.write("one", &interactive, "hello\n").await;
     let waited = system.wait("one", &interactive, 1_000).await;
     assert!(waited.status.success(), "{waited:?}");
-    assert_eq!(waited.stdout, b"received:hello\n");
+    assert_eq!(waited.stdout, b"stdin-eof\n");
     assert!(
         String::from_utf8(waited.stderr)
             .unwrap()
@@ -438,7 +437,7 @@ impl TestSystem {
                         "name": "apply_patch",
                         "arguments": {
                             "runner": "two",
-                            "patch": "*** Begin Patch\n*** Add File: model-patched.txt\n+patch-ok\n*** End Patch"
+                            "patch": "*** Add File: model-patched.txt\n+patch-ok"
                         }
                     }
                 },
@@ -647,25 +646,6 @@ impl TestSystem {
             .output()
             .await
             .unwrap()
-    }
-
-    async fn write(&self, runner: &str, process_handle: &str, text: &str) {
-        let output = self
-            .atra()
-            .args([
-                "runner",
-                "write",
-                "--name",
-                runner,
-                "--process-handle",
-                process_handle,
-                "--text",
-                text,
-            ])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
     }
 
     async fn stop_process(&self, runner: &str, process_handle: &str) {

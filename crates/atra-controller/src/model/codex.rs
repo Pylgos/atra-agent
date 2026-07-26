@@ -1005,105 +1005,64 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             }
         },
         {
-            "type": "function",
-            "name": "exec_command",
-            "description": "Execute a Bash command on a named Atra Runner.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "runner": {"type": "string"},
-                    "command": {"type": "string"},
-                    "background": {"type": "boolean"},
-                    "timeout_ms": {"type": ["integer", "null"]},
-                    "timeout_action": {
-                        "type": "string",
-                        "enum": ["return_running", "terminate"]
-                    }
-                },
-                "required": ["runner", "command", "background", "timeout_ms", "timeout_action"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "wait_process",
-            "description": "Wait for more output or completion from a background process on a named Atra Runner.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "runner": {"type": "string"},
-                    "process_handle": {"type": "string"},
-                    "timeout_ms": {"type": "integer"}
-                },
-                "required": ["runner", "process_handle", "timeout_ms"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "write_process",
-            "description": "Write text to the standard input of a background process on a named Atra Runner.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "runner": {"type": "string"},
-                    "process_handle": {"type": "string"},
-                    "input": {"type": "string"}
-                },
-                "required": ["runner", "process_handle", "input"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "stop_process",
-            "description": "Stop a background process on a named Atra Runner.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "runner": {"type": "string"},
-                    "process_handle": {"type": "string"}
-                },
-                "required": ["runner", "process_handle"],
-                "additionalProperties": false
-            }
-        },
-        {
             "type": "custom",
-            "name": "apply_patch",
+            "name": "runner",
             "description": indoc! {"
-                Add, update, delete, or move files on a named Atra Runner.
-                Paths are relative to the Runner's working directory unless absolute.
-                Use `@ start <line>` and an optional `@ end <line>` with matching `-` boundary lines to replace or delete a line range.
+                Execute one or more operations on named Atra Runners.
+                Start each group with `*** Runner <runner>`; repeat it to switch Runners.
+
+                Processes:
+                Use `*** Command` to wait up to 10000 milliseconds for a Bash command and leave it running if unfinished.
+                Use `*** Timed Command <milliseconds>` to stop a command if it exceeds the specified duration.
+                Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
+                End every command with `*** End`.
+                Use `*** Wait <process-id> <milliseconds>` to wait for more output or completion.
+                Use `*** Stop <process-id>` to stop a managed process.
+                Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+
+                Patches:
+                Use `*** Patch` and `*** End` to add, update, delete, or move files.
+                Paths in patches are relative to the current Runner's working directory unless absolute.
                 Use line ranges for large deletions or replacements when the line numbers are already known.
-                When inspecting the file is otherwise necessary, obtain line numbers as part of that inspection.
+                When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
                 Use ordinary diff lines for small changes.
-                Do not make an additional tool call solely to obtain line numbers unless doing so avoids a substantially larger patch.
+                Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
+
+                Operations execute sequentially, and their results are returned together after all operations have finished.
+                Use a separate tool call when a result is needed to decide the next operation.
             "},
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
                 "definition": indoc! {r#"
-                    start: begin_patch runner hunk+ end_patch
-                    begin_patch: "*** Begin Patch" LF
-                    runner: "*** Runner: " filename LF
-                    end_patch: "*** End Patch" LF?
+                    start: runner_group+
+                    runner_group: runner operation+
+                    runner: "*** Runner " name LF
+                    operation: command | patch | wait_process | stop_process
 
+                    command: foreground_command | background_command | timed_command
+                    foreground_command: "*** Command" LF command_body
+                    background_command: "*** Background Command " process_id LF command_body
+                    timed_command: "*** Timed Command " INT LF command_body
+                    command_body: command_line+ END
+                    command_line: /(.+)/ LF | LF
+                    END: /\*\*\* End\r?\n/
+
+                    patch: "*** Patch" LF hunk+ END
                     hunk: add_hunk | delete_hunk | update_hunk
                     add_hunk: "*** Add File: " filename LF add_line+
                     delete_hunk: "*** Delete File: " filename LF
-                    update_hunk: "*** Update File: " filename LF change_move? update_change+
+                    update_hunk: "*** Update File: " filename LF change_move? first_update following_update*
 
+                    name: /(.+)/
                     filename: /(.+)/
                     add_line: "+" /(.*)/ LF -> line
 
                     change_move: "*** Move to: " filename LF
-                    update_change: change | range_change
+                    first_update: change | range_change
+                    following_update: headed_change | range_change
                     change: change_context? change_line+ eof_line?
+                    headed_change: change_context change_line+ eof_line?
                     change_context: ("@@" | "@@ " /(.+)/) LF
                     change_line: ("+" | "-" | " ") /(.*)/ LF
                     eof_line: "*** End of File" LF
@@ -1113,11 +1072,15 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     range_end: "@ end " INT LF
                     remove_line: "-" /(.*)/ LF
 
+                    wait_process: "*** Wait " process_id " " INT LF
+                    stop_process: "*** Stop " process_id LF
+                    process_id: /[a-z][a-z0-9_-]{0,63}/
+
                     %import common.INT
                     %import common.LF
                 "#}
             }
-        }
+        },
     ]);
     let raw = RawValue::from_string(tools.to_string()).context("failed to encode tool schemas")?;
     Ok(Arc::<RawValue>::from(raw).into())
@@ -1159,7 +1122,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|tool| tool["name"] == "apply_patch")
+                .any(|tool| tool["name"] == "runner")
         );
     }
 }
