@@ -373,15 +373,15 @@ fn parse(patch: &str) -> Result<Vec<Operation>> {
     let mut index = 1;
     if lines
         .get(index)
-        .is_some_and(|line| line.trim().starts_with("*** Environment ID:"))
+        .is_some_and(|line| line.trim().starts_with("*** Runner:"))
     {
-        let environment = lines[index]
+        let runner = lines[index]
             .trim()
-            .strip_prefix("*** Environment ID:")
+            .strip_prefix("*** Runner:")
             .unwrap()
             .trim();
-        if environment.is_empty() {
-            bail!("apply_patch environment_id cannot be empty");
+        if runner.is_empty() {
+            bail!("apply_patch runner cannot be empty");
         }
         index += 1;
     }

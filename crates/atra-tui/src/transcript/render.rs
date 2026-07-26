@@ -422,12 +422,12 @@ fn tool_call_lines(
                 .unwrap_or_default();
             let runner = input
                 .lines()
-                .find_map(|line| line.strip_prefix("*** Environment ID: "));
+                .find_map(|line| line.strip_prefix("*** Runner: "));
             let patch = input
                 .lines()
                 .filter(|line| {
                     !line.starts_with("*** Begin Patch")
-                        && !line.starts_with("*** Environment ID:")
+                        && !line.starts_with("*** Runner:")
                         && !line.starts_with("*** End Patch")
                 })
                 .collect::<Vec<_>>()

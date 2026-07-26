@@ -25,6 +25,7 @@ use codex_protocol::models::{
 use codex_protocol::openai_models::ModelVisibility;
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
+use indoc::indoc;
 use serde_json::{json, value::RawValue};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
@@ -995,7 +996,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "type": "function",
             "name": "list_runners",
             "description": "List the available Atra Runners and their roles. Use this when the appropriate execution environment is not already known.",
-            "strict": false,
+            "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1007,7 +1008,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "type": "function",
             "name": "exec_command",
             "description": "Execute a Bash command on a named Atra Runner.",
-            "strict": false,
+            "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1020,7 +1021,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                         "enum": ["return_running", "terminate"]
                     }
                 },
-                "required": ["runner", "command", "background", "timeout_action"],
+                "required": ["runner", "command", "background", "timeout_ms", "timeout_action"],
                 "additionalProperties": false
             }
         },
@@ -1028,7 +1029,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "type": "function",
             "name": "wait_process",
             "description": "Wait for more output or completion from a background process on a named Atra Runner.",
-            "strict": false,
+            "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1044,7 +1045,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "type": "function",
             "name": "write_process",
             "description": "Write text to the standard input of a background process on a named Atra Runner.",
-            "strict": false,
+            "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1060,7 +1061,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "type": "function",
             "name": "stop_process",
             "description": "Stop a background process on a named Atra Runner.",
-            "strict": false,
+            "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1074,11 +1075,47 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
         {
             "type": "custom",
             "name": "apply_patch",
-            "description": "Apply an Atra patch. Put the target Runner name in the required `*** Environment ID: <runner>` line.",
+            "description": indoc! {"
+                Add, update, delete, or move files on a named Atra Runner.
+                Paths are relative to the Runner's working directory unless absolute.
+                Use `@ start <line>` and an optional `@ end <line>` with matching `-` boundary lines to replace or delete a line range.
+                Use line ranges for large deletions or replacements when the line numbers are already known.
+                When inspecting the file is otherwise necessary, obtain line numbers as part of that inspection.
+                Use ordinary diff lines for small changes.
+                Do not make an additional tool call solely to obtain line numbers unless doing so avoids a substantially larger patch.
+            "},
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                "definition": "start: begin_patch environment_id hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nenvironment_id: \"*** Environment ID: \" filename LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF"
+                "definition": indoc! {r#"
+                    start: begin_patch runner hunk+ end_patch
+                    begin_patch: "*** Begin Patch" LF
+                    runner: "*** Runner: " filename LF
+                    end_patch: "*** End Patch" LF?
+
+                    hunk: add_hunk | delete_hunk | update_hunk
+                    add_hunk: "*** Add File: " filename LF add_line+
+                    delete_hunk: "*** Delete File: " filename LF
+                    update_hunk: "*** Update File: " filename LF change_move? update_change+
+
+                    filename: /(.+)/
+                    add_line: "+" /(.*)/ LF -> line
+
+                    change_move: "*** Move to: " filename LF
+                    update_change: change | range_change
+                    change: change_context? change_line+ eof_line?
+                    change_context: ("@@" | "@@ " /(.+)/) LF
+                    change_line: ("+" | "-" | " ") /(.*)/ LF
+                    eof_line: "*** End of File" LF
+
+                    range_change: range_start remove_line (range_end remove_line)? add_line*
+                    range_start: "@ start " INT LF
+                    range_end: "@ end " INT LF
+                    remove_line: "-" /(.*)/ LF
+
+                    %import common.INT
+                    %import common.LF
+                "#}
             }
         }
     ]);

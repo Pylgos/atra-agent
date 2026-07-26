@@ -1758,9 +1758,9 @@ fn parse_apply_patch_input(patch: String) -> Result<ApplyPatchArguments> {
     }
     let runner = lines
         .next()
-        .and_then(|line| line.strip_prefix("*** Environment ID: "))
+        .and_then(|line| line.strip_prefix("*** Runner: "))
         .filter(|runner| !runner.is_empty())
-        .context("custom apply_patch input must include a non-empty Environment ID")?
+        .context("custom apply_patch input must include a non-empty Runner")?
         .to_owned();
     Ok(ApplyPatchArguments { runner, patch })
 }
