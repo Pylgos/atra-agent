@@ -13,6 +13,7 @@ pub(crate) enum TranscriptMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusPane {
     Input,
+    Checkpoints,
     Transcript,
     Requests,
     Detail,
@@ -69,7 +70,6 @@ pub(crate) enum Overlay {
     Rename,
     ModelPicker(ModelPicker),
     ThreadPicker(ThreadPicker),
-    CheckpointPicker(CheckpointPicker),
     HistoryConfirmation(HistoryAction),
 }
 

@@ -184,40 +184,35 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = request(
-                        &endpoint,
-                        ControllerRequest::ThreadCheckpointList { thread_id },
-                    )
-                    .await
-                    .and_then(|response| match response {
-                        ControllerResponse::ThreadCheckpointList { checkpoints } => Ok(checkpoints),
-                        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                        response => anyhow::bail!(
-                            "controller returned an unexpected response: {response:?}"
-                        ),
-                    });
+                    let result = async {
+                        let checkpoints = match request(
+                            &endpoint,
+                            ControllerRequest::ThreadCheckpointList { thread_id },
+                        )
+                        .await?
+                        {
+                            ControllerResponse::ThreadCheckpointList { checkpoints } => checkpoints,
+                            ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+                            response => anyhow::bail!(
+                                "controller returned an unexpected response: {response:?}"
+                            ),
+                        };
+                        let events = match checkpoints.first() {
+                            Some(checkpoint) => checkpoint_events(&endpoint, checkpoint.id).await?,
+                            None => Vec::new(),
+                        };
+                        Ok((checkpoints, events))
+                    }
+                    .await;
                     let _ = updates.send(TurnUpdate::CheckpointsLoaded { thread_id, result });
                 }
                 Self::LoadCheckpoint {
                     endpoint,
                     checkpoint,
                 } => {
-                    let result = request(
-                        &endpoint,
-                        ControllerRequest::ThreadCheckpointEvents {
-                            checkpoint_id: checkpoint.id,
-                        },
-                    )
-                    .await
-                    .and_then(|response| match response {
-                        ControllerResponse::ThreadCheckpointEvents { events } => {
-                            Ok((checkpoint, events))
-                        }
-                        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                        response => anyhow::bail!(
-                            "controller returned an unexpected response: {response:?}"
-                        ),
-                    });
+                    let result = checkpoint_events(&endpoint, checkpoint.id)
+                        .await
+                        .map(|events| (checkpoint, events));
                     let _ = updates.send(TurnUpdate::CheckpointLoaded(result));
                 }
                 Self::HistoryRequest {
@@ -255,6 +250,22 @@ impl Effect {
                 }
             }
         });
+    }
+}
+
+async fn checkpoint_events(
+    endpoint: &std::path::Path,
+    checkpoint_id: i64,
+) -> Result<Vec<atra_protocol::ThreadEvent>> {
+    match request(
+        endpoint,
+        ControllerRequest::ThreadCheckpointEvents { checkpoint_id },
+    )
+    .await?
+    {
+        ControllerResponse::ThreadCheckpointEvents { events } => Ok(events),
+        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+        response => anyhow::bail!("controller returned an unexpected response: {response:?}"),
     }
 }
 

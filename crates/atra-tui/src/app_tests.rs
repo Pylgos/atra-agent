@@ -48,6 +48,7 @@ fn transcript_render_is_stable() {
         transcript: items,
         events: Vec::new(),
         checkpoint: None,
+        checkpoint_picker: None,
         tool_call_previews: HashMap::new(),
         message_input: {
             let mut input = InputBuffer::new(Vec::new(), true);

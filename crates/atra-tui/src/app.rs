@@ -98,7 +98,7 @@ pub(crate) enum TurnUpdate {
     },
     CheckpointsLoaded {
         thread_id: i64,
-        result: Result<Vec<ThreadCheckpoint>>,
+        result: Result<(Vec<ThreadCheckpoint>, Vec<ThreadEvent>)>,
     },
     CheckpointLoaded(Result<(ThreadCheckpoint, Vec<ThreadEvent>)>),
     HistoryChanged {
@@ -123,6 +123,7 @@ pub(crate) struct App {
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
     pub(crate) checkpoint: Option<ThreadCheckpoint>,
+    pub(crate) checkpoint_picker: Option<CheckpointPicker>,
     pub(crate) tool_call_previews: HashMap<String, usize>,
     pub(crate) message_input: InputBuffer,
     pub(crate) command_input: InputBuffer,
@@ -176,6 +177,7 @@ impl App {
             transcript,
             events,
             checkpoint: None,
+            checkpoint_picker: None,
             tool_call_previews: HashMap::new(),
             message_input: InputBuffer::new(message_history, true),
             command_input: InputBuffer::new(command_history, false),
@@ -274,6 +276,7 @@ impl App {
             }
             if matches!(key.code, KeyCode::Enter | KeyCode::Char('g'))
                 && self.overlay.is_none()
+                && self.checkpoint_picker.is_none()
                 && self.view.focus == FocusPane::Input
                 && !self.message_input.value.trim().is_empty()
             {
@@ -436,31 +439,45 @@ impl App {
             return Ok(false);
         }
 
-        if let Overlay::CheckpointPicker(picker) = &mut self.overlay {
+        if self.view.focus == FocusPane::Checkpoints
+            && let Some(picker) = &mut self.checkpoint_picker
+        {
             match key.code {
-                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Up => {
+                    let selected = picker.selected.saturating_sub(1);
+                    if selected != picker.selected {
+                        picker.selected = selected;
+                        let checkpoint = picker.checkpoints[selected].clone();
+                        self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
+                        effects
+                            .send(Effect::LoadCheckpoint {
+                                endpoint: self.endpoint.clone(),
+                                checkpoint,
+                            })
+                            .ok();
+                    }
+                }
                 KeyCode::Down => {
-                    picker.selected =
+                    let selected =
                         (picker.selected + 1).min(picker.checkpoints.len().saturating_sub(1));
+                    if selected != picker.selected {
+                        picker.selected = selected;
+                        let checkpoint = picker.checkpoints[selected].clone();
+                        self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
+                        effects
+                            .send(Effect::LoadCheckpoint {
+                                endpoint: self.endpoint.clone(),
+                                checkpoint,
+                            })
+                            .ok();
+                    }
                 }
-                KeyCode::Enter if !picker.checkpoints.is_empty() => {
-                    let checkpoint = picker.checkpoints[picker.selected].clone();
-                    self.overlay = Overlay::None;
-                    self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
-                    effects
-                        .send(Effect::LoadCheckpoint {
-                            endpoint: self.endpoint.clone(),
-                            checkpoint,
-                        })
-                        .ok();
-                }
-                KeyCode::Esc => {
-                    self.overlay = Overlay::None;
-                    self.activity = None;
-                }
-                _ => {}
+                KeyCode::Esc => {}
+                _ => return Ok(false),
             }
-            return Ok(false);
+            if key.code != KeyCode::Esc {
+                return Ok(false);
+            }
         }
 
         if matches!(self.overlay, Overlay::HistoryConfirmation(_)) {
@@ -485,6 +502,7 @@ impl App {
         if key.code == KeyCode::Esc
             && let (Some(thread_id), Some(_)) = (self.thread_id, self.checkpoint.take())
         {
+            self.checkpoint_picker = None;
             self.select_thread(thread_id, effects);
             return Ok(false);
         }
@@ -576,6 +594,7 @@ impl App {
         self.transcript.clear();
         self.events.clear();
         self.checkpoint = None;
+        self.checkpoint_picker = None;
         self.tool_call_previews.clear();
         self.message_input.clear();
         self.overlay = Overlay::None;
@@ -818,10 +837,7 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if matches!(
             self.overlay,
-            Overlay::Help
-                | Overlay::ThreadPicker(_)
-                | Overlay::CheckpointPicker(_)
-                | Overlay::HistoryConfirmation(_)
+            Overlay::Help | Overlay::ThreadPicker(_) | Overlay::HistoryConfirmation(_)
         ) {
             return Ok(());
         }
@@ -925,6 +941,7 @@ impl App {
             _ => {}
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.checkpoint_picker.is_none()
             && self
                 .layout
                 .input_area
@@ -1296,6 +1313,7 @@ impl App {
                 self.transcript = transcript;
                 self.events = events;
                 self.checkpoint = None;
+                self.checkpoint_picker = None;
                 self.tool_call_previews.clear();
                 self.overlay = Overlay::None;
                 self.clear_selection();
@@ -1357,16 +1375,28 @@ impl App {
                 if self.thread_id != Some(thread_id) {
                     return Ok(());
                 }
-                let checkpoints = result?;
+                let (checkpoints, events) = result?;
                 if checkpoints.is_empty() {
                     self.activity = Some(Activity::Info("No checkpoints are available".to_owned()));
                 } else {
-                    self.overlay = Overlay::CheckpointPicker(CheckpointPicker {
+                    let checkpoint = checkpoints[0].clone();
+                    self.transcript = events
+                        .iter()
+                        .cloned()
+                        .filter_map(TranscriptEntry::from_event)
+                        .collect();
+                    self.events = events;
+                    self.checkpoint = Some(checkpoint);
+                    self.clear_selection();
+                    self.reset_view();
+                    self.view.transcript_mode = TranscriptMode::Coding;
+                    self.checkpoint_picker = Some(CheckpointPicker {
                         checkpoints,
                         selected: 0,
                     });
+                    self.view.focus = FocusPane::Checkpoints;
                     self.activity = Some(Activity::Info(
-                        "Select checkpoint · Enter opens · Esc cancels".to_owned(),
+                        "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
                     ));
                 }
                 return Ok(());
@@ -1376,6 +1406,11 @@ impl App {
                 if self.thread_id != Some(checkpoint.thread_id) {
                     return Ok(());
                 }
+                if let Some(picker) = &self.checkpoint_picker
+                    && picker.checkpoints[picker.selected].id != checkpoint.id
+                {
+                    return Ok(());
+                }
                 self.transcript = events
                     .iter()
                     .cloned()
@@ -1383,11 +1418,13 @@ impl App {
                     .collect();
                 self.events = events;
                 self.checkpoint = Some(checkpoint);
-                self.overlay = Overlay::None;
                 self.clear_selection();
                 self.reset_view();
+                if self.checkpoint_picker.is_some() {
+                    self.view.focus = FocusPane::Checkpoints;
+                }
                 self.activity = Some(Activity::Info(
-                    "Checkpoint view · Esc returns to active history".to_owned(),
+                    "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
                 ));
                 return Ok(());
             }
@@ -1418,6 +1455,7 @@ impl App {
                 self.transcript = transcript;
                 self.events = events;
                 self.checkpoint = None;
+                self.checkpoint_picker = None;
                 self.overlay = Overlay::None;
                 self.tool_call_previews.clear();
                 self.clear_selection();
@@ -1530,9 +1568,15 @@ impl App {
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
-        let panes: &[FocusPane] = match self.view.transcript_mode {
-            TranscriptMode::Coding => &[FocusPane::Input, FocusPane::Transcript],
-            TranscriptMode::Debug => &[FocusPane::Input, FocusPane::Requests, FocusPane::Detail],
+        let panes: &[FocusPane] = if self.checkpoint_picker.is_some() {
+            &[FocusPane::Checkpoints, FocusPane::Transcript]
+        } else {
+            match self.view.transcript_mode {
+                TranscriptMode::Coding => &[FocusPane::Input, FocusPane::Transcript],
+                TranscriptMode::Debug => {
+                    &[FocusPane::Input, FocusPane::Requests, FocusPane::Detail]
+                }
+            }
         };
         let current = panes
             .iter()
@@ -1548,6 +1592,7 @@ impl App {
 
     fn handle_pane_key(&mut self, key: KeyEvent) {
         match self.view.focus {
+            FocusPane::Checkpoints => {}
             FocusPane::Transcript => match key.code {
                 KeyCode::Home => self.view.transcript_scroll = self.layout.transcript_max_scroll,
                 KeyCode::PageUp => {

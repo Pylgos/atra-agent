@@ -87,10 +87,19 @@ impl App {
             ])
             .areas(frame.area());
         self.layout.input_area = input;
-        self.layout.transcript_area = main;
+        let transcript_area = if self.checkpoint_picker.is_some() {
+            let [_, transcript] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(30), Constraint::Min(20)])
+                .areas(main);
+            transcript
+        } else {
+            main
+        };
+        self.layout.transcript_area = transcript_area;
         match self.view.transcript_mode {
-            TranscriptMode::Coding => self.render_coding_transcript(frame, main),
-            TranscriptMode::Debug => self.render_debug_transcript(frame, main),
+            TranscriptMode::Coding => self.render_coding_transcript(frame, transcript_area),
+            TranscriptMode::Debug => self.render_debug_transcript(frame, transcript_area),
         }
 
         let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.overlay
@@ -185,8 +194,17 @@ impl App {
         if let Overlay::ThreadPicker(picker) = &self.overlay {
             render_thread_picker(frame, picker, &self.threads);
         }
-        if let Overlay::CheckpointPicker(picker) = &self.overlay {
-            render_checkpoint_picker(frame, picker);
+        if let Some(picker) = &self.checkpoint_picker {
+            let [list, _] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(30), Constraint::Min(20)])
+                .areas(main);
+            render_checkpoint_picker(
+                frame,
+                list,
+                picker,
+                self.view.focus == FocusPane::Checkpoints,
+            );
         }
         if matches!(self.overlay, Overlay::HistoryConfirmation(_)) {
             render_history_confirmation(frame);
@@ -202,7 +220,6 @@ impl App {
             Overlay::Approval(_)
                 | Overlay::ModelPicker(_)
                 | Overlay::ThreadPicker(_)
-                | Overlay::CheckpointPicker(_)
                 | Overlay::HistoryConfirmation(_)
         ) && self.view.focus == pane
         {
@@ -757,17 +774,12 @@ fn render_thread_picker(
     );
 }
 
-fn render_checkpoint_picker(frame: &mut Frame<'_>, picker: &CheckpointPicker) {
-    let width = frame.area().width.saturating_sub(8).min(72);
-    let height = (picker.checkpoints.len() as u16 + 2)
-        .min(frame.area().height.saturating_sub(4))
-        .max(3);
-    let area = Rect::new(
-        frame.area().x + (frame.area().width - width) / 2,
-        frame.area().y + (frame.area().height - height) / 2,
-        width,
-        height,
-    );
+fn render_checkpoint_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &CheckpointPicker,
+    focused: bool,
+) {
     let items = picker
         .checkpoints
         .iter()
@@ -779,13 +791,17 @@ fn render_checkpoint_picker(frame: &mut Frame<'_>, picker: &CheckpointPicker) {
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(picker.selected));
-    frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("● ").block(
             Block::default()
                 .title("Checkpoints")
-                .title_bottom(Line::from("Enter opens · Esc cancels").right_aligned())
-                .borders(Borders::ALL),
+                .title_bottom(Line::from("Tab: transcript · Esc: return").right_aligned())
+                .borders(Borders::ALL)
+                .border_style(if focused {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
         ),
         area,
         &mut state,
