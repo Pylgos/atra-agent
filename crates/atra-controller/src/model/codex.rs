@@ -835,7 +835,7 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                             _ => return None,
                         };
                         ResponseItem::from(ResponseInputItem::Message {
-                            role: "user".to_owned(),
+                            role: "developer".to_owned(),
                             content: vec![ContentItem::InputText {
                                 text: format!(
                                     "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
@@ -858,7 +858,7 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                             _ => return None,
                         };
                         ResponseItem::from(ResponseInputItem::Message {
-                            role: "user".to_owned(),
+                            role: "developer".to_owned(),
                             content: vec![ContentItem::InputText { text }],
                             phase: None,
                         })
