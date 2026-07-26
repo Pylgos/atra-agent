@@ -5,7 +5,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ControllerRequest, ControllerResponse, Model, Thread, ThreadEvent};
+use atra_protocol::{
+    ControllerRequest, ControllerResponse, Model, Thread, ThreadCheckpoint, ThreadEvent,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
@@ -18,8 +20,8 @@ use crate::{
     layout::{SelectionPoint, ViewLayout},
     runtime::Effect,
     state::{
-        Approval, FocusPane, ModelPicker, Overlay, ThreadPicker, TranscriptMode, TurnState,
-        ViewState,
+        Approval, CheckpointPicker, FocusPane, HistoryAction, ModelPicker, Overlay, ThreadPicker,
+        TranscriptMode, TurnState, ViewState,
     },
     transcript::{
         Author, TranscriptEntry, TranscriptItem, item_from_event, sanitize, transcript_text,
@@ -31,6 +33,12 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
     ("/thread", "Select a thread"),
     ("/new", "Start a new thread"),
     ("/model", "Select the model and reasoning effort"),
+    ("/checkpoint", "Save the current thread"),
+    ("/checkpoints", "Browse saved checkpoints"),
+    ("/fork", "Fork at the selected message"),
+    ("/rewind", "Rewind to the selected message"),
+    ("/restore", "Restore the displayed checkpoint"),
+    ("/continue", "Continue an incomplete turn"),
     ("/help", "Show this command list"),
     ("/exit", "Exit Atra"),
 ];
@@ -88,6 +96,21 @@ pub(crate) enum TurnUpdate {
         reasoning_effort: String,
         result: Result<ControllerResponse>,
     },
+    CheckpointsLoaded {
+        thread_id: i64,
+        result: Result<Vec<ThreadCheckpoint>>,
+    },
+    CheckpointLoaded(Result<(ThreadCheckpoint, Vec<ThreadEvent>)>),
+    HistoryChanged {
+        source_thread_id: i64,
+        draft: Option<String>,
+        result: Result<(
+            ControllerResponse,
+            i64,
+            Vec<Thread>,
+            (Vec<TranscriptEntry>, Vec<ThreadEvent>),
+        )>,
+    },
 }
 
 pub(crate) struct App {
@@ -99,6 +122,7 @@ pub(crate) struct App {
     pub(crate) thread_id: Option<i64>,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
+    pub(crate) checkpoint: Option<ThreadCheckpoint>,
     pub(crate) tool_call_previews: HashMap<String, usize>,
     pub(crate) message_input: InputBuffer,
     pub(crate) command_input: InputBuffer,
@@ -151,6 +175,7 @@ impl App {
             thread_id,
             transcript,
             events,
+            checkpoint: None,
             tool_call_previews: HashMap::new(),
             message_input: InputBuffer::new(message_history, true),
             command_input: InputBuffer::new(command_history, false),
@@ -201,7 +226,7 @@ impl App {
             ) {
                 self.overlay = Overlay::None;
                 let command = self.command_input.take();
-                return self.execute_command(&command);
+                return self.execute_command(&command, effects);
             }
             return Ok(false);
         }
@@ -254,7 +279,7 @@ impl App {
             {
                 if self.message_input.value.starts_with('/') {
                     let command = self.message_input.take();
-                    return self.execute_command(&command);
+                    return self.execute_command(&command, effects);
                 } else if !self.turn.is_running() {
                     self.send(effects)?;
                 }
@@ -411,6 +436,59 @@ impl App {
             return Ok(false);
         }
 
+        if let Overlay::CheckpointPicker(picker) = &mut self.overlay {
+            match key.code {
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.checkpoints.len().saturating_sub(1));
+                }
+                KeyCode::Enter if !picker.checkpoints.is_empty() => {
+                    let checkpoint = picker.checkpoints[picker.selected].clone();
+                    self.overlay = Overlay::None;
+                    self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
+                    effects
+                        .send(Effect::LoadCheckpoint {
+                            endpoint: self.endpoint.clone(),
+                            checkpoint,
+                        })
+                        .ok();
+                }
+                KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    self.activity = None;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if matches!(self.overlay, Overlay::HistoryConfirmation(_)) {
+            match key.code {
+                KeyCode::Char('y') => {
+                    let Overlay::HistoryConfirmation(action) =
+                        std::mem::replace(&mut self.overlay, Overlay::None)
+                    else {
+                        unreachable!()
+                    };
+                    self.run_history_action(action, effects)?;
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    self.activity = None;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if key.code == KeyCode::Esc
+            && let (Some(thread_id), Some(_)) = (self.thread_id, self.checkpoint.take())
+        {
+            self.select_thread(thread_id, effects);
+            return Ok(false);
+        }
+
         if self.view.focus != FocusPane::Input {
             self.handle_pane_key(key);
             return Ok(false);
@@ -424,7 +502,11 @@ impl App {
         Ok(false)
     }
 
-    fn execute_command(&mut self, command: &str) -> Result<bool> {
+    fn execute_command(
+        &mut self,
+        command: &str,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<bool> {
         let command = command.strip_prefix('/').unwrap_or(command);
         if !command.is_empty() {
             history::record(
@@ -452,6 +534,24 @@ impl App {
             "thread" => self.open_thread_picker(),
             "new" => self.start_new_thread(),
             "model" => self.open_model_picker()?,
+            "checkpoint" => {
+                self.run_command(|app| app.create_checkpoint(effects));
+            }
+            "checkpoints" => {
+                self.run_command(|app| app.open_checkpoints(effects));
+            }
+            "fork" => {
+                self.run_command(|app| app.fork_selected(effects));
+            }
+            "rewind" => {
+                self.run_command(Self::confirm_rewind);
+            }
+            "restore" => {
+                self.run_command(Self::confirm_restore);
+            }
+            "continue" => {
+                self.run_command(|app| app.continue_thread(effects));
+            }
             "help" => {
                 self.overlay = Overlay::Help;
                 self.activity = Some(Activity::Info("Command help".to_owned()));
@@ -465,10 +565,17 @@ impl App {
         Ok(false)
     }
 
+    fn run_command(&mut self, command: impl FnOnce(&mut Self) -> Result<()>) {
+        if let Err(error) = command(self) {
+            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+        }
+    }
+
     fn start_new_thread(&mut self) {
         self.thread_id = None;
         self.transcript.clear();
         self.events.clear();
+        self.checkpoint = None;
         self.tool_call_previews.clear();
         self.message_input.clear();
         self.overlay = Overlay::None;
@@ -544,8 +651,178 @@ impl App {
             .ok();
     }
 
+    fn create_checkpoint(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        if self.checkpoint.is_some() {
+            bail!("cannot checkpoint a checkpoint view");
+        }
+        if self.turn.is_running() {
+            bail!("cannot checkpoint while a turn is running");
+        }
+        self.activity = Some(Activity::Info("Creating checkpoint…".to_owned()));
+        effects
+            .send(Effect::HistoryRequest {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+                draft: None,
+                request: ControllerRequest::ThreadCheckpointCreate { thread_id },
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn open_checkpoints(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        if self.turn.is_running() {
+            bail!("cannot browse checkpoints while a turn is running");
+        }
+        self.activity = Some(Activity::Info("Loading checkpoints…".to_owned()));
+        effects
+            .send(Effect::LoadCheckpoints {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn selected_history_point(&self) -> Result<(i64, Option<String>)> {
+        let index = self
+            .view
+            .selected_item
+            .context("select a user or assistant message in the transcript first")?;
+        let entry = &self.transcript[index];
+        if !entry.is_assistant_message() && entry.user_message().is_none() {
+            bail!("the selected transcript item is not a user or assistant message");
+        }
+        let sequence = entry
+            .sequence
+            .context("the selected transcript item has not been saved yet")?;
+        Ok((sequence, entry.user_message().map(str::to_owned)))
+    }
+
+    fn fork_selected(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        if self.turn.is_running() {
+            bail!("cannot fork while a turn is running");
+        }
+        let (sequence, draft) = self.selected_history_point()?;
+        self.activity = Some(Activity::Info("Forking thread…".to_owned()));
+        effects
+            .send(Effect::HistoryRequest {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+                draft,
+                request: ControllerRequest::ThreadFork {
+                    thread_id,
+                    checkpoint_id: self.checkpoint.as_ref().map(|checkpoint| checkpoint.id),
+                    sequence,
+                    display_name: None,
+                },
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn confirm_rewind(&mut self) -> Result<()> {
+        if self.turn.is_running() {
+            bail!("cannot rewind while a turn is running");
+        }
+        let (sequence, draft) = self.selected_history_point()?;
+        self.overlay = Overlay::HistoryConfirmation(HistoryAction::Rewind {
+            checkpoint_id: self.checkpoint.as_ref().map(|checkpoint| checkpoint.id),
+            sequence,
+            draft,
+        });
+        self.activity = Some(Activity::Info(
+            "Rewind to selected turn? [y] Yes  [n] No".to_owned(),
+        ));
+        Ok(())
+    }
+
+    fn confirm_restore(&mut self) -> Result<()> {
+        if self.turn.is_running() {
+            bail!("cannot restore while a turn is running");
+        }
+        let checkpoint_id = self
+            .checkpoint
+            .as_ref()
+            .context("open a checkpoint with /checkpoints first")?
+            .id;
+        self.overlay = Overlay::HistoryConfirmation(HistoryAction::Restore { checkpoint_id });
+        self.activity = Some(Activity::Info(
+            "Restore this checkpoint? [y] Yes  [n] No".to_owned(),
+        ));
+        Ok(())
+    }
+
+    fn run_history_action(
+        &mut self,
+        action: HistoryAction,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        let (request, draft) = match action {
+            HistoryAction::Rewind {
+                checkpoint_id,
+                sequence,
+                draft,
+            } => (
+                ControllerRequest::ThreadRewind {
+                    thread_id,
+                    checkpoint_id,
+                    sequence,
+                },
+                draft,
+            ),
+            HistoryAction::Restore { checkpoint_id } => (
+                ControllerRequest::ThreadCheckpointRestore {
+                    thread_id,
+                    checkpoint_id,
+                },
+                None,
+            ),
+        };
+        self.activity = Some(Activity::Info("Updating thread history…".to_owned()));
+        effects
+            .send(Effect::HistoryRequest {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+                draft,
+                request,
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn continue_thread(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        let thread_id = self.thread_id.context("no thread is selected")?;
+        if self.checkpoint.is_some() {
+            bail!("cannot continue a checkpoint view");
+        }
+        if self.turn.is_running() {
+            bail!("a turn is already running");
+        }
+        self.turn = TurnState::Running;
+        self.activity = Some(Activity::Info("Continuing turn…".to_owned()));
+        effects
+            .send(Effect::ResumeTurn {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+                request: ControllerRequest::ThreadContinue { thread_id },
+            })
+            .ok();
+        Ok(())
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        if matches!(self.overlay, Overlay::Help | Overlay::ThreadPicker(_)) {
+        if matches!(
+            self.overlay,
+            Overlay::Help
+                | Overlay::ThreadPicker(_)
+                | Overlay::CheckpointPicker(_)
+                | Overlay::HistoryConfirmation(_)
+        ) {
             return Ok(());
         }
         match mouse.kind {
@@ -754,8 +1031,6 @@ impl App {
             &mut self.message_input,
             message.clone(),
         )?;
-        self.transcript
-            .push(TranscriptEntry::message(Author::User, sanitize(&message)));
         self.turn = TurnState::Running;
         self.activity = Some(Activity::Info("Waiting for Atra Controller…".to_owned()));
         effects
@@ -852,17 +1127,7 @@ impl App {
                 threads,
             } => {
                 self.threads = threads;
-                if self.thread_id.is_none()
-                    && self.transcript.last().is_some_and(|item| {
-                        matches!(
-                            &item.item,
-                            TranscriptItem::Message {
-                                author: Author::User,
-                                text,
-                            } if text == &sanitize(&message)
-                        )
-                    })
-                {
+                if self.thread_id.is_none() {
                     self.thread_id = Some(thread_id);
                 }
                 if let Some(thread) = self
@@ -965,6 +1230,7 @@ impl App {
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
+                    let sequence = event.sequence;
                     let Some(item) = item_from_event(event) else {
                         return Ok(());
                     };
@@ -972,10 +1238,27 @@ impl App {
                         && let Some(item_id) = item_id
                         && let Some(index) = self.tool_call_previews.remove(&item_id)
                     {
-                        self.transcript[index].replace(item);
+                        self.transcript[index].replace_event(sequence, item);
                         return Ok(());
                     }
-                    self.transcript.push(TranscriptEntry::new(item));
+                    if matches!(
+                        item,
+                        TranscriptItem::Message {
+                            author: Author::Assistant,
+                            ..
+                        }
+                    ) && let Some(entry) = self.transcript.last_mut()
+                        && entry.is_assistant_message()
+                        && entry.sequence.is_none()
+                    {
+                        entry.replace_event(sequence, item);
+                        return Ok(());
+                    }
+                    self.transcript.push(TranscriptEntry {
+                        item,
+                        sequence: Some(sequence),
+                        rendered: None,
+                    });
                 }
                 return Ok(());
             }
@@ -1012,6 +1295,7 @@ impl App {
                 self.thread_id = Some(thread_id);
                 self.transcript = transcript;
                 self.events = events;
+                self.checkpoint = None;
                 self.tool_call_previews.clear();
                 self.overlay = Overlay::None;
                 self.clear_selection();
@@ -1067,6 +1351,83 @@ impl App {
                     }
                     response => bail!("controller returned an unexpected response: {response:?}"),
                 }
+                return Ok(());
+            }
+            TurnUpdate::CheckpointsLoaded { thread_id, result } => {
+                if self.thread_id != Some(thread_id) {
+                    return Ok(());
+                }
+                let checkpoints = result?;
+                if checkpoints.is_empty() {
+                    self.activity = Some(Activity::Info("No checkpoints are available".to_owned()));
+                } else {
+                    self.overlay = Overlay::CheckpointPicker(CheckpointPicker {
+                        checkpoints,
+                        selected: 0,
+                    });
+                    self.activity = Some(Activity::Info(
+                        "Select checkpoint · Enter opens · Esc cancels".to_owned(),
+                    ));
+                }
+                return Ok(());
+            }
+            TurnUpdate::CheckpointLoaded(result) => {
+                let (checkpoint, events) = result?;
+                if self.thread_id != Some(checkpoint.thread_id) {
+                    return Ok(());
+                }
+                self.transcript = events
+                    .iter()
+                    .cloned()
+                    .filter_map(TranscriptEntry::from_event)
+                    .collect();
+                self.events = events;
+                self.checkpoint = Some(checkpoint);
+                self.overlay = Overlay::None;
+                self.clear_selection();
+                self.reset_view();
+                self.activity = Some(Activity::Info(
+                    "Checkpoint view · Esc returns to active history".to_owned(),
+                ));
+                return Ok(());
+            }
+            TurnUpdate::HistoryChanged {
+                source_thread_id,
+                draft,
+                result,
+            } => {
+                if self.thread_id != Some(source_thread_id) {
+                    return Ok(());
+                }
+                let (response, thread_id, threads, (transcript, events)) = result?;
+                let message = match response {
+                    ControllerResponse::ThreadCheckpointCreated { checkpoint_id } => {
+                        format!("Checkpoint {checkpoint_id} created")
+                    }
+                    ControllerResponse::ThreadCheckpointRestored => {
+                        "Checkpoint restored".to_owned()
+                    }
+                    ControllerResponse::ThreadForked { .. } => "Thread forked".to_owned(),
+                    ControllerResponse::ThreadRewound => "Thread rewound".to_owned(),
+                    response => {
+                        bail!("controller returned an unexpected history response: {response:?}")
+                    }
+                };
+                self.thread_id = Some(thread_id);
+                self.threads = threads;
+                self.transcript = transcript;
+                self.events = events;
+                self.checkpoint = None;
+                self.overlay = Overlay::None;
+                self.tool_call_previews.clear();
+                self.clear_selection();
+                self.reset_view();
+                if let Some(draft) = draft {
+                    self.message_input.set(draft);
+                    self.view.focus = FocusPane::Input;
+                }
+                self.metrics_stale = false;
+                self.activity = Some(Activity::Info(message));
                 return Ok(());
             }
         };
@@ -1309,8 +1670,10 @@ pub(super) async fn load_transcript(
     match request(endpoint, ControllerRequest::ThreadEvents { thread_id }).await? {
         ControllerResponse::ThreadEvents { events } => {
             let mut transcript = Vec::new();
-            for item in events.iter().cloned().filter_map(item_from_event) {
-                transcript.push(TranscriptEntry::new(item));
+            for event in events.iter().cloned() {
+                if let Some(item) = TranscriptEntry::from_event(event) {
+                    transcript.push(item);
+                }
             }
             Ok((transcript, events))
         }

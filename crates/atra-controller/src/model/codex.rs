@@ -897,9 +897,7 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                     EventKind::Reasoning => {
                         serde_json::from_value(event.payload["item"].clone()).ok()?
                     }
-                    EventKind::ApprovalRequest
-                    | EventKind::ApprovalResponse
-                    | EventKind::Compaction
+                    EventKind::Compaction
                     | EventKind::ModelRequest
                     | EventKind::TokenUsage
                     | EventKind::RateLimits => return None,

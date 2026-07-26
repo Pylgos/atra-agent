@@ -314,13 +314,8 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
             })
             .flatten()
             .collect(),
-        TranscriptItem::ToolDenied { reason } => {
-            let mut message = "denied".to_owned();
-            if let Some(reason) = reason {
-                message.push_str(": ");
-                message.push_str(reason);
-            }
-            vec![(Some('✗'), Line::from(message))]
+        TranscriptItem::Compaction => {
+            vec![(Some('·'), Line::from("Earlier context compacted"))]
         }
         TranscriptItem::Message { .. } | TranscriptItem::ReasoningSummary { .. } => unreachable!(),
     };
@@ -355,7 +350,7 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         TranscriptItem::ReasoningSummary { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
-        TranscriptItem::ToolDenied { .. } => Style::default().fg(Color::Red),
+        TranscriptItem::Compaction => Style::default().fg(Color::DarkGray),
     };
     if selected {
         style.add_modifier(Modifier::REVERSED | Modifier::BOLD)

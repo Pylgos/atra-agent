@@ -291,20 +291,14 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "user_message",
             "model_request",
             "tool_call",
-            "approval_request",
-            "approval_response",
             "tool_result",
             "model_request",
             "assistant_message",
         ]
     );
     assert_eq!(
-        denied_events[4].payload,
-        serde_json::json!({
-            "approval_id": denied_approval_id,
-            "decision": "deny",
-            "reason": "not in this environment",
-        })
+        denied_events[3].payload["result"],
+        serde_json::json!("user denied the tool call: not in this environment")
     );
     let allowed_events = system.events(allowed_thread).await;
     assert_eq!(
@@ -316,23 +310,13 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "user_message",
             "model_request",
             "tool_call",
-            "approval_request",
-            "approval_response",
             "tool_result",
             "model_request",
             "assistant_message",
         ]
     );
     assert_eq!(
-        allowed_events[4].payload,
-        serde_json::json!({
-            "approval_id": allowed_approval_id,
-            "decision": "allow",
-            "reason": null,
-        })
-    );
-    assert_eq!(
-        allowed_events[5].payload["result"],
+        allowed_events[3].payload["result"],
         serde_json::json!("approved-output\natra exec_command: process finished with exit code 0")
     );
 }

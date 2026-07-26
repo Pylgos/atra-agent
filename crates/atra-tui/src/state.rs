@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use atra_protocol::Model;
+use atra_protocol::{Model, ThreadCheckpoint};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
@@ -69,6 +69,8 @@ pub(crate) enum Overlay {
     Rename,
     ModelPicker(ModelPicker),
     ThreadPicker(ThreadPicker),
+    CheckpointPicker(CheckpointPicker),
+    HistoryConfirmation(HistoryAction),
 }
 
 impl Overlay {
@@ -98,4 +100,20 @@ pub(crate) struct ModelPicker {
 
 pub(crate) struct ThreadPicker {
     pub(crate) selected: usize,
+}
+
+pub(crate) struct CheckpointPicker {
+    pub(crate) checkpoints: Vec<ThreadCheckpoint>,
+    pub(crate) selected: usize,
+}
+
+pub(crate) enum HistoryAction {
+    Rewind {
+        checkpoint_id: Option<i64>,
+        sequence: i64,
+        draft: Option<String>,
+    },
+    Restore {
+        checkpoint_id: i64,
+    },
 }

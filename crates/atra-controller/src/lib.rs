@@ -140,6 +140,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         store,
         provider,
         approvals: Mutex::new(HashMap::new()),
+        thread_locks: StdMutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
         platform_bundle,
         auth_home: auth_home.to_owned(),
@@ -177,6 +178,7 @@ pub(crate) struct State {
     store: Store,
     provider: Provider,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
+    thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
     next_approval_id: AtomicU64,
     platform_bundle: Option<Arc<PlatformBundle>>,
     auth_home: PathBuf,
@@ -199,6 +201,9 @@ impl State {
         match request {
             ControllerRequest::ThreadSend { thread_id, message } => {
                 self.run_turn(thread_id, message, Some(updates)).await
+            }
+            ControllerRequest::ThreadContinue { thread_id } => {
+                self.continue_thread(thread_id, Some(updates)).await
             }
             ControllerRequest::ApprovalAllow { approval_id } => {
                 self.resolve_approval(approval_id, true, None, Some(updates))
@@ -304,6 +309,78 @@ impl State {
                     })
                     .collect();
                 Ok(ControllerResponse::ThreadEvents { events })
+            }
+            ControllerRequest::ThreadCheckpointCreate { thread_id } => {
+                let _guard = self.thread_lock(thread_id).lock_owned().await;
+                self.ensure_no_pending_approval(thread_id).await?;
+                let checkpoint_id = self
+                    .store
+                    .create_checkpoint(thread_id, checkpoint_time_ms(), "manual".to_owned())
+                    .await
+                    .context("failed to create checkpoint")?;
+                Ok(ControllerResponse::ThreadCheckpointCreated { checkpoint_id })
+            }
+            ControllerRequest::ThreadCheckpointList { thread_id } => {
+                let checkpoints = self
+                    .store
+                    .checkpoints(thread_id)
+                    .await
+                    .context("failed to list checkpoints")?;
+                Ok(ControllerResponse::ThreadCheckpointList { checkpoints })
+            }
+            ControllerRequest::ThreadCheckpointEvents { checkpoint_id } => {
+                let events = self
+                    .store
+                    .checkpoint_events(checkpoint_id)
+                    .await
+                    .context("failed to load checkpoint events")?
+                    .into_iter()
+                    .map(protocol_event)
+                    .collect();
+                Ok(ControllerResponse::ThreadCheckpointEvents { events })
+            }
+            ControllerRequest::ThreadCheckpointRestore {
+                thread_id,
+                checkpoint_id,
+            } => {
+                let _guard = self.thread_lock(thread_id).lock_owned().await;
+                self.ensure_no_pending_approval(thread_id).await?;
+                self.store
+                    .restore_checkpoint(thread_id, checkpoint_id, checkpoint_time_ms())
+                    .await
+                    .context("failed to restore checkpoint")?;
+                Ok(ControllerResponse::ThreadCheckpointRestored)
+            }
+            ControllerRequest::ThreadFork {
+                thread_id,
+                checkpoint_id,
+                sequence,
+                display_name,
+            } => {
+                let _guard = self.thread_lock(thread_id).lock_owned().await;
+                self.ensure_no_pending_approval(thread_id).await?;
+                let thread_id = self
+                    .store
+                    .fork_thread(thread_id, checkpoint_id, sequence, display_name)
+                    .await
+                    .context("failed to fork thread")?;
+                Ok(ControllerResponse::ThreadForked { thread_id })
+            }
+            ControllerRequest::ThreadRewind {
+                thread_id,
+                checkpoint_id,
+                sequence,
+            } => {
+                let _guard = self.thread_lock(thread_id).lock_owned().await;
+                self.ensure_no_pending_approval(thread_id).await?;
+                self.store
+                    .rewind(thread_id, checkpoint_id, sequence, checkpoint_time_ms())
+                    .await
+                    .context("failed to rewind thread")?;
+                Ok(ControllerResponse::ThreadRewound)
+            }
+            ControllerRequest::ThreadContinue { thread_id } => {
+                self.continue_thread(thread_id, None).await
             }
             ControllerRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
@@ -418,6 +495,8 @@ impl State {
         message: String,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
+        let _guard = self.thread_lock(thread_id).lock_owned().await;
+        self.prepare_thread_for_turn(thread_id, updates).await?;
         self.store
             .name_thread_if_unnamed(thread_id, message.clone())
             .await
@@ -432,6 +511,107 @@ impl State {
             .await
             .context("failed to save user message")?;
         self.continue_turn(thread_id, updates).await
+    }
+
+    async fn continue_thread(
+        &self,
+        thread_id: i64,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ControllerResponse> {
+        let _guard = self.thread_lock(thread_id).lock_owned().await;
+        self.prepare_thread_for_turn(thread_id, updates).await?;
+        let events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load thread history")?;
+        let resumable = events.iter().rev().find(|event| {
+            matches!(
+                event.kind,
+                EventKind::UserMessage
+                    | EventKind::AssistantMessage
+                    | EventKind::ToolCall
+                    | EventKind::ToolResult
+                    | EventKind::Compaction
+            )
+        });
+        match resumable.map(|event| event.kind) {
+            Some(EventKind::UserMessage | EventKind::ToolResult | EventKind::Compaction) => {}
+            Some(EventKind::AssistantMessage) => bail!("thread turn is already complete"),
+            Some(EventKind::ToolCall) => unreachable!(),
+            None => bail!("thread has no resumable history"),
+            _ => unreachable!(),
+        }
+        self.sync_workspace_instructions(thread_id).await?;
+        self.continue_turn(thread_id, updates).await
+    }
+
+    async fn prepare_thread_for_turn(
+        &self,
+        thread_id: i64,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<()> {
+        let events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load thread history")?;
+        let Some(tool_call) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::UserMessage
+                        | EventKind::AssistantMessage
+                        | EventKind::ToolCall
+                        | EventKind::ToolResult
+                        | EventKind::Compaction
+                )
+            })
+            .filter(|event| event.kind == EventKind::ToolCall)
+        else {
+            return Ok(());
+        };
+        self.approvals
+            .lock()
+            .await
+            .retain(|_, approval| approval.thread_id != thread_id);
+        self.save_tool_result(
+            thread_id,
+            tool_call.payload["name"]
+                .as_str()
+                .context("tool call has no name")?,
+            tool_call.payload["call_id"].as_str(),
+            ToolOutcome::text("tool execution was interrupted before completion".to_owned()),
+            tool_call.payload["type"].as_str() == Some("custom"),
+            updates,
+        )
+        .await
+        .context("failed to save interrupted tool result")
+    }
+
+    fn thread_lock(&self, thread_id: i64) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.thread_locks
+                .lock()
+                .unwrap()
+                .entry(thread_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    async fn ensure_no_pending_approval(&self, thread_id: i64) -> Result<()> {
+        if self
+            .approvals
+            .lock()
+            .await
+            .values()
+            .any(|approval| approval.thread_id == thread_id)
+        {
+            bail!("thread has a pending approval");
+        }
+        Ok(())
     }
 
     async fn continue_turn(
@@ -504,33 +684,36 @@ impl State {
                 )
                 .await
                 .context("failed to save compaction request")?;
+                self.store
+                    .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
+                    .await
+                    .context("failed to checkpoint history before compaction")?;
                 let items = model_session
                     .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
                     .await?;
                 if !items.is_empty() {
-                    self.store
-                        .append(thread_id, EventKind::Compaction, json!({ "items": items }))
-                        .await
-                        .context("failed to save compacted model history")?;
                     let workspace_instructions = workspace_instructions(&events);
-                    if workspace_instructions.tracked {
+                    let workspace_event = if workspace_instructions.tracked {
                         let transition = if workspace_instructions.content.is_some() {
                             "initial"
                         } else {
                             "removal"
                         };
-                        self.store
-                            .append(
-                                thread_id,
-                                EventKind::WorkspaceInstructions,
-                                json!({
-                                    "content": workspace_instructions.content,
-                                    "transition": transition,
-                                }),
-                            )
-                            .await
-                            .context("failed to restore workspace instructions after compaction")?;
-                    }
+                        Some(json!({
+                            "content": workspace_instructions.content,
+                            "transition": transition,
+                        }))
+                    } else {
+                        None
+                    };
+                    self.store
+                        .replace_with_compaction(
+                            thread_id,
+                            json!({ "items": items }),
+                            workspace_event,
+                        )
+                        .await
+                        .context("failed to replace history after compaction")?;
                     events = self
                         .store
                         .events(thread_id)
@@ -686,14 +869,14 @@ impl State {
         while let Some(response) = responses.pop_front() {
             match response {
                 ModelResponse::AssistantMessage { content } => {
-                    self.store
-                        .append(
-                            thread_id,
-                            EventKind::AssistantMessage,
-                            json!({ "content": content }),
-                        )
-                        .await
-                        .context("failed to save assistant message")?;
+                    self.append_event(
+                        thread_id,
+                        EventKind::AssistantMessage,
+                        json!({ "content": content }),
+                        updates,
+                    )
+                    .await
+                    .context("failed to save assistant message")?;
                     return Ok(Some(ControllerResponse::TurnCompleted { content }));
                 }
                 ModelResponse::ToolCall {
@@ -897,18 +1080,6 @@ impl State {
             let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
             let arguments_json =
                 serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
-            self.append_event(
-                thread_id,
-                EventKind::ApprovalRequest,
-                json!({
-                    "approval_id": approval_id,
-                    "tool": &name,
-                    "arguments": &arguments_json,
-                }),
-                updates,
-            )
-            .await
-            .context("failed to save approval request")?;
             self.approvals.lock().await.insert(
                 approval_id,
                 PendingApproval {
@@ -947,25 +1118,20 @@ impl State {
         reason: Option<String>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
+        let thread_id = self
+            .approvals
+            .lock()
+            .await
+            .get(&approval_id)
+            .with_context(|| format!("approval {approval_id} is not pending"))?
+            .thread_id;
+        let _guard = self.thread_lock(thread_id).lock_owned().await;
         let pending = self
             .approvals
             .lock()
             .await
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
-        self.append_event(
-            pending.thread_id,
-            EventKind::ApprovalResponse,
-            json!({
-                "approval_id": approval_id,
-                "decision": if allowed { "allow" } else { "deny" },
-                "reason": &reason,
-            }),
-            updates,
-        )
-        .await
-        .context("failed to save approval response")?;
-
         let result = if allowed {
             self.execute(pending.arguments).await?
         } else {
@@ -1364,6 +1530,18 @@ fn unix_time_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("system time is before the Unix epoch")
         .as_millis()
+}
+
+fn checkpoint_time_ms() -> i64 {
+    i64::try_from(unix_time_ms()).expect("current time fits in i64 milliseconds")
+}
+
+fn protocol_event(event: storage::Event) -> ThreadEvent {
+    ThreadEvent {
+        sequence: event.sequence,
+        kind: event.kind.as_str().to_owned(),
+        payload: event.payload,
+    }
 }
 
 struct Runner {

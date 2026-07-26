@@ -44,6 +44,33 @@ pub enum ControllerRequest {
     ThreadEvents {
         thread_id: i64,
     },
+    ThreadCheckpointCreate {
+        thread_id: i64,
+    },
+    ThreadCheckpointList {
+        thread_id: i64,
+    },
+    ThreadCheckpointEvents {
+        checkpoint_id: i64,
+    },
+    ThreadCheckpointRestore {
+        thread_id: i64,
+        checkpoint_id: i64,
+    },
+    ThreadFork {
+        thread_id: i64,
+        checkpoint_id: Option<i64>,
+        sequence: i64,
+        display_name: Option<String>,
+    },
+    ThreadRewind {
+        thread_id: i64,
+        checkpoint_id: Option<i64>,
+        sequence: i64,
+    },
+    ThreadContinue {
+        thread_id: i64,
+    },
     CodexLogin,
     CodexLogout,
     CodexLoginStatus,
@@ -130,6 +157,20 @@ pub enum ControllerResponse {
     ThreadEvents {
         events: Vec<ThreadEvent>,
     },
+    ThreadCheckpointCreated {
+        checkpoint_id: i64,
+    },
+    ThreadCheckpointList {
+        checkpoints: Vec<ThreadCheckpoint>,
+    },
+    ThreadCheckpointEvents {
+        events: Vec<ThreadEvent>,
+    },
+    ThreadCheckpointRestored,
+    ThreadForked {
+        thread_id: i64,
+    },
+    ThreadRewound,
     RunnerList {
         runners: Vec<Runner>,
     },
@@ -176,6 +217,14 @@ pub struct Thread {
     pub display_name: Option<String>,
     pub model: String,
     pub reasoning_effort: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ThreadCheckpoint {
+    pub id: i64,
+    pub thread_id: i64,
+    pub created_at_ms: i64,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -29,9 +29,7 @@ pub(crate) enum TranscriptItem {
     ToolResult {
         artifacts: Vec<ToolArtifact>,
     },
-    ToolDenied {
-        reason: Option<String>,
-    },
+    Compaction,
 }
 
 #[derive(Clone)]
@@ -89,6 +87,7 @@ impl TranscriptItem {
 
 pub(crate) struct TranscriptEntry {
     pub(crate) item: TranscriptItem,
+    pub(crate) sequence: Option<i64>,
     pub(crate) rendered: Option<RenderedItem>,
 }
 
@@ -96,8 +95,18 @@ impl TranscriptEntry {
     pub(crate) fn new(item: TranscriptItem) -> Self {
         Self {
             item,
+            sequence: None,
             rendered: None,
         }
+    }
+
+    pub(crate) fn from_event(event: ThreadEvent) -> Option<Self> {
+        let sequence = event.sequence;
+        Some(Self {
+            item: item_from_event(event)?,
+            sequence: Some(sequence),
+            rendered: None,
+        })
     }
 
     pub(crate) fn message(author: Author, text: String) -> Self {
@@ -114,12 +123,27 @@ impl TranscriptEntry {
         self.rendered = None;
     }
 
+    pub(crate) fn replace_event(&mut self, sequence: i64, item: TranscriptItem) {
+        self.sequence = Some(sequence);
+        self.replace(item);
+    }
+
     pub(crate) fn is_tool_result(&self) -> bool {
         self.item.is_tool_result()
     }
 
     pub(crate) fn is_assistant_message(&self) -> bool {
         self.item.is_assistant_message()
+    }
+
+    pub(crate) fn user_message(&self) -> Option<&str> {
+        match &self.item {
+            TranscriptItem::Message {
+                author: Author::User,
+                text,
+            } => Some(text),
+            _ => None,
+        }
     }
 
     pub(crate) fn is_reasoning_summary(&self) -> bool {
@@ -188,11 +212,7 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 })
                 .collect(),
         }),
-        "approval_response" if event.payload.get("decision")?.as_str()? == "deny" => {
-            Some(TranscriptItem::ToolDenied {
-                reason: event.payload.get("reason")?.as_str().map(sanitize),
-            })
-        }
+        "compaction" => Some(TranscriptItem::Compaction),
         _ => None,
     }
 }

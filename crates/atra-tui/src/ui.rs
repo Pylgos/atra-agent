@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{Activity, App, COMMAND_HELP},
-    state::{FocusPane, ModelPicker, Overlay, ThreadPicker, TranscriptMode},
+    state::{CheckpointPicker, FocusPane, ModelPicker, Overlay, ThreadPicker, TranscriptMode},
     transcript::{
         layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
     },
@@ -185,6 +185,12 @@ impl App {
         if let Overlay::ThreadPicker(picker) = &self.overlay {
             render_thread_picker(frame, picker, &self.threads);
         }
+        if let Overlay::CheckpointPicker(picker) = &self.overlay {
+            render_checkpoint_picker(frame, picker);
+        }
+        if matches!(self.overlay, Overlay::HistoryConfirmation(_)) {
+            render_history_confirmation(frame);
+        }
         if matches!(self.overlay, Overlay::Help) {
             render_command_help(frame);
         }
@@ -193,7 +199,11 @@ impl App {
     fn focus_border_style(&self, pane: FocusPane) -> Style {
         if !matches!(
             self.overlay,
-            Overlay::Approval(_) | Overlay::ModelPicker(_) | Overlay::ThreadPicker(_)
+            Overlay::Approval(_)
+                | Overlay::ModelPicker(_)
+                | Overlay::ThreadPicker(_)
+                | Overlay::CheckpointPicker(_)
+                | Overlay::HistoryConfirmation(_)
         ) && self.view.focus == pane
         {
             Style::default().fg(Color::Cyan)
@@ -275,6 +285,13 @@ impl App {
             ),
         ];
         spans.extend(self.quota_status());
+        if let Some(checkpoint) = &self.checkpoint {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(
+                format!("checkpoint {} ({})", checkpoint.id, checkpoint.reason),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         Line::from(spans)
     }
 
@@ -737,6 +754,60 @@ fn render_thread_picker(
         ),
         area,
         &mut state,
+    );
+}
+
+fn render_checkpoint_picker(frame: &mut Frame<'_>, picker: &CheckpointPicker) {
+    let width = frame.area().width.saturating_sub(8).min(72);
+    let height = (picker.checkpoints.len() as u16 + 2)
+        .min(frame.area().height.saturating_sub(4))
+        .max(3);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    let items = picker
+        .checkpoints
+        .iter()
+        .map(|checkpoint| {
+            ListItem::new(format!(
+                "#{} · {} · {}",
+                checkpoint.id, checkpoint.reason, checkpoint.created_at_ms
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("● ").block(
+            Block::default()
+                .title("Checkpoints")
+                .title_bottom(Line::from("Enter opens · Esc cancels").right_aligned())
+                .borders(Borders::ALL),
+        ),
+        area,
+        &mut state,
+    );
+}
+
+fn render_history_confirmation(frame: &mut Frame<'_>) {
+    let width = frame.area().width.saturating_sub(8).min(52);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + frame.area().height.saturating_sub(3) / 2,
+        width,
+        3,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new("[y] Confirm  [n] Cancel").block(
+            Block::default()
+                .title("Change thread history")
+                .borders(Borders::ALL),
+        ),
+        area,
     );
 }
 

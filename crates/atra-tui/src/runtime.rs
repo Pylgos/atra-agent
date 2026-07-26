@@ -42,6 +42,20 @@ pub(crate) enum Effect {
         thread_id: i64,
         request: ControllerRequest,
     },
+    LoadCheckpoints {
+        endpoint: std::path::PathBuf,
+        thread_id: i64,
+    },
+    LoadCheckpoint {
+        endpoint: std::path::PathBuf,
+        checkpoint: atra_protocol::ThreadCheckpoint,
+    },
+    HistoryRequest {
+        endpoint: std::path::PathBuf,
+        thread_id: i64,
+        draft: Option<String>,
+        request: ControllerRequest,
+    },
 }
 
 pub(super) async fn run(
@@ -165,6 +179,79 @@ impl Effect {
                             response,
                         });
                     let _ = updates.send(TurnUpdate::Completed(result));
+                }
+                Self::LoadCheckpoints {
+                    endpoint,
+                    thread_id,
+                } => {
+                    let result = request(
+                        &endpoint,
+                        ControllerRequest::ThreadCheckpointList { thread_id },
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        ControllerResponse::ThreadCheckpointList { checkpoints } => Ok(checkpoints),
+                        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+                        response => anyhow::bail!(
+                            "controller returned an unexpected response: {response:?}"
+                        ),
+                    });
+                    let _ = updates.send(TurnUpdate::CheckpointsLoaded { thread_id, result });
+                }
+                Self::LoadCheckpoint {
+                    endpoint,
+                    checkpoint,
+                } => {
+                    let result = request(
+                        &endpoint,
+                        ControllerRequest::ThreadCheckpointEvents {
+                            checkpoint_id: checkpoint.id,
+                        },
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        ControllerResponse::ThreadCheckpointEvents { events } => {
+                            Ok((checkpoint, events))
+                        }
+                        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+                        response => anyhow::bail!(
+                            "controller returned an unexpected response: {response:?}"
+                        ),
+                    });
+                    let _ = updates.send(TurnUpdate::CheckpointLoaded(result));
+                }
+                Self::HistoryRequest {
+                    endpoint,
+                    thread_id,
+                    draft,
+                    request: history_request,
+                } => {
+                    let result = async {
+                        let response = request(&endpoint, history_request).await?;
+                        if let ControllerResponse::Error { message } = response {
+                            anyhow::bail!("{message}");
+                        }
+                        let selected_thread_id = match &response {
+                            ControllerResponse::ThreadForked { thread_id } => *thread_id,
+                            _ => thread_id,
+                        };
+                        let threads =
+                            match request(&endpoint, ControllerRequest::ThreadList).await? {
+                                ControllerResponse::ThreadList { threads } => threads,
+                                ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+                                response => anyhow::bail!(
+                                    "controller returned an unexpected response: {response:?}"
+                                ),
+                            };
+                        let transcript = load_transcript(&endpoint, selected_thread_id).await?;
+                        Ok((response, selected_thread_id, threads, transcript))
+                    }
+                    .await;
+                    let _ = updates.send(TurnUpdate::HistoryChanged {
+                        source_thread_id: thread_id,
+                        draft,
+                        result,
+                    });
                 }
             }
         });

@@ -35,6 +35,7 @@ pub(crate) async fn handle_client(
     if matches!(
         request,
         ControllerRequest::ThreadSend { .. }
+            | ControllerRequest::ThreadContinue { .. }
             | ControllerRequest::ApprovalAllow { .. }
             | ControllerRequest::ApprovalDeny { .. }
     ) {
