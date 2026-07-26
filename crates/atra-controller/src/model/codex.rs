@@ -858,6 +858,9 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         }],
                         phase: None,
                     }),
+                    EventKind::WebSearch => {
+                        serde_json::from_value(event.payload["item"].clone()).ok()?
+                    }
                     EventKind::ToolCall if event.payload["type"] == "custom" => {
                         ResponseItem::CustomToolCall {
                             id: None,
@@ -953,12 +956,17 @@ fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
             input,
             call_id,
         })),
+        item @ ResponseItem::WebSearchCall { .. } => Ok(Some(ModelResponse::WebSearch { item })),
         _ => Ok(None),
     }
 }
 
 fn tool_definitions() -> Result<ResponsesApiTools> {
     let tools = json!([
+        {
+            "type": "web_search",
+            "external_web_access": true
+        },
         {
             "type": "function",
             "name": "list_runners",

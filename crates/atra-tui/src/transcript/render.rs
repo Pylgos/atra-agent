@@ -302,6 +302,7 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
             .collect();
     }
     let mut logical_lines = match item {
+        TranscriptItem::WebSearch { action } => web_search_lines(action),
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
         TranscriptItem::ToolResult { artifacts } => artifacts
             .iter()
@@ -348,6 +349,7 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
             ..
         } => Style::default().fg(Color::Cyan),
         TranscriptItem::ReasoningSummary { .. } => Style::default().fg(Color::DarkGray),
+        TranscriptItem::WebSearch { .. } => Style::default().fg(Color::Blue),
         TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::Compaction => Style::default().fg(Color::DarkGray),
@@ -357,6 +359,37 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
     } else {
         style
     }
+}
+
+fn web_search_lines(action: &serde_json::Value) -> Vec<(Option<char>, Line<'static>)> {
+    let action_type = action["type"].as_str();
+    let text = match action_type {
+        Some("search") => action["query"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                action["queries"].as_array().map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            })
+            .map(|query| format!("search web: {query}"))
+            .unwrap_or_else(|| "search web".to_owned()),
+        Some("open_page") => action["url"]
+            .as_str()
+            .map(|url| format!("open page: {url}"))
+            .unwrap_or_else(|| "open page".to_owned()),
+        Some("find_in_page") => {
+            let url = action["url"].as_str().unwrap_or_default();
+            let pattern = action["pattern"].as_str().unwrap_or_default();
+            format!("find in page: {pattern} ({url})")
+        }
+        _ => "search web".to_owned(),
+    };
+    vec![(Some('⌕'), Line::from(text))]
 }
 
 fn tool_call_lines(

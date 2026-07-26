@@ -20,6 +20,9 @@ pub(crate) enum ModelResponse {
     AssistantMessage {
         content: String,
     },
+    WebSearch {
+        item: ResponseItem,
+    },
     ToolCall {
         name: String,
         arguments: serde_json::Value,

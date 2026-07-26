@@ -22,6 +22,9 @@ pub(crate) enum TranscriptItem {
     ReasoningSummary {
         text: String,
     },
+    WebSearch {
+        action: serde_json::Value,
+    },
     ToolCall {
         name: String,
         arguments: Option<serde_json::Value>,
@@ -188,6 +191,15 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 .join("\n\n");
             (!text.is_empty()).then_some(TranscriptItem::ReasoningSummary { text })
         }
+        "web_search" => Some(TranscriptItem::WebSearch {
+            action: sanitize_value(
+                event
+                    .payload
+                    .pointer("/item/action")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+        }),
         "tool_call" => Some(TranscriptItem::ToolCall {
             name: sanitize(event.payload.get("name")?.as_str()?),
             arguments: Some(sanitize_value(

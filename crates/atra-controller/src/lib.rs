@@ -990,6 +990,16 @@ impl State {
                     .context("failed to save assistant message")?;
                     return Ok(Some(ControllerResponse::TurnCompleted { content }));
                 }
+                ModelResponse::WebSearch { item } => {
+                    self.append_event(
+                        thread_id,
+                        EventKind::WebSearch,
+                        json!({ "item": item }),
+                        updates,
+                    )
+                    .await
+                    .context("failed to save web search")?;
+                }
                 ModelResponse::ToolCall {
                     name,
                     arguments,
