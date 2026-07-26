@@ -13,6 +13,7 @@ use tokio_rusqlite::{
 pub(crate) enum EventKind {
     WorkspaceInstructions,
     Skills,
+    Runners,
     UserMessage,
     AssistantMessage,
     WebSearch,
@@ -30,6 +31,7 @@ impl EventKind {
         match self {
             Self::WorkspaceInstructions => "workspace_instructions",
             Self::Skills => "skills",
+            Self::Runners => "runners",
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",
             Self::WebSearch => "web_search",
@@ -499,12 +501,16 @@ impl Store {
         items: Value,
         workspace_instructions: Option<Value>,
         skills: Option<Value>,
+        runners: Option<Value>,
     ) -> tokio_rusqlite::Result<()> {
         let items = serde_json::to_string(&items).map_err(to_sql_error)?;
         let workspace_instructions = workspace_instructions
             .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
             .transpose()?;
         let skills = skills
+            .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
+            .transpose()?;
+        let runners = runners
             .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
             .transpose()?;
         self.connection
@@ -543,6 +549,20 @@ impl Store {
                         )
                         ",
                         params![thread_id, EventKind::Skills.as_str(), skills],
+                    )?;
+                }
+                if let Some(runners) = runners {
+                    transaction.execute(
+                        "
+                        INSERT INTO events (thread_id, sequence, kind, payload)
+                        VALUES (
+                            ?1,
+                            COALESCE((SELECT MAX(sequence) + 1 FROM events WHERE thread_id = ?1), 0),
+                            ?2,
+                            ?3
+                        )
+                        ",
+                        params![thread_id, EventKind::Runners.as_str(), runners],
                     )?;
                 }
                 transaction.commit()

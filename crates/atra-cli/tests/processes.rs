@@ -277,6 +277,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "skills",
+            "runners",
             "user_message",
             "model_request",
             "tool_call",
@@ -286,11 +287,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        events[4].payload["result"],
+        events[5].payload["result"],
         serde_json::json!("model-output")
     );
     assert_eq!(
-        events[6].payload["content"],
+        events[7].payload["content"],
         serde_json::json!("observed model-output")
     );
     let denied_events = system.events(denied_thread).await;
@@ -301,6 +302,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "skills",
+            "runners",
             "user_message",
             "model_request",
             "tool_call",
@@ -310,7 +312,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        denied_events[4].payload["result"],
+        denied_events[5].payload["result"],
         serde_json::json!("user denied the tool call: not in this environment")
     );
     let allowed_events = system.events(allowed_thread).await;
@@ -321,6 +323,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .collect::<Vec<_>>(),
         [
             "skills",
+            "runners",
             "user_message",
             "model_request",
             "tool_call",
@@ -330,7 +333,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        allowed_events[4].payload["result"],
+        allowed_events[5].payload["result"],
         serde_json::json!("approved-output")
     );
 }

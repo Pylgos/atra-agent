@@ -523,35 +523,23 @@ fn logical_path(name: &str, relative: &Path) -> Result<String> {
 fn format_prompt(skills: &[Skill]) -> String {
     let mut lines = vec![
         "The following skills provide specialized instructions for specific tasks.".to_owned(),
-        "Use exec_command to read the full skill file when the task matches its description."
-            .to_owned(),
-        "Skill locations use $ATRA_SKILLS, which is available in every Runner. Resolve relative references against the directory containing SKILL.md."
+        "When a skill applies, read $ATRA_SKILLS/<name>/SKILL.md with exec_command. \
+         $ATRA_SKILLS is available in every Runner; resolve relative references against the \
+         directory containing SKILL.md."
             .to_owned(),
         String::new(),
-        "<available_skills>".to_owned(),
+        "Available skills:".to_owned(),
     ];
     for skill in skills {
-        lines.push("  <skill>".to_owned());
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
         lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
+            "{}: {}",
+            skill.name,
+            skill
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         ));
-        lines.push(format!(
-            "    <location>$ATRA_SKILLS/{}/SKILL.md</location>",
-            escape_xml(&skill.name)
-        ));
-        lines.push("  </skill>".to_owned());
     }
-    lines.push("</available_skills>".to_owned());
     lines.join("\n")
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }

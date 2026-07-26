@@ -558,6 +558,7 @@ impl State {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
+        self.sync_runners(thread_id, updates).await?;
         self.store
             .name_thread_if_unnamed(thread_id, message.clone())
             .await
@@ -582,6 +583,7 @@ impl State {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
+        self.sync_runners(thread_id, updates).await?;
         let events = self
             .store
             .events(thread_id)
@@ -734,6 +736,7 @@ impl State {
         );
         let model_session = self.provider.start_turn(&prompt_cache_key).await?;
         loop {
+            self.sync_runners(thread_id, updates).await?;
             let mut events = self
                 .store
                 .events(thread_id)
@@ -821,6 +824,7 @@ impl State {
                             json!({ "items": items }),
                             workspace_event,
                             skill_event(&events),
+                            runner_event(&events),
                         )
                         .await
                         .context("failed to replace history after compaction")?;
@@ -997,6 +1001,35 @@ impl State {
         ))
     }
 
+    async fn sync_runners(
+        &self,
+        thread_id: i64,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<()> {
+        let runners = self.list_runners().await?;
+        let events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load runner state")?;
+        let previous = current_runners(&events);
+        if previous.as_ref() == Some(&runners) {
+            return Ok(());
+        }
+        self.append_event(
+            thread_id,
+            EventKind::Runners,
+            json!({
+                "runners": runners,
+                "transition": if previous.is_some() { "replacement" } else { "initial" },
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save runners")?;
+        Ok(())
+    }
+
     async fn read_workspace_instructions(&self) -> Result<Option<String>> {
         for filename in ["AGENTS.override.md", "AGENTS.md"] {
             let path = self.workspace.join(filename);
@@ -1109,36 +1142,6 @@ impl State {
                             {
                                 return Ok(Some(response));
                             }
-                        }
-                        "list_runners" => {
-                            let runners = self.list_runners().await?;
-                            let result = if runners.is_empty() {
-                                "No runners are available.".to_owned()
-                            } else {
-                                format!(
-                                    "Available runners:\n{}",
-                                    runners
-                                        .iter()
-                                        .map(|runner| {
-                                            format!("- {}: {}", runner.name, runner.description)
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                )
-                            };
-                            self.save_tool_result(
-                                thread_id,
-                                &name,
-                                call_id.as_deref(),
-                                ToolOutcome::with_artifact(
-                                    result,
-                                    "runner_list",
-                                    json!({ "runners": runners }),
-                                ),
-                                false,
-                                updates,
-                            )
-                            .await?;
                         }
                         "wait_process" => {
                             let arguments: WaitProcessArguments = serde_json::from_value(arguments)
@@ -1819,12 +1822,29 @@ fn current_skills(events: &[storage::Event]) -> WorkspaceInstructions {
         )
 }
 
+fn current_runners(events: &[storage::Event]) -> Option<Vec<RunnerInfo>> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::Runners)
+        .and_then(|event| serde_json::from_value(event.payload["runners"].clone()).ok())
+}
+
 fn skill_event(events: &[storage::Event]) -> Option<serde_json::Value> {
     let skills = current_skills(events);
     skills.tracked.then(|| {
         json!({
             "content": skills.content,
             "transition": if skills.content.is_some() { "initial" } else { "removal" },
+        })
+    })
+}
+
+fn runner_event(events: &[storage::Event]) -> Option<serde_json::Value> {
+    current_runners(events).map(|runners| {
+        json!({
+            "runners": runners,
+            "transition": "initial",
         })
     })
 }

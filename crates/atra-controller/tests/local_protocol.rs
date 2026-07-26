@@ -88,6 +88,13 @@ async fn lists_threads_newest_first() {
         skills,
         ControllerResponse::TurnEvent { event } if event.kind == "skills"
     ));
+    let runners =
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap();
+    assert!(matches!(
+        runners,
+        ControllerResponse::TurnEvent { event } if event.kind == "runners"
+    ));
     let event =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap();

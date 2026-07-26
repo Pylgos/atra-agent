@@ -29,14 +29,14 @@ use indoc::indoc;
 use serde_json::{json, value::RawValue};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use atra_protocol::Model;
+use atra_protocol::{Model, Runner};
 
 use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
 use crate::storage::{Event, EventKind};
 
 const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
 
-Commands, managed processes, and patches execute on Atra Runners. For each tool call, choose a suitable Runner with no more access than the operation requires. List the available Runners when the appropriate execution environment is unclear.
+Commands, managed processes, and patches execute on Atra Runners. The available Runners are provided in the conversation context. For each tool call, choose a suitable Runner with no more access than the operation requires.
 
 Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
 
@@ -869,6 +869,26 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                             phase: None,
                         })
                     }
+                    EventKind::Runners => {
+                        let transition = event.payload["transition"].as_str()?;
+                        let runners =
+                            serde_json::from_value::<Vec<Runner>>(event.payload["runners"].clone())
+                                .ok()?;
+                        let list = format_runners(&runners);
+                        let text = match transition {
+                            "initial" => list,
+                            "replacement" => format!(
+                                "The available Atra Runner list has changed. This list replaces \
+                                 the previously provided list.\n\n{list}"
+                            ),
+                            _ => return None,
+                        };
+                        ResponseItem::from(ResponseInputItem::Message {
+                            role: "developer".to_owned(),
+                            content: vec![ContentItem::InputText { text }],
+                            phase: None,
+                        })
+                    }
                     EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
                         role: "user".to_owned(),
                         content: vec![ContentItem::InputText {
@@ -944,6 +964,26 @@ fn tool_result_text(result: &serde_json::Value) -> String {
         .unwrap_or_else(|| result.to_string())
 }
 
+fn format_runners(runners: &[Runner]) -> String {
+    if runners.is_empty() {
+        return "No Atra Runners are currently available.".to_owned();
+    }
+
+    let mut lines = vec!["Available Atra Runners:".to_owned()];
+    for runner in runners {
+        lines.push(format!(
+            "{}: {}",
+            runner.name,
+            runner
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
+    lines.join("\n")
+}
+
 fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
     match item {
         ResponseItem::Message { content, .. } => {
@@ -991,18 +1031,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
         {
             "type": "web_search",
             "external_web_access": true
-        },
-        {
-            "type": "function",
-            "name": "list_runners",
-            "description": "List the available Atra Runners and their roles. Use this when the appropriate execution environment is not already known.",
-            "strict": true,
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }
         },
         {
             "type": "custom",
