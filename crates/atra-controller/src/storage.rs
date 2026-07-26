@@ -11,6 +11,7 @@ use tokio_rusqlite::{
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EventKind {
+    WorkspaceInstructions,
     UserMessage,
     AssistantMessage,
     ToolCall,
@@ -27,6 +28,7 @@ pub(crate) enum EventKind {
 impl EventKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::WorkspaceInstructions => "workspace_instructions",
             Self::UserMessage => "user_message",
             Self::AssistantMessage => "assistant_message",
             Self::ToolCall => "tool_call",

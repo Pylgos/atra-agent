@@ -819,6 +819,31 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
             .iter()
             .filter_map(|event| {
                 let item = match event.kind {
+                    EventKind::WorkspaceInstructions => {
+                        let transition = event.payload["transition"].as_str()?;
+                        let text = match transition {
+                            "initial" => event.payload["content"].as_str()?.to_owned(),
+                            "replacement" => format!(
+                                "These AGENTS.md instructions replace all previously provided \
+                                 AGENTS.md instructions.\n\n{}",
+                                event.payload["content"].as_str()?
+                            ),
+                            "removal" => {
+                                "The previously provided AGENTS.md instructions no longer apply."
+                                    .to_owned()
+                            }
+                            _ => return None,
+                        };
+                        ResponseItem::from(ResponseInputItem::Message {
+                            role: "user".to_owned(),
+                            content: vec![ContentItem::InputText {
+                                text: format!(
+                                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
+                                ),
+                            }],
+                            phase: None,
+                        })
+                    }
                     EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
                         role: "user".to_owned(),
                         content: vec![ContentItem::InputText {

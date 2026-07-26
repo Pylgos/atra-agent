@@ -43,6 +43,8 @@ mod storage;
 use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
 use storage::{EventKind, Store};
 
+const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
     let _ = set_default_originator("atra".to_owned());
     fs::create_dir_all(auth_home)
@@ -90,6 +92,7 @@ pub async fn codex_logout(auth_home: &Path) -> Result<()> {
 
 pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<()> {
     let _ = set_default_originator("atra".to_owned());
+    let workspace = env::current_dir().context("failed to determine controller workspace")?;
     let store = Store::open(database)
         .await
         .with_context(|| format!("failed to open controller database {}", database.display()))?;
@@ -141,6 +144,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         platform_bundle,
         auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
+        workspace,
     });
 
     let (shutdown, mut shutdown_requested) = watch::channel(false);
@@ -177,6 +181,13 @@ pub(crate) struct State {
     platform_bundle: Option<Arc<PlatformBundle>>,
     auth_home: PathBuf,
     prompt_cache_namespace: String,
+    workspace: PathBuf,
+}
+
+#[derive(Clone)]
+struct WorkspaceInstructions {
+    content: Option<String>,
+    tracked: bool,
 }
 
 impl State {
@@ -411,6 +422,7 @@ impl State {
             .name_thread_if_unnamed(thread_id, message.clone())
             .await
             .context("failed to name thread")?;
+        self.sync_workspace_instructions(thread_id).await?;
         self.store
             .append(
                 thread_id,
@@ -500,6 +512,25 @@ impl State {
                         .append(thread_id, EventKind::Compaction, json!({ "items": items }))
                         .await
                         .context("failed to save compacted model history")?;
+                    let workspace_instructions = workspace_instructions(&events);
+                    if workspace_instructions.tracked {
+                        let transition = if workspace_instructions.content.is_some() {
+                            "initial"
+                        } else {
+                            "removal"
+                        };
+                        self.store
+                            .append(
+                                thread_id,
+                                EventKind::WorkspaceInstructions,
+                                json!({
+                                    "content": workspace_instructions.content,
+                                    "transition": transition,
+                                }),
+                            )
+                            .await
+                            .context("failed to restore workspace instructions after compaction")?;
+                    }
                     events = self
                         .store
                         .events(thread_id)
@@ -578,6 +609,72 @@ impl State {
                 return Ok(response);
             }
         }
+    }
+
+    async fn sync_workspace_instructions(&self, thread_id: i64) -> Result<()> {
+        let content = self.read_workspace_instructions().await?;
+        let events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load workspace instruction state")?;
+        let previous = workspace_instructions(&events);
+        if previous.tracked && previous.content == content {
+            return Ok(());
+        }
+        if !previous.tracked && content.is_none() {
+            return Ok(());
+        }
+
+        let transition = match (&previous.content, &content) {
+            (_, None) => "removal",
+            (Some(_), Some(_)) => "replacement",
+            (None, Some(_)) => "initial",
+        };
+        self.store
+            .append(
+                thread_id,
+                EventKind::WorkspaceInstructions,
+                json!({
+                    "content": content,
+                    "transition": transition,
+                }),
+            )
+            .await
+            .context("failed to save workspace instructions")?;
+        Ok(())
+    }
+
+    async fn read_workspace_instructions(&self) -> Result<Option<String>> {
+        for filename in ["AGENTS.override.md", "AGENTS.md"] {
+            let path = self.workspace.join(filename);
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) if !metadata.is_file() => continue,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect workspace instructions {}",
+                            path.display()
+                        )
+                    });
+                }
+            }
+            let mut data = match tokio::fs::read(&path).await {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read workspace instructions {}", path.display())
+                    });
+                }
+            };
+            data.truncate(WORKSPACE_INSTRUCTIONS_MAX_BYTES);
+            let content = String::from_utf8_lossy(&data).trim().to_owned();
+            return Ok((!content.is_empty()).then_some(content));
+        }
+        Ok(None)
     }
 
     async fn execute_model_responses(
@@ -1126,6 +1223,23 @@ impl State {
             .cloned()
             .with_context(|| format!("runner {name} is not running"))
     }
+}
+
+fn workspace_instructions(events: &[storage::Event]) -> WorkspaceInstructions {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::WorkspaceInstructions)
+        .map_or(
+            WorkspaceInstructions {
+                content: None,
+                tracked: false,
+            },
+            |event| WorkspaceInstructions {
+                content: event.payload["content"].as_str().map(str::to_owned),
+                tracked: true,
+            },
+        )
 }
 
 #[derive(Deserialize, serde::Serialize)]
