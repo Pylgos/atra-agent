@@ -16,6 +16,7 @@ atra-controller.workspace = true
 atra-platform.workspace = true
 atra-protocol.workspace = true
 atra-runner.workspace = true
+atra-store.workspace = true
 atra-tui.workspace = true
 clap.workspace = true
 rustix.workspace = true

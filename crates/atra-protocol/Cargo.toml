@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 atra-patch.workspace = true
+atra-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -5,50 +5,61 @@ output=$1
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/blobs"
-tools_json='[]'
+objects='[]'
+entries='[]'
 
-executable=/opt/atra/bin/atra-runner
-description=$(file "$executable")
-printf '%s\n' "$description"
-printf '%s\n' "$description" | grep -Eq 'statically linked|static-pie linked'
-runner_digest=$(sha256sum "$executable" | cut -d' ' -f1)
-compressed="$work/atra-runner.zst"
-zstd -q -19 -T0 "$executable" -o "$compressed"
-compressed_digest=$(sha256sum "$compressed" | cut -d' ' -f1)
-runner_blob="blobs/$compressed_digest.zst"
-mv "$compressed" "$work/$runner_blob"
-
-for name in bash rg fd jq tmux; do
-    executable="/opt/atra/bin/$name"
+add_object() {
+    name=$1
+    executable=$2
     description=$(file "$executable")
     printf '%s\n' "$description"
     printf '%s\n' "$description" | grep -Eq 'statically linked|static-pie linked'
-    digest=$(sha256sum "$executable" | cut -d' ' -f1)
+    digest=$(
+        {
+            printf 'atra-object\000\001'
+            cat "$executable"
+        } | sha256sum | cut -d' ' -f1
+    )
     compressed="$work/$name.zst"
     zstd -q -19 -T0 "$executable" -o "$compressed"
     compressed_digest=$(sha256sum "$compressed" | cut -d' ' -f1)
     blob="blobs/$compressed_digest.zst"
     mv "$compressed" "$work/$blob"
-    tools_json=$(jq \
-        --arg name "$name" \
+    objects=$(jq \
         --arg digest "$digest" \
         --arg blob "$blob" \
-        '. + [{name: $name, digest: $digest, blob: $blob}]' \
+        '. + [{digest: $digest, executable: true, blob: $blob}]' \
         <<EOF
-$tools_json
+$objects
+EOF
+    )
+}
+
+add_object atra-runner /opt/atra/bin/atra-runner
+runner_digest=$digest
+
+for name in bash fd jq rg tmux; do
+    add_object "$name" "/opt/atra/bin/$name"
+    entries=$(jq \
+        --arg path "bin/$name" \
+        --arg object "$digest" \
+        '. + [{type: "file", path: $path, object: $object}]' \
+        <<EOF
+$entries
 EOF
     )
 done
 
 jq -n \
-    --arg platform "$(uname -m)-linux-musl" \
-    --arg runner_digest "$runner_digest" \
-    --arg runner_blob "$runner_blob" \
-    --argjson tools "$tools_json" \
+    --arg platform "$(uname -m)-linux-static" \
+    --arg runner "$runner_digest" \
+    --argjson entries "$entries" \
+    --argjson objects "$objects" \
     '{
         platform: $platform,
-        runner: {digest: $runner_digest, blob: $runner_blob},
-        tools: $tools
+        runner: $runner,
+        tools: {entries: $entries},
+        objects: $objects
     }' >"$work/manifest.json"
 
 mkdir -p "$(dirname "$output")"

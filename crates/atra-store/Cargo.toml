@@ -1,5 +1,5 @@
 [package]
-name = "atra-platform"
+name = "atra-store"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-atra-store.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-zip.workspace = true
-zstd.workspace = true
+tempfile.workspace = true

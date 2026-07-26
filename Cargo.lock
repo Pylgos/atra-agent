@@ -479,6 +479,7 @@ dependencies = [
  "atra-platform",
  "atra-protocol",
  "atra-runner",
+ "atra-store",
  "atra-tui",
  "clap",
  "rustix",
@@ -511,6 +512,7 @@ dependencies = [
  "atra-patch",
  "atra-platform",
  "atra-protocol",
+ "atra-store",
  "base64 0.22.1",
  "codex-api",
  "codex-http-client",
@@ -528,6 +530,7 @@ dependencies = [
  "tokio-rusqlite",
  "tracing",
  "xdg",
+ "zstd",
 ]
 
 [[package]]
@@ -552,6 +555,7 @@ name = "atra-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atra-store",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -564,6 +568,7 @@ name = "atra-protocol"
 version = "0.1.0"
 dependencies = [
  "atra-patch",
+ "atra-store",
  "serde",
  "serde_json",
 ]
@@ -576,6 +581,7 @@ dependencies = [
  "atra-id",
  "atra-patch",
  "atra-protocol",
+ "atra-store",
  "base64 0.22.1",
  "clap",
  "rustix",
@@ -586,6 +592,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zstd",
+]
+
+[[package]]
+name = "atra-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

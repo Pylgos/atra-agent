@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use atra_patch::ApplyPatchResult;
+use atra_store::TreeManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -266,26 +267,35 @@ pub struct RunnerResponseEnvelope {
     pub response: RunnerResponse,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CommandEnvironment {
+    pub set: BTreeMap<String, String>,
+    pub prepend_path: Vec<String>,
+    pub append_path: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RunnerRequest {
-    Initialize {
-        tools: Vec<String>,
+    Initialize,
+    PrepareTree {
+        manifest: TreeManifest,
     },
-    InstallTool {
-        name: String,
+    UploadObject {
         digest: String,
+        executable: bool,
         blob: String,
     },
-    FinishInitialize,
     ExecCommand {
         command: String,
         background: bool,
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
+        environment: CommandEnvironment,
     },
     StartCommand {
         command: String,
+        environment: CommandEnvironment,
     },
     ApplyPatch {
         patch: String,
@@ -307,10 +317,14 @@ pub enum RunnerRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunnerResponse {
     Ready,
-    ToolsRequired {
-        names: Vec<String>,
+    MissingObjects {
+        digests: Vec<String>,
     },
-    ToolInstalled,
+    TreeReady {
+        digest: String,
+        path: String,
+    },
+    ObjectStored,
     ProcessStarted {
         process_handle: String,
     },

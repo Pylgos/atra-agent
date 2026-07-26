@@ -1,39 +1,53 @@
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use atra_store::{PreparedTree, Store, TreeEntry, TreeManifest};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 #[derive(Debug, Deserialize)]
-struct Manifest {
+struct BundleManifest {
     platform: String,
-    runner: ManifestExecutable,
-    tools: Vec<ManifestTool>,
+    runner: String,
+    tools: TreeManifest,
+    objects: Vec<ManifestObject>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ManifestExecutable {
+struct ManifestObject {
     digest: String,
+    executable: bool,
     blob: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ManifestTool {
-    name: String,
-    #[serde(flatten)]
-    executable: ManifestExecutable,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlatformProfile {
+    pub runner: String,
+    pub tools: String,
 }
 
 pub struct PlatformBundle {
     platform: String,
-    runner: Executable,
-    tools: HashMap<String, Executable>,
+    runner: String,
+    tools: TreeManifest,
+    objects: HashMap<String, Object>,
 }
 
-pub struct Executable {
-    digest: String,
+pub struct Object {
+    executable: bool,
     compressed: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct PlatformStore {
+    store: Store,
+    profile: PlatformProfile,
 }
 
 impl PlatformBundle {
@@ -42,30 +56,50 @@ impl PlatformBundle {
             .with_context(|| format!("failed to open platform bundle {}", path.display()))?;
         let mut archive = ZipArchive::new(file)
             .with_context(|| format!("failed to read platform bundle {}", path.display()))?;
-        let manifest: Manifest = {
+        let manifest: BundleManifest = {
             let mut entry = archive
                 .by_name("manifest.json")
                 .context("platform bundle does not contain manifest.json")?;
             serde_json::from_reader(&mut entry)
                 .context("failed to decode platform bundle manifest")?
         };
+        if manifest.platform.is_empty()
+            || !manifest.platform.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+        {
+            bail!("invalid platform name {:?}", manifest.platform);
+        }
+        manifest.tools.validate().map_err(anyhow::Error::msg)?;
 
-        let runner = read_executable(&mut archive, manifest.runner, "atra-runner")?;
-        let mut tools = HashMap::new();
-        for manifest_tool in manifest.tools {
-            let executable =
-                read_executable(&mut archive, manifest_tool.executable, &manifest_tool.name)?;
-            if tools
-                .insert(manifest_tool.name.clone(), executable)
+        let mut objects = HashMap::new();
+        for object in manifest.objects {
+            let digest = object.digest.clone();
+            if objects
+                .insert(digest.clone(), read_object(&mut archive, object)?)
                 .is_some()
             {
-                bail!("duplicate tool {} in bundle", manifest_tool.name);
+                bail!("duplicate object {digest} in bundle");
             }
         }
+        match objects.get(&manifest.runner) {
+            Some(object) if object.executable => {}
+            Some(_) => bail!("platform bundle runner object is not executable"),
+            None => bail!("platform bundle does not contain runner object"),
+        }
+        for entry in &manifest.tools.entries {
+            if let TreeEntry::File { object, .. } = entry
+                && !objects.contains_key(object)
+            {
+                bail!("platform bundle does not contain tool object {object}");
+            }
+        }
+
         Ok(Self {
             platform: manifest.platform,
-            runner,
-            tools,
+            runner: manifest.runner,
+            tools: manifest.tools,
+            objects,
         })
     }
 
@@ -73,62 +107,113 @@ impl PlatformBundle {
         &self.platform
     }
 
-    pub fn runner(&self) -> &Executable {
+    pub fn runner_digest(&self) -> &str {
         &self.runner
     }
 
-    pub fn tool_names(&self) -> Vec<String> {
-        let mut names = self.tools.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
+    pub fn tools(&self) -> &TreeManifest {
+        &self.tools
     }
 
-    pub fn tool(&self, name: &str) -> Option<&Executable> {
-        self.tools.get(name)
-    }
-}
-
-impl Executable {
-    pub fn digest(&self) -> &str {
-        &self.digest
-    }
-
-    pub fn compressed(&self) -> &[u8] {
-        &self.compressed
-    }
-
-    pub fn decompress(&self) -> Result<Vec<u8>> {
-        let executable =
-            zstd::decode_all(self.compressed.as_slice()).context("failed to decompress blob")?;
-        let actual = format!("{:x}", Sha256::digest(&executable));
-        if actual != self.digest {
-            bail!(
-                "executable digest mismatch: expected {}, got {actual}",
-                self.digest
-            );
+    pub fn install(&self, root: &Path) -> Result<PathBuf> {
+        let store = Store::open(root.to_owned())?;
+        for (digest, object) in &self.objects {
+            let decoder = zstd::Decoder::new(object.compressed.as_slice())
+                .context("failed to decompress object")?;
+            store.put_object(digest, object.executable, decoder)?;
         }
-        Ok(executable)
+        let tree_digest = self.tools.digest();
+        match store.prepare_tree(&self.tools)? {
+            PreparedTree::Ready { digest, .. } if digest == tree_digest => {}
+            PreparedTree::Ready { digest, .. } => {
+                bail!("stored tree digest {digest}, expected {tree_digest}")
+            }
+            PreparedTree::MissingObjects(_) => {
+                bail!("platform bundle is missing objects for its tool tree")
+            }
+        }
+
+        let platform_directory = root.join("platforms").join(&self.platform);
+        fs::create_dir_all(&platform_directory).with_context(|| {
+            format!(
+                "failed to create platform directory {}",
+                platform_directory.display()
+            )
+        })?;
+        let profile = PlatformProfile {
+            runner: self.runner.clone(),
+            tools: tree_digest,
+        };
+        let destination = platform_directory.join("default.json");
+        let temporary =
+            platform_directory.join(format!(".default.json.tmp-{}", std::process::id()));
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&profile).context("failed to encode platform profile")?,
+        )
+        .with_context(|| format!("failed to write platform profile {}", temporary.display()))?;
+        fs::rename(&temporary, &destination)
+            .with_context(|| format!("failed to install profile {}", destination.display()))?;
+        Ok(destination)
     }
 }
 
-fn read_executable(
-    archive: &mut ZipArchive<File>,
-    manifest: ManifestExecutable,
-    name: &str,
-) -> Result<Executable> {
+impl PlatformStore {
+    pub fn load(root: PathBuf, platform: &str) -> Result<Option<Self>> {
+        let path = root.join("platforms").join(platform).join("default.json");
+        let profile: PlatformProfile = match File::open(&path) {
+            Ok(file) => serde_json::from_reader(file)
+                .with_context(|| format!("failed to decode platform profile {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to open platform profile {}", path.display())
+                });
+            }
+        };
+        Ok(Some(Self {
+            store: Store::open(root)?,
+            profile,
+        }))
+    }
+
+    pub fn runner(&self) -> Result<Vec<u8>> {
+        let mut content = Vec::new();
+        if !self
+            .store
+            .copy_object_to(&self.profile.runner, &mut content)?
+        {
+            bail!("platform runner object is not executable");
+        }
+        Ok(content)
+    }
+
+    pub fn tools(&self) -> Result<TreeManifest> {
+        self.store.read_manifest(&self.profile.tools)
+    }
+
+    pub fn copy_object_to(&self, digest: &str, destination: impl std::io::Write) -> Result<bool> {
+        self.store.copy_object_to(digest, destination)
+    }
+}
+
+fn read_object(archive: &mut ZipArchive<File>, manifest: ManifestObject) -> Result<Object> {
     let mut compressed = Vec::new();
     archive
         .by_name(&manifest.blob)
-        .with_context(|| format!("platform bundle does not contain blob for {name}"))?
+        .with_context(|| format!("platform bundle does not contain blob {}", manifest.blob))?
         .read_to_end(&mut compressed)
-        .with_context(|| format!("failed to read blob for {name}"))?;
+        .with_context(|| format!("failed to read blob {}", manifest.blob))?;
     let compressed_digest = format!("{:x}", Sha256::digest(&compressed));
     let expected_blob = format!("blobs/{compressed_digest}.zst");
     if manifest.blob != expected_blob {
-        bail!("compressed blob digest mismatch for {name}");
+        bail!(
+            "compressed blob digest mismatch for object {}",
+            manifest.digest
+        );
     }
-    Ok(Executable {
-        digest: manifest.digest,
+    Ok(Object {
+        executable: manifest.executable,
         compressed,
     })
 }

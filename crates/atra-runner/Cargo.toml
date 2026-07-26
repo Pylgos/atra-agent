@@ -14,6 +14,7 @@ anyhow.workspace = true
 atra-id.workspace = true
 atra-patch.workspace = true
 atra-protocol.workspace = true
+atra-store.workspace = true
 base64.workspace = true
 clap.workspace = true
 rustix.workspace = true

@@ -78,7 +78,7 @@ RUN apk add --no-cache file jq zip zstd
 COPY --from=runner-build /atra-runner /opt/atra/bin/atra-runner
 COPY tools/platform-bundle/package.sh /usr/local/bin/package-platform-bundle
 RUN chmod +x /usr/local/bin/package-platform-bundle \
-    && package-platform-bundle "/out/atra-platform-${TARGETARCH}-linux-musl.zip"
+    && package-platform-bundle "/out/atra-platform-${TARGETARCH}-linux-static.zip"
 
 FROM scratch
 COPY --from=package /out/ /

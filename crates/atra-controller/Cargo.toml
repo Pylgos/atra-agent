@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 atra-patch.workspace = true
 atra-protocol.workspace = true
+atra-store.workspace = true
 atra-platform.workspace = true
 base64.workspace = true
 codex-api.workspace = true
@@ -26,6 +27,7 @@ tokio.workspace = true
 tokio-rusqlite.workspace = true
 tracing.workspace = true
 xdg.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

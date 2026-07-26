@@ -13,12 +13,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
-use atra_platform::PlatformBundle;
+use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, CommandOutput, ControllerRequest, ControllerResponse, Runner as RunnerInfo,
-    RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, ThreadEvent,
-    TimeoutAction,
+    ApprovalPolicy, CommandEnvironment, CommandOutput, ControllerRequest, ControllerResponse,
+    Runner as RunnerInfo, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
+    RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
+use atra_store::TreeManifest;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
@@ -105,14 +106,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         Some(path) => Provider::fake(Path::new(&path))?,
         None => Provider::codex(auth_home.to_owned()).await,
     };
-    let platform_bundle_path = match env::var_os("ATRA_PLATFORM_BUNDLE") {
-        Some(path) => Some(path.into()),
-        None => current_platform_bundle()?,
-    };
-    let platform_bundle = platform_bundle_path
-        .map(|path| PlatformBundle::load(&path))
-        .transpose()?
-        .map(Arc::new);
+    let platform = current_platform()?.map(Arc::new);
 
     if endpoint.exists() {
         match UnixStream::connect(endpoint).await {
@@ -144,7 +138,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         active_turns: Mutex::new(HashMap::new()),
         thread_locks: StdMutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
-        platform_bundle,
+        platform,
         auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
         workspace,
@@ -183,7 +177,7 @@ pub(crate) struct State {
     active_turns: Mutex<HashMap<i64, Arc<ActiveTurn>>>,
     thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
     next_approval_id: AtomicU64,
-    platform_bundle: Option<Arc<PlatformBundle>>,
+    platform: Option<Arc<PlatformStore>>,
     auth_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
@@ -498,13 +492,14 @@ impl State {
                     ?timeout_action,
                     "executing command"
                 );
-                self.runner(&runner)
-                    .await?
+                let runner = self.runner(&runner).await?;
+                runner
                     .request(RunnerRequest::ExecCommand {
                         command,
                         background,
                         timeout_ms,
                         timeout_action,
+                        environment: runner.environment.clone(),
                     })
                     .await
             }
@@ -1283,6 +1278,7 @@ impl State {
                             background: true,
                             timeout_ms: arguments.timeout_ms,
                             timeout_action: arguments.timeout_action,
+                            environment: runner.environment.clone(),
                         })
                         .await?
                 } else {
@@ -1297,6 +1293,7 @@ impl State {
                     let response = runner
                         .request_raw(RunnerRequest::StartCommand {
                             command: arguments.command,
+                            environment: runner.environment.clone(),
                         })
                         .await?;
                     let RunnerResponse::ProcessStarted { process_handle } = response else {
@@ -1537,7 +1534,7 @@ impl State {
                 description,
                 approval,
                 command,
-                self.platform_bundle.as_deref(),
+                self.platform.as_deref(),
             )
             .await?,
         );
@@ -1741,6 +1738,7 @@ struct Runner {
     config: Mutex<RunnerConfig>,
     child: Mutex<Child>,
     client: RunnerClient,
+    environment: CommandEnvironment,
 }
 
 struct RunnerConfig {
@@ -1755,7 +1753,7 @@ impl Runner {
         description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
-        platform_bundle: Option<&PlatformBundle>,
+        platform: Option<&PlatformStore>,
     ) -> Result<Self> {
         tracing::info!(runner = name, executable = command[0], "starting runner");
         let mut child = Command::new(&command[0])
@@ -1807,46 +1805,15 @@ impl Runner {
         });
 
         let client = RunnerClient::new(stdin, stdout, name);
-        let requested_tools = platform_bundle
-            .map(PlatformBundle::tool_names)
-            .unwrap_or_default();
-        match client
-            .request_raw(RunnerRequest::Initialize {
-                tools: requested_tools,
-            })
-            .await?
-        {
+        match client.request_raw(RunnerRequest::Initialize).await? {
             RunnerResponse::Ready => {}
-            RunnerResponse::ToolsRequired { names } => {
-                let bundle =
-                    platform_bundle.context("runner requested tools without a platform bundle")?;
-                for tool_name in names {
-                    let tool = bundle
-                        .tool(&tool_name)
-                        .with_context(|| format!("runner requested unknown tool {tool_name}"))?;
-                    match client
-                        .request_raw(RunnerRequest::InstallTool {
-                            name: tool_name.clone(),
-                            digest: tool.digest().to_owned(),
-                            blob: STANDARD.encode(tool.compressed()),
-                        })
-                        .await?
-                    {
-                        RunnerResponse::ToolInstalled => {}
-                        response => bail!(
-                            "runner {name} returned an invalid install response for \
-                             {tool_name}: {response:?}"
-                        ),
-                    }
-                }
-                match client.request_raw(RunnerRequest::FinishInitialize).await? {
-                    RunnerResponse::Ready => {}
-                    response => {
-                        bail!("runner {name} returned an invalid readiness response: {response:?}")
-                    }
-                }
-            }
             response => bail!("runner {name} returned an invalid readiness response: {response:?}"),
+        }
+        let mut environment = CommandEnvironment::default();
+        if let Some(platform) = platform {
+            let tools = platform.tools()?;
+            let path = deploy_tree(&client, platform, tools).await?;
+            environment.prepend_path.push(format!("{path}/bin"));
         }
         if child
             .try_wait()
@@ -1865,6 +1832,7 @@ impl Runner {
             }),
             child: Mutex::new(child),
             client,
+            environment,
         })
     }
 
@@ -1878,6 +1846,58 @@ impl Runner {
 
     async fn approval(&self) -> ApprovalPolicy {
         self.config.lock().await.approval
+    }
+}
+
+async fn deploy_tree(
+    client: &RunnerClient,
+    platform: &PlatformStore,
+    manifest: TreeManifest,
+) -> Result<String> {
+    let expected_digest = manifest.digest();
+    loop {
+        match client
+            .request_raw(RunnerRequest::PrepareTree {
+                manifest: manifest.clone(),
+            })
+            .await?
+        {
+            RunnerResponse::MissingObjects { digests } => {
+                for digest in digests {
+                    let platform = platform.clone();
+                    let object_digest = digest.clone();
+                    let (compressed, executable) = tokio::task::spawn_blocking(move || {
+                        let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+                            .context("failed to compress object")?;
+                        let executable = platform.copy_object_to(&object_digest, &mut encoder)?;
+                        let compressed = encoder.finish().context("failed to finish object")?;
+                        Ok::<_, anyhow::Error>((compressed, executable))
+                    })
+                    .await
+                    .context("object compression task failed")??;
+                    match client
+                        .request_raw(RunnerRequest::UploadObject {
+                            digest,
+                            executable,
+                            blob: STANDARD.encode(compressed),
+                        })
+                        .await?
+                    {
+                        RunnerResponse::ObjectStored => {}
+                        response => {
+                            bail!("runner returned an invalid object response: {response:?}")
+                        }
+                    }
+                }
+            }
+            RunnerResponse::TreeReady { digest, path } => {
+                if digest != expected_digest {
+                    bail!("runner returned tree digest {digest}, expected {expected_digest}");
+                }
+                return Ok(path);
+            }
+            response => bail!("runner returned an invalid tree response: {response:?}"),
+        }
     }
 }
 
@@ -2001,7 +2021,9 @@ impl RunnerClient {
 fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
     match response {
         RunnerResponse::Ready => Ok(ControllerResponse::Running),
-        RunnerResponse::ToolsRequired { .. } | RunnerResponse::ToolInstalled => {
+        RunnerResponse::MissingObjects { .. }
+        | RunnerResponse::TreeReady { .. }
+        | RunnerResponse::ObjectStored => {
             bail!("runner returned an initialization response after becoming ready")
         }
         RunnerResponse::ProcessStarted { process_handle } => {
@@ -2073,8 +2095,9 @@ fn format_exec_response(response: RunnerResponse) -> Result<String> {
         )),
         RunnerResponse::Error { message } => bail!("{message}"),
         RunnerResponse::Ready
-        | RunnerResponse::ToolsRequired { .. }
-        | RunnerResponse::ToolInstalled
+        | RunnerResponse::MissingObjects { .. }
+        | RunnerResponse::TreeReady { .. }
+        | RunnerResponse::ObjectStored
         | RunnerResponse::InputWritten
         | RunnerResponse::ProcessStopped { .. }
         | RunnerResponse::PatchCompleted { .. } => {
@@ -2253,39 +2276,17 @@ fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
     index
 }
 
-fn current_platform_bundle() -> Result<Option<PathBuf>> {
+fn current_platform() -> Result<Option<PlatformStore>> {
     let platform = match env::consts::ARCH {
-        "x86_64" => "x86_64-linux-musl",
-        "aarch64" => "aarch64-linux-musl",
+        "x86_64" => "x86_64-linux-static",
+        "aarch64" => "aarch64-linux-static",
         _ => return Ok(None),
     };
-    let platform_directory = xdg::BaseDirectories::new()
+    let root = xdg::BaseDirectories::new()
         .get_data_home()
         .context("cannot determine the XDG data directory")?
-        .join("atra/platforms")
-        .join(platform);
-    let current = platform_directory.join("current");
-    let digest = match fs::read_to_string(&current) {
-        Ok(digest) => digest,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to read current platform bundle {}",
-                    current.display()
-                )
-            });
-        }
-    };
-    let digest = digest.trim();
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("current platform bundle contains an invalid digest");
-    }
-    Ok(Some(
-        platform_directory
-            .join("bundles")
-            .join(format!("{digest}.zip")),
-    ))
+        .join("atra");
+    PlatformStore::load(root, platform)
 }
 
 struct SocketGuard<'a>(&'a Path);

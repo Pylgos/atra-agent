@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
-    env,
-    ffi::OsString,
+    env, fs,
+    io::ErrorKind,
     os::fd::OwnedFd,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream as StdUnixStream,
     path::PathBuf,
     process::Stdio,
@@ -17,12 +17,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    CommandOutput, RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
-    TimeoutAction,
+    CommandEnvironment, CommandOutput, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
+    RunnerResponseEnvelope, TimeoutAction,
 };
+use atra_store::{PreparedTree, Store};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rustix::process::{Pid, Signal, kill_process_group};
-use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -51,20 +51,9 @@ async fn serve(
     let envelope: RunnerRequestEnvelope =
         serde_json::from_str(&line).context("failed to decode runner initialize request")?;
     let writer = Arc::new(Mutex::new(writer));
-    let tools = Arc::new(Mutex::new(ToolEnvironment::default()));
+    let store = Arc::new(runner_store()?);
     let response = match envelope.request {
-        RunnerRequest::Initialize { tools: requested } => {
-            let names = requested
-                .into_iter()
-                .filter(|name| !command_available(name))
-                .collect::<Vec<_>>();
-            if names.is_empty() {
-                tracing::info!("runner initialized");
-                RunnerResponse::Ready
-            } else {
-                RunnerResponse::ToolsRequired { names }
-            }
-        }
+        RunnerRequest::Initialize => RunnerResponse::Ready,
         _ => bail!("runner received a command before initialization"),
     };
     write_response(
@@ -91,9 +80,9 @@ async fn serve(
             serde_json::from_str(&line).context("failed to decode runner request")?;
         let writer = Arc::clone(&writer);
         let processes = Arc::clone(&processes);
-        let tools = Arc::clone(&tools);
+        let store = Arc::clone(&store);
         tokio::spawn(async move {
-            let response = match handle_request(&processes, &tools, envelope.request).await {
+            let response = match handle_request(&processes, &store, envelope.request).await {
                 Ok(response) => response,
                 Err(error) => RunnerResponse::Error {
                     message: format!("{error:#}"),
@@ -116,29 +105,55 @@ async fn serve(
 
 async fn handle_request(
     processes: &ProcessManager,
-    tools: &Mutex<ToolEnvironment>,
+    store: &Store,
     request: RunnerRequest,
 ) -> Result<RunnerResponse> {
     match request {
-        RunnerRequest::Initialize { .. } => bail!("runner was initialized more than once"),
-        RunnerRequest::InstallTool { name, digest, blob } => {
-            let directory = install_tool(&name, &digest, &blob).await?;
-            tools.lock().await.add(directory);
-            Ok(RunnerResponse::ToolInstalled)
+        RunnerRequest::Initialize => bail!("runner was initialized more than once"),
+        RunnerRequest::PrepareTree { manifest } => {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || match store.prepare_tree(&manifest)? {
+                PreparedTree::MissingObjects(digests) => {
+                    Ok(RunnerResponse::MissingObjects { digests })
+                }
+                PreparedTree::Ready { digest, path } => Ok(RunnerResponse::TreeReady {
+                    digest,
+                    path: path
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("tree path is not valid UTF-8"))?,
+                }),
+            })
+            .await
+            .context("tree preparation task failed")?
         }
-        RunnerRequest::FinishInitialize => {
-            tracing::info!("runner initialized with deployed tools");
-            Ok(RunnerResponse::Ready)
+        RunnerRequest::UploadObject {
+            digest,
+            executable,
+            blob,
+        } => {
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || {
+                let compressed = STANDARD
+                    .decode(blob)
+                    .context("failed to decode object blob")?;
+                let decoder = zstd::Decoder::new(compressed.as_slice())
+                    .context("failed to decompress object blob")?;
+                store.put_object(&digest, executable, decoder)?;
+                Ok(RunnerResponse::ObjectStored)
+            })
+            .await
+            .context("object upload task failed")?
         }
         RunnerRequest::ExecCommand {
             command,
             background,
             timeout_ms,
             timeout_action,
+            environment,
         } => {
             tracing::debug!(%command, "executing command");
-            let path = tools.lock().await.path();
-            let process = processes.start(command, path).await?;
+            let process = processes.start(command, environment).await?;
             if background {
                 return Ok(RunnerResponse::ProcessStarted {
                     process_handle: process.handle.clone(),
@@ -152,10 +167,12 @@ async fn handle_request(
                 )
                 .await
         }
-        RunnerRequest::StartCommand { command } => {
+        RunnerRequest::StartCommand {
+            command,
+            environment,
+        } => {
             tracing::debug!(%command, "starting command");
-            let path = tools.lock().await.path();
-            let process = processes.start(command, path).await?;
+            let process = processes.start(command, environment).await?;
             Ok(RunnerResponse::ProcessStarted {
                 process_handle: process.handle.clone(),
             })
@@ -202,97 +219,27 @@ async fn write_response(
         .context("failed to flush runner stdout")
 }
 
-#[derive(Default)]
-struct ToolEnvironment {
-    directories: Vec<PathBuf>,
-}
-
-impl ToolEnvironment {
-    fn add(&mut self, directory: PathBuf) {
-        if !self.directories.contains(&directory) {
-            self.directories.push(directory);
-        }
-    }
-
-    fn path(&self) -> Option<OsString> {
-        if self.directories.is_empty() {
-            return None;
-        }
-        let mut paths = self.directories.clone();
-        paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-        env::join_paths(paths).ok()
-    }
-}
-
-fn command_available(name: &str) -> bool {
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|directory| {
-            let path = directory.join(name);
-            path.is_file()
-                && path
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
-async fn install_tool(name: &str, digest: &str, blob: &str) -> Result<PathBuf> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        bail!("invalid tool name {name:?}");
-    }
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("invalid tool digest");
-    }
-
-    let compressed = STANDARD
-        .decode(blob)
-        .context("failed to decode tool blob")?;
-    let name = name.to_owned();
-    let digest = digest.to_ascii_lowercase();
-    tokio::task::spawn_blocking(move || {
-        let executable =
-            zstd::decode_all(compressed.as_slice()).context("failed to decompress tool blob")?;
-        let actual = format!("{:x}", Sha256::digest(&executable));
-        if actual != digest {
-            bail!("tool {name} digest mismatch: expected {digest}, got {actual}");
-        }
-
-        let root = env::var_os("ATRA_TOOL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir().join("atra-tools"));
-        let directory = root.join(&digest);
-        let path = directory.join(&name);
-        if !path.exists() {
-            std::fs::create_dir_all(&directory).with_context(|| {
-                format!("failed to create tool directory {}", directory.display())
-            })?;
-            let temporary = directory.join(format!(".{name}.tmp-{}", std::process::id()));
-            std::fs::write(&temporary, executable)
-                .with_context(|| format!("failed to write tool {}", temporary.display()))?;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| {
-                    format!("failed to make tool executable {}", temporary.display())
-                })?;
-            match std::fs::rename(&temporary, &path) {
-                Ok(()) => {}
-                Err(error) if path.exists() => {
-                    let _ = std::fs::remove_file(&temporary);
-                    tracing::debug!(%error, tool = name, "tool was installed concurrently");
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to install tool {}", path.display()));
-                }
+fn runner_store() -> Result<Store> {
+    let root = env::temp_dir().join(format!("atra-{}", rustix::process::geteuid().as_raw()));
+    match fs::create_dir(&root) {
+        Ok(()) => fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure store {}", root.display()))?,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&root)
+                .with_context(|| format!("failed to inspect store {}", root.display()))?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                bail!("unsafe Runner store {}", root.display());
             }
         }
-        Ok(directory)
-    })
-    .await
-    .context("tool install task failed")?
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create store {}", root.display()));
+        }
+    }
+    Store::open(root)
 }
 
 struct ProcessManager {
@@ -309,7 +256,11 @@ impl ProcessManager {
         })
     }
 
-    async fn start(&self, command: String, path: Option<OsString>) -> Result<Arc<ManagedProcess>> {
+    async fn start(
+        &self,
+        command: String,
+        environment: CommandEnvironment,
+    ) -> Result<Arc<ManagedProcess>> {
         let (output_reader, output_writer) =
             StdUnixStream::pair().context("failed to create command output stream")?;
         output_reader
@@ -327,8 +278,25 @@ impl ProcessManager {
             .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
             .process_group(0)
             .kill_on_drop(true);
-        if let Some(path) = path {
-            child.env("PATH", path);
+        child.envs(&environment.set);
+        if !environment.prepend_path.is_empty() || !environment.append_path.is_empty() {
+            let base = environment
+                .set
+                .get("PATH")
+                .map(Into::into)
+                .or_else(|| env::var_os("PATH"))
+                .unwrap_or_default();
+            let mut paths = environment
+                .prepend_path
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            paths.extend(env::split_paths(&base));
+            paths.extend(environment.append_path.iter().map(PathBuf::from));
+            child.env(
+                "PATH",
+                env::join_paths(paths).context("command PATH contains an invalid path")?,
+            );
         }
         let mut child = child
             .spawn()
