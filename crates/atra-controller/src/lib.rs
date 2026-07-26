@@ -566,14 +566,14 @@ impl State {
             .await
             .context("failed to name thread")?;
         self.sync_workspace_instructions(thread_id).await?;
-        self.store
-            .append(
-                thread_id,
-                EventKind::UserMessage,
-                json!({ "content": message }),
-            )
-            .await
-            .context("failed to save user message")?;
+        self.append_event(
+            thread_id,
+            EventKind::UserMessage,
+            json!({ "content": message }),
+            updates,
+        )
+        .await
+        .context("failed to save user message")?;
         self.continue_turn(thread_id, updates).await
     }
 

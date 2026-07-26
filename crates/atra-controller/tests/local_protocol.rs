@@ -72,17 +72,28 @@ async fn lists_threads_newest_first() {
         .await,
         ControllerResponse::ThreadRenamed
     );
+    let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
+    let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
+        thread_id: 2,
+        message: "First prompt".to_owned(),
+    })
+    .unwrap();
+    encoded_request.push(b'\n');
+    stream.write_all(&encoded_request).await.unwrap();
+    let mut responses = BufReader::new(stream).lines();
+    let event =
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap();
     assert!(matches!(
-        request(
-            &controller.endpoint,
-            ControllerRequest::ThreadSend {
-                thread_id: 2,
-                message: "First prompt".to_owned(),
-            },
-        )
-        .await,
-        ControllerResponse::Error { .. }
+        event,
+        ControllerResponse::TurnEvent { event }
+            if event.kind == "user_message"
+                && event.payload["content"] == "First prompt"
     ));
+    let response =
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap();
+    assert!(matches!(response, ControllerResponse::Error { .. }));
     assert_eq!(
         request(&controller.endpoint, ControllerRequest::ThreadList).await,
         ControllerResponse::ThreadList {
