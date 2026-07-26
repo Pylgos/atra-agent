@@ -33,8 +33,13 @@ use atra_protocol::Model;
 use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
 use crate::storage::{Event, EventKind};
 
-const INSTRUCTIONS: &str = "You are Atra Agent. Use the provided tools when needed. \
-Return a final answer after completing the user's request.";
+const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
+
+Commands, managed processes, and patches execute on Atra Runners. For each tool call, choose a suitable Runner with no more access than the operation requires. List the available Runners when the appropriate execution environment is unclear.
+
+Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
+
+Use tool results to determine the next action, then return a final answer."#;
 const WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
