@@ -1354,6 +1354,7 @@ impl State {
     async fn execute(&self, thread_id: i64, arguments: ToolArguments) -> Result<ToolOutcome> {
         match arguments {
             ToolArguments::ExecCommand(arguments) => {
+                let runner_name = arguments.runner.clone();
                 let runner = self.runner(&arguments.runner).await?;
                 let response = if arguments.background {
                     runner
@@ -1447,7 +1448,7 @@ impl State {
                 };
                 let artifact = command_artifact(&response)?;
                 Ok(ToolOutcome::with_artifact(
-                    format_exec_response(response)?,
+                    format_exec_response(&runner_name, response)?,
                     "command_execution",
                     artifact,
                 ))
@@ -1475,6 +1476,7 @@ impl State {
                 })
             }
             ToolArguments::WaitProcess(arguments) => {
+                let runner_name = arguments.runner.clone();
                 let response = self
                     .runner(&arguments.runner)
                     .await?
@@ -1485,7 +1487,7 @@ impl State {
                     .await?;
                 let artifact = command_artifact(&response)?;
                 Ok(ToolOutcome::with_artifact(
-                    format_process_response("wait_process", response)?,
+                    format_process_response("wait_process", &runner_name, response)?,
                     "command_execution",
                     artifact,
                 ))
@@ -1515,6 +1517,7 @@ impl State {
                 })
             }
             ToolArguments::StopProcess(arguments) => {
+                let runner_name = arguments.runner.clone();
                 let response = self
                     .runner(&arguments.runner)
                     .await?
@@ -1524,7 +1527,7 @@ impl State {
                     .await?;
                 let artifact = command_artifact(&response)?;
                 Ok(ToolOutcome::with_artifact(
-                    format_process_response("stop_process", response)?,
+                    format_process_response("stop_process", &runner_name, response)?,
                     "command_execution",
                     artifact,
                 ))
@@ -2217,37 +2220,41 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
     }
 }
 
-fn format_exec_response(response: RunnerResponse) -> Result<String> {
+fn format_exec_response(runner: &str, response: RunnerResponse) -> Result<String> {
     match response {
-        RunnerResponse::ProcessStarted { process_handle } => Ok(format!(
-            "atra exec_command: process started with handle {process_handle}"
-        )),
+        RunnerResponse::ProcessStarted { process_handle } => {
+            Ok(format!("Process started with handle {process_handle}"))
+        }
         RunnerResponse::ProcessRunning {
             process_handle,
             output,
-        } => Ok(format!(
-            "{}\natra exec_command: process {process_handle} is still running",
-            format_command_output(&output)
+        } => Ok(append_process_status(
+            model_command_output(&output, runner),
+            &format!("Process {process_handle} is still running"),
         )),
         RunnerResponse::ProcessFinished {
             output,
             exit_code: Some(0),
-        } => Ok(format!(
-            "{}\natra exec_command: process finished with exit code 0",
-            format_command_output(&output)
-        )),
+        } => {
+            let output = model_command_output(&output, runner);
+            Ok(if output.is_empty() {
+                "Process completed with no output".to_owned()
+            } else {
+                output
+            })
+        }
         RunnerResponse::ProcessFinished { output, exit_code } => {
             let exit_code = exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
-            Ok(format!(
-                "{}\natra exec_command: process finished with exit code {exit_code}",
-                format_command_output(&output)
+            Ok(append_process_status(
+                model_command_output(&output, runner),
+                &format!("Process exited with code {exit_code}"),
             ))
         }
-        RunnerResponse::ProcessTimedOut { output } => Ok(format!(
-            "{}\natra exec_command: process timed out",
-            format_command_output(&output)
+        RunnerResponse::ProcessTimedOut { output } => Ok(append_process_status(
+            model_command_output(&output, runner),
+            "Process timed out",
         )),
         RunnerResponse::Error { message } => bail!("{message}"),
         RunnerResponse::Ready
@@ -2344,29 +2351,42 @@ fn command_artifact(response: &RunnerResponse) -> Result<serde_json::Value> {
     })
 }
 
-fn format_process_response(tool: &str, response: RunnerResponse) -> Result<String> {
-    let (description, output) = match response {
+fn format_process_response(tool: &str, runner: &str, response: RunnerResponse) -> Result<String> {
+    match response {
         RunnerResponse::ProcessRunning {
             process_handle,
             output,
-        } => (format!("process {process_handle} is still running"), output),
-        RunnerResponse::ProcessFinished { output, exit_code } => (
-            format!(
-                "process finished with exit code {}",
+        } => Ok(append_process_status(
+            model_command_output(&output, runner),
+            &format!("Process {process_handle} is still running"),
+        )),
+        RunnerResponse::ProcessFinished {
+            output,
+            exit_code: Some(0),
+        } => {
+            let output = model_command_output(&output, runner);
+            Ok(if output.is_empty() {
+                "Process completed with no output".to_owned()
+            } else {
+                output
+            })
+        }
+        RunnerResponse::ProcessFinished { output, exit_code } => Ok(append_process_status(
+            model_command_output(&output, runner),
+            &format!(
+                "Process exited with code {}",
                 exit_code
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
-            output,
-        ),
-        RunnerResponse::ProcessStopped { output } => ("process stopped".to_owned(), output),
+        )),
+        RunnerResponse::ProcessStopped { output } => Ok(append_process_status(
+            model_command_output(&output, runner),
+            "Process stopped",
+        )),
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("runner returned an invalid {tool} response"),
-    };
-    Ok(format!(
-        "atra {tool}: {description}\n{}",
-        format_command_output(&output)
-    ))
+    }
 }
 
 fn append_command_output(collected: &mut Option<CommandOutput>, output: CommandOutput) {
@@ -2393,6 +2413,13 @@ fn append_command_output(collected: &mut Option<CommandOutput>, output: CommandO
 const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;
 
 fn format_command_output(output: &CommandOutput) -> String {
+    format_command_output_with_location(output, &output.full_output_path.display().to_string())
+}
+
+fn format_command_output_with_location(
+    output: &CommandOutput,
+    full_output_location: &str,
+) -> String {
     if output.omitted_bytes == 0 && output.content.len() <= MAX_TOOL_OUTPUT_BYTES {
         return output.content.clone();
     }
@@ -2411,11 +2438,31 @@ fn format_command_output(output: &CommandOutput) -> String {
     .max(head_end);
     let omitted_bytes = output.omitted_bytes + tail_start.saturating_sub(head_end);
     format!(
-        "{}\n\n... {omitted_bytes} bytes omitted; full output: {} ...\n\n{}",
+        "{}\n\n... {omitted_bytes} bytes omitted; full output: {full_output_location} ...\n\n{}",
         &output.content[..head_end],
-        output.full_output_path.display(),
         &output.content[tail_start..]
     )
+}
+
+fn model_command_output(output: &CommandOutput, runner: &str) -> String {
+    let location = format!("runner \"{runner}\": {}", output.full_output_path.display());
+    let output = format_command_output_with_location(output, &location);
+    output
+        .chars()
+        .filter(|character| {
+            matches!(character, '\t' | '\n' | '\r')
+                || (*character >= ' ' && !('\u{fff9}'..='\u{fffb}').contains(character))
+        })
+        .filter(|character| *character != '\r')
+        .collect()
+}
+
+fn append_process_status(output: String, status: &str) -> String {
+    if output.is_empty() {
+        status.to_owned()
+    } else {
+        format!("{output}\n\n{status}")
+    }
 }
 
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {

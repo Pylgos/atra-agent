@@ -44,10 +44,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .send_message(thread, "run the scripted command")
         .await;
     assert!(turn.status.success(), "{turn:?}");
-    assert_eq!(
-        turn.stdout,
-        b"observed model-output\natra exec_command: process finished with exit code 0\n"
-    );
+    assert_eq!(turn.stdout, b"observed model-output\n");
 
     let denied_thread = system.create_thread().await;
     let mut pending = system.start_message(denied_thread, "request a denied command");
@@ -88,10 +85,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(approval.status.success(), "{approval:?}");
     let allowed = pending.finish().await;
     assert!(allowed.status.success(), "{allowed:?}");
-    assert_eq!(
-        allowed.stdout,
-        b"approved approved-output\natra exec_command: process finished with exit code 0\n"
-    );
+    assert_eq!(allowed.stdout, b"approved approved-output\n");
 
     let patch_thread = system.create_thread().await;
     let mut pending = system.start_message(patch_thread, "request an approved patch");
@@ -294,13 +288,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         events[4].payload["result"],
-        serde_json::json!("model-output\natra exec_command: process finished with exit code 0")
+        serde_json::json!("model-output")
     );
     assert_eq!(
         events[6].payload["content"],
-        serde_json::json!(
-            "observed model-output\natra exec_command: process finished with exit code 0"
-        )
+        serde_json::json!("observed model-output")
     );
     let denied_events = system.events(denied_thread).await;
     assert_eq!(
@@ -340,7 +332,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         allowed_events[4].payload["result"],
-        serde_json::json!("approved-output\natra exec_command: process finished with exit code 0")
+        serde_json::json!("approved-output")
     );
 }
 
