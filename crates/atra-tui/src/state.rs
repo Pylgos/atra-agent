@@ -24,11 +24,12 @@ pub(crate) enum TurnState {
     #[default]
     Idle,
     Running,
+    Cancelling,
 }
 
 impl TurnState {
     pub(crate) fn is_running(&self) -> bool {
-        matches!(self, Self::Running)
+        !matches!(self, Self::Idle)
     }
 }
 

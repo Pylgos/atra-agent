@@ -79,7 +79,19 @@ pub(crate) enum TurnUpdate {
         thread_id: i64,
         event: ThreadEvent,
     },
+    ApprovalRequired {
+        approval_id: u64,
+        thread_id: i64,
+    },
     Completed(Result<TurnCompletion>),
+    ApprovalResolved {
+        approval_id: u64,
+        result: Result<ControllerResponse>,
+    },
+    CancelRequestFailed {
+        thread_id: i64,
+        error: anyhow::Error,
+    },
     LoginCompleted(Result<ControllerResponse>),
     ThreadSelected {
         thread_id: i64,
@@ -203,6 +215,10 @@ impl App {
         key: KeyEvent,
         effects: &mpsc::UnboundedSender<Effect>,
     ) -> Result<bool> {
+        if matches!(self.turn, TurnState::Running) && key.code == KeyCode::Esc {
+            self.cancel_turn(effects);
+            return Ok(false);
+        }
         if matches!(self.overlay, Overlay::Help) {
             let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
@@ -234,6 +250,10 @@ impl App {
         }
 
         if let Overlay::Approval(approval) = &mut self.overlay {
+            if key.code == KeyCode::Esc && approval.deny_reason.is_none() {
+                self.cancel_turn(effects);
+                return Ok(false);
+            }
             if let Some(reason) = &mut approval.deny_reason {
                 match key.code {
                     KeyCode::Enter => {
@@ -825,7 +845,7 @@ impl App {
         self.turn = TurnState::Running;
         self.activity = Some(Activity::Info("Continuing turn…".to_owned()));
         effects
-            .send(Effect::ResumeTurn {
+            .send(Effect::ContinueTurn {
                 endpoint: self.endpoint.clone(),
                 thread_id,
                 request: ControllerRequest::ThreadContinue { thread_id },
@@ -1049,7 +1069,9 @@ impl App {
             message.clone(),
         )?;
         self.turn = TurnState::Running;
-        self.activity = Some(Activity::Info("Waiting for Atra Controller…".to_owned()));
+        self.activity = Some(Activity::Info(
+            "Waiting for Atra Controller… · Esc cancels".to_owned(),
+        ));
         effects
             .send(Effect::SendTurn {
                 endpoint: self.endpoint.clone(),
@@ -1059,6 +1081,19 @@ impl App {
             })
             .ok();
         Ok(())
+    }
+
+    fn cancel_turn(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
+        let thread_id = self.thread_id.expect("active turn belongs to a thread");
+        self.overlay = Overlay::None;
+        self.turn = TurnState::Cancelling;
+        self.activity = Some(Activity::Info("Cancelling…".to_owned()));
+        effects
+            .send(Effect::CancelTurn {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+            })
+            .ok();
     }
 
     fn rename(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
@@ -1125,12 +1160,13 @@ impl App {
         };
         self.overlay = Overlay::None;
         self.turn = TurnState::Running;
-        self.activity = Some(Activity::Info("Waiting for Atra Controller…".to_owned()));
-        let thread_id = self.thread_id.expect("approval belongs to a thread");
+        self.activity = Some(Activity::Info(
+            "Waiting for Atra Controller… · Esc cancels".to_owned(),
+        ));
         effects
-            .send(Effect::ResumeTurn {
+            .send(Effect::ResolveApproval {
                 endpoint: self.endpoint.clone(),
-                thread_id,
+                approval_id,
                 request: request_message,
             })
             .ok();
@@ -1279,6 +1315,19 @@ impl App {
                 }
                 return Ok(());
             }
+            TurnUpdate::ApprovalRequired {
+                approval_id,
+                thread_id,
+            } => {
+                if self.thread_id == Some(thread_id) {
+                    self.overlay = Overlay::Approval(Approval {
+                        id: approval_id,
+                        deny_reason: None,
+                    });
+                    self.activity = None;
+                }
+                return Ok(());
+            }
             TurnUpdate::Completed(Ok(completion)) => completion,
             TurnUpdate::Completed(Err(error)) => {
                 let mut preview_indices = self
@@ -1292,6 +1341,39 @@ impl App {
                 }
                 self.turn = TurnState::Idle;
                 self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                return Ok(());
+            }
+            TurnUpdate::ApprovalResolved {
+                approval_id,
+                result,
+            } => {
+                match result {
+                    Ok(ControllerResponse::ApprovalResolved) => {}
+                    Ok(ControllerResponse::Error { message }) => {
+                        self.overlay = Overlay::Approval(Approval {
+                            id: approval_id,
+                            deny_reason: None,
+                        });
+                        self.activity = Some(Activity::Error(sanitize(&message)));
+                    }
+                    Ok(response) => {
+                        bail!("controller returned an unexpected approval response: {response:?}")
+                    }
+                    Err(error) => {
+                        self.overlay = Overlay::Approval(Approval {
+                            id: approval_id,
+                            deny_reason: None,
+                        });
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::CancelRequestFailed { thread_id, error } => {
+                if self.thread_id == Some(thread_id) {
+                    self.turn = TurnState::Running;
+                    self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                }
                 return Ok(());
             }
             TurnUpdate::LoginCompleted(result) => {
@@ -1497,12 +1579,8 @@ impl App {
                 ));
                 self.activity = None;
             }
-            ControllerResponse::ApprovalRequired { approval_id, .. } => {
-                self.overlay = Overlay::Approval(Approval {
-                    id: approval_id,
-                    deny_reason: None,
-                });
-                self.activity = None;
+            ControllerResponse::ThreadCancelled => {
+                self.activity = Some(Activity::Info("Cancelled".to_owned()));
             }
             ControllerResponse::Error { message } => {
                 self.activity = Some(Activity::Error(sanitize(&message)));

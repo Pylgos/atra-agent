@@ -1,11 +1,16 @@
-use std::{fs, process::Stdio, time::Duration};
+use std::{
+    fs,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
 use atra_protocol::ThreadEvent;
 use rustix::process::{Pid, test_kill_process};
 use tempfile::TempDir;
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     net::UnixStream,
-    process::{Child, Command},
+    process::{Child, ChildStdout, Command},
     time::{sleep, timeout},
 };
 
@@ -28,11 +33,8 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
 
     let denied_thread = system.create_thread().await;
-    let pending = system
-        .send_message(denied_thread, "request a denied command")
-        .await;
-    assert!(pending.status.success(), "{pending:?}");
-    let pending_stdout = String::from_utf8(pending.stdout).unwrap();
+    let mut pending = system.start_message(denied_thread, "request a denied command");
+    let pending_stdout = pending.approval().await;
     let denied_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
     assert!(
         pending_stdout.contains("tool: exec_command"),
@@ -43,9 +45,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             && pending_stdout.contains("printf should-not-run > denied-marker"),
         "{pending_stdout:?}"
     );
-    let denied = system
+    let approval = system
         .deny(denied_approval_id, "not in this environment")
         .await;
+    assert!(approval.status.success(), "{approval:?}");
+    let denied = pending.finish().await;
     assert!(denied.status.success(), "{denied:?}");
     assert_eq!(
         denied.stdout,
@@ -54,18 +58,18 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(!system.workspace.path().join("denied-marker").exists());
 
     let allowed_thread = system.create_thread().await;
-    let pending = system
-        .send_message(allowed_thread, "request an approved command")
-        .await;
-    assert!(pending.status.success(), "{pending:?}");
-    let allowed_approval_id = String::from_utf8(pending.stdout)
-        .unwrap()
+    let mut pending = system.start_message(allowed_thread, "request an approved command");
+    let allowed_approval_id = pending
+        .approval()
+        .await
         .lines()
         .next()
         .unwrap()
         .parse()
         .unwrap();
-    let allowed = system.allow(allowed_approval_id).await;
+    let approval = system.allow(allowed_approval_id).await;
+    assert!(approval.status.success(), "{approval:?}");
+    let allowed = pending.finish().await;
     assert!(allowed.status.success(), "{allowed:?}");
     assert_eq!(
         allowed.stdout,
@@ -73,17 +77,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
 
     let patch_thread = system.create_thread().await;
-    let pending = system
-        .send_message(patch_thread, "request an approved patch")
-        .await;
-    assert!(pending.status.success(), "{pending:?}");
-    let pending_stdout = String::from_utf8(pending.stdout).unwrap();
+    let mut pending = system.start_message(patch_thread, "request an approved patch");
+    let pending_stdout = pending.approval().await;
     assert!(
         pending_stdout.contains("tool: apply_patch"),
         "{pending_stdout:?}"
     );
     let patch_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
-    let approved_patch = system.allow(patch_approval_id).await;
+    let approval = system.allow(patch_approval_id).await;
+    assert!(approval.status.success(), "{approval:?}");
+    let approved_patch = pending.finish().await;
     assert!(approved_patch.status.success(), "{approved_patch:?}");
     assert_eq!(approved_patch.stdout, b"patched patch-ok\n");
     assert_eq!(
@@ -330,6 +333,42 @@ struct TestSystem {
     controller: Option<Child>,
 }
 
+#[derive(Debug)]
+struct CompletedTurn {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+struct PendingTurn {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PendingTurn {
+    async fn approval(&mut self) -> String {
+        let mut output = String::new();
+        for _ in 0..3 {
+            self.stdout.read_line(&mut output).await.unwrap();
+        }
+        output
+    }
+
+    async fn finish(mut self) -> CompletedTurn {
+        let mut stdout = Vec::new();
+        self.stdout.read_to_end(&mut stdout).await.unwrap();
+        let status = self.child.wait().await.unwrap();
+        let mut stderr = Vec::new();
+        self.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .await
+            .unwrap();
+        CompletedTurn { status, stdout }
+    }
+}
+
 impl TestSystem {
     async fn start() -> Self {
         let workspace = tempfile::tempdir().unwrap();
@@ -489,6 +528,27 @@ impl TestSystem {
             .output()
             .await
             .unwrap()
+    }
+
+    fn start_message(&self, thread: i64, message: &str) -> PendingTurn {
+        let mut child = self
+            .atra()
+            .args([
+                "thread",
+                "send",
+                "--thread",
+                &thread.to_string(),
+                "--message",
+                message,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        PendingTurn {
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
     }
 
     async fn deny(&self, approval: u64, reason: &str) -> std::process::Output {

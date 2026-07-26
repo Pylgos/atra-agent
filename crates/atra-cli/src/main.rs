@@ -468,15 +468,14 @@ async fn run(command: Command) -> Result<()> {
         Command::Thread {
             command: ThreadCommand::Send { thread, message },
         } => {
-            let response = send_controller_request(
+            display_turn_stream(
                 &endpoint,
                 ControllerRequest::ThreadSend {
                     thread_id: thread,
                     message,
                 },
             )
-            .await?;
-            display_turn_response(response)
+            .await
         }
         Command::Thread {
             command: ThreadCommand::Events { thread },
@@ -626,12 +625,11 @@ async fn run(command: Command) -> Result<()> {
         Command::Thread {
             command: ThreadCommand::Continue { thread },
         } => {
-            let response = send_controller_request(
+            display_turn_stream(
                 &endpoint,
                 ControllerRequest::ThreadContinue { thread_id: thread },
             )
-            .await?;
-            display_turn_response(response)
+            .await
         }
         Command::Approval {
             command: ApprovalCommand::Allow { approval },
@@ -800,6 +798,11 @@ async fn run(command: Command) -> Result<()> {
 
 fn display_turn_response(response: ControllerResponse) -> Result<()> {
     match response {
+        ControllerResponse::ApprovalResolved => Ok(()),
+        ControllerResponse::ThreadCancelled => {
+            println!("cancelled");
+            Ok(())
+        }
         ControllerResponse::TurnCompleted { content } => {
             println!("{content}");
             Ok(())
@@ -820,6 +823,37 @@ fn display_turn_response(response: ControllerResponse) -> Result<()> {
         }
         ControllerResponse::Error { message } => bail!("{message}"),
         response => bail!("controller returned an unexpected response: {response:?}"),
+    }
+}
+
+async fn display_turn_stream(endpoint: &Path, request: ControllerRequest) -> Result<()> {
+    let mut connection = atra_client::Connection::open(endpoint, &request).await?;
+    loop {
+        match connection.receive().await? {
+            ControllerResponse::TurnDelta { .. }
+            | ControllerResponse::ReasoningSummaryDelta { .. }
+            | ControllerResponse::ReasoningSummaryPartAdded
+            | ControllerResponse::ToolCallStarted { .. }
+            | ControllerResponse::ToolCallDelta { .. }
+            | ControllerResponse::TurnEvent { .. } => {}
+            ControllerResponse::ApprovalRequired {
+                approval_id,
+                tool,
+                arguments,
+                ..
+            } => {
+                println!("{approval_id}");
+                println!("tool: {tool}");
+                println!(
+                    "arguments: {}",
+                    serde_json::to_string(&arguments).context("failed to encode tool arguments")?
+                );
+                std::io::stdout()
+                    .flush()
+                    .context("failed to flush approval request")?;
+            }
+            response => return display_turn_response(response),
+        }
     }
 }
 
@@ -1228,6 +1262,9 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ToolCallDelta { .. }
         | ControllerResponse::TurnEvent { .. }
         | ControllerResponse::TurnCompleted { .. }
+        | ControllerResponse::ThreadCancelled
+        | ControllerResponse::ThreadNotActive
+        | ControllerResponse::ApprovalResolved
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::ThreadEvents { .. }
         | ControllerResponse::ThreadCheckpointCreated { .. }

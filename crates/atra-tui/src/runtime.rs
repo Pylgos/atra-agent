@@ -37,10 +37,19 @@ pub(crate) enum Effect {
         new_thread_model: Option<(String, String)>,
         message: String,
     },
-    ResumeTurn {
+    ContinueTurn {
         endpoint: std::path::PathBuf,
         thread_id: i64,
         request: ControllerRequest,
+    },
+    ResolveApproval {
+        endpoint: std::path::PathBuf,
+        approval_id: u64,
+        request: ControllerRequest,
+    },
+    CancelTurn {
+        endpoint: std::path::PathBuf,
+        thread_id: i64,
     },
     LoadCheckpoints {
         endpoint: std::path::PathBuf,
@@ -167,18 +176,39 @@ impl Effect {
                         send_turn(&endpoint, thread_id, new_thread_model, message, &updates).await;
                     let _ = updates.send(TurnUpdate::Completed(result));
                 }
-                Self::ResumeTurn {
+                Self::ContinueTurn {
                     endpoint,
                     thread_id,
-                    request,
+                    request: turn_request,
                 } => {
-                    let result = request_stream(&endpoint, request, thread_id, &updates)
+                    let result = request_stream(&endpoint, turn_request, thread_id, &updates)
                         .await
                         .map(|response| TurnCompletion {
                             thread_id,
                             response,
                         });
                     let _ = updates.send(TurnUpdate::Completed(result));
+                }
+                Self::ResolveApproval {
+                    endpoint,
+                    approval_id,
+                    request: approval_request,
+                } => {
+                    let result = request(&endpoint, approval_request).await;
+                    let _ = updates.send(TurnUpdate::ApprovalResolved {
+                        approval_id,
+                        result,
+                    });
+                }
+                Self::CancelTurn {
+                    endpoint,
+                    thread_id,
+                } => {
+                    if let Err(error) =
+                        request(&endpoint, ControllerRequest::ThreadCancel { thread_id }).await
+                    {
+                        let _ = updates.send(TurnUpdate::CancelRequestFailed { thread_id, error });
+                    }
                 }
                 Self::LoadCheckpoints {
                     endpoint,

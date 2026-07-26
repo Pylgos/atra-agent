@@ -71,6 +71,9 @@ pub enum ControllerRequest {
     ThreadContinue {
         thread_id: i64,
     },
+    ThreadCancel {
+        thread_id: i64,
+    },
     CodexLogin,
     CodexLogout,
     CodexLoginStatus,
@@ -148,6 +151,9 @@ pub enum ControllerResponse {
     TurnCompleted {
         content: String,
     },
+    ThreadCancelled,
+    ThreadNotActive,
+    ApprovalResolved,
     ApprovalRequired {
         approval_id: u64,
         thread_id: i64,
@@ -277,6 +283,9 @@ pub enum RunnerRequest {
         background: bool,
         timeout_ms: Option<u64>,
         timeout_action: TimeoutAction,
+    },
+    StartCommand {
+        command: String,
     },
     ApplyPatch {
         patch: String,

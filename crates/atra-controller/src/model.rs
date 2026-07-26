@@ -38,8 +38,20 @@ pub(crate) enum ModelStreamEvent {
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
     ReasoningSummaryPartAdded,
-    ToolCallStarted { item_id: String, name: String },
-    ToolCallDelta { item_id: String, delta: String },
+    ToolCallStarted {
+        item_id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        item_id: String,
+        delta: String,
+    },
+    ApprovalRequired {
+        approval_id: u64,
+        thread_id: i64,
+        tool: String,
+        arguments: serde_json::Value,
+    },
     ThreadEvent(ThreadEvent),
 }
 

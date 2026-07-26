@@ -26,9 +26,7 @@ pub(super) async fn request_stream(
 ) -> Result<ControllerResponse> {
     let mut connection = atra_client::Connection::open(endpoint, &request).await?;
     loop {
-        let response = tokio::time::timeout(Duration::from_secs(300), connection.receive())
-            .await
-            .context("controller request timed out")??;
+        let response = connection.receive().await?;
         match response {
             ControllerResponse::TurnDelta { content } => {
                 updates.send(TurnUpdate::Delta { thread_id, content }).ok();
@@ -55,6 +53,18 @@ pub(super) async fn request_stream(
             ControllerResponse::ToolCallDelta { .. } => {}
             ControllerResponse::TurnEvent { event } => {
                 updates.send(TurnUpdate::Event { thread_id, event }).ok();
+            }
+            ControllerResponse::ApprovalRequired {
+                approval_id,
+                thread_id,
+                ..
+            } => {
+                updates
+                    .send(TurnUpdate::ApprovalRequired {
+                        approval_id,
+                        thread_id,
+                    })
+                    .ok();
             }
             response => return Ok(response),
         }

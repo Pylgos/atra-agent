@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +33,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::{Child, ChildStdin, Command},
     sync::{Mutex, mpsc, oneshot, watch},
+    time::Instant,
 };
 
 mod connection;
@@ -140,6 +141,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         store,
         provider,
         approvals: Mutex::new(HashMap::new()),
+        active_turns: Mutex::new(HashMap::new()),
         thread_locks: StdMutex::new(HashMap::new()),
         next_approval_id: AtomicU64::new(0),
         platform_bundle,
@@ -178,6 +180,7 @@ pub(crate) struct State {
     store: Store,
     provider: Provider,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
+    active_turns: Mutex<HashMap<i64, Arc<ActiveTurn>>>,
     thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
     next_approval_id: AtomicU64,
     platform_bundle: Option<Arc<PlatformBundle>>,
@@ -192,32 +195,100 @@ struct WorkspaceInstructions {
     tracked: bool,
 }
 
+struct ActiveTurn {
+    cancel_requested: watch::Sender<bool>,
+    cancellation: watch::Sender<Option<Result<(), String>>>,
+    cancelling: AtomicBool,
+    uncancellable: Mutex<()>,
+    process: Mutex<Option<(Arc<Runner>, String)>>,
+}
+
 impl State {
     async fn handle_streaming(
         &self,
         request: ControllerRequest,
         updates: &mpsc::UnboundedSender<ModelStreamEvent>,
     ) -> Result<ControllerResponse> {
-        match request {
-            ControllerRequest::ThreadSend { thread_id, message } => {
-                self.run_turn(thread_id, message, Some(updates)).await
-            }
-            ControllerRequest::ThreadContinue { thread_id } => {
-                self.continue_thread(thread_id, Some(updates)).await
-            }
-            ControllerRequest::ApprovalAllow { approval_id } => {
-                self.resolve_approval(approval_id, true, None, Some(updates))
-                    .await
-            }
-            ControllerRequest::ApprovalDeny {
-                approval_id,
-                reason,
-            } => {
-                self.resolve_approval(approval_id, false, reason, Some(updates))
-                    .await
-            }
+        let thread_id = match &request {
+            ControllerRequest::ThreadSend { thread_id, .. }
+            | ControllerRequest::ThreadContinue { thread_id } => *thread_id,
             _ => unreachable!("non-streaming request dispatched as streaming"),
+        };
+        let (cancel_requested, _) = watch::channel(false);
+        let (cancellation, _) = watch::channel(None);
+        let active = Arc::new(ActiveTurn {
+            cancel_requested,
+            cancellation,
+            cancelling: AtomicBool::new(false),
+            uncancellable: Mutex::new(()),
+            process: Mutex::new(None),
+        });
+        let mut active_turns = self.active_turns.lock().await;
+        if active_turns.contains_key(&thread_id) {
+            bail!("thread already has an active turn");
         }
+        active_turns.insert(thread_id, Arc::clone(&active));
+        drop(active_turns);
+        let mut cancel_requested = active.cancel_requested.subscribe();
+        let mut cancellation = active.cancellation.subscribe();
+        let response = async {
+            match request {
+                ControllerRequest::ThreadSend { thread_id, message } => {
+                    self.run_turn(thread_id, message, Some(updates)).await
+                }
+                ControllerRequest::ThreadContinue { thread_id } => {
+                    self.continue_thread(thread_id, Some(updates)).await
+                }
+                _ => unreachable!("non-streaming request dispatched as streaming"),
+            }
+        };
+        tokio::pin!(response);
+        let mut response = tokio::select! {
+            biased;
+            changed = cancel_requested.changed() => {
+                changed.context("turn cancellation channel closed")?;
+                cancellation.changed().await.context("turn cancellation channel closed")?;
+                match cancellation.borrow().clone().expect("cancellation completed") {
+                    Ok(()) => Ok(ControllerResponse::ThreadCancelled),
+                    Err(message) => bail!("{message}"),
+                }
+            }
+            response = &mut response => response,
+        };
+        if active.cancelling.load(Ordering::Acquire)
+            && !matches!(response, Ok(ControllerResponse::ThreadCancelled))
+        {
+            if !*cancel_requested.borrow() {
+                cancel_requested
+                    .changed()
+                    .await
+                    .context("turn cancellation channel closed")?;
+            }
+            if cancellation.borrow().is_none() {
+                cancellation
+                    .changed()
+                    .await
+                    .context("turn cancellation channel closed")?;
+            }
+            response = match cancellation
+                .borrow()
+                .clone()
+                .expect("cancellation completed")
+            {
+                Ok(()) => Ok(ControllerResponse::ThreadCancelled),
+                Err(message) => Err(anyhow!(message)),
+            };
+        }
+        if !active.cancelling.load(Ordering::Acquire) {
+            let mut active_turns = self.active_turns.lock().await;
+            if active_turns
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &active))
+            {
+                active_turns.remove(&thread_id);
+            }
+        }
+        response
     }
 
     async fn codex_login_status(&self) -> Result<ControllerResponse> {
@@ -382,6 +453,7 @@ impl State {
             ControllerRequest::ThreadContinue { thread_id } => {
                 self.continue_thread(thread_id, None).await
             }
+            ControllerRequest::ThreadCancel { thread_id } => self.cancel_thread(thread_id).await,
             ControllerRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
                 self.provider.reload_auth().await;
@@ -393,15 +465,12 @@ impl State {
             }
             ControllerRequest::CodexLoginStatus => self.codex_login_status().await,
             ControllerRequest::ApprovalAllow { approval_id } => {
-                self.resolve_approval(approval_id, true, None, None).await
+                self.resolve_approval(approval_id, true, None).await
             }
             ControllerRequest::ApprovalDeny {
                 approval_id,
                 reason,
-            } => {
-                self.resolve_approval(approval_id, false, reason, None)
-                    .await
-            }
+            } => self.resolve_approval(approval_id, false, reason).await,
             ControllerRequest::RunnerList => Ok(ControllerResponse::RunnerList {
                 runners: self.list_runners().await?,
             }),
@@ -589,6 +658,53 @@ impl State {
         )
         .await
         .context("failed to save interrupted tool result")
+    }
+
+    async fn cancel_thread(&self, thread_id: i64) -> Result<ControllerResponse> {
+        let active = {
+            let active_turns = self.active_turns.lock().await;
+            let Some(active) = active_turns.get(&thread_id).cloned() else {
+                return Ok(ControllerResponse::ThreadNotActive);
+            };
+            active.cancelling.store(true, Ordering::Release);
+            active
+        };
+        let result = async {
+            let _uncancellable = active.uncancellable.lock().await;
+            let mut process = active.process.lock().await;
+            active.cancel_requested.send_replace(true);
+            if let Some((runner, process_handle)) = process.take() {
+                match runner
+                    .request_raw(RunnerRequest::StopProcess { process_handle })
+                    .await?
+                {
+                    RunnerResponse::ProcessStopped { .. } => {}
+                    RunnerResponse::Error { message } => bail!("{message}"),
+                    _ => bail!("runner returned an invalid stop_process response"),
+                }
+            }
+            drop(process);
+            let _guard = self.thread_lock(thread_id).lock_owned().await;
+            self.approvals
+                .lock()
+                .await
+                .retain(|_, approval| approval.thread_id != thread_id);
+            self.prepare_thread_for_turn(thread_id, None).await
+        }
+        .await;
+        let mut active_turns = self.active_turns.lock().await;
+        if active_turns
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &active))
+        {
+            active_turns.remove(&thread_id);
+        }
+        drop(active_turns);
+        let outcome = result.map_err(|error| format!("{error:#}"));
+        active.cancellation.send_replace(Some(outcome.clone()));
+        outcome
+            .map(|()| ControllerResponse::ThreadCancelled)
+            .map_err(anyhow::Error::msg)
     }
 
     fn thread_lock(&self, thread_id: i64) -> Arc<Mutex<()>> {
@@ -907,7 +1023,6 @@ impl State {
                                     call_id,
                                     ToolArguments::ExecCommand(arguments),
                                     false,
-                                    &mut responses,
                                     updates,
                                 )
                                 .await?
@@ -925,7 +1040,6 @@ impl State {
                                     call_id,
                                     ToolArguments::ApplyPatch(arguments),
                                     false,
-                                    &mut responses,
                                     updates,
                                 )
                                 .await?
@@ -973,7 +1087,6 @@ impl State {
                                     call_id,
                                     ToolArguments::WaitProcess(arguments),
                                     false,
-                                    &mut responses,
                                     updates,
                                 )
                                 .await?
@@ -992,7 +1105,6 @@ impl State {
                                     call_id,
                                     ToolArguments::WriteProcess(arguments),
                                     false,
-                                    &mut responses,
                                     updates,
                                 )
                                 .await?
@@ -1010,7 +1122,6 @@ impl State {
                                     call_id,
                                     ToolArguments::StopProcess(arguments),
                                     false,
-                                    &mut responses,
                                     updates,
                                 )
                                 .await?
@@ -1052,7 +1163,6 @@ impl State {
                             Some(call_id),
                             ToolArguments::ApplyPatch(arguments),
                             true,
-                            &mut responses,
                             updates,
                         )
                         .await?
@@ -1072,33 +1182,65 @@ impl State {
         call_id: Option<String>,
         arguments: ToolArguments,
         custom: bool,
-        remaining_responses: &mut VecDeque<ModelResponse>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<Option<ControllerResponse>> {
         let runner = self.runner(arguments.runner()).await?;
-        if runner.approval().await == ApprovalPolicy::Ask {
+        let decision = if runner.approval().await == ApprovalPolicy::Ask {
             let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
             let arguments_json =
                 serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
+            let (decision, approval) = oneshot::channel();
             self.approvals.lock().await.insert(
                 approval_id,
                 PendingApproval {
                     thread_id,
-                    name: name.clone(),
-                    call_id,
-                    arguments,
-                    custom,
-                    remaining_responses: std::mem::take(remaining_responses),
+                    decision,
                 },
             );
-            return Ok(Some(ControllerResponse::ApprovalRequired {
-                approval_id,
-                thread_id,
-                tool: name,
-                arguments: arguments_json,
-            }));
-        }
-        let result = self.execute(arguments).await?;
+            updates
+                .context("approval requires a streaming turn")?
+                .send(ModelStreamEvent::ApprovalRequired {
+                    approval_id,
+                    thread_id,
+                    tool: name.clone(),
+                    arguments: arguments_json,
+                })
+                .context("turn stream closed while waiting for approval")?;
+            Some(
+                approval
+                    .await
+                    .context("approval was removed before it was resolved")?,
+            )
+        } else {
+            None
+        };
+        let allowed = decision.as_ref().is_none_or(|decision| decision.allowed);
+        let active = if allowed && matches!(&arguments, ToolArguments::ApplyPatch(_)) {
+            Some(
+                self.active_turns
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .cloned()
+                    .context("thread has no active turn")?,
+            )
+        } else {
+            None
+        };
+        let _uncancellable = match &active {
+            Some(active) => Some(active.uncancellable.lock().await),
+            None => None,
+        };
+        let result = if allowed {
+            self.execute(thread_id, arguments).await?
+        } else {
+            let reason = decision.and_then(|decision| decision.reason);
+            let output = match reason {
+                Some(reason) => format!("user denied the tool call: {reason}"),
+                None => "user denied the tool call".to_owned(),
+            };
+            ToolOutcome::text(output)
+        };
         self.save_tool_result(
             thread_id,
             &name,
@@ -1116,62 +1258,112 @@ impl State {
         approval_id: u64,
         allowed: bool,
         reason: Option<String>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ControllerResponse> {
-        let thread_id = self
-            .approvals
-            .lock()
-            .await
-            .get(&approval_id)
-            .with_context(|| format!("approval {approval_id} is not pending"))?
-            .thread_id;
-        let _guard = self.thread_lock(thread_id).lock_owned().await;
         let pending = self
             .approvals
             .lock()
             .await
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
-        let result = if allowed {
-            self.execute(pending.arguments).await?
-        } else {
-            let output = match reason {
-                Some(reason) => format!("user denied the tool call: {reason}"),
-                None => "user denied the tool call".to_owned(),
-            };
-            ToolOutcome::text(output)
-        };
-        self.save_tool_result(
-            pending.thread_id,
-            &pending.name,
-            pending.call_id.as_deref(),
-            result,
-            pending.custom,
-            updates,
-        )
-        .await?;
-        if let Some(response) = self
-            .execute_model_responses(pending.thread_id, pending.remaining_responses, updates)
-            .await?
-        {
-            return Ok(response);
-        }
-        self.continue_turn(pending.thread_id, updates).await
+        pending
+            .decision
+            .send(ApprovalDecision { allowed, reason })
+            .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))?;
+        Ok(ControllerResponse::ApprovalResolved)
     }
 
-    async fn execute(&self, arguments: ToolArguments) -> Result<ToolOutcome> {
+    async fn execute(&self, thread_id: i64, arguments: ToolArguments) -> Result<ToolOutcome> {
         match arguments {
             ToolArguments::ExecCommand(arguments) => {
-                let response = self
-                    .runner(&arguments.runner)
-                    .await?
-                    .request_raw(RunnerRequest::ExecCommand {
-                        command: arguments.command,
-                        background: arguments.background,
-                        timeout_ms: arguments.timeout_ms,
-                        timeout_action: arguments.timeout_action,
-                    })
-                    .await?;
+                let runner = self.runner(&arguments.runner).await?;
+                let response = if arguments.background {
+                    runner
+                        .request_raw(RunnerRequest::ExecCommand {
+                            command: arguments.command,
+                            background: true,
+                            timeout_ms: arguments.timeout_ms,
+                            timeout_action: arguments.timeout_action,
+                        })
+                        .await?
+                } else {
+                    let active = self
+                        .active_turns
+                        .lock()
+                        .await
+                        .get(&thread_id)
+                        .cloned()
+                        .context("thread has no active turn")?;
+                    let mut process = active.process.lock().await;
+                    let response = runner
+                        .request_raw(RunnerRequest::StartCommand {
+                            command: arguments.command,
+                        })
+                        .await?;
+                    let RunnerResponse::ProcessStarted { process_handle } = response else {
+                        bail!("runner returned an invalid start command response");
+                    };
+                    *process = Some((Arc::clone(&runner), process_handle.clone()));
+                    drop(process);
+                    let deadline = arguments
+                        .timeout_ms
+                        .map(|timeout| Instant::now() + std::time::Duration::from_millis(timeout));
+                    let mut collected = None;
+                    let response = loop {
+                        let timeout_ms = deadline.map_or(1000, |deadline| {
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .as_millis()
+                                .min(1000)
+                                .try_into()
+                                .unwrap_or(1000)
+                        });
+                        match runner
+                            .request_raw(RunnerRequest::WaitProcess {
+                                process_handle: process_handle.clone(),
+                                timeout_ms,
+                            })
+                            .await?
+                        {
+                            RunnerResponse::ProcessRunning { output, .. } => {
+                                append_command_output(&mut collected, output);
+                                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                    break match arguments.timeout_action {
+                                        TimeoutAction::ReturnRunning => {
+                                            RunnerResponse::ProcessRunning {
+                                                process_handle: process_handle.clone(),
+                                                output: collected.take().unwrap(),
+                                            }
+                                        }
+                                        TimeoutAction::Terminate => match runner
+                                            .request_raw(RunnerRequest::StopProcess {
+                                                process_handle: process_handle.clone(),
+                                            })
+                                            .await?
+                                        {
+                                            RunnerResponse::ProcessStopped { output } => {
+                                                append_command_output(&mut collected, output);
+                                                RunnerResponse::ProcessTimedOut {
+                                                    output: collected.take().unwrap(),
+                                                }
+                                            }
+                                            response => response,
+                                        },
+                                    };
+                                }
+                            }
+                            RunnerResponse::ProcessFinished { output, exit_code } => {
+                                append_command_output(&mut collected, output);
+                                break RunnerResponse::ProcessFinished {
+                                    output: collected.take().unwrap(),
+                                    exit_code,
+                                };
+                            }
+                            response => break response,
+                        }
+                    };
+                    active.process.lock().await.take();
+                    response
+                };
                 let artifact = command_artifact(&response)?;
                 Ok(ToolOutcome::with_artifact(
                     format_exec_response(response)?,
@@ -1514,11 +1706,12 @@ impl ToolArguments {
 
 struct PendingApproval {
     thread_id: i64,
-    name: String,
-    call_id: Option<String>,
-    arguments: ToolArguments,
-    custom: bool,
-    remaining_responses: VecDeque<ModelResponse>,
+    decision: oneshot::Sender<ApprovalDecision>,
+}
+
+struct ApprovalDecision {
+    allowed: bool,
+    reason: Option<String>,
 }
 
 fn return_running() -> TimeoutAction {
@@ -1689,18 +1882,22 @@ impl Runner {
 }
 
 struct RunnerClient {
-    stdin: Mutex<ChildStdin>,
+    stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RunnerResponse>>>>,
-    next_request_id: AtomicU64,
+    next_request_id: Arc<AtomicU64>,
     name: String,
 }
 
 impl RunnerClient {
     fn new(stdin: ChildStdin, stdout: tokio::process::ChildStdout, name: &str) -> Self {
+        let stdin = Arc::new(Mutex::new(stdin));
+        let reader_stdin = Arc::clone(&stdin);
         let pending = Arc::new(StdMutex::new(
             HashMap::<u64, oneshot::Sender<RunnerResponse>>::new(),
         ));
         let reader_pending = Arc::clone(&pending);
+        let next_request_id = Arc::new(AtomicU64::new(0));
+        let reader_next_request_id = Arc::clone(&next_request_id);
         let runner_name = name.to_owned();
         tokio::spawn(async move {
             let mut stdout = BufReader::new(stdout);
@@ -1711,10 +1908,30 @@ impl RunnerClient {
                     Ok(0) => break,
                     Ok(_) => match serde_json::from_str::<RunnerResponseEnvelope>(&line) {
                         Ok(envelope) => {
-                            if let Some(sender) =
-                                reader_pending.lock().unwrap().remove(&envelope.request_id)
-                            {
-                                let _ = sender.send(envelope.response);
+                            let sender =
+                                reader_pending.lock().unwrap().remove(&envelope.request_id);
+                            if let Some(sender) = sender {
+                                if let Err(RunnerResponse::ProcessStarted { process_handle }) =
+                                    sender.send(envelope.response)
+                                {
+                                    let request_id =
+                                        reader_next_request_id.fetch_add(1, Ordering::Relaxed);
+                                    let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
+                                        request_id,
+                                        request: RunnerRequest::StopProcess { process_handle },
+                                    })
+                                    .expect("runner stop request should encode");
+                                    request.push(b'\n');
+                                    if let Err(error) =
+                                        reader_stdin.lock().await.write_all(&request).await
+                                    {
+                                        tracing::warn!(
+                                            runner = runner_name,
+                                            %error,
+                                            "failed to stop an abandoned process"
+                                        );
+                                    }
+                                }
                             } else {
                                 tracing::warn!(
                                     runner = runner_name,
@@ -1750,9 +1967,9 @@ impl RunnerClient {
         });
 
         Self {
-            stdin: Mutex::new(stdin),
+            stdin,
             pending,
-            next_request_id: AtomicU64::new(0),
+            next_request_id,
             name: name.to_owned(),
         }
     }
@@ -1971,6 +2188,27 @@ fn format_process_response(tool: &str, response: RunnerResponse) -> Result<Strin
         "atra {tool}: {description}\n{}",
         format_command_output(&output)
     ))
+}
+
+fn append_command_output(collected: &mut Option<CommandOutput>, output: CommandOutput) {
+    match collected {
+        Some(collected) => {
+            collected.content.push_str(&output.content);
+            collected.omitted_bytes += output.omitted_bytes;
+            collected.full_output_path = output.full_output_path;
+            if collected.content.len() > MAX_TOOL_OUTPUT_BYTES {
+                let head_end = floor_char_boundary(&collected.content, MAX_TOOL_OUTPUT_BYTES / 2);
+                let tail_start = ceil_char_boundary(
+                    &collected.content,
+                    collected.content.len() - MAX_TOOL_OUTPUT_BYTES / 2,
+                )
+                .max(head_end);
+                collected.omitted_bytes += tail_start - head_end;
+                collected.content.replace_range(head_end..tail_start, "");
+            }
+        }
+        None => *collected = Some(output),
+    }
 }
 
 const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;

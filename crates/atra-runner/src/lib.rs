@@ -152,6 +152,14 @@ async fn handle_request(
                 )
                 .await
         }
+        RunnerRequest::StartCommand { command } => {
+            tracing::debug!(%command, "starting command");
+            let path = tools.lock().await.path();
+            let process = processes.start(command, path).await?;
+            Ok(RunnerResponse::ProcessStarted {
+                process_handle: process.handle.clone(),
+            })
+        }
         RunnerRequest::ApplyPatch { patch } => {
             tracing::info!(patch_bytes = patch.len(), "applying patch");
             tracing::trace!(%patch, "patch content");

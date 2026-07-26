@@ -34,10 +34,7 @@ pub(crate) async fn handle_client(
     }
     if matches!(
         request,
-        ControllerRequest::ThreadSend { .. }
-            | ControllerRequest::ThreadContinue { .. }
-            | ControllerRequest::ApprovalAllow { .. }
-            | ControllerRequest::ApprovalDeny { .. }
+        ControllerRequest::ThreadSend { .. } | ControllerRequest::ThreadContinue { .. }
     ) {
         let (updates, mut pending_updates) = mpsc::unbounded_channel();
         let response = {
@@ -85,6 +82,17 @@ async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) 
         ModelStreamEvent::ToolCallDelta { item_id, delta } => {
             ControllerResponse::ToolCallDelta { item_id, delta }
         }
+        ModelStreamEvent::ApprovalRequired {
+            approval_id,
+            thread_id,
+            tool,
+            arguments,
+        } => ControllerResponse::ApprovalRequired {
+            approval_id,
+            thread_id,
+            tool,
+            arguments,
+        },
         ModelStreamEvent::ThreadEvent(event) => ControllerResponse::TurnEvent { event },
     };
     write_response(stream, &response).await
