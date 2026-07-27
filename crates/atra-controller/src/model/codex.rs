@@ -930,7 +930,10 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                             call_id: event.payload["call_id"].as_str()?.to_owned(),
                             name: event.payload["name"].as_str().map(str::to_owned),
                             output: FunctionCallOutputPayload::from_text(tool_result_text(
-                                &event.payload["result"],
+                                event
+                                    .payload
+                                    .get("masked_result")
+                                    .unwrap_or(&event.payload["result"]),
                             )),
                         })
                     }
@@ -938,7 +941,10 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         ResponseItem::from(ResponseInputItem::FunctionCallOutput {
                             call_id: event.payload["call_id"].as_str()?.to_owned(),
                             output: FunctionCallOutputPayload::from_text(tool_result_text(
-                                &event.payload["result"],
+                                event
+                                    .payload
+                                    .get("masked_result")
+                                    .unwrap_or(&event.payload["result"]),
                             )),
                         })
                     }
@@ -955,6 +961,12 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
             .collect::<Result<Vec<_>>>()?,
     );
     Ok(input)
+}
+
+pub(super) fn context_tokens(events: &[Event]) -> Result<usize> {
+    let input = serde_json::to_string(&model_input(events)?)
+        .context("failed to encode model input for token counting")?;
+    Ok(super::text_tokens(&input))
 }
 
 fn tool_result_text(result: &serde_json::Value) -> String {

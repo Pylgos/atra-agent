@@ -83,6 +83,7 @@ fn layout_mapping_does_not_insert_soft_wraps() {
                 "exit_code": 0,
             }),
         }],
+        masked: false,
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 4);

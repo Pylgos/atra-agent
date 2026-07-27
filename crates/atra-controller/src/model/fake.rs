@@ -32,7 +32,10 @@ impl FakeProvider {
             && let Some(output) = events.iter().rev().find_map(|event| {
                 (event.kind == EventKind::ToolResult)
                     .then(|| {
-                        event.payload["result"]
+                        event
+                            .payload
+                            .get("masked_result")
+                            .unwrap_or(&event.payload["result"])
                             .as_str()
                             .or_else(|| event.payload.pointer("/result/output")?.as_str())
                     })

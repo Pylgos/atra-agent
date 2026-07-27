@@ -1297,6 +1297,22 @@ impl App {
                     if usage_matches_selected_model {
                         self.metrics_stale = false;
                     }
+                    if let Some(existing) = self
+                        .events
+                        .iter_mut()
+                        .find(|existing| existing.sequence == event.sequence)
+                    {
+                        *existing = event.clone();
+                        if let Some(item) = item_from_event(event)
+                            && let Some(entry) = self
+                                .transcript
+                                .iter_mut()
+                                .find(|entry| entry.sequence == Some(existing.sequence))
+                        {
+                            entry.replace(item);
+                        }
+                        return Ok(());
+                    }
                     self.events.push(event.clone());
                     let item_id = event
                         .payload

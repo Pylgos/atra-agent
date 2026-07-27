@@ -56,7 +56,7 @@ impl TryFrom<&str> for EventKind {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Event {
     pub sequence: i64,
     pub kind: EventKind,
@@ -289,6 +289,37 @@ impl Store {
                     })
                 })
                 .collect()
+            })
+            .await
+    }
+
+    pub async fn update_event_payloads(
+        &self,
+        thread_id: i64,
+        events: Vec<(i64, Value)>,
+    ) -> tokio_rusqlite::Result<()> {
+        let events = events
+            .into_iter()
+            .map(|(sequence, payload)| {
+                serde_json::to_string(&payload)
+                    .map(|payload| (sequence, payload))
+                    .map_err(to_sql_error)
+            })
+            .collect::<tokio_rusqlite::Result<Vec<_>>>()?;
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                for (sequence, payload) in events {
+                    transaction.execute(
+                        "
+                        UPDATE events
+                        SET payload = ?1
+                        WHERE thread_id = ?2 AND sequence = ?3
+                        ",
+                        params![payload, thread_id, sequence],
+                    )?;
+                }
+                transaction.commit()
             })
             .await
     }

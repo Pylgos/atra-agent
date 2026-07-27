@@ -31,6 +31,7 @@ pub(crate) enum TranscriptItem {
     },
     ToolResult {
         artifacts: Vec<ToolArtifact>,
+        masked: bool,
     },
     Compaction,
 }
@@ -222,20 +223,27 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     .or_else(|| event.payload.get("arguments").cloned())?,
             )),
         }),
-        "tool_result" => Some(TranscriptItem::ToolResult {
-            artifacts: event
+        "tool_result" => {
+            let masked = event
                 .payload
-                .get("artifacts")?
-                .as_array()?
-                .iter()
-                .filter_map(|artifact| {
-                    Some(ToolArtifact {
-                        kind: sanitize(artifact.get("kind")?.as_str()?),
-                        data: sanitize_value(artifact.get("data")?.clone()),
+                .get("masked_result")
+                .is_some_and(|masked| Some(masked) != event.payload.get("result"));
+            Some(TranscriptItem::ToolResult {
+                artifacts: event
+                    .payload
+                    .get("artifacts")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|artifact| {
+                        Some(ToolArtifact {
+                            kind: sanitize(artifact.get("kind")?.as_str()?),
+                            data: sanitize_value(artifact.get("data")?.clone()),
+                        })
                     })
-                })
-                .collect(),
-        }),
+                    .collect(),
+                masked,
+            })
+        }
         "compaction" => Some(TranscriptItem::Compaction),
         _ => None,
     }

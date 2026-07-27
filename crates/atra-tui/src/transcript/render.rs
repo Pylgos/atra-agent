@@ -304,17 +304,32 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
     let mut logical_lines = match item {
         TranscriptItem::WebSearch { action } => web_search_lines(action),
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
-        TranscriptItem::ToolResult { artifacts } => artifacts
-            .iter()
-            .filter_map(|artifact| match artifact.kind.as_str() {
-                "runner_operation" => runner_operation_lines(&artifact.data),
-                "command_execution" => command_execution_lines(&artifact.data),
-                "patch_operations" => patch_operation_lines(&artifact.data),
-                "runner_list" => runner_list_lines(&artifact.data),
-                _ => None,
-            })
-            .flatten()
-            .collect(),
+        TranscriptItem::ToolResult { artifacts, masked } => {
+            let mut lines = (*masked)
+                .then(|| {
+                    vec![(
+                        Some('◇'),
+                        Line::from(Span::styled(
+                            "model context uses masked output",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    )]
+                })
+                .unwrap_or_default();
+            lines.extend(
+                artifacts
+                    .iter()
+                    .filter_map(|artifact| match artifact.kind.as_str() {
+                        "runner_operation" => runner_operation_lines(&artifact.data),
+                        "command_execution" => command_execution_lines(&artifact.data),
+                        "patch_operations" => patch_operation_lines(&artifact.data),
+                        "runner_list" => runner_list_lines(&artifact.data),
+                        _ => None,
+                    })
+                    .flatten(),
+            );
+            lines
+        }
         TranscriptItem::Compaction => {
             vec![(Some('·'), Line::from("Earlier context compacted"))]
         }

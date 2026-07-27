@@ -47,6 +47,11 @@ use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
 use storage::{EventKind, Store};
 
 const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+const ACTIVE_CONTEXT_HIGH_TOKENS: usize = 96_000;
+const ACTIVE_CONTEXT_LOW_TOKENS: usize = 48_000;
+const MINIMUM_FULL_RESULT_REQUESTS: usize = 3;
+const MASK_OUTPUT_LINES: usize = 8;
+const MASK_OUTPUT_SIDE_BYTES: usize = 4 * 1024;
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
     let _ = set_default_originator("atra".to_owned());
@@ -758,6 +763,10 @@ impl State {
                 .and_then(|model| model.context_window);
             let auto_compact_token_limit =
                 selected_model.and_then(|model| model.auto_compact_token_limit);
+            let masked_tokens = self
+                .mask_old_command_results(thread_id, &mut events, updates)
+                .await?;
+            let masked_tokens = i64::try_from(masked_tokens).unwrap_or(i64::MAX);
             let active_history_start = events
                 .iter()
                 .rposition(|event| event.kind == EventKind::Compaction)
@@ -770,7 +779,8 @@ impl State {
                     event.payload["usage"]["total_tokens"]
                         .as_i64()
                         .or_else(|| event.payload["total_tokens"].as_i64())
-                });
+                })
+                .map(|tokens| tokens.saturating_sub(masked_tokens));
             if active_tokens
                 .zip(auto_compact_token_limit)
                 .is_some_and(|(tokens, limit)| tokens >= limit)
@@ -790,7 +800,7 @@ impl State {
                         "request": request,
                         "context_window": context_window,
                         "auto_compact_token_limit": auto_compact_token_limit,
-                        "compacted": active_history_start > 0,
+                        "compacted": events.iter().any(|event| event.kind == EventKind::Compaction),
                     }),
                     updates,
                 )
@@ -906,6 +916,77 @@ impl State {
                 return Ok(response);
             }
         }
+    }
+
+    async fn mask_old_command_results(
+        &self,
+        thread_id: i64,
+        events: &mut [storage::Event],
+        stream_updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<usize> {
+        let active_start = events
+            .iter()
+            .rposition(|event| {
+                event.kind == EventKind::Compaction
+                    || (event.kind == EventKind::ToolResult
+                        && event.payload.get("masked_result").is_some())
+            })
+            .map_or(0, |index| index + 1);
+        if self.provider.context_tokens(&events[active_start..])? <= ACTIVE_CONTEXT_HIGH_TOKENS {
+            return Ok(0);
+        }
+        let context_tokens_before = self.provider.context_tokens(events)?;
+
+        let request_sequences = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::ModelRequest && event.payload["kind"] == "response"
+            })
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        let mut masked_events = Vec::new();
+        for index in active_start..events.len() {
+            let event = &mut events[index];
+            if event.kind != EventKind::ToolResult
+                || request_sequences
+                    .iter()
+                    .filter(|sequence| **sequence > event.sequence)
+                    .take(MINIMUM_FULL_RESULT_REQUESTS)
+                    .count()
+                    < MINIMUM_FULL_RESULT_REQUESTS
+            {
+                continue;
+            }
+            let Some(masked_result) = masked_tool_result(&event.payload) else {
+                continue;
+            };
+            event.payload["masked_result"] = serde_json::Value::String(masked_result);
+            masked_events.push(event.clone());
+            if self.provider.context_tokens(&events[index + 1..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
+                break;
+            }
+        }
+        if masked_events.is_empty() {
+            return Ok(0);
+        }
+        let masked_tokens =
+            context_tokens_before.saturating_sub(self.provider.context_tokens(events)?);
+        self.store
+            .update_event_payloads(
+                thread_id,
+                masked_events
+                    .iter()
+                    .map(|event| (event.sequence, event.payload.clone()))
+                    .collect(),
+            )
+            .await
+            .context("failed to mask old command results")?;
+        if let Some(stream_updates) = stream_updates {
+            for event in masked_events {
+                let _ = stream_updates.send(ModelStreamEvent::ThreadEvent(protocol_event(event)));
+            }
+        }
+        Ok(masked_tokens)
     }
 
     async fn sync_workspace_instructions(&self, thread_id: i64) -> Result<()> {
@@ -1530,7 +1611,7 @@ impl State {
                     }
                     response => response,
                 };
-                let artifact = command_artifact(&response)?;
+                let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_exec_response(&runner_name, response)?,
                     "command_execution",
@@ -1602,7 +1683,7 @@ impl State {
                     }
                     response => response,
                 };
-                let artifact = command_artifact(&response)?;
+                let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_process_response("wait_process", &runner_name, response)?,
                     "command_execution",
@@ -1643,7 +1724,7 @@ impl State {
                     }
                     response => response,
                 };
-                let artifact = command_artifact(&response)?;
+                let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_process_response("stop_process", &runner_name, response)?,
                     "command_execution",
@@ -2656,27 +2737,146 @@ fn format_patch_result(result: &ApplyPatchResult) -> String {
     output
 }
 
-fn command_artifact(response: &RunnerResponse) -> Result<serde_json::Value> {
+fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
+    let original = payload["result"].as_str()?;
+    if payload["type"] == "custom" {
+        let mut operations = Vec::new();
+        let mut command_found = false;
+        let mut command_masked = false;
+        for artifact in payload["artifacts"].as_array()? {
+            if artifact["kind"] != "runner_operation" {
+                continue;
+            }
+            let data = &artifact["data"];
+            let operation = data["operation"].as_u64()?;
+            let runner = data["runner"].as_str()?;
+            let label = data["label"].as_str()?;
+            let operation_result = data["result"].as_str()?;
+            let masked = data["artifacts"]
+                .as_array()?
+                .iter()
+                .find(|artifact| artifact["kind"] == "command_execution")
+                .and_then(|artifact| masked_command_result(&artifact["data"]));
+            let result = if let Some(masked) = masked {
+                command_found = true;
+                if model::text_tokens(&masked) < model::text_tokens(operation_result) {
+                    command_masked = true;
+                    masked
+                } else {
+                    operation_result.to_owned()
+                }
+            } else {
+                operation_result.to_owned()
+            };
+            operations.push(format!(
+                "Operation {operation} [{runner}] {label}:\n{result}"
+            ));
+        }
+        if !command_found {
+            return None;
+        }
+        let masked = operations.join("\n\n");
+        return Some(
+            (command_masked && model::text_tokens(&masked) < model::text_tokens(original))
+                .then_some(masked)
+                .unwrap_or_else(|| original.to_owned()),
+        );
+    }
+
+    let command = payload["artifacts"]
+        .as_array()?
+        .iter()
+        .find(|artifact| artifact["kind"] == "command_execution")?;
+    let masked = masked_command_result(&command["data"])?;
+    Some(
+        (model::text_tokens(&masked) < model::text_tokens(original))
+            .then_some(masked)
+            .unwrap_or_else(|| original.to_owned()),
+    )
+}
+
+fn masked_command_result(data: &serde_json::Value) -> Option<String> {
+    let output = data["output"]
+        .as_str()
+        .filter(|output| !output.is_empty())?;
+    let runner = data["runner"].as_str()?;
+    let full_output_path = data["full_output_path"].as_str()?;
+    let lines = output.lines().collect::<Vec<_>>();
+    let head = lines
+        .iter()
+        .take(MASK_OUTPUT_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let head = truncate_mask_head(&head);
+    let tail = lines
+        .iter()
+        .rev()
+        .take(MASK_OUTPUT_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail = truncate_mask_tail(&tail);
+    let status = match data["state"].as_str()? {
+        "running" => "Process is still running".to_owned(),
+        "finished" => format!(
+            "Process exited with code {}",
+            data["exit_code"]
+                .as_i64()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        ),
+        "timed_out" => "Process timed out".to_owned(),
+        "stopped" => "Process stopped".to_owned(),
+        _ => return None,
+    };
+    Some(clean_model_output(&format!(
+        "{head}\n\n... output masked ...\n\n{tail}\n\n{status}\n\
+         Full output: runner \"{runner}\": {full_output_path}"
+    )))
+}
+
+fn truncate_mask_head(output: &str) -> &str {
+    &output[..floor_char_boundary(output, output.len().min(MASK_OUTPUT_SIDE_BYTES))]
+}
+
+fn truncate_mask_tail(output: &str) -> &str {
+    &output[ceil_char_boundary(output, output.len().saturating_sub(MASK_OUTPUT_SIDE_BYTES))..]
+}
+
+fn command_artifact(response: &RunnerResponse, runner: &str) -> Result<serde_json::Value> {
     Ok(match response {
         RunnerResponse::ProcessStarted { .. } => json!({
             "state": "started",
+            "runner": runner,
         }),
         RunnerResponse::ProcessRunning { output, .. } => json!({
             "state": "running",
             "output": format_command_output(output),
+            "runner": runner,
+            "full_output_path": output.full_output_path.display().to_string(),
         }),
         RunnerResponse::ProcessFinished { output, exit_code } => json!({
             "state": "finished",
             "output": format_command_output(output),
             "exit_code": exit_code,
+            "runner": runner,
+            "full_output_path": output.full_output_path.display().to_string(),
         }),
         RunnerResponse::ProcessTimedOut { output } => json!({
             "state": "timed_out",
             "output": format_command_output(output),
+            "runner": runner,
+            "full_output_path": output.full_output_path.display().to_string(),
         }),
         RunnerResponse::ProcessStopped { output } => json!({
             "state": "stopped",
             "output": format_command_output(output),
+            "runner": runner,
+            "full_output_path": output.full_output_path.display().to_string(),
         }),
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("runner returned an invalid command response"),
@@ -2778,7 +2978,10 @@ fn format_command_output_with_location(
 
 fn model_command_output(output: &CommandOutput, runner: &str) -> String {
     let location = format!("runner \"{runner}\": {}", output.full_output_path.display());
-    let output = format_command_output_with_location(output, &location);
+    clean_model_output(&format_command_output_with_location(output, &location))
+}
+
+fn clean_model_output(output: &str) -> String {
     output
         .chars()
         .filter(|character| {

@@ -152,6 +152,10 @@ impl Provider {
         }
     }
 
+    pub(crate) fn context_tokens(&self, events: &[Event]) -> Result<usize> {
+        codex::context_tokens(events)
+    }
+
     pub(crate) fn compaction_snapshot(
         &self,
         model: &str,
@@ -172,6 +176,12 @@ impl Provider {
             }
         }
     }
+}
+
+pub(crate) fn text_tokens(text: &str) -> usize {
+    tiktoken_rs::o200k_base_singleton()
+        .encode_ordinary(text)
+        .len()
 }
 
 impl TurnSession<'_> {
