@@ -416,13 +416,10 @@ fn completion_request(
     events: &[Event],
     prompt_cache_key: &str,
 ) -> Result<serde_json::Value> {
-    let input = model_input(events)?;
-    let initial_boundary = input.initial_boundary;
-    let frozen_boundaries = input.frozen_boundaries;
-    let mut request = serde_json::to_value(ResponsesApiRequest {
+    serde_json::to_value(ResponsesApiRequest {
         model: model.to_owned(),
         instructions: INSTRUCTIONS.to_owned(),
-        input: input.items,
+        input: model_input(events)?,
         tools: Some(tool_definitions()?),
         tool_choice: "auto".to_owned(),
         parallel_tool_calls: true,
@@ -439,17 +436,7 @@ fn completion_request(
             ("thread_id".to_owned(), prompt_cache_key.to_owned()),
         ])),
     })
-    .context("failed to encode Codex request")?;
-    if model.starts_with("gpt-5.6") {
-        request["prompt_cache_options"] = json!({ "mode": "implicit" });
-        add_prompt_cache_breakpoints(
-            &mut request["input"],
-            events,
-            initial_boundary,
-            &frozen_boundaries,
-        );
-    }
-    Ok(request)
+    .context("failed to encode Codex request")
 }
 
 fn compaction_request(
@@ -459,9 +446,9 @@ fn compaction_request(
     prompt_cache_key: &str,
 ) -> Result<serde_json::Value> {
     let input = model_input(events)?;
-    let mut request = serde_json::to_value(CompactionInput {
+    serde_json::to_value(CompactionInput {
         model,
-        input: &input.items,
+        input: &input,
         instructions: INSTRUCTIONS,
         tools: Some(tool_definitions()?),
         parallel_tool_calls: false,
@@ -470,87 +457,7 @@ fn compaction_request(
         prompt_cache_key: Some(prompt_cache_key),
         text: None,
     })
-    .context("failed to encode Codex compaction request")?;
-    if model.starts_with("gpt-5.6") {
-        request["prompt_cache_options"] = json!({ "mode": "implicit" });
-        add_prompt_cache_breakpoints(
-            &mut request["input"],
-            events,
-            input.initial_boundary,
-            &input.frozen_boundaries,
-        );
-    }
-    Ok(request)
-}
-
-fn add_prompt_cache_breakpoints(
-    input: &mut serde_json::Value,
-    events: &[Event],
-    initial_boundary: Option<usize>,
-    frozen_boundaries: &[(i64, usize)],
-) {
-    let boundaries = events
-        .iter()
-        .filter(|event| event.kind == EventKind::FrozenBoundary)
-        .filter_map(|event| {
-            event.payload["through_sequence"]
-                .as_i64()
-                .map(|through_sequence| (event.sequence, through_sequence))
-        })
-        .collect::<Vec<_>>();
-    let selected = match boundaries.last() {
-        None => vec![initial_boundary.expect("initial developer context has a boundary")],
-        Some(latest) if frozen_boundary_activated(events, latest.0) => {
-            vec![frozen_boundary(frozen_boundaries, latest.1)]
-        }
-        Some(latest) => vec![
-            boundaries
-                .iter()
-                .rev()
-                .skip(1)
-                .find(|boundary| frozen_boundary_activated(events, boundary.0))
-                .map(|boundary| frozen_boundary(frozen_boundaries, boundary.1))
-                .unwrap_or_else(|| {
-                    initial_boundary.expect("initial developer context has a boundary")
-                }),
-            frozen_boundary(frozen_boundaries, latest.1),
-        ],
-    };
-    for index in selected {
-        input[index]["content"][0]["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
-    }
-}
-
-fn frozen_boundary(boundaries: &[(i64, usize)], sequence: i64) -> usize {
-    boundaries
-        .iter()
-        .find_map(|(candidate, index)| (*candidate == sequence).then_some(*index))
-        .expect("frozen boundary references a tool result in model input")
-}
-
-fn frozen_boundary_activated(events: &[Event], boundary_sequence: i64) -> bool {
-    let Some(request_sequence) = events
-        .iter()
-        .find(|event| {
-            event.sequence > boundary_sequence
-                && event.kind == EventKind::ModelRequest
-                && event.payload["kind"] == "response"
-        })
-        .map(|event| event.sequence)
-    else {
-        return false;
-    };
-    events.iter().any(|event| {
-        event.sequence > request_sequence
-            && matches!(
-                event.kind,
-                EventKind::AssistantMessage
-                    | EventKind::WebSearch
-                    | EventKind::ToolCall
-                    | EventKind::Reasoning
-                    | EventKind::TokenUsage
-            )
-    })
+    .context("failed to encode Codex compaction request")
 }
 
 fn reasoning(reasoning_effort: &str) -> Result<Reasoning> {
@@ -593,13 +500,7 @@ impl AuthProvider for BearerAuth {
     }
 }
 
-struct ModelInput {
-    items: Vec<ResponseItem>,
-    initial_boundary: Option<usize>,
-    frozen_boundaries: Vec<(i64, usize)>,
-}
-
-fn model_input(events: &[Event]) -> Result<ModelInput> {
+fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
     let mut items = Vec::new();
     let events = if let Some(index) = events
         .iter()
@@ -613,11 +514,6 @@ fn model_input(events: &[Event]) -> Result<ModelInput> {
     } else {
         events
     };
-    let frozen_sequences = events
-        .iter()
-        .filter(|event| event.kind == EventKind::FrozenBoundary)
-        .filter_map(|event| event.payload["through_sequence"].as_i64())
-        .collect::<HashSet<_>>();
     let masked_sequences = crate::storage::latest_frozen_boundary(events)
         .map(|boundary| {
             boundary
@@ -626,9 +522,6 @@ fn model_input(events: &[Event]) -> Result<ModelInput> {
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    let mut initial_boundary = None;
-    let mut active_started = false;
-    let mut frozen_boundaries = Vec::new();
     for event in events {
         let Some(item) = (|| {
             Some(match event.kind {
@@ -761,34 +654,9 @@ fn model_input(events: &[Event]) -> Result<ModelInput> {
         })() else {
             continue;
         };
-        if event.kind == EventKind::UserMessage {
-            active_started = true;
-        } else if !active_started
-            && matches!(
-                event.kind,
-                EventKind::WorkspaceInstructions | EventKind::Skills | EventKind::Runners
-            )
-        {
-            initial_boundary = Some(items.len());
-        }
         items.push(item);
-        if event.kind == EventKind::ToolResult && frozen_sequences.contains(&event.sequence) {
-            let index = items.len();
-            items.push(ResponseItem::from(ResponseInputItem::Message {
-                role: "developer".to_owned(),
-                content: vec![ContentItem::InputText {
-                    text: "----".to_owned(),
-                }],
-                phase: None,
-            }));
-            frozen_boundaries.push((event.sequence, index));
-        }
     }
-    Ok(ModelInput {
-        items,
-        initial_boundary,
-        frozen_boundaries,
-    })
+    Ok(items)
 }
 
 fn projected_tool_result<'a>(
@@ -803,7 +671,7 @@ fn projected_tool_result<'a>(
 }
 
 pub(super) fn context_tokens(events: &[Event]) -> Result<usize> {
-    let input = serde_json::to_string(&model_input(events)?.items)
+    let input = serde_json::to_string(&model_input(events)?)
         .context("failed to encode model input for token counting")?;
     Ok(super::text_tokens(&input))
 }
