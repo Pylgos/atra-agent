@@ -1,16 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Error, Result};
+use anyhow::{Context, Result};
 use codex_api::{
-    ApiError, AuthProvider, CompactClient, CompactionInput, Compression, ModelsClient, Reasoning,
-    ResponseCreateWsRequest, ResponseEvent, ResponseStream, ResponsesApiRequest, ResponsesApiTools,
-    ResponsesClient, ResponsesOptions, ResponsesWebsocketClient, ResponsesWebsocketConnection,
-    ResponsesWsRequest, TransportError,
+    AuthProvider, CompactClient, CompactionInput, ModelsClient, Reasoning, ResponseEvent,
+    ResponseStream, ResponsesApiRequest, ResponsesApiTools, ResponsesClient,
 };
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
@@ -41,7 +39,6 @@ Commands, managed processes, and patches execute on Atra Runners. The available 
 Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
 
 Use tool results to determine the next action, then return a final answer."#;
-const WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct CodexProvider {
@@ -53,9 +50,6 @@ pub(crate) struct CodexProvider {
 struct CodexSession {
     responses: ResponsesClient<codex_api::ReqwestTransport>,
     compact: CompactClient<codex_api::ReqwestTransport>,
-    websocket: ResponsesWebsocketClient,
-    websocket_state: Mutex<WebsocketState>,
-    http_client_factory: HttpClientFactory,
     session_id: String,
     last_used_at: StdMutex<Instant>,
 }
@@ -78,28 +72,9 @@ impl CodexSession {
     }
 }
 
-#[derive(Default)]
-struct WebsocketState {
-    connection: Option<ResponsesWebsocketConnection>,
-    last_request: Option<ResponsesApiRequest>,
-    last_response: Option<LastResponse>,
-    fallback_active: bool,
-}
-
-struct LastResponse {
-    id: String,
-    items: Vec<ResponseItem>,
-}
-
 pub(crate) struct CodexTurn {
     session: Arc<CodexSession>,
     turn_state: Arc<OnceLock<String>>,
-}
-
-struct CompletionReadError {
-    error: Error,
-    visible_output: bool,
-    report_fallback: bool,
 }
 
 impl CodexProvider {
@@ -251,7 +226,6 @@ impl CodexProvider {
             .to_api_provider(Some(auth.auth_mode()))
             .context("failed to configure Codex model endpoint")?;
         let api_auth = Arc::new(BearerAuth::new(&auth)?);
-        let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
         let session = Arc::new(CodexSession {
             responses: ResponsesClient::new(
                 codex_api::ReqwestTransport::from_http_client(create_client()),
@@ -260,12 +234,9 @@ impl CodexProvider {
             ),
             compact: CompactClient::new(
                 codex_api::ReqwestTransport::from_http_client(create_client()),
-                provider.clone(),
-                api_auth.clone(),
+                provider,
+                api_auth,
             ),
-            websocket: ResponsesWebsocketClient::new(provider.clone(), api_auth),
-            websocket_state: Mutex::new(WebsocketState::default()),
-            http_client_factory,
             session_id,
             last_used_at: StdMutex::new(now),
         });
@@ -290,13 +261,7 @@ impl CodexProvider {
         events: &[Event],
         prompt_cache_key: &str,
     ) -> Result<serde_json::Value> {
-        serde_json::to_value(completion_request(
-            model,
-            reasoning_effort,
-            events,
-            prompt_cache_key,
-        )?)
-        .context("failed to encode Codex request snapshot")
+        completion_request(model, reasoning_effort, events, prompt_cache_key)
     }
 
     pub(super) fn compaction_snapshot(
@@ -306,19 +271,7 @@ impl CodexProvider {
         events: &[Event],
         prompt_cache_key: &str,
     ) -> Result<serde_json::Value> {
-        let input = model_input(events)?;
-        serde_json::to_value(CompactionInput {
-            model,
-            input: &input,
-            instructions: INSTRUCTIONS,
-            tools: Some(tool_definitions()?),
-            parallel_tool_calls: false,
-            reasoning: Some(reasoning(reasoning_effort)?),
-            service_tier: None,
-            prompt_cache_key: Some(prompt_cache_key),
-            text: None,
-        })
-        .context("failed to encode Codex compaction snapshot")
+        compaction_request(model, reasoning_effort, events, prompt_cache_key)
     }
 }
 
@@ -332,184 +285,25 @@ impl CodexTurn {
         prompt_cache_key: &str,
     ) -> Result<ModelCompletion> {
         self.session.touch();
-        let mut request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
-        request.client_metadata = Some(HashMap::from([
-            ("session_id".to_owned(), self.session.session_id.clone()),
-            ("thread_id".to_owned(), self.session.session_id.clone()),
-        ]));
-        match self.complete_websocket(&request, updates).await {
-            Ok(completion) => Ok(completion),
-            Err(failure) if !failure.visible_output => {
-                if failure.report_fallback {
-                    tracing::warn!(
-                        error = %format!("{:#}", failure.error),
-                        session_id = %self.session.session_id,
-                        "Codex websocket failed before emitting output; falling back to SSE"
-                    );
-                }
-                self.complete_sse(request, updates).await
-            }
-            Err(failure) => Err(failure.error),
-        }
-    }
-
-    async fn complete_websocket(
-        &self,
-        request: &ResponsesApiRequest,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> std::result::Result<ModelCompletion, CompletionReadError> {
-        let mut state = self.session.websocket_state.lock().await;
-        if state.fallback_active {
-            return Err(CompletionReadError {
-                error: anyhow::anyhow!("websocket fallback is active for this session"),
-                visible_output: false,
-                report_fallback: false,
-            });
-        }
-
-        let closed = match state.connection.as_ref() {
-            Some(connection) => connection.is_closed().await,
-            None => true,
-        };
-        if closed {
-            state.connection = None;
-            state.last_request = None;
-            state.last_response = None;
-        }
-
-        if state.connection.is_none() {
-            let headers = self
-                .websocket_headers()
-                .map_err(|error| CompletionReadError {
-                    error,
-                    visible_output: false,
-                    report_fallback: true,
-                })?;
-            match self
-                .session
-                .websocket
-                .connect(
-                    &self.session.http_client_factory,
-                    headers,
-                    HeaderMap::new(),
-                    Some(self.turn_state.clone()),
-                    None,
-                )
-                .await
-            {
-                Ok(connection) => {
-                    state.connection = Some(connection);
-                }
-                Err(error) => {
-                    state.fallback_active = is_upgrade_required(&error);
-                    return Err(CompletionReadError {
-                        error: Error::new(error).context("failed to connect Codex websocket"),
-                        visible_output: false,
-                        report_fallback: true,
-                    });
-                }
-            }
-        }
-
-        let incremental = websocket_incremental_input(
-            state.last_request.as_ref(),
-            state.last_response.as_ref(),
-            request,
-        );
-        let previous_response_id = incremental.as_ref().and_then(|_| {
-            state
-                .last_response
-                .as_ref()
-                .map(|response| response.id.clone())
-        });
-        let input = incremental.as_deref().unwrap_or(&request.input);
-        let mut client_metadata = request.client_metadata.clone().unwrap_or_default();
-        if let Some(turn_state) = self.turn_state.get() {
-            client_metadata.insert("x-codex-turn-state".to_owned(), turn_state.clone());
-        }
-        let ws_request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-            previous_response_id,
-            input,
-            client_metadata: Some(client_metadata),
-            ..ResponseCreateWsRequest::from(request)
-        });
-        let connection = state
-            .connection
-            .as_ref()
-            .expect("connection was established");
-        let stream = match connection
-            .stream_request(
-                ws_request,
-                state.last_request.is_some(),
-                Some(self.turn_state.clone()),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                state.connection = None;
-                state.last_request = None;
-                state.last_response = None;
-                state.fallback_active = is_upgrade_required(&error);
-                return Err(CompletionReadError {
-                    error: Error::new(error).context("failed to start Codex websocket request"),
-                    visible_output: false,
-                    report_fallback: true,
-                });
-            }
-        };
-
-        match read_completion(stream, updates).await {
-            Ok((completion, response)) => {
-                state.last_request = Some(request.clone());
-                state.last_response = Some(response);
-                Ok(completion)
-            }
-            Err(failure) => {
-                state.connection = None;
-                state.last_request = None;
-                state.last_response = None;
-                Err(failure)
-            }
-        }
-    }
-
-    async fn complete_sse(
-        &self,
-        request: ResponsesApiRequest,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ModelCompletion> {
-        let stream = self
-            .session
-            .responses
-            .stream_request(
-                request,
-                ResponsesOptions {
-                    session_id: Some(self.session.session_id.clone()),
-                    thread_id: Some(self.session.session_id.clone()),
-                    compression: Compression::None,
-                    turn_state: Some(self.turn_state.clone()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("Codex request failed")?;
-        read_completion(stream, updates)
-            .await
-            .map(|(completion, _)| completion)
-            .map_err(|failure| failure.error)
-    }
-
-    fn websocket_headers(&self) -> Result<HeaderMap> {
+        let request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
         let mut headers = HeaderMap::new();
         let session_id = HeaderValue::from_str(&self.session.session_id)
             .context("model session ID is not a valid header value")?;
         headers.insert("session-id", session_id.clone());
         headers.insert("thread-id", session_id.clone());
         headers.insert("x-client-request-id", session_id);
-        headers.insert("originator", HeaderValue::from_static("atra"));
-        headers.insert("openai-beta", HeaderValue::from_static(WEBSOCKET_BETA));
-        Ok(headers)
+        let stream = self
+            .session
+            .responses
+            .stream(
+                request,
+                headers,
+                codex_api::Compression::None,
+                Some(self.turn_state.clone()),
+            )
+            .await
+            .context("Codex request failed")?;
+        read_completion(stream, updates).await
     }
 
     pub(super) async fn compact(
@@ -520,12 +314,7 @@ impl CodexTurn {
         prompt_cache_key: &str,
     ) -> Result<Vec<ResponseItem>> {
         self.session.touch();
-        let mut state = self.session.websocket_state.lock().await;
-        state.connection = None;
-        state.last_request = None;
-        state.last_response = None;
-        drop(state);
-        let input = model_input(events)?;
+        let request = compaction_request(model, reasoning_effort, events, prompt_cache_key)?;
         let mut headers = HeaderMap::new();
         let session_id = HeaderValue::from_str(&self.session.session_id)
             .context("model session ID is not a valid header value")?;
@@ -534,18 +323,8 @@ impl CodexTurn {
         headers.insert("x-client-request-id", session_id);
         self.session
             .compact
-            .compact_input(
-                &CompactionInput {
-                    model,
-                    input: &input,
-                    instructions: INSTRUCTIONS,
-                    tools: Some(tool_definitions()?),
-                    parallel_tool_calls: false,
-                    reasoning: Some(reasoning(reasoning_effort)?),
-                    service_tier: None,
-                    prompt_cache_key: Some(prompt_cache_key),
-                    text: None,
-                },
+            .compact(
+                request,
                 headers,
                 Duration::from_secs(300),
                 Some(self.turn_state.as_ref()),
@@ -555,52 +334,31 @@ impl CodexTurn {
     }
 }
 
-fn is_upgrade_required(error: &ApiError) -> bool {
-    matches!(
-        error,
-        ApiError::Transport(TransportError::Http { status, .. })
-            if *status == http::StatusCode::UPGRADE_REQUIRED
-    )
-}
-
 async fn read_completion(
     mut stream: ResponseStream,
     updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-) -> std::result::Result<(ModelCompletion, LastResponse), CompletionReadError> {
+) -> Result<ModelCompletion> {
     let mut responses = Vec::new();
-    let mut response_id = None;
-    let mut response_items = Vec::new();
     let mut reasoning = Vec::new();
     let mut token_usage = None;
     let mut rate_limits = Vec::new();
-    let mut visible_output = false;
 
     while let Some(event) = stream.next().await {
-        let event = event.map_err(|error| CompletionReadError {
-            error: Error::new(error).context("Codex response stream failed"),
-            visible_output,
-            report_fallback: true,
-        })?;
+        let event = event.context("Codex response stream failed")?;
         match event {
             ResponseEvent::OutputTextDelta(delta) => {
                 if let Some(updates) = updates {
-                    visible_output |= updates
-                        .send(ModelStreamEvent::AssistantDelta(delta))
-                        .is_ok();
+                    let _ = updates.send(ModelStreamEvent::AssistantDelta(delta));
                 }
             }
             ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
                 if let Some(updates) = updates {
-                    visible_output |= updates
-                        .send(ModelStreamEvent::ReasoningSummaryDelta(delta))
-                        .is_ok();
+                    let _ = updates.send(ModelStreamEvent::ReasoningSummaryDelta(delta));
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { .. } => {
                 if let Some(updates) = updates {
-                    visible_output |= updates
-                        .send(ModelStreamEvent::ReasoningSummaryPartAdded)
-                        .is_ok();
+                    let _ = updates.send(ModelStreamEvent::ReasoningSummaryPartAdded);
                 }
             }
             ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
@@ -609,41 +367,29 @@ async fn read_completion(
                 ..
             }) => {
                 if let Some(updates) = updates {
-                    visible_output |= updates
-                        .send(ModelStreamEvent::ToolCallStarted {
-                            item_id: item_id.to_string(),
-                            name,
-                        })
-                        .is_ok();
+                    let _ = updates.send(ModelStreamEvent::ToolCallStarted {
+                        item_id: item_id.to_string(),
+                        name,
+                    });
                 }
             }
             ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
                 if let Some(updates) = updates {
-                    visible_output |= updates
-                        .send(ModelStreamEvent::ToolCallDelta { item_id, delta })
-                        .is_ok();
+                    let _ = updates.send(ModelStreamEvent::ToolCallDelta { item_id, delta });
                 }
             }
             ResponseEvent::OutputItemDone(item) => {
-                response_items.push(item.clone());
                 if matches!(item, ResponseItem::Reasoning { .. }) {
                     reasoning.push(item);
-                } else if let Some(item_response) =
-                    response_from_item(item).map_err(|error| CompletionReadError {
-                        error,
-                        visible_output,
-                        report_fallback: true,
-                    })?
-                {
+                } else if let Some(item_response) = response_from_item(item)? {
                     responses.push(item_response);
                 }
             }
             ResponseEvent::Completed {
-                response_id: id,
+                response_id: _,
                 token_usage: usage,
                 ..
             } => {
-                response_id = Some(id);
                 token_usage = usage;
             }
             ResponseEvent::RateLimits(snapshot) => {
@@ -654,91 +400,14 @@ async fn read_completion(
     }
 
     if responses.is_empty() {
-        return Err(CompletionReadError {
-            error: anyhow::anyhow!(
-                "Codex response ended without an assistant message or tool call"
-            ),
-            visible_output,
-            report_fallback: true,
-        });
+        anyhow::bail!("Codex response ended without an assistant message or tool call");
     }
-    let response_id = response_id.ok_or_else(|| CompletionReadError {
-        error: anyhow::anyhow!("Codex response ended without a response ID"),
-        visible_output,
-        report_fallback: true,
-    })?;
-    Ok((
-        ModelCompletion {
-            responses,
-            reasoning,
-            token_usage,
-            rate_limits,
-        },
-        LastResponse {
-            id: response_id,
-            items: response_items,
-        },
-    ))
-}
-
-fn websocket_incremental_input(
-    previous_request: Option<&ResponsesApiRequest>,
-    previous_response: Option<&LastResponse>,
-    request: &ResponsesApiRequest,
-) -> Option<Vec<ResponseItem>> {
-    let previous_request = previous_request?;
-    let previous_response = previous_response?;
-    if !request_properties_match(previous_request, request) {
-        return None;
-    }
-
-    let baseline_len = previous_request
-        .input
-        .len()
-        .checked_add(previous_response.items.len())?;
-    if request.input.len() < baseline_len {
-        return None;
-    }
-    let (prefix, incremental) = request.input.split_at(baseline_len);
-    let (request_prefix, response_prefix) = prefix.split_at(previous_request.input.len());
-    if request_prefix != previous_request.input
-        || !response_prefix
-            .iter()
-            .zip(&previous_response.items)
-            .all(|(current, previous)| response_items_equal(current, previous))
-    {
-        return None;
-    }
-    Some(incremental.to_vec())
-}
-
-fn request_properties_match(previous: &ResponsesApiRequest, current: &ResponsesApiRequest) -> bool {
-    let Ok(mut previous) = serde_json::to_value(previous) else {
-        return false;
-    };
-    let Ok(mut current) = serde_json::to_value(current) else {
-        return false;
-    };
-    for request in [&mut previous, &mut current] {
-        if let Some(request) = request.as_object_mut() {
-            request.remove("input");
-            request.remove("client_metadata");
-        }
-    }
-    previous == current
-}
-
-fn response_items_equal(current: &ResponseItem, previous: &ResponseItem) -> bool {
-    if current == previous {
-        return true;
-    }
-    let mut current = current.clone();
-    current.set_id(None);
-    current.clear_internal_chat_message_metadata_passthrough();
-    let mut previous = previous.clone();
-    previous.set_id(None);
-    previous.clear_internal_chat_message_metadata_passthrough();
-    current == previous
+    Ok(ModelCompletion {
+        responses,
+        reasoning,
+        token_usage,
+        rate_limits,
+    })
 }
 
 fn completion_request(
@@ -746,11 +415,14 @@ fn completion_request(
     reasoning_effort: &str,
     events: &[Event],
     prompt_cache_key: &str,
-) -> Result<ResponsesApiRequest> {
-    Ok(ResponsesApiRequest {
+) -> Result<serde_json::Value> {
+    let input = model_input(events)?;
+    let initial_boundary = input.initial_boundary;
+    let frozen_boundaries = input.frozen_boundaries;
+    let mut request = serde_json::to_value(ResponsesApiRequest {
         model: model.to_owned(),
         instructions: INSTRUCTIONS.to_owned(),
-        input: model_input(events)?,
+        input: input.items,
         tools: Some(tool_definitions()?),
         tool_choice: "auto".to_owned(),
         parallel_tool_calls: true,
@@ -762,7 +434,122 @@ fn completion_request(
         service_tier: None,
         prompt_cache_key: Some(prompt_cache_key.to_owned()),
         text: None,
-        client_metadata: None,
+        client_metadata: Some(HashMap::from([
+            ("session_id".to_owned(), prompt_cache_key.to_owned()),
+            ("thread_id".to_owned(), prompt_cache_key.to_owned()),
+        ])),
+    })
+    .context("failed to encode Codex request")?;
+    if model.starts_with("gpt-5.6") {
+        request["prompt_cache_options"] = json!({ "mode": "implicit" });
+        add_prompt_cache_breakpoints(
+            &mut request["input"],
+            events,
+            initial_boundary,
+            &frozen_boundaries,
+        );
+    }
+    Ok(request)
+}
+
+fn compaction_request(
+    model: &str,
+    reasoning_effort: &str,
+    events: &[Event],
+    prompt_cache_key: &str,
+) -> Result<serde_json::Value> {
+    let input = model_input(events)?;
+    let mut request = serde_json::to_value(CompactionInput {
+        model,
+        input: &input.items,
+        instructions: INSTRUCTIONS,
+        tools: Some(tool_definitions()?),
+        parallel_tool_calls: false,
+        reasoning: Some(reasoning(reasoning_effort)?),
+        service_tier: None,
+        prompt_cache_key: Some(prompt_cache_key),
+        text: None,
+    })
+    .context("failed to encode Codex compaction request")?;
+    if model.starts_with("gpt-5.6") {
+        request["prompt_cache_options"] = json!({ "mode": "implicit" });
+        add_prompt_cache_breakpoints(
+            &mut request["input"],
+            events,
+            input.initial_boundary,
+            &input.frozen_boundaries,
+        );
+    }
+    Ok(request)
+}
+
+fn add_prompt_cache_breakpoints(
+    input: &mut serde_json::Value,
+    events: &[Event],
+    initial_boundary: Option<usize>,
+    frozen_boundaries: &[(i64, usize)],
+) {
+    let boundaries = events
+        .iter()
+        .filter(|event| event.kind == EventKind::FrozenBoundary)
+        .filter_map(|event| {
+            event.payload["through_sequence"]
+                .as_i64()
+                .map(|through_sequence| (event.sequence, through_sequence))
+        })
+        .collect::<Vec<_>>();
+    let selected = match boundaries.last() {
+        None => vec![initial_boundary.expect("initial developer context has a boundary")],
+        Some(latest) if frozen_boundary_activated(events, latest.0) => {
+            vec![frozen_boundary(frozen_boundaries, latest.1)]
+        }
+        Some(latest) => vec![
+            boundaries
+                .iter()
+                .rev()
+                .skip(1)
+                .find(|boundary| frozen_boundary_activated(events, boundary.0))
+                .map(|boundary| frozen_boundary(frozen_boundaries, boundary.1))
+                .unwrap_or_else(|| {
+                    initial_boundary.expect("initial developer context has a boundary")
+                }),
+            frozen_boundary(frozen_boundaries, latest.1),
+        ],
+    };
+    for index in selected {
+        input[index]["content"][0]["prompt_cache_breakpoint"] = json!({ "mode": "explicit" });
+    }
+}
+
+fn frozen_boundary(boundaries: &[(i64, usize)], sequence: i64) -> usize {
+    boundaries
+        .iter()
+        .find_map(|(candidate, index)| (*candidate == sequence).then_some(*index))
+        .expect("frozen boundary references a tool result in model input")
+}
+
+fn frozen_boundary_activated(events: &[Event], boundary_sequence: i64) -> bool {
+    let Some(request_sequence) = events
+        .iter()
+        .find(|event| {
+            event.sequence > boundary_sequence
+                && event.kind == EventKind::ModelRequest
+                && event.payload["kind"] == "response"
+        })
+        .map(|event| event.sequence)
+    else {
+        return false;
+    };
+    events.iter().any(|event| {
+        event.sequence > request_sequence
+            && matches!(
+                event.kind,
+                EventKind::AssistantMessage
+                    | EventKind::WebSearch
+                    | EventKind::ToolCall
+                    | EventKind::Reasoning
+                    | EventKind::TokenUsage
+            )
     })
 }
 
@@ -806,13 +593,19 @@ impl AuthProvider for BearerAuth {
     }
 }
 
-fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
-    let mut input = Vec::new();
+struct ModelInput {
+    items: Vec<ResponseItem>,
+    initial_boundary: Option<usize>,
+    frozen_boundaries: Vec<(i64, usize)>,
+}
+
+fn model_input(events: &[Event]) -> Result<ModelInput> {
+    let mut items = Vec::new();
     let events = if let Some(index) = events
         .iter()
         .rposition(|event| event.kind == EventKind::Compaction)
     {
-        input.extend(
+        items.extend(
             serde_json::from_value::<Vec<ResponseItem>>(events[index].payload["items"].clone())
                 .context("stored compaction contains invalid response items")?,
         );
@@ -820,151 +613,197 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
     } else {
         events
     };
-    input.extend(
-        events
-            .iter()
-            .filter_map(|event| {
-                let item = match event.kind {
-                    EventKind::WorkspaceInstructions => {
-                        let transition = event.payload["transition"].as_str()?;
-                        let text = match transition {
-                            "initial" => event.payload["content"].as_str()?.to_owned(),
-                            "replacement" => format!(
-                                "These AGENTS.md instructions replace all previously provided \
+    let frozen_sequences = events
+        .iter()
+        .filter(|event| event.kind == EventKind::FrozenBoundary)
+        .filter_map(|event| event.payload["through_sequence"].as_i64())
+        .collect::<HashSet<_>>();
+    let masked_sequences = crate::storage::latest_frozen_boundary(events)
+        .map(|boundary| {
+            boundary
+                .masked_sequences
+                .into_iter()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut initial_boundary = None;
+    let mut active_started = false;
+    let mut frozen_boundaries = Vec::new();
+    for event in events {
+        let Some(item) = (|| {
+            Some(match event.kind {
+                EventKind::WorkspaceInstructions => {
+                    let transition = event.payload["transition"].as_str()?;
+                    let text = match transition {
+                        "initial" => event.payload["content"].as_str()?.to_owned(),
+                        "replacement" => format!(
+                            "These AGENTS.md instructions replace all previously provided \
                                  AGENTS.md instructions.\n\n{}",
-                                event.payload["content"].as_str()?
-                            ),
-                            "removal" => {
-                                "The previously provided AGENTS.md instructions no longer apply."
-                                    .to_owned()
-                            }
-                            _ => return None,
-                        };
-                        ResponseItem::from(ResponseInputItem::Message {
-                            role: "developer".to_owned(),
-                            content: vec![ContentItem::InputText {
-                                text: format!(
-                                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
-                                ),
-                            }],
-                            phase: None,
-                        })
-                    }
-                    EventKind::Skills => {
-                        let transition = event.payload["transition"].as_str()?;
-                        let text = match transition {
-                            "initial" => event.payload["content"].as_str()?.to_owned(),
-                            "replacement" => format!(
-                                "This skills list replaces all previously provided skills.\n\n{}",
-                                event.payload["content"].as_str()?
-                            ),
-                            "removal" => {
-                                "The previously provided skills are no longer available.".to_owned()
-                            }
-                            _ => return None,
-                        };
-                        ResponseItem::from(ResponseInputItem::Message {
-                            role: "developer".to_owned(),
-                            content: vec![ContentItem::InputText { text }],
-                            phase: None,
-                        })
-                    }
-                    EventKind::Runners => {
-                        let transition = event.payload["transition"].as_str()?;
-                        let runners =
-                            serde_json::from_value::<Vec<Runner>>(event.payload["runners"].clone())
-                                .ok()?;
-                        let list = format_runners(&runners);
-                        let text = match transition {
-                            "initial" => list,
-                            "replacement" => format!(
-                                "The available Atra Runner list has changed. This list replaces \
-                                 the previously provided list.\n\n{list}"
-                            ),
-                            _ => return None,
-                        };
-                        ResponseItem::from(ResponseInputItem::Message {
-                            role: "developer".to_owned(),
-                            content: vec![ContentItem::InputText { text }],
-                            phase: None,
-                        })
-                    }
-                    EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
-                        role: "user".to_owned(),
-                        content: vec![ContentItem::InputText {
-                            text: event.payload["content"].as_str()?.to_owned(),
-                        }],
-                        phase: None,
-                    }),
-                    EventKind::AssistantMessage => ResponseItem::from(ResponseInputItem::Message {
-                        role: "assistant".to_owned(),
-                        content: vec![ContentItem::OutputText {
-                            text: event.payload["content"].as_str()?.to_owned(),
-                        }],
-                        phase: None,
-                    }),
-                    EventKind::WebSearch => {
-                        serde_json::from_value(event.payload["item"].clone()).ok()?
-                    }
-                    EventKind::ToolCall if event.payload["type"] == "custom" => {
-                        ResponseItem::CustomToolCall {
-                            id: None,
-                            status: Some("completed".to_owned()),
-                            call_id: event.payload["call_id"].as_str()?.to_owned(),
-                            name: event.payload["name"].as_str()?.to_owned(),
-                            namespace: None,
-                            input: event.payload["input"].as_str()?.to_owned(),
-                            internal_chat_message_metadata_passthrough: None,
+                            event.payload["content"].as_str()?
+                        ),
+                        "removal" => {
+                            "The previously provided AGENTS.md instructions no longer apply."
+                                .to_owned()
                         }
-                    }
-                    EventKind::ToolCall => ResponseItem::FunctionCall {
+                        _ => return None,
+                    };
+                    ResponseItem::from(ResponseInputItem::Message {
+                        role: "developer".to_owned(),
+                        content: vec![ContentItem::InputText {
+                            text: format!(
+                                "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
+                            ),
+                        }],
+                        phase: None,
+                    })
+                }
+                EventKind::Skills => {
+                    let transition = event.payload["transition"].as_str()?;
+                    let text = match transition {
+                        "initial" => event.payload["content"].as_str()?.to_owned(),
+                        "replacement" => format!(
+                            "This skills list replaces all previously provided skills.\n\n{}",
+                            event.payload["content"].as_str()?
+                        ),
+                        "removal" => {
+                            "The previously provided skills are no longer available.".to_owned()
+                        }
+                        _ => return None,
+                    };
+                    ResponseItem::from(ResponseInputItem::Message {
+                        role: "developer".to_owned(),
+                        content: vec![ContentItem::InputText { text }],
+                        phase: None,
+                    })
+                }
+                EventKind::Runners => {
+                    let transition = event.payload["transition"].as_str()?;
+                    let runners =
+                        serde_json::from_value::<Vec<Runner>>(event.payload["runners"].clone())
+                            .ok()?;
+                    let list = format_runners(&runners);
+                    let text = match transition {
+                        "initial" => list,
+                        "replacement" => format!(
+                            "The available Atra Runner list has changed. This list replaces \
+                                 the previously provided list.\n\n{list}"
+                        ),
+                        _ => return None,
+                    };
+                    ResponseItem::from(ResponseInputItem::Message {
+                        role: "developer".to_owned(),
+                        content: vec![ContentItem::InputText { text }],
+                        phase: None,
+                    })
+                }
+                EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
+                    role: "user".to_owned(),
+                    content: vec![ContentItem::InputText {
+                        text: event.payload["content"].as_str()?.to_owned(),
+                    }],
+                    phase: None,
+                }),
+                EventKind::AssistantMessage => ResponseItem::from(ResponseInputItem::Message {
+                    role: "assistant".to_owned(),
+                    content: vec![ContentItem::OutputText {
+                        text: event.payload["content"].as_str()?.to_owned(),
+                    }],
+                    phase: None,
+                }),
+                EventKind::WebSearch => {
+                    serde_json::from_value(event.payload["item"].clone()).ok()?
+                }
+                EventKind::ToolCall if event.payload["type"] == "custom" => {
+                    ResponseItem::CustomToolCall {
                         id: None,
+                        status: Some("completed".to_owned()),
+                        call_id: event.payload["call_id"].as_str()?.to_owned(),
                         name: event.payload["name"].as_str()?.to_owned(),
                         namespace: None,
-                        arguments: event.payload["arguments"].to_string(),
-                        call_id: event.payload["call_id"].as_str()?.to_owned(),
+                        input: event.payload["input"].as_str()?.to_owned(),
                         internal_chat_message_metadata_passthrough: None,
-                    },
-                    EventKind::ToolResult if event.payload["type"] == "custom" => {
-                        ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
-                            call_id: event.payload["call_id"].as_str()?.to_owned(),
-                            name: event.payload["name"].as_str().map(str::to_owned),
-                            output: FunctionCallOutputPayload::from_text(tool_result_text(
-                                event
-                                    .payload
-                                    .get("masked_result")
-                                    .unwrap_or(&event.payload["result"]),
-                            )),
-                        })
                     }
-                    EventKind::ToolResult => {
-                        ResponseItem::from(ResponseInputItem::FunctionCallOutput {
-                            call_id: event.payload["call_id"].as_str()?.to_owned(),
-                            output: FunctionCallOutputPayload::from_text(tool_result_text(
-                                event
-                                    .payload
-                                    .get("masked_result")
-                                    .unwrap_or(&event.payload["result"]),
-                            )),
-                        })
-                    }
-                    EventKind::Reasoning => {
-                        serde_json::from_value(event.payload["item"].clone()).ok()?
-                    }
-                    EventKind::Compaction
-                    | EventKind::ModelRequest
-                    | EventKind::TokenUsage
-                    | EventKind::RateLimits => return None,
-                };
-                Some(Ok(item))
+                }
+                EventKind::ToolCall => ResponseItem::FunctionCall {
+                    id: None,
+                    name: event.payload["name"].as_str()?.to_owned(),
+                    namespace: None,
+                    arguments: event.payload["arguments"].to_string(),
+                    call_id: event.payload["call_id"].as_str()?.to_owned(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                EventKind::ToolResult if event.payload["type"] == "custom" => {
+                    ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
+                        call_id: event.payload["call_id"].as_str()?.to_owned(),
+                        name: event.payload["name"].as_str().map(str::to_owned),
+                        output: FunctionCallOutputPayload::from_text(tool_result_text(
+                            projected_tool_result(event, &masked_sequences),
+                        )),
+                    })
+                }
+                EventKind::ToolResult => {
+                    ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+                        call_id: event.payload["call_id"].as_str()?.to_owned(),
+                        output: FunctionCallOutputPayload::from_text(tool_result_text(
+                            projected_tool_result(event, &masked_sequences),
+                        )),
+                    })
+                }
+                EventKind::Reasoning => {
+                    serde_json::from_value(event.payload["item"].clone()).ok()?
+                }
+                EventKind::Compaction
+                | EventKind::FrozenBoundary
+                | EventKind::ModelRequest
+                | EventKind::TokenUsage
+                | EventKind::RateLimits => return None,
             })
-            .collect::<Result<Vec<_>>>()?,
-    );
-    Ok(input)
+        })() else {
+            continue;
+        };
+        if event.kind == EventKind::UserMessage {
+            active_started = true;
+        } else if !active_started
+            && matches!(
+                event.kind,
+                EventKind::WorkspaceInstructions | EventKind::Skills | EventKind::Runners
+            )
+        {
+            initial_boundary = Some(items.len());
+        }
+        items.push(item);
+        if event.kind == EventKind::ToolResult && frozen_sequences.contains(&event.sequence) {
+            let index = items.len();
+            items.push(ResponseItem::from(ResponseInputItem::Message {
+                role: "developer".to_owned(),
+                content: vec![ContentItem::InputText {
+                    text: "----".to_owned(),
+                }],
+                phase: None,
+            }));
+            frozen_boundaries.push((event.sequence, index));
+        }
+    }
+    Ok(ModelInput {
+        items,
+        initial_boundary,
+        frozen_boundaries,
+    })
+}
+
+fn projected_tool_result<'a>(
+    event: &'a Event,
+    masked_sequences: &HashSet<i64>,
+) -> &'a serde_json::Value {
+    if masked_sequences.contains(&event.sequence) {
+        &event.payload["masked_result"]
+    } else {
+        &event.payload["result"]
+    }
 }
 
 pub(super) fn context_tokens(events: &[Event]) -> Result<usize> {
-    let input = serde_json::to_string(&model_input(events)?)
+    let input = serde_json::to_string(&model_input(events)?.items)
         .context("failed to encode model input for token counting")?;
     Ok(super::text_tokens(&input))
 }

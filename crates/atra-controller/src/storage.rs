@@ -19,6 +19,7 @@ pub(crate) enum EventKind {
     WebSearch,
     ToolCall,
     ToolResult,
+    FrozenBoundary,
     Reasoning,
     Compaction,
     ModelRequest,
@@ -37,6 +38,7 @@ impl EventKind {
             Self::WebSearch => "web_search",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::FrozenBoundary => "frozen_boundary",
             Self::Reasoning => "reasoning",
             Self::Compaction => "compaction",
             Self::ModelRequest => "model_request",
@@ -61,6 +63,38 @@ pub(crate) struct Event {
     pub sequence: i64,
     pub kind: EventKind,
     pub payload: Value,
+}
+
+pub(crate) struct FrozenBoundary {
+    pub through_sequence: i64,
+    pub masked_sequences: Vec<i64>,
+}
+
+pub(crate) fn latest_frozen_boundary(events: &[Event]) -> Option<FrozenBoundary> {
+    for event in events.iter().rev() {
+        match event.kind {
+            EventKind::FrozenBoundary => {
+                return Some(FrozenBoundary {
+                    through_sequence: event.payload["through_sequence"]
+                        .as_i64()
+                        .expect("frozen boundary has a through sequence"),
+                    masked_sequences: event.payload["masked_sequences"]
+                        .as_array()
+                        .expect("frozen boundary has masked sequences")
+                        .iter()
+                        .map(|sequence| {
+                            sequence
+                                .as_i64()
+                                .expect("masked result sequence is an integer")
+                        })
+                        .collect(),
+                });
+            }
+            EventKind::Compaction => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) struct Store {
@@ -293,11 +327,12 @@ impl Store {
             .await
     }
 
-    pub async fn update_event_payloads(
+    pub async fn freeze_event_payloads(
         &self,
         thread_id: i64,
         events: Vec<(i64, Value)>,
-    ) -> tokio_rusqlite::Result<()> {
+        boundary: Value,
+    ) -> tokio_rusqlite::Result<i64> {
         let events = events
             .into_iter()
             .map(|(sequence, payload)| {
@@ -306,6 +341,7 @@ impl Store {
                     .map_err(to_sql_error)
             })
             .collect::<tokio_rusqlite::Result<Vec<_>>>()?;
+        let boundary = serde_json::to_string(&boundary).map_err(to_sql_error)?;
         self.connection
             .call(move |connection| {
                 let transaction = connection.transaction()?;
@@ -319,7 +355,29 @@ impl Store {
                         params![payload, thread_id, sequence],
                     )?;
                 }
-                transaction.commit()
+                let sequence = transaction.query_row(
+                    "
+                    SELECT COALESCE(MAX(sequence) + 1, 0)
+                    FROM events
+                    WHERE thread_id = ?1
+                    ",
+                    [thread_id],
+                    |row| row.get(0),
+                )?;
+                transaction.execute(
+                    "
+                    INSERT INTO events (thread_id, sequence, kind, payload)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    params![
+                        thread_id,
+                        sequence,
+                        EventKind::FrozenBoundary.as_str(),
+                        boundary
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(sequence)
             })
             .await
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -387,18 +387,12 @@ impl State {
                 self.run_turn(thread_id, message, None).await
             }
             ControllerRequest::ThreadEvents { thread_id } => {
-                let events = self
-                    .store
-                    .events(thread_id)
-                    .await
-                    .context("failed to load thread events")?
-                    .into_iter()
-                    .map(|event| ThreadEvent {
-                        sequence: event.sequence,
-                        kind: event.kind.as_str().to_owned(),
-                        payload: event.payload,
-                    })
-                    .collect();
+                let events = protocol_events(
+                    self.store
+                        .events(thread_id)
+                        .await
+                        .context("failed to load thread events")?,
+                );
                 Ok(ControllerResponse::ThreadEvents { events })
             }
             ControllerRequest::ThreadCheckpointCreate { thread_id } => {
@@ -420,14 +414,12 @@ impl State {
                 Ok(ControllerResponse::ThreadCheckpointList { checkpoints })
             }
             ControllerRequest::ThreadCheckpointEvents { checkpoint_id } => {
-                let events = self
-                    .store
-                    .checkpoint_events(checkpoint_id)
-                    .await
-                    .context("failed to load checkpoint events")?
-                    .into_iter()
-                    .map(protocol_event)
-                    .collect();
+                let events = protocol_events(
+                    self.store
+                        .checkpoint_events(checkpoint_id)
+                        .await
+                        .context("failed to load checkpoint events")?,
+                );
                 Ok(ControllerResponse::ThreadCheckpointEvents { events })
             }
             ControllerRequest::ThreadCheckpointRestore {
@@ -921,21 +913,39 @@ impl State {
     async fn mask_old_command_results(
         &self,
         thread_id: i64,
-        events: &mut [storage::Event],
+        events: &mut Vec<storage::Event>,
         stream_updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<usize> {
-        let active_start = events
-            .iter()
-            .rposition(|event| {
-                event.kind == EventKind::Compaction
-                    || (event.kind == EventKind::ToolResult
-                        && event.payload.get("masked_result").is_some())
-            })
-            .map_or(0, |index| index + 1);
+        let previous_boundary = storage::latest_frozen_boundary(events);
+        let active_through = previous_boundary
+            .as_ref()
+            .map(|boundary| boundary.through_sequence)
+            .into_iter()
+            .chain(
+                events
+                    .iter()
+                    .rfind(|event| event.kind == EventKind::Compaction)
+                    .map(|event| event.sequence),
+            )
+            .max();
+        let active_start = active_through.map_or(0, |sequence| {
+            events.partition_point(|event| event.sequence <= sequence)
+        });
         if self.provider.context_tokens(&events[active_start..])? <= ACTIVE_CONTEXT_HIGH_TOKENS {
             return Ok(0);
         }
         let context_tokens_before = self.provider.context_tokens(events)?;
+        let mut suffix_start = active_start;
+        let mut suffix_end = events.len();
+        while suffix_start < suffix_end {
+            let middle = suffix_start + (suffix_end - suffix_start) / 2;
+            if self.provider.context_tokens(&events[middle..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
+                suffix_end = middle;
+            } else {
+                suffix_start = middle + 1;
+            }
+        }
+        let freeze_through_index = suffix_start.saturating_sub(1);
 
         let request_sequences = events
             .iter()
@@ -945,45 +955,78 @@ impl State {
             .map(|event| event.sequence)
             .collect::<Vec<_>>();
         let mut masked_events = Vec::new();
+        let mut through_sequence = None;
         for index in active_start..events.len() {
-            let event = &mut events[index];
+            let event = &events[index];
+            let later_requests =
+                request_sequences.partition_point(|sequence| *sequence <= event.sequence);
             if event.kind != EventKind::ToolResult
-                || request_sequences
-                    .iter()
-                    .filter(|sequence| **sequence > event.sequence)
-                    .take(MINIMUM_FULL_RESULT_REQUESTS)
-                    .count()
-                    < MINIMUM_FULL_RESULT_REQUESTS
+                || request_sequences.len() - later_requests < MINIMUM_FULL_RESULT_REQUESTS
             {
                 continue;
             }
-            let Some(masked_result) = masked_tool_result(&event.payload) else {
-                continue;
-            };
-            event.payload["masked_result"] = serde_json::Value::String(masked_result);
-            masked_events.push(event.clone());
-            if self.provider.context_tokens(&events[index + 1..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
+            through_sequence = Some(event.sequence);
+            if let Some(masked_result) = masked_tool_result(&event.payload) {
+                let mut event = event.clone();
+                event.payload["masked_result"] = serde_json::Value::String(masked_result);
+                masked_events.push((index, event));
+            }
+            if index >= freeze_through_index {
                 break;
             }
         }
         if masked_events.is_empty() {
             return Ok(0);
         }
+        let through_sequence = through_sequence.expect("a masked event was passed");
+        let mut masked_sequences = previous_boundary
+            .map(|boundary| boundary.masked_sequences)
+            .unwrap_or_default();
+        masked_sequences.extend(masked_events.iter().map(|(_, event)| event.sequence));
+        let payload = json!({
+            "through_sequence": through_sequence,
+            "masked_sequences": masked_sequences,
+        });
+        let mut projected_events = events.clone();
+        for (index, event) in &masked_events {
+            projected_events[*index] = event.clone();
+        }
+        projected_events.push(storage::Event {
+            sequence: events.last().map_or(0, |event| event.sequence + 1),
+            kind: EventKind::FrozenBoundary,
+            payload: payload.clone(),
+        });
         let masked_tokens =
-            context_tokens_before.saturating_sub(self.provider.context_tokens(events)?);
-        self.store
-            .update_event_payloads(
+            context_tokens_before.saturating_sub(self.provider.context_tokens(&projected_events)?);
+        if masked_tokens == 0 {
+            return Ok(0);
+        }
+        let sequence = self
+            .store
+            .freeze_event_payloads(
                 thread_id,
                 masked_events
                     .iter()
-                    .map(|event| (event.sequence, event.payload.clone()))
+                    .map(|(_, event)| (event.sequence, event.payload.clone()))
                     .collect(),
+                payload.clone(),
             )
             .await
             .context("failed to mask old command results")?;
+        for (index, event) in &masked_events {
+            events[*index] = event.clone();
+        }
+        let boundary = storage::Event {
+            sequence,
+            kind: EventKind::FrozenBoundary,
+            payload,
+        };
+        events.push(boundary.clone());
         if let Some(stream_updates) = stream_updates {
-            for event in masked_events {
-                let _ = stream_updates.send(ModelStreamEvent::ThreadEvent(protocol_event(event)));
+            let _ = stream_updates.send(ModelStreamEvent::ThreadEvent(protocol_event(boundary)));
+            for (_, event) in &masked_events {
+                let _ = stream_updates
+                    .send(ModelStreamEvent::ThreadEvent(protocol_event(event.clone())));
             }
         }
         Ok(masked_tokens)
@@ -2266,6 +2309,27 @@ fn protocol_event(event: storage::Event) -> ThreadEvent {
     }
 }
 
+fn protocol_events(mut events: Vec<storage::Event>) -> Vec<ThreadEvent> {
+    let masked_sequences = storage::latest_frozen_boundary(&events)
+        .map(|boundary| {
+            boundary
+                .masked_sequences
+                .into_iter()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    for event in &mut events {
+        if event.kind == EventKind::ToolResult && !masked_sequences.contains(&event.sequence) {
+            event
+                .payload
+                .as_object_mut()
+                .expect("tool result payload is an object")
+                .remove("masked_result");
+        }
+    }
+    events.into_iter().map(protocol_event).collect()
+}
+
 struct Runner {
     config: Mutex<RunnerConfig>,
     child: Mutex<Child>,
@@ -2776,11 +2840,8 @@ fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
             return None;
         }
         let masked = operations.join("\n\n");
-        return Some(
-            (command_masked && model::text_tokens(&masked) < model::text_tokens(original))
-                .then_some(masked)
-                .unwrap_or_else(|| original.to_owned()),
-        );
+        return (command_masked && model::text_tokens(&masked) < model::text_tokens(original))
+            .then_some(masked);
     }
 
     let command = payload["artifacts"]
@@ -2788,11 +2849,7 @@ fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
         .iter()
         .find(|artifact| artifact["kind"] == "command_execution")?;
     let masked = masked_command_result(&command["data"])?;
-    Some(
-        (model::text_tokens(&masked) < model::text_tokens(original))
-            .then_some(masked)
-            .unwrap_or_else(|| original.to_owned()),
-    )
+    (model::text_tokens(&masked) < model::text_tokens(original)).then_some(masked)
 }
 
 fn masked_command_result(data: &serde_json::Value) -> Option<String> {

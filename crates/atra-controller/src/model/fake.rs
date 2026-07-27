@@ -28,16 +28,20 @@ impl FakeProvider {
             .await
             .pop_front()
             .context("fake model script has no response remaining")?;
+        let masked_sequences = crate::storage::latest_frozen_boundary(events)
+            .map(|boundary| boundary.masked_sequences)
+            .unwrap_or_default();
         if let ModelResponse::AssistantMessage { content } = &mut response
             && let Some(output) = events.iter().rev().find_map(|event| {
                 (event.kind == EventKind::ToolResult)
                     .then(|| {
-                        event
-                            .payload
-                            .get("masked_result")
-                            .unwrap_or(&event.payload["result"])
-                            .as_str()
-                            .or_else(|| event.payload.pointer("/result/output")?.as_str())
+                        if masked_sequences.contains(&event.sequence) {
+                            &event.payload["masked_result"]
+                        } else {
+                            &event.payload["result"]
+                        }
+                        .as_str()
+                        .or_else(|| event.payload.pointer("/result/output")?.as_str())
                     })
                     .flatten()
             })
