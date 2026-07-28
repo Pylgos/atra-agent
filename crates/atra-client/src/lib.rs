@@ -116,9 +116,6 @@ pub enum ProcessResult {
         output: String,
         exit_code: Option<i32>,
     },
-    TimedOut {
-        output: String,
-    },
     Stopped {
         output: String,
     },
@@ -629,7 +626,6 @@ fn decode_process(response: ControllerResponse) -> Result<ProcessResult> {
         ControllerResponse::ProcessFinished { output, exit_code } => {
             Ok(ProcessResult::Finished { output, exit_code })
         }
-        ControllerResponse::ProcessTimedOut { output } => Ok(ProcessResult::TimedOut { output }),
         ControllerResponse::ProcessStopped { output } => Ok(ProcessResult::Stopped { output }),
         response => unexpected(response),
     }

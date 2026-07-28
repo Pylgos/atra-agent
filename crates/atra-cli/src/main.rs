@@ -214,8 +214,6 @@ enum RunnerCommand {
         background: bool,
         #[arg(long)]
         timeout_ms: Option<u64>,
-        #[arg(long, value_enum, default_value_t = OnTimeout::ReturnRunning)]
-        on_timeout: OnTimeout,
     },
     Wait {
         #[arg(long)]
@@ -237,12 +235,6 @@ enum RunnerCommand {
 enum Approval {
     Ask,
     Allow,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum OnTimeout {
-    ReturnRunning,
-    Terminate,
 }
 
 impl From<Approval> for ApprovalPolicy {
@@ -431,21 +423,12 @@ async fn run(command: Command) -> Result<()> {
                     command,
                     background,
                     timeout_ms,
-                    on_timeout,
                 },
         } => {
-            let mode = match (background, timeout_ms, on_timeout) {
-                (true, None, OnTimeout::ReturnRunning) => CommandMode::Background,
-                (false, timeout_ms, OnTimeout::ReturnRunning) => {
-                    CommandMode::Foreground { timeout_ms }
-                }
-                (false, Some(timeout_ms), OnTimeout::Terminate) => {
-                    CommandMode::Timed { timeout_ms }
-                }
-                (true, _, _) => bail!("background commands cannot have timeout options"),
-                (false, None, OnTimeout::Terminate) => {
-                    bail!("--on-timeout terminate requires --timeout-ms")
-                }
+            let mode = match (background, timeout_ms) {
+                (true, None) => CommandMode::Background,
+                (false, timeout_ms) => CommandMode::Foreground { timeout_ms },
+                (true, Some(_)) => bail!("background commands cannot have timeout options"),
             };
             display_process_result(client(&endpoint).exec_command(name, command, mode).await?)
         }
@@ -700,10 +683,6 @@ fn display_process_result(result: ProcessResult) -> Result<()> {
                 );
             }
             Ok(())
-        }
-        ProcessResult::TimedOut { output } => {
-            print!("{output}");
-            bail!("command timed out")
         }
         ProcessResult::Stopped { output } => {
             print!("{output}");

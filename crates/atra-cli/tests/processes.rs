@@ -188,8 +188,6 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "one",
             "--timeout-ms",
             "200",
-            "--on-timeout",
-            "return-running",
             "--command",
             "printf partial; sleep 30",
         ])
@@ -205,41 +203,6 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .unwrap()
         .to_owned();
     system.stop_process("one", &returned_handle).await;
-
-    let terminated = system
-        .atra()
-        .args([
-            "runner",
-            "exec",
-            "--name",
-            "one",
-            "--timeout-ms",
-            "200",
-            "--on-timeout",
-            "terminate",
-            "--command",
-            "sleep 30 & printf '%s\\n' \"$!\"; wait",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(!terminated.status.success(), "{terminated:?}");
-    assert!(
-        String::from_utf8_lossy(&terminated.stderr).contains("command timed out"),
-        "{terminated:?}"
-    );
-    let descendant = Pid::from_raw(
-        String::from_utf8(terminated.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        test_kill_process(descendant).is_err(),
-        "timeout left a descendant process running"
-    );
 
     let abandoned = system
         .background("two", "sleep 30 & printf '%s\\n' \"$!\"; wait")

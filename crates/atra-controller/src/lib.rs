@@ -476,17 +476,9 @@ impl State {
             return Ok(ControllerResponse::ProcessStarted { process_handle });
         }
 
-        let (deadline, terminate_on_timeout) = match mode {
-            CommandMode::Foreground { timeout_ms } => (
-                timeout_ms.map(|timeout_ms| {
-                    Instant::now() + std::time::Duration::from_millis(timeout_ms)
-                }),
-                false,
-            ),
-            CommandMode::Timed { timeout_ms } => (
-                Some(Instant::now() + std::time::Duration::from_millis(timeout_ms)),
-                true,
-            ),
+        let deadline = match mode {
+            CommandMode::Foreground { timeout_ms } => timeout_ms
+                .map(|timeout_ms| Instant::now() + std::time::Duration::from_millis(timeout_ms)),
             CommandMode::Background => unreachable!(),
         };
         let mut collected = None;
@@ -503,19 +495,9 @@ impl State {
                 RunnerResponse::ProcessRunning { output, .. } => {
                     append_command_output(&mut collected, output);
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        let response = if terminate_on_timeout {
-                            append_command_output(
-                                &mut collected,
-                                runner.stop(process_handle.clone()).await?,
-                            );
-                            RunnerResponse::ProcessTimedOut {
-                                output: collected.take().unwrap(),
-                            }
-                        } else {
-                            RunnerResponse::ProcessRunning {
-                                process_handle,
-                                output: collected.take().unwrap(),
-                            }
+                        let response = RunnerResponse::ProcessRunning {
+                            process_handle,
+                            output: collected.take().unwrap(),
                         };
                         return map_runner_response(response);
                     }

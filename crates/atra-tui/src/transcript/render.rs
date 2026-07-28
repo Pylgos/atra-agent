@@ -526,15 +526,12 @@ fn runner_tool_lines(
             index += 1;
         } else if input[index] == "*** Command"
             || input[index].starts_with("*** Background Command ")
-            || input[index].starts_with("*** Timed Command ")
         {
             let header = input[index];
             operation += 1;
             separate_operation(&mut lines, operation);
             let label = if let Some(process_id) = header.strip_prefix("*** Background Command ") {
                 format!("Background Command {process_id}")
-            } else if let Some(timeout) = header.strip_prefix("*** Timed Command ") {
-                format!("Timed Command {timeout}")
             } else {
                 "Command".to_owned()
             };
@@ -886,12 +883,6 @@ fn command_execution_lines(
                 output.as_str(),
             )
         }
-        CommandExecutionArtifact::TimedOut { output, .. } => (
-            '!',
-            "timed out".to_owned(),
-            Style::default().fg(Color::Red),
-            output.as_str(),
-        ),
         CommandExecutionArtifact::Stopped { output, .. } => (
             '■',
             "stopped".to_owned(),

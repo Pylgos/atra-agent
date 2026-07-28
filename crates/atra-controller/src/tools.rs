@@ -13,7 +13,6 @@ pub(super) struct ExecCommandArguments {
 pub(super) enum ModelCommandMode {
     Foreground { timeout_ms: u64 },
     Background { process_id: ProcessId },
-    Timed { timeout_ms: u64 },
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -70,9 +69,6 @@ impl RunnerOperation {
                 ModelCommandMode::Background { process_id } => {
                     format!("Background Command {process_id}")
                 }
-                ModelCommandMode::Timed { timeout_ms } => {
-                    format!("Timed Command {timeout_ms}")
-                }
             },
             Self::Patch(_) => "Patch".to_owned(),
             Self::Wait(arguments) => {
@@ -122,29 +118,19 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
             .context("runner input must start with '*** Runner <runner>'")?
             .clone();
         match lines[index] {
-            header
-                if header == "*** Command"
-                    || header.starts_with("*** Background Command ")
-                    || header.starts_with("*** Timed Command ") =>
-            {
-                let mode = match header {
-                    "*** Command" => ModelCommandMode::Foreground {
+            header if header == "*** Command" || header.starts_with("*** Background Command ") => {
+                let mode = if header == "*** Command" {
+                    ModelCommandMode::Foreground {
                         timeout_ms: FOREGROUND_TIMEOUT_MS,
-                    },
-                    header if header.starts_with("*** Background Command ") => {
-                        let process_id = &header["*** Background Command ".len()..];
-                        if !valid_process_id(process_id) {
-                            bail!("invalid background command process ID '{process_id}'");
-                        }
-                        ModelCommandMode::Background {
-                            process_id: ProcessId(process_id.to_owned()),
-                        }
                     }
-                    header => ModelCommandMode::Timed {
-                        timeout_ms: header["*** Timed Command ".len()..]
-                            .parse()
-                            .context("timed command milliseconds must be an integer")?,
-                    },
+                } else {
+                    let process_id = &header["*** Background Command ".len()..];
+                    if !valid_process_id(process_id) {
+                        bail!("invalid background command process ID '{process_id}'");
+                    }
+                    ModelCommandMode::Background {
+                        process_id: ProcessId(process_id.to_owned()),
+                    }
                 };
                 index += 1;
                 let end = lines[index..]
@@ -442,16 +428,6 @@ pub(super) fn masked_command_result(command: &CommandExecutionArtifact) -> Optio
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
         ),
-        CommandExecutionArtifact::TimedOut {
-            output,
-            runner,
-            full_output_path,
-        } => (
-            output,
-            runner,
-            full_output_path,
-            "Process timed out".to_owned(),
-        ),
         CommandExecutionArtifact::Stopped {
             output,
             runner,
@@ -521,11 +497,6 @@ pub(super) fn command_artifact(
                 full_output_path: output.full_output_path.clone(),
             }
         }
-        RunnerResponse::ProcessTimedOut { output } => CommandExecutionArtifact::TimedOut {
-            output: format_command_output(output),
-            runner: runner.to_owned(),
-            full_output_path: output.full_output_path.clone(),
-        },
         RunnerResponse::ProcessStopped { output } => CommandExecutionArtifact::Stopped {
             output: format_command_output(output),
             runner: runner.to_owned(),

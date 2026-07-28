@@ -1060,14 +1060,7 @@ impl State {
                             process_handle: ProcessHandle(process_id.0),
                         }
                     }
-                    mode @ (ModelCommandMode::Foreground { .. }
-                    | ModelCommandMode::Timed { .. }) => {
-                        let terminate_on_timeout = matches!(&mode, ModelCommandMode::Timed { .. });
-                        let timeout_ms = match mode {
-                            ModelCommandMode::Foreground { timeout_ms }
-                            | ModelCommandMode::Timed { timeout_ms } => timeout_ms,
-                            ModelCommandMode::Background { .. } => unreachable!(),
-                        };
+                    ModelCommandMode::Foreground { timeout_ms } => {
                         let active = self
                             .turns
                             .get(thread_id)
@@ -1104,21 +1097,9 @@ impl State {
                                     )?;
                                     append_command_output(&mut collected, output);
                                     if Instant::now() >= deadline {
-                                        break if terminate_on_timeout {
-                                            {
-                                                append_command_output(
-                                                    &mut collected,
-                                                    runner.stop(process_handle.clone()).await?,
-                                                );
-                                                RunnerResponse::ProcessTimedOut {
-                                                    output: collected.take().unwrap(),
-                                                }
-                                            }
-                                        } else {
-                                            RunnerResponse::ProcessRunning {
-                                                process_handle: process_handle.clone(),
-                                                output: collected.take().unwrap(),
-                                            }
+                                        break RunnerResponse::ProcessRunning {
+                                            process_handle: process_handle.clone(),
+                                            output: collected.take().unwrap(),
                                         };
                                     }
                                 }

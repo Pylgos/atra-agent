@@ -248,9 +248,6 @@ pub(super) fn map_runner_response(response: RunnerResponse) -> Result<Controller
                 exit_code,
             })
         }
-        RunnerResponse::ProcessTimedOut { output } => Ok(ControllerResponse::ProcessTimedOut {
-            output: format_command_output(&output),
-        }),
         RunnerResponse::ProcessStopped { output } => Ok(ControllerResponse::ProcessStopped {
             output: format_command_output(&output),
         }),
@@ -299,10 +296,6 @@ pub(super) fn format_exec_response(runner: &str, response: RunnerResponse) -> Re
                 &format!("Process exited with code {exit_code}"),
             ))
         }
-        RunnerResponse::ProcessTimedOut { output } => Ok(append_process_status(
-            model_command_output(&output, runner),
-            "Process timed out",
-        )),
         RunnerResponse::Error { message } => bail!("{message}"),
         RunnerResponse::Ready
         | RunnerResponse::MissingObjects { .. }

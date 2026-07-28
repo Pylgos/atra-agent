@@ -782,7 +782,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
 
                 Processes:
                 Use `*** Command` to wait up to 10000 milliseconds for a Bash command and leave it running if unfinished.
-                Use `*** Timed Command <milliseconds>` to stop a command if it exceeds the specified duration.
                 Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
                 End every command with `*** End`.
                 Use `*** Wait <process-id> <milliseconds>` to wait for more output or completion.
@@ -812,10 +811,9 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     runner: "*** Runner " name LF
                     operation: command | patch | wait_process | stop_process
 
-                    command: foreground_command | background_command | timed_command
+                    command: foreground_command | background_command
                     foreground_command: "*** Command" LF command_body
                     background_command: "*** Background Command " process_id LF command_body
-                    timed_command: "*** Timed Command " INT LF command_body
                     command_body: command_line+ OPERATION_END
                     command_line: /(.+)/ LF | LF
                     OPERATION_END: /\*\*\* End\r?\n/

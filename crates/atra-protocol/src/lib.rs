@@ -101,7 +101,6 @@ pub enum ApprovalPolicy {
 pub enum CommandMode {
     Foreground { timeout_ms: Option<u64> },
     Background,
-    Timed { timeout_ms: u64 },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -302,9 +301,6 @@ pub enum ControllerResponse {
         output: String,
         exit_code: Option<i32>,
     },
-    ProcessTimedOut {
-        output: String,
-    },
     ProcessStopped {
         output: String,
     },
@@ -354,11 +350,6 @@ pub enum CommandExecutionArtifact {
     Finished {
         output: String,
         exit_code: Option<i32>,
-        runner: String,
-        full_output_path: PathBuf,
-    },
-    TimedOut {
-        output: String,
         runner: String,
         full_output_path: PathBuf,
     },
@@ -685,9 +676,6 @@ pub enum RunnerResponse {
     ProcessFinished {
         output: CommandOutput,
         exit_code: Option<i32>,
-    },
-    ProcessTimedOut {
-        output: CommandOutput,
     },
     ProcessStopped {
         output: CommandOutput,
