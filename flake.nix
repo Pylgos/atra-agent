@@ -107,6 +107,39 @@
                   "$staging" \
                   "${platform}"
               '';
+          devRootfs = pkgs.runCommand "atra-dev-rootfs" { } ''
+            mkdir -p \
+              "$out/activation" \
+              "$out/atra" \
+              "$out/bin" \
+              "$out/cargo" \
+              "$out/dev/shm" \
+              "$out/etc/ssl/certs" \
+              "$out/nix/store" \
+              "$out/proc" \
+              "$out/run" \
+              "$out/sys" \
+              "$out/tmp/home" \
+              "$out/usr/bin" \
+              "$out/var/tmp" \
+              "$out/workspace"
+            ln -s ${pkgs.bash}/bin/bash "$out/bin/bash"
+            ln -s bash "$out/bin/sh"
+            ln -s ${pkgs.coreutils}/bin/env "$out/usr/bin/env"
+            ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt \
+              "$out/etc/ssl/certs/ca-bundle.crt"
+            ln -s /proc/mounts "$out/etc/mtab"
+            touch \
+              "$out/activation/dev-env.bash" \
+              "$out/etc/hostname" \
+              "$out/etc/hosts" \
+              "$out/etc/resolv.conf"
+            printf '%s\n' \
+              'root:x:0:0:root:/tmp/home:/bin/bash' \
+              >"$out/etc/passwd"
+            printf '%s\n' 'root:x:0:' >"$out/etc/group"
+            printf '%s\n' 'hosts: files dns' >"$out/etc/nsswitch.conf"
+          '';
           atra = pkgs.runCommand "atra-${version}" { } ''
             mkdir -p "$out/bin" "$out/share"
             install -m755 ${cli}/bin/atra "$out/bin/atra"
@@ -117,7 +150,29 @@
         {
           inherit atra runner;
           default = atra;
+          dev-rootfs = devRootfs;
           platform-bundle = platformBundle;
+        }
+      );
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              clang
+              clippy
+              git
+              openssl
+              pkg-config
+              rust-analyzer
+              rustc
+              rustfmt
+            ];
+          };
         }
       );
     };
