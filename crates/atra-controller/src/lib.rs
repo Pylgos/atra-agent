@@ -12,13 +12,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalId, ApprovalPolicy, CommandEnvironment, CommandExecutionArtifact, CommandMode,
-    CommandOutput, CompactionEvent, ControllerResponse, CustomToolType, EventSequence,
-    FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent, ModelRequestEvent,
-    ModelRequestKind, ProcessHandle, ProcessId, RateLimitsEvent, Runner as RunnerInfo,
-    RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent, ThreadEvent, ThreadEventData,
-    ThreadId, TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest,
-    UnaryRequest,
+    ApprovalId, ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
+    CommandExecutionArtifact, CommandMode, CommandOutput, CompactionEvent, ControllerResponse,
+    CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
+    ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, RateLimitsEvent,
+    Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent,
+    ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent, ToolArtifact, ToolCallEvent,
+    ToolResultEvent, TurnRequest, UnaryRequest,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};

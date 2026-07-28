@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::storage::Event;
 use anyhow::Result;
-use atra_protocol::{ApprovalId, Model, RunnerOperationUpdate, ThreadEvent, ThreadId};
+use atra_protocol::{
+    ApprovalId, AssistantMessagePhase, Model, RunnerOperationUpdate, ThreadEvent, ThreadId,
+};
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
 use serde::Deserialize;
@@ -19,6 +21,8 @@ pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) enum ModelResponse {
     AssistantMessage {
         content: String,
+        #[serde(default)]
+        phase: Option<AssistantMessagePhase>,
     },
     WebSearch {
         item: ResponseItem,

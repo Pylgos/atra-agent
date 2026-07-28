@@ -386,7 +386,7 @@ pub enum ThreadEventData {
     Skills(InstructionEvent),
     Runners(RunnersEvent),
     UserMessage(MessageEvent),
-    AssistantMessage(MessageEvent),
+    AssistantMessage(AssistantMessageEvent),
     WebSearch(ItemEvent),
     ToolCall(ToolCallEvent),
     ToolResult(ToolResultEvent),
@@ -447,6 +447,20 @@ pub enum RunnersEvent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MessageEvent {
     pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AssistantMessageEvent {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AssistantMessagePhase>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantMessagePhase {
+    Commentary,
+    FinalAnswer,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

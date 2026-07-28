@@ -799,8 +799,9 @@ mod tests {
             store
                 .append(
                     thread,
-                    ThreadEventData::AssistantMessage(atra_protocol::MessageEvent {
-                        content: "two".to_owned()
+                    ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
+                        content: "two".to_owned(),
+                        phase: None,
                     })
                 )
                 .await
@@ -818,8 +819,9 @@ mod tests {
                 },
                 Event {
                     sequence: EventSequence(1),
-                    data: ThreadEventData::AssistantMessage(atra_protocol::MessageEvent {
-                        content: "two".to_owned()
+                    data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
+                        content: "two".to_owned(),
+                        phase: None,
                     }),
                 },
             ]

@@ -133,6 +133,8 @@ impl State {
                 | ThreadEventData::ToolResult(_)
                 | ThreadEventData::Compaction(_),
             ) => {}
+            Some(ThreadEventData::AssistantMessage(message))
+                if message.phase == Some(AssistantMessagePhase::Commentary) => {}
             Some(ThreadEventData::AssistantMessage(_)) => bail!("thread turn is already complete"),
             Some(ThreadEventData::ToolCall(_)) => unreachable!(),
             None => bail!("thread has no resumable history"),
@@ -716,19 +718,24 @@ impl State {
         mut responses: VecDeque<ModelResponse>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<Option<ControllerResponse>> {
+        let mut final_answer = None;
+        let mut needs_follow_up = false;
         while let Some(response) = responses.pop_front() {
             match response {
-                ModelResponse::AssistantMessage { content } => {
+                ModelResponse::AssistantMessage { content, phase } => {
                     self.append_event(
                         thread_id,
-                        ThreadEventData::AssistantMessage(MessageEvent {
+                        ThreadEventData::AssistantMessage(AssistantMessageEvent {
                             content: content.clone(),
+                            phase,
                         }),
                         updates,
                     )
                     .await
                     .context("failed to save assistant message")?;
-                    return Ok(Some(ControllerResponse::TurnCompleted { content }));
+                    if phase != Some(AssistantMessagePhase::Commentary) {
+                        final_answer = Some(content);
+                    }
                 }
                 ModelResponse::WebSearch { item } => {
                     self.append_event(
@@ -746,6 +753,7 @@ impl State {
                     arguments,
                     call_id,
                 } => {
+                    needs_follow_up = true;
                     self.append_event(
                         thread_id,
                         ThreadEventData::ToolCall(ToolCallEvent::Function {
@@ -835,6 +843,7 @@ impl State {
                     input,
                     call_id,
                 } => {
+                    needs_follow_up = true;
                     if name != "runner" {
                         bail!("model requested unsupported custom tool {name}");
                     }
@@ -912,7 +921,10 @@ impl State {
                 }
             }
         }
-        Ok(None)
+        Ok((!needs_follow_up)
+            .then_some(final_answer)
+            .flatten()
+            .map(|content| ControllerResponse::TurnCompleted { content }))
     }
 
     pub(super) async fn route_tool(

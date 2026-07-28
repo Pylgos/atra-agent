@@ -18,7 +18,7 @@ use codex_login::{
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{
-    ContentItem, FunctionCallOutputPayload, ResponseInputItem, ResponseItem,
+    ContentItem, FunctionCallOutputPayload, MessagePhase, ResponseInputItem, ResponseItem,
 };
 use codex_protocol::openai_models::ModelVisibility;
 use futures_util::StreamExt;
@@ -32,7 +32,8 @@ use atra_protocol::{Model, Runner};
 use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
 use crate::storage::Event;
 use atra_protocol::{
-    InstructionEvent, RunnersEvent, ThreadEventData, ToolCallEvent, ToolResultEvent,
+    AssistantMessagePhase, InstructionEvent, RunnersEvent, ThreadEventData, ToolCallEvent,
+    ToolResultEvent,
 };
 
 const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
@@ -601,7 +602,10 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         content: vec![ContentItem::OutputText {
                             text: message.content.clone(),
                         }],
-                        phase: None,
+                        phase: message.phase.map(|phase| match phase {
+                            AssistantMessagePhase::Commentary => MessagePhase::Commentary,
+                            AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
+                        }),
                     })
                 }
                 ThreadEventData::WebSearch(event) => {
@@ -726,7 +730,7 @@ fn format_runners(runners: &[Runner]) -> String {
 
 fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
     match item {
-        ResponseItem::Message { content, .. } => {
+        ResponseItem::Message { content, phase, .. } => {
             let content = content
                 .into_iter()
                 .filter_map(|item| match item {
@@ -736,7 +740,11 @@ fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
                     | ContentItem::InputAudio { .. } => None,
                 })
                 .collect::<String>();
-            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content }))
+            let phase = phase.map(|phase| match phase {
+                MessagePhase::Commentary => AssistantMessagePhase::Commentary,
+                MessagePhase::FinalAnswer => AssistantMessagePhase::FinalAnswer,
+            });
+            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content, phase }))
         }
         ResponseItem::FunctionCall {
             name,

@@ -32,7 +32,7 @@ impl FakeProvider {
         let masked_sequences = crate::storage::latest_frozen_boundary(events)
             .map(|boundary| boundary.masked_sequences)
             .unwrap_or_default();
-        if let ModelResponse::AssistantMessage { content } = &mut response
+        if let ModelResponse::AssistantMessage { content, .. } = &mut response
             && let Some(output) = events.iter().rev().find_map(|event| {
                 let ThreadEventData::ToolResult(result) = &event.data else {
                     return None;
