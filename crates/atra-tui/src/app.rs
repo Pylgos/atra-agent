@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
-    ControllerRequest, ControllerResponse, Model, Thread, ThreadCheckpoint, ThreadEvent,
+    ControllerRequest, ControllerResponse, Model, RunnerOperationUpdate, Thread, ThreadCheckpoint,
+    ThreadEvent,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -24,7 +25,8 @@ use crate::{
         TranscriptMode, TurnState, ViewState,
     },
     transcript::{
-        Author, TranscriptEntry, TranscriptItem, item_from_event, sanitize, transcript_text,
+        Author, TranscriptEntry, TranscriptItem, item_from_event, merge_runner_tool_result,
+        sanitize, transcript_from_events, transcript_text,
     },
 };
 
@@ -90,6 +92,12 @@ pub(crate) enum TurnUpdate {
         runner: String,
         label: String,
         operation_index: Option<usize>,
+    },
+    RunnerOperationUpdate {
+        thread_id: i64,
+        call_id: String,
+        operation_index: usize,
+        update: RunnerOperationUpdate,
     },
     Completed(Result<TurnCompletion>),
     ApprovalResolved {
@@ -1166,6 +1174,14 @@ impl App {
                 reason,
             }
         };
+        if let Some(entry) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.runner_call_id().is_some())
+        {
+            entry.set_pending_approval(None);
+        }
         self.overlay = Overlay::None;
         self.turn = TurnState::Running;
         self.activity = Some(Activity::Info(
@@ -1303,6 +1319,9 @@ impl App {
                         .find(|existing| existing.sequence == event.sequence)
                     {
                         *existing = event.clone();
+                        if merge_runner_tool_result(&mut self.transcript, &event) {
+                            return Ok(());
+                        }
                         if let Some(item) = item_from_event(event)
                             && let Some(entry) = self
                                 .transcript
@@ -1320,11 +1339,16 @@ impl App {
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned);
                     let sequence = event.sequence;
+                    if merge_runner_tool_result(&mut self.transcript, &event) {
+                        return Ok(());
+                    }
                     let Some(item) = item_from_event(event) else {
                         return Ok(());
                     };
-                    if matches!(item, TranscriptItem::ToolCall { .. })
-                        && let Some(item_id) = item_id
+                    if matches!(
+                        item,
+                        TranscriptItem::ToolCall { .. } | TranscriptItem::RunnerTool { .. }
+                    ) && let Some(item_id) = item_id
                         && let Some(index) = self.tool_call_previews.remove(&item_id)
                     {
                         self.transcript[index].replace_event(sequence, item);
@@ -1351,6 +1375,24 @@ impl App {
                 }
                 return Ok(());
             }
+            TurnUpdate::RunnerOperationUpdate {
+                thread_id,
+                call_id,
+                operation_index,
+                update,
+            } => {
+                if self.thread_id == Some(thread_id) {
+                    if let Some(entry) = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| entry.runner_call_id() == Some(call_id.as_str()))
+                    {
+                        entry.update_runner_operation(&call_id, operation_index, update);
+                    }
+                }
+                return Ok(());
+            }
             TurnUpdate::ApprovalRequired {
                 approval_id,
                 thread_id,
@@ -1359,6 +1401,16 @@ impl App {
                 operation_index,
             } => {
                 if self.thread_id == Some(thread_id) {
+                    if operation_index.is_some() {
+                        if let Some(entry) = self
+                            .transcript
+                            .iter_mut()
+                            .rev()
+                            .find(|entry| entry.runner_call_id().is_some())
+                        {
+                            entry.set_pending_approval(operation_index);
+                        }
+                    }
                     self.overlay = Overlay::Approval(Approval {
                         id: approval_id,
                         runner,
@@ -1510,11 +1562,7 @@ impl App {
                     self.activity = Some(Activity::Info("No checkpoints are available".to_owned()));
                 } else {
                     let checkpoint = checkpoints[0].clone();
-                    self.transcript = events
-                        .iter()
-                        .cloned()
-                        .filter_map(TranscriptEntry::from_event)
-                        .collect();
+                    self.transcript = transcript_from_events(&events);
                     self.events = events;
                     self.checkpoint = Some(checkpoint);
                     self.clear_selection();
@@ -1541,11 +1589,7 @@ impl App {
                 {
                     return Ok(());
                 }
-                self.transcript = events
-                    .iter()
-                    .cloned()
-                    .filter_map(TranscriptEntry::from_event)
-                    .collect();
+                self.transcript = transcript_from_events(&events);
                 self.events = events;
                 self.checkpoint = Some(checkpoint);
                 self.clear_selection();
@@ -1840,12 +1884,7 @@ pub(super) async fn load_transcript(
 ) -> Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)> {
     match request(endpoint, ControllerRequest::ThreadEvents { thread_id }).await? {
         ControllerResponse::ThreadEvents { events } => {
-            let mut transcript = Vec::new();
-            for event in events.iter().cloned() {
-                if let Some(item) = TranscriptEntry::from_event(event) {
-                    transcript.push(item);
-                }
-            }
+            let transcript = transcript_from_events(&events);
             Ok((transcript, events))
         }
         ControllerResponse::Error { message } => bail!("{message}"),

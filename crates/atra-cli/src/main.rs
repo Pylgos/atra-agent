@@ -804,6 +804,7 @@ async fn display_turn_stream(endpoint: &Path, request: ControllerRequest) -> Res
             | ControllerResponse::ReasoningSummaryPartAdded
             | ControllerResponse::ToolCallStarted { .. }
             | ControllerResponse::ToolCallDelta { .. }
+            | ControllerResponse::RunnerOperationUpdate { .. }
             | ControllerResponse::TurnEvent { .. } => {}
             ControllerResponse::ApprovalRequired {
                 approval_id,
@@ -1235,6 +1236,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::ThreadNotActive
         | ControllerResponse::ApprovalResolved
         | ControllerResponse::ApprovalRequired { .. }
+        | ControllerResponse::RunnerOperationUpdate { .. }
         | ControllerResponse::ThreadEvents { .. }
         | ControllerResponse::ThreadCheckpointCreated { .. }
         | ControllerResponse::ThreadCheckpointList { .. }

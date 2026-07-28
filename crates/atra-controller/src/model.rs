@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::storage::Event;
 use anyhow::Result;
-use atra_protocol::{Model, ThreadEvent};
+use atra_protocol::{Model, RunnerOperationUpdate, ThreadEvent};
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
 use serde::Deserialize;
@@ -56,6 +56,11 @@ pub(crate) enum ModelStreamEvent {
         arguments: serde_json::Value,
         operation_index: Option<usize>,
         operation_label: Option<String>,
+    },
+    RunnerOperationUpdate {
+        call_id: String,
+        operation_index: usize,
+        update: RunnerOperationUpdate,
     },
     ThreadEvent(ThreadEvent),
 }

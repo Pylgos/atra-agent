@@ -158,6 +158,11 @@ pub enum ControllerResponse {
         operation_index: Option<usize>,
         operation_label: Option<String>,
     },
+    RunnerOperationUpdate {
+        call_id: String,
+        operation_index: usize,
+        update: RunnerOperationUpdate,
+    },
     ThreadEvents {
         events: Vec<ThreadEvent>,
     },
@@ -205,6 +210,20 @@ pub enum ControllerResponse {
         email: Option<String>,
     },
     CodexLoggedOut,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunnerOperationUpdate {
+    CommandStarted,
+    WaitStarted,
+    CommandOutput {
+        content: String,
+        omitted_bytes: usize,
+    },
+    Completed {
+        artifact: Value,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

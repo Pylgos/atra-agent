@@ -85,6 +85,20 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
+            ControllerResponse::RunnerOperationUpdate {
+                call_id,
+                operation_index,
+                update,
+            } => {
+                updates
+                    .send(TurnUpdate::RunnerOperationUpdate {
+                        thread_id,
+                        call_id,
+                        operation_index,
+                        update,
+                    })
+                    .ok();
+            }
             response => return Ok(response),
         }
     }

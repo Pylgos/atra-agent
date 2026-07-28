@@ -30,6 +30,7 @@ pub(crate) async fn request(
             ControllerResponse::TurnDelta { .. }
             | ControllerResponse::ToolCallStarted { .. }
             | ControllerResponse::ToolCallDelta { .. }
+            | ControllerResponse::RunnerOperationUpdate { .. }
             | ControllerResponse::TurnEvent { .. } => {}
             response => return Ok(response),
         }

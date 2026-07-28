@@ -16,8 +16,8 @@ use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalPolicy, CommandEnvironment, CommandOutput, ControllerRequest, ControllerResponse,
-    Runner as RunnerInfo, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
-    RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
+    Runner as RunnerInfo, RunnerOperationUpdate, RunnerRequest, RunnerRequestEnvelope,
+    RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1334,7 +1334,8 @@ impl State {
                         let runner = operation.runner().to_owned();
                         let operation_name = operation.name();
                         let result_label = operation.result_label();
-                        let approval_operation = ApprovalOperation {
+                        let operation_context = OperationContext {
+                            call_id: call_id.clone(),
                             index: operation_index,
                             label: result_label.clone(),
                         };
@@ -1343,7 +1344,7 @@ impl State {
                                 thread_id,
                                 operation_name,
                                 operation.into_arguments(),
-                                Some(&approval_operation),
+                                Some(&operation_context),
                                 updates,
                             )
                             .await?;
@@ -1356,7 +1357,7 @@ impl State {
                             "Operation {} [{runner}] {result_label}:\n{}",
                             operation_index, result
                         ));
-                        artifacts.push(json!({
+                        let artifact = json!({
                             "kind": "runner_operation",
                             "data": {
                                 "operation": operation_index,
@@ -1365,7 +1366,15 @@ impl State {
                                 "result": result,
                                 "artifacts": outcome.artifacts,
                             },
-                        }));
+                        });
+                        send_operation_update(
+                            Some(&operation_context),
+                            updates,
+                            RunnerOperationUpdate::Completed {
+                                artifact: artifact.clone(),
+                            },
+                        )?;
+                        artifacts.push(artifact);
                     }
                     self.save_tool_result(
                         thread_id,
@@ -1414,7 +1423,7 @@ impl State {
         thread_id: i64,
         name: &str,
         arguments: ToolArguments,
-        operation: Option<&ApprovalOperation>,
+        operation: Option<&OperationContext>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ToolOutcome> {
         let runner = self.runner(arguments.runner()).await?;
@@ -1468,7 +1477,8 @@ impl State {
             None => None,
         };
         let result = if allowed {
-            self.execute(thread_id, arguments).await?
+            self.execute(thread_id, arguments, operation, updates)
+                .await?
         } else {
             let reason = decision.and_then(|decision| decision.reason);
             let output = match reason {
@@ -1499,7 +1509,13 @@ impl State {
         Ok(ControllerResponse::ApprovalResolved)
     }
 
-    async fn execute(&self, thread_id: i64, arguments: ToolArguments) -> Result<ToolOutcome> {
+    async fn execute(
+        &self,
+        thread_id: i64,
+        arguments: ToolArguments,
+        operation: Option<&OperationContext>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ToolOutcome> {
         match arguments {
             ToolArguments::ExecCommand(arguments) => {
                 let runner_name = arguments.runner.clone();
@@ -1545,6 +1561,11 @@ impl State {
                     };
                     *process = Some((Arc::clone(&runner), process_handle.clone()));
                     drop(process);
+                    send_operation_update(
+                        operation,
+                        updates,
+                        RunnerOperationUpdate::CommandStarted,
+                    )?;
                     let deadline = arguments
                         .timeout_ms
                         .map(|timeout| Instant::now() + std::time::Duration::from_millis(timeout));
@@ -1566,6 +1587,14 @@ impl State {
                             .await?
                         {
                             RunnerResponse::ProcessRunning { output, .. } => {
+                                send_operation_update(
+                                    operation,
+                                    updates,
+                                    RunnerOperationUpdate::CommandOutput {
+                                        content: output.content.clone(),
+                                        omitted_bytes: output.omitted_bytes,
+                                    },
+                                )?;
                                 append_command_output(&mut collected, output);
                                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                                     break match arguments.timeout_action {
@@ -1701,18 +1730,56 @@ impl State {
                         arguments.process_id
                     )));
                 };
-                let response = self
-                    .runner(&arguments.runner)
-                    .await?
-                    .request_raw(RunnerRequest::WaitProcess {
-                        process_handle,
-                        timeout_ms: arguments.timeout_ms,
-                    })
-                    .await?;
+                let runner = self.runner(&arguments.runner).await?;
+                send_operation_update(operation, updates, RunnerOperationUpdate::WaitStarted)?;
+                let deadline =
+                    Instant::now() + std::time::Duration::from_millis(arguments.timeout_ms);
+                let mut collected = None;
+                let response = loop {
+                    let timeout_ms = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(1000)
+                        .try_into()
+                        .unwrap_or(1000);
+                    match runner
+                        .request_raw(RunnerRequest::WaitProcess {
+                            process_handle: process_handle.clone(),
+                            timeout_ms,
+                        })
+                        .await?
+                    {
+                        RunnerResponse::ProcessRunning { output, .. } => {
+                            send_operation_update(
+                                operation,
+                                updates,
+                                RunnerOperationUpdate::CommandOutput {
+                                    content: output.content.clone(),
+                                    omitted_bytes: output.omitted_bytes,
+                                },
+                            )?;
+                            append_command_output(&mut collected, output);
+                            if Instant::now() >= deadline {
+                                break RunnerResponse::ProcessRunning {
+                                    process_handle,
+                                    output: collected.take().unwrap(),
+                                };
+                            }
+                        }
+                        RunnerResponse::ProcessFinished { output, exit_code } => {
+                            append_command_output(&mut collected, output);
+                            break RunnerResponse::ProcessFinished {
+                                output: collected.take().unwrap(),
+                                exit_code,
+                            };
+                        }
+                        response => break response,
+                    }
+                };
                 let response = match response {
                     RunnerResponse::ProcessRunning { output, .. } => {
                         RunnerResponse::ProcessRunning {
-                            process_handle: arguments.process_id,
+                            process_handle: arguments.process_id.clone(),
                             output,
                         }
                     }
@@ -1720,7 +1787,7 @@ impl State {
                         self.processes.lock().await.remove(&ProcessKey {
                             thread_id,
                             runner: runner_name.clone(),
-                            process_id: arguments.process_id,
+                            process_id: arguments.process_id.clone(),
                         });
                         response
                     }
@@ -2281,9 +2348,28 @@ struct ApprovalDecision {
     reason: Option<String>,
 }
 
-struct ApprovalOperation {
+struct OperationContext {
+    call_id: String,
     index: usize,
     label: String,
+}
+
+fn send_operation_update(
+    operation: Option<&OperationContext>,
+    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    update: RunnerOperationUpdate,
+) -> Result<()> {
+    if let Some(operation) = operation {
+        updates
+            .context("runner operation update requires a streaming turn")?
+            .send(ModelStreamEvent::RunnerOperationUpdate {
+                call_id: operation.call_id.clone(),
+                operation_index: operation.index,
+                update,
+            })
+            .context("turn stream closed during runner operation")?;
+    }
+    Ok(())
 }
 
 fn return_running() -> TimeoutAction {

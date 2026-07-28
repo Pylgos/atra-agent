@@ -97,6 +97,15 @@ async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) 
             operation_index,
             operation_label,
         },
+        ModelStreamEvent::RunnerOperationUpdate {
+            call_id,
+            operation_index,
+            update,
+        } => ControllerResponse::RunnerOperationUpdate {
+            call_id,
+            operation_index,
+            update,
+        },
         ModelStreamEvent::ThreadEvent(event) => ControllerResponse::TurnEvent { event },
     };
     write_response(stream, &response).await

@@ -1,4 +1,6 @@
-use atra_protocol::ThreadEvent;
+use std::collections::BTreeMap;
+
+use atra_protocol::{RunnerOperationUpdate, ThreadEvent};
 use ratatui::text::Line;
 
 mod render;
@@ -29,6 +31,13 @@ pub(crate) enum TranscriptItem {
         name: String,
         arguments: Option<serde_json::Value>,
     },
+    RunnerTool {
+        call_id: String,
+        input: String,
+        results: BTreeMap<usize, RunnerResult>,
+        pending_approval: Option<usize>,
+        masked: bool,
+    },
     ToolResult {
         artifacts: Vec<ToolArtifact>,
         masked: bool,
@@ -40,6 +49,22 @@ pub(crate) enum TranscriptItem {
 pub(crate) struct ToolArtifact {
     pub(crate) kind: String,
     pub(crate) data: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub(crate) enum RunnerResult {
+    Running {
+        activity: RunnerActivity,
+        output: String,
+        omitted_bytes: usize,
+    },
+    Completed(ToolArtifact),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RunnerActivity {
+    Running,
+    Waiting,
 }
 
 impl TranscriptItem {
@@ -58,6 +83,7 @@ impl TranscriptItem {
 
     pub(crate) fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
+            || matches!(self, Self::RunnerTool { results, .. } if !results.is_empty())
     }
 
     pub(crate) fn is_user_message(&self) -> bool {
@@ -123,15 +149,108 @@ impl TranscriptEntry {
     }
 
     pub(crate) fn append_tool_input(&mut self, content: &str) {
-        let TranscriptItem::ToolCall { arguments, .. } = &mut self.item else {
-            unreachable!();
-        };
-        match arguments {
-            Some(serde_json::Value::String(input)) => input.push_str(content),
-            None => *arguments = Some(serde_json::Value::String(content.to_owned())),
-            Some(_) => unreachable!(),
+        match &mut self.item {
+            TranscriptItem::RunnerTool { input, .. } => input.push_str(content),
+            TranscriptItem::ToolCall { arguments, .. } => match arguments {
+                Some(serde_json::Value::String(input)) => input.push_str(content),
+                None => *arguments = Some(serde_json::Value::String(content.to_owned())),
+                Some(_) => unreachable!(),
+            },
+            _ => unreachable!(),
         }
         self.rendered = None;
+    }
+
+    pub(crate) fn update_runner_operation(
+        &mut self,
+        call_id: &str,
+        operation_index: usize,
+        update: RunnerOperationUpdate,
+    ) -> bool {
+        let TranscriptItem::RunnerTool {
+            call_id: entry_call_id,
+            results,
+            ..
+        } = &mut self.item
+        else {
+            return false;
+        };
+        if entry_call_id != call_id {
+            return false;
+        }
+        match update {
+            RunnerOperationUpdate::CommandStarted => {
+                results.insert(
+                    operation_index,
+                    RunnerResult::Running {
+                        activity: RunnerActivity::Running,
+                        output: String::new(),
+                        omitted_bytes: 0,
+                    },
+                );
+            }
+            RunnerOperationUpdate::WaitStarted => {
+                results.insert(
+                    operation_index,
+                    RunnerResult::Running {
+                        activity: RunnerActivity::Waiting,
+                        output: String::new(),
+                        omitted_bytes: 0,
+                    },
+                );
+            }
+            RunnerOperationUpdate::CommandOutput {
+                content,
+                omitted_bytes,
+            } => {
+                let result =
+                    results
+                        .entry(operation_index)
+                        .or_insert_with(|| RunnerResult::Running {
+                            activity: RunnerActivity::Running,
+                            output: String::new(),
+                            omitted_bytes: 0,
+                        });
+                let RunnerResult::Running {
+                    activity: _,
+                    output,
+                    omitted_bytes: total_omitted,
+                } = result
+                else {
+                    return true;
+                };
+                output.push_str(&sanitize(&content));
+                *total_omitted += omitted_bytes;
+                truncate_live_output(output, total_omitted);
+            }
+            RunnerOperationUpdate::Completed { artifact } => {
+                let Some(artifact) = tool_artifact(artifact) else {
+                    return true;
+                };
+                results.insert(operation_index, RunnerResult::Completed(artifact));
+            }
+        }
+        self.rendered = None;
+        true
+    }
+
+    pub(crate) fn set_pending_approval(&mut self, operation: Option<usize>) -> bool {
+        let TranscriptItem::RunnerTool {
+            pending_approval, ..
+        } = &mut self.item
+        else {
+            return false;
+        };
+        *pending_approval = operation;
+        self.rendered = None;
+        true
+    }
+
+    pub(crate) fn runner_call_id(&self) -> Option<&str> {
+        match &self.item {
+            TranscriptItem::RunnerTool { call_id, .. } => Some(call_id),
+            _ => None,
+        }
     }
 
     pub(crate) fn replace(&mut self, item: TranscriptItem) {
@@ -213,16 +332,32 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     .unwrap_or(serde_json::Value::Null),
             ),
         }),
-        "tool_call" => Some(TranscriptItem::ToolCall {
-            name: sanitize(event.payload.get("name")?.as_str()?),
-            arguments: Some(sanitize_value(
+        "tool_call" => {
+            let name = sanitize(event.payload.get("name")?.as_str()?);
+            let arguments = sanitize_value(
                 event
                     .payload
                     .get("input")
                     .cloned()
                     .or_else(|| event.payload.get("arguments").cloned())?,
-            )),
-        }),
+            );
+            if name == "runner"
+                && let serde_json::Value::String(input) = arguments
+            {
+                Some(TranscriptItem::RunnerTool {
+                    call_id: sanitize(event.payload.get("call_id")?.as_str()?),
+                    input,
+                    results: BTreeMap::new(),
+                    pending_approval: None,
+                    masked: false,
+                })
+            } else {
+                Some(TranscriptItem::ToolCall {
+                    name,
+                    arguments: Some(arguments),
+                })
+            }
+        }
         "tool_result" => {
             let masked = event
                 .payload
@@ -247,6 +382,105 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
         "compaction" => Some(TranscriptItem::Compaction),
         _ => None,
     }
+}
+
+pub(crate) fn merge_runner_tool_result(
+    transcript: &mut [TranscriptEntry],
+    event: &ThreadEvent,
+) -> bool {
+    if event.kind != "tool_result"
+        || event.payload.get("name").and_then(|name| name.as_str()) != Some("runner")
+    {
+        return false;
+    }
+    let Some(call_id) = event
+        .payload
+        .get("call_id")
+        .and_then(|call_id| call_id.as_str())
+    else {
+        return false;
+    };
+    let Some(entry) = transcript.iter_mut().rev().find(|entry| {
+        matches!(
+            &entry.item,
+            TranscriptItem::RunnerTool {
+                call_id: entry_call_id,
+                ..
+            } if entry_call_id == call_id
+        )
+    }) else {
+        return false;
+    };
+    let TranscriptItem::RunnerTool {
+        results, masked, ..
+    } = &mut entry.item
+    else {
+        unreachable!();
+    };
+    for artifact in event.payload["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| tool_artifact(artifact.clone()))
+    {
+        if artifact.kind == "runner_operation"
+            && let Some(operation) = artifact.data["operation"].as_u64()
+        {
+            results.insert(operation as usize, RunnerResult::Completed(artifact));
+        }
+    }
+    *masked = event
+        .payload
+        .get("masked_result")
+        .is_some_and(|masked| Some(masked) != event.payload.get("result"));
+    entry.rendered = None;
+    true
+}
+
+pub(crate) fn transcript_from_events(events: &[ThreadEvent]) -> Vec<TranscriptEntry> {
+    let mut transcript = Vec::new();
+    for event in events {
+        if merge_runner_tool_result(&mut transcript, event) {
+            continue;
+        }
+        if let Some(entry) = TranscriptEntry::from_event(event.clone()) {
+            transcript.push(entry);
+        }
+    }
+    transcript
+}
+
+fn tool_artifact(artifact: serde_json::Value) -> Option<ToolArtifact> {
+    Some(ToolArtifact {
+        kind: sanitize(artifact.get("kind")?.as_str()?),
+        data: sanitize_value(artifact.get("data")?.clone()),
+    })
+}
+
+fn truncate_live_output(output: &mut String, omitted_bytes: &mut usize) {
+    const MAX_LIVE_OUTPUT_BYTES: usize = 40_000;
+    if output.len() <= MAX_LIVE_OUTPUT_BYTES {
+        return;
+    }
+    let head_end = char_boundary_at_or_before(output, MAX_LIVE_OUTPUT_BYTES / 2);
+    let tail_start =
+        char_boundary_at_or_after(output, output.len() - MAX_LIVE_OUTPUT_BYTES / 2).max(head_end);
+    *omitted_bytes += tail_start - head_end;
+    output.replace_range(head_end..tail_start, "");
+}
+
+fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn char_boundary_at_or_after(value: &str, mut index: usize) -> usize {
+    while !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn sanitize_value(value: serde_json::Value) -> serde_json::Value {

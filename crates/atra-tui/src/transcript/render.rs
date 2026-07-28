@@ -20,7 +20,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     layout::{MappedRow, TranscriptLayout},
-    transcript::{Author, DisplayedLine, RenderedItem, TranscriptEntry, TranscriptItem},
+    transcript::{
+        Author, DisplayedLine, RenderedItem, RunnerActivity, RunnerResult, TranscriptEntry,
+        TranscriptItem,
+    },
 };
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -246,7 +249,7 @@ pub(crate) fn prepare_transcript(
     }
 }
 
-fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> Vec<DisplayedLine> {
+fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Vec<DisplayedLine> {
     let content_width = usize::from(width.saturating_sub(2)).max(1);
     if let TranscriptItem::Message { author, text } = item {
         let background = (*author == Author::User).then_some(Color::DarkGray);
@@ -304,6 +307,13 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
     let mut logical_lines = match item {
         TranscriptItem::WebSearch { action } => web_search_lines(action),
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
+        TranscriptItem::RunnerTool {
+            input,
+            results,
+            pending_approval,
+            masked,
+            ..
+        } => runner_tool_lines(input, results, *pending_approval, *masked, expanded),
         TranscriptItem::ToolResult { artifacts, masked } => {
             let mut lines = (*masked)
                 .then(|| {
@@ -316,18 +326,20 @@ fn displayed_item_lines(item: &TranscriptItem, _expanded: bool, width: u16) -> V
                     )]
                 })
                 .unwrap_or_default();
-            lines.extend(
+            lines.extend(fold_result_lines(
                 artifacts
                     .iter()
                     .filter_map(|artifact| match artifact.kind.as_str() {
                         "runner_operation" => runner_operation_lines(&artifact.data),
-                        "command_execution" => command_execution_lines(&artifact.data),
+                        "command_execution" => command_execution_lines(&artifact.data, false),
                         "patch_operations" => patch_operation_lines(&artifact.data),
                         "runner_list" => runner_list_lines(&artifact.data),
                         _ => None,
                     })
-                    .flatten(),
-            );
+                    .flatten()
+                    .collect(),
+                expanded,
+            ));
             lines
         }
         TranscriptItem::Compaction => {
@@ -365,7 +377,9 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         } => Style::default().fg(Color::Cyan),
         TranscriptItem::ReasoningSummary { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::WebSearch { .. } => Style::default().fg(Color::Blue),
-        TranscriptItem::ToolCall { .. } => Style::default().fg(Color::Yellow),
+        TranscriptItem::ToolCall { .. } | TranscriptItem::RunnerTool { .. } => {
+            Style::default().fg(Color::Yellow)
+        }
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::Compaction => Style::default().fg(Color::DarkGray),
     };
@@ -417,6 +431,10 @@ fn tool_call_lines(
             arguments
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default(),
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+            false,
         ),
         "exec_command" => {
             let runner = object
@@ -487,7 +505,13 @@ fn tool_call_lines(
     }
 }
 
-fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
+fn runner_tool_lines(
+    input: &str,
+    results: &std::collections::BTreeMap<usize, RunnerResult>,
+    pending_approval: Option<usize>,
+    masked: bool,
+    expanded: bool,
+) -> Vec<(Option<char>, Line<'static>)> {
     let input = input.lines().collect::<Vec<_>>();
     let mut index = 0;
     let mut operation = 0;
@@ -513,9 +537,11 @@ fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
             } else {
                 "Command".to_owned()
             };
-            lines.push((
-                Some('◆'),
-                Line::from(format!("Operation {operation} · {label}")),
+            lines.push(runner_operation_header(
+                '◆',
+                operation,
+                &label,
+                pending_approval == Some(operation),
             ));
             index += 1;
             let end = input[index..]
@@ -529,25 +555,30 @@ fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
                     .map(|(index, line)| ((index == 0).then_some('$'), line)),
             );
             index = (end + 1).min(input.len());
+            append_runner_result(&mut lines, results.get(&operation), expanded);
         } else if let Some(process) = input[index].strip_prefix("*** Wait ") {
             let (process_id, timeout) = process.split_once(' ').unwrap_or((process, ""));
             operation += 1;
             separate_operation(&mut lines, operation);
-            lines.push((
-                Some('…'),
-                Line::from(format!(
-                    "Operation {operation} · Wait {process_id} {timeout}"
-                )),
+            lines.push(runner_operation_header(
+                '…',
+                operation,
+                &format!("Wait {process_id} {timeout}"),
+                pending_approval == Some(operation),
             ));
             index += 1;
+            append_runner_result(&mut lines, results.get(&operation), expanded);
         } else if let Some(process_id) = input[index].strip_prefix("*** Stop ") {
             operation += 1;
             separate_operation(&mut lines, operation);
-            lines.push((
-                Some('■'),
-                Line::from(format!("Operation {operation} · Stop {process_id}")),
+            lines.push(runner_operation_header(
+                '■',
+                operation,
+                &format!("Stop {process_id}"),
+                pending_approval == Some(operation),
             ));
             index += 1;
+            append_runner_result(&mut lines, results.get(&operation), expanded);
         } else if input[index] == "*** Patch" {
             operation += 1;
             separate_operation(&mut lines, operation);
@@ -556,9 +587,11 @@ fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
                 .iter()
                 .position(|line| *line == "*** End")
                 .map_or(input.len(), |offset| index + offset);
-            lines.push((
-                Some('±'),
-                Line::from(format!("Operation {operation} · Patch")),
+            lines.push(runner_operation_header(
+                '±',
+                operation,
+                "Patch",
+                pending_approval == Some(operation),
             ));
             lines.extend(
                 patch_lines(&input[index..end].join("\n"))
@@ -566,11 +599,126 @@ fn runner_tool_lines(input: &str) -> Vec<(Option<char>, Line<'static>)> {
                     .map(|line| (None, line)),
             );
             index = (end + 1).min(input.len());
+            append_runner_result(&mut lines, results.get(&operation), expanded);
         } else {
             index += 1;
         }
     }
+    if masked {
+        lines.push((
+            Some('◇'),
+            Line::from(Span::styled(
+                "model context uses masked output",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ));
+    }
     lines
+}
+
+fn runner_operation_header(
+    marker: char,
+    operation: usize,
+    label: &str,
+    approval_required: bool,
+) -> (Option<char>, Line<'static>) {
+    let text = if approval_required {
+        format!("Operation {operation} · {label} · APPROVAL REQUIRED")
+    } else {
+        format!("Operation {operation} · {label}")
+    };
+    let style = if approval_required {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    (Some(marker), Line::from(Span::styled(text, style)))
+}
+
+fn append_runner_result(
+    lines: &mut Vec<(Option<char>, Line<'static>)>,
+    result: Option<&RunnerResult>,
+    expanded: bool,
+) {
+    let Some(result) = result else {
+        return;
+    };
+    let result_lines = match result {
+        RunnerResult::Running {
+            activity,
+            output,
+            omitted_bytes,
+        } => {
+            let status = (
+                Some('…'),
+                Line::from(Span::styled(
+                    match activity {
+                        RunnerActivity::Running => "running",
+                        RunnerActivity::Waiting => "waiting",
+                    },
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            );
+            let mut result_lines = output
+                .lines()
+                .map(|line| {
+                    (
+                        None,
+                        Line::from(Span::styled(
+                            line.to_owned(),
+                            Style::default().fg(Color::Gray),
+                        )),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if *omitted_bytes > 0 {
+                result_lines.push((
+                    None,
+                    Line::from(Span::styled(
+                        format!("… {omitted_bytes} output bytes omitted"),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ));
+            }
+            result_lines.push(status);
+            result_lines
+        }
+        RunnerResult::Completed(artifact) if artifact.kind == "runner_operation" => {
+            runner_operation_result_lines(&artifact.data).unwrap_or_default()
+        }
+        RunnerResult::Completed(_) => Vec::new(),
+    };
+    lines.extend(fold_result_lines(result_lines, expanded));
+}
+
+fn fold_result_lines(
+    lines: Vec<(Option<char>, Line<'static>)>,
+    expanded: bool,
+) -> Vec<(Option<char>, Line<'static>)> {
+    const COLLAPSED_ROWS: usize = 12;
+    const HEAD_ROWS: usize = 6;
+    const TAIL_ROWS: usize = 5;
+
+    if expanded || lines.len() <= COLLAPSED_ROWS {
+        return lines;
+    }
+    let hidden = lines.len() - HEAD_ROWS - TAIL_ROWS;
+    let mut folded = Vec::with_capacity(COLLAPSED_ROWS);
+    folded.extend(lines.iter().take(HEAD_ROWS).cloned());
+    folded.push((
+        Some('…'),
+        Line::from(Span::styled(
+            format!("{hidden} rows hidden · Enter to expand"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ));
+    folded.extend(lines.into_iter().skip(HEAD_ROWS + hidden));
+    folded
 }
 
 fn separate_operation(lines: &mut Vec<(Option<char>, Line<'static>)>, operation: usize) {
@@ -751,7 +899,10 @@ fn runner_list_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line
     )
 }
 
-fn command_execution_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
+fn command_execution_lines(
+    data: &serde_json::Value,
+    status_last: bool,
+) -> Option<Vec<(Option<char>, Line<'static>)>> {
     let command: CommandExecution = serde_json::from_value(data.clone()).ok()?;
     let (marker, label, style) = match command.state.as_str() {
         "started" => ('›', "started".to_owned(), Style::default().fg(Color::Cyan)),
@@ -780,19 +931,28 @@ fn command_execution_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>
         ),
         _ => return None,
     };
-    let mut lines = vec![(
+    let status = (
         Some(marker),
         Line::from(Span::styled(label, style.add_modifier(Modifier::BOLD))),
-    )];
-    lines.extend(command.output.lines().map(|output| {
-        (
-            None,
-            Line::from(Span::styled(
-                output.to_owned(),
-                Style::default().fg(Color::Gray),
-            )),
-        )
-    }));
+    );
+    let mut lines = command
+        .output
+        .lines()
+        .map(|output| {
+            (
+                None,
+                Line::from(Span::styled(
+                    output.to_owned(),
+                    Style::default().fg(Color::Gray),
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
+    if status_last {
+        lines.push(status);
+    } else {
+        lines.insert(0, status);
+    }
     Some(lines)
 }
 
@@ -814,10 +974,18 @@ fn runner_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>,
         )),
     ));
 
+    lines.extend(runner_operation_result_lines(data)?);
+    Some(lines)
+}
+
+fn runner_operation_result_lines(
+    data: &serde_json::Value,
+) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    let mut lines = Vec::new();
     let artifacts = data.get("artifacts")?.as_array()?;
     for artifact in artifacts {
         let rendered = match artifact.get("kind")?.as_str()? {
-            "command_execution" => command_execution_lines(artifact.get("data")?),
+            "command_execution" => command_execution_lines(artifact.get("data")?, true),
             "patch_operations" => patch_operation_lines(artifact.get("data")?),
             _ => None,
         };
