@@ -27,34 +27,28 @@ jobs:
         include:
           - runner: ubuntu-24.04
             architecture: x86_64
-            container_arch: amd64
             platform: x86_64-linux-static
           - runner: ubuntu-24.04-arm
             architecture: aarch64
-            container_arch: arm64
             platform: aarch64-linux-static
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      - run: rustup toolchain install 1.96.0 --profile minimal
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        with:
+          use-flakehub: false
       - name: Build Atra
-        env:
-          ATRA_BUILD_COMMIT: ${{ github.sha }}
-        run: cargo +1.96.0 build --locked --release -p atra-cli --bin atra
+        run: nix build --no-link --print-out-paths .#atra > atra-package
       - name: Package Atra
         run: |
           mkdir -p dist
-          tar -C target/release -czf "dist/atra-${{ matrix.architecture }}-linux.tar.gz" atra
-      - uses: docker/setup-buildx-action@v4
+          tar -C "$(cat atra-package)/bin" -czf "dist/atra-${{ matrix.architecture }}-linux.tar.gz" atra
       - name: Build platform bundle
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: tools/platform-bundle/Containerfile
-          platforms: linux/${{ matrix.container_arch }}
-          outputs: type=local,dest=platform-dist
-          cache-from: type=gha,scope=platform-${{ matrix.container_arch }}
-          cache-to: type=gha,mode=max,scope=platform-${{ matrix.container_arch }}
+        run: |
+          bundle=$(nix build --no-link --print-out-paths .#platform-bundle)
+          mkdir platform-dist
+          cp "$bundle"/* platform-dist/
       - run: mv platform-dist/* dist/
       - uses: actions/upload-artifact@v7
         with:

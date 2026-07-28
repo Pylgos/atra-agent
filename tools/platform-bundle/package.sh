@@ -2,6 +2,8 @@
 set -eu
 
 output=$1
+root=${2:-/opt/atra}
+platform=${3:-"$(uname -m)-linux-static"}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/blobs"
@@ -35,11 +37,11 @@ EOF
     )
 }
 
-add_object atra-runner /opt/atra/bin/atra-runner
+add_object atra-runner "$root/bin/atra-runner"
 runner_digest=$digest
 
 for name in bash fd jq rg tmux; do
-    add_object "$name" "/opt/atra/bin/$name"
+    add_object "$name" "$root/bin/$name"
     entries=$(jq \
         --arg path "bin/$name" \
         --arg object "$digest" \
@@ -51,7 +53,7 @@ EOF
 done
 
 jq -n \
-    --arg platform "$(uname -m)-linux-static" \
+    --arg platform "$platform" \
     --arg runner "$runner_digest" \
     --argjson entries "$entries" \
     --argjson objects "$objects" \
@@ -62,5 +64,6 @@ jq -n \
         objects: $objects
     }' >"$work/manifest.json"
 
+find "$work" -exec touch -h -d '@315532800' {} +
 mkdir -p "$(dirname "$output")"
-(cd "$work" && zip -q -0 -r "$output" manifest.json blobs)
+(cd "$work" && zip -q -X -0 -r "$output" manifest.json blobs)
