@@ -135,20 +135,6 @@ impl RunnerPool {
         Ok(())
     }
 
-    pub(super) async fn contains_process(&self, key: &ProcessKey) -> bool {
-        let Some(record) = self.process(key).await else {
-            return false;
-        };
-        let available = match self.get(&key.runner).await {
-            Ok(runner) => runner.client.status(record.handle).await.is_ok(),
-            Err(_) => false,
-        };
-        if !available {
-            self.remove_process(key).await;
-        }
-        available
-    }
-
     pub(super) async fn process(&self, key: &ProcessKey) -> Option<ProcessRecord> {
         self.processes.lock().await.get(key).cloned()
     }

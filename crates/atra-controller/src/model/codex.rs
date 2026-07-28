@@ -714,9 +714,9 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
 
                 Processes:
                 Use `*** Command` to wait up to 120000 milliseconds for a Bash command and leave it running if unfinished.
-                Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
                 End every command with `*** End`.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+                Use `atri proc spawn <process-id> '<command>'` in a foreground command to start a named managed process without waiting for it to finish.
                 Use `atri proc wait <process-id>... [--timeout <seconds>]` in a foreground command to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
                 Use `atri proc stop <process-id>...` in a foreground command to stop named processes.
                 These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
@@ -746,9 +746,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     runner: "*** Runner " name LF
                     operation: command
 
-                    command: foreground_command | background_command
-                    foreground_command: "*** Command" LF command_body
-                    background_command: "*** Background Command " process_id LF command_body
+                    command: "*** Command" LF command_body
                     command_body: command_item+ OPERATION_END
                     ?command_item: command_line | patch
                     command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF | LF
@@ -781,7 +779,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     remove_line: "-" /(.*)/ LF
 
                     TOOL_END: "*** Done"
-                    process_id: /[a-z][a-z0-9_-]{0,63}/
 
                     %import common.INT
                     %import common.LF

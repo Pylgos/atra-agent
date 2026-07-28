@@ -4,18 +4,9 @@ use super::*;
 pub(super) struct ExecCommandArguments {
     pub(super) runner: String,
     pub(super) command: String,
-    #[serde(flatten)]
-    pub(super) mode: ModelCommandMode,
 }
 
-#[derive(Deserialize, serde::Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub(super) enum ModelCommandMode {
-    Foreground { timeout_ms: u64 },
-    Background { process_id: ProcessId },
-}
-
-const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
+pub(super) const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
 
 impl ExecCommandArguments {
     pub(super) fn name(&self) -> &'static str {
@@ -27,12 +18,7 @@ impl ExecCommandArguments {
     }
 
     pub(super) fn result_label(&self) -> String {
-        match &self.mode {
-            ModelCommandMode::Foreground { .. } => "Command".to_owned(),
-            ModelCommandMode::Background { process_id } => {
-                format!("Background Command {process_id}")
-            }
-        }
+        "Command".to_owned()
     }
 }
 
@@ -66,20 +52,7 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<ExecCommandArguments
             .context("runner input must start with '*** Runner <runner>'")?
             .clone();
         match lines[index] {
-            header if header == "*** Command" || header.starts_with("*** Background Command ") => {
-                let mode = if header == "*** Command" {
-                    ModelCommandMode::Foreground {
-                        timeout_ms: FOREGROUND_TIMEOUT_MS,
-                    }
-                } else {
-                    let process_id = &header["*** Background Command ".len()..];
-                    if !valid_process_id(process_id) {
-                        bail!("invalid background command process ID '{process_id}'");
-                    }
-                    ModelCommandMode::Background {
-                        process_id: ProcessId(process_id.to_owned()),
-                    }
-                };
+            "*** Command" => {
                 index += 1;
                 let end = lines[index..]
                     .iter()
@@ -92,7 +65,6 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<ExecCommandArguments
                 operations.push(ExecCommandArguments {
                     runner,
                     command: lines[index..end].join("\n"),
-                    mode,
                 });
                 group_operations += 1;
                 index = end + 1;
@@ -285,9 +257,6 @@ pub(super) fn command_artifact(
     runner: &str,
 ) -> CommandExecutionArtifact {
     match response {
-        CommandOutcome::Started { .. } => CommandExecutionArtifact::Started {
-            runner: runner.to_owned(),
-        },
         CommandOutcome::Running { output, .. } => CommandExecutionArtifact::Running {
             output: format_command_output(output),
             runner: runner.to_owned(),
@@ -306,9 +275,6 @@ pub(super) fn command_artifact(
 
 pub(super) fn format_command_response(runner: &str, response: CommandOutcome) -> String {
     match response {
-        CommandOutcome::Started { process_id } => {
-            format!("Process started with ID {process_id}")
-        }
         CommandOutcome::Running {
             process_id, output, ..
         } => append_process_status(

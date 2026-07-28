@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use atra_patch::ApplyPatchResult;
 use atra_protocol::{
     CommandOutput, ProcessHandle, ProcessStatus, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope,
+    RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
 };
 use atra_store::TreeManifest;
 use tokio::{
@@ -42,11 +42,13 @@ pub(super) enum WaitOutcome {
         process_handle: ProcessHandle,
         output: CommandOutput,
         patch_results: Vec<ApplyPatchResult>,
+        spawned_processes: Vec<SpawnedProcess>,
     },
     Finished {
         output: CommandOutput,
         exit_code: Option<i32>,
         patch_results: Vec<ApplyPatchResult>,
+        spawned_processes: Vec<SpawnedProcess>,
     },
 }
 
@@ -181,19 +183,23 @@ impl RunnerClient {
                 process_handle,
                 output,
                 patch_results,
+                spawned_processes,
             } => Ok(WaitOutcome::Running {
                 process_handle,
                 output,
                 patch_results,
+                spawned_processes,
             }),
             RunnerResponse::ProcessFinished {
                 output,
                 exit_code,
                 patch_results,
+                spawned_processes,
             } => Ok(WaitOutcome::Finished {
                 output,
                 exit_code,
                 patch_results,
+                spawned_processes,
             }),
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid wait_process response"),

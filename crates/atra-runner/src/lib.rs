@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
     CommandEnvironment, CommandOutput, ProcessHandle, ProcessStatus, RunnerRequest,
-    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
 };
 use atra_store::{PreparedTree, Store};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -160,11 +160,14 @@ async fn handle_request(
         } => {
             tracing::debug!(%command, "starting command");
             let process = processes
-                .start(command, environment, process_id, process_prefix)
+                .start(command, environment, process_id, process_prefix, None)
                 .await?;
             Ok(RunnerResponse::ProcessStarted {
                 process_handle: process.handle.clone(),
             })
+        }
+        RunnerRequest::SpawnProcess { .. } => {
+            bail!("processes can only be spawned through the Runner control socket")
         }
         RunnerRequest::ApplyPatch {
             process_handle,
@@ -229,6 +232,23 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
                 .await
         }
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
+        RunnerRequest::SpawnProcess {
+            parent_process_handle,
+            command,
+            cwd,
+            environment,
+            process_id,
+        } => {
+            processes
+                .spawn(
+                    &parent_process_handle,
+                    command,
+                    cwd,
+                    environment,
+                    process_id,
+                )
+                .await
+        }
         RunnerRequest::ApplyPatch {
             process_handle,
             cwd,
@@ -315,6 +335,7 @@ impl ProcessManager {
         environment: CommandEnvironment,
         process_id: atra_protocol::ProcessId,
         process_prefix: String,
+        cwd: Option<PathBuf>,
     ) -> Result<Arc<ManagedProcess>> {
         let handle = ProcessHandle(format!("{process_prefix}{process_id}"));
         let mut processes = self.processes.lock().await;
@@ -338,6 +359,9 @@ impl ProcessManager {
             .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
             .process_group(0)
             .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            child.current_dir(cwd);
+        }
         child.envs(&environment.set);
         if !environment.prepend_path.is_empty() || !environment.append_path.is_empty() {
             let base = environment
@@ -359,7 +383,7 @@ impl ProcessManager {
             );
         }
         child.env("ATRI_RUNNER_ENDPOINT", &self.control_endpoint);
-        child.env("ATRI_PROCESS_PREFIX", process_prefix);
+        child.env("ATRI_PROCESS_PREFIX", &process_prefix);
         child.env("ATRI_PROCESS_HANDLE", handle.as_ref());
         let child = child
             .spawn()
@@ -383,6 +407,8 @@ impl ProcessManager {
             output: Mutex::new(OutputBuffer::default()),
             output_tail: Mutex::new(TailBuffer::default()),
             patch_results: Mutex::new(Vec::new()),
+            spawned_processes: Mutex::new(Vec::new()),
+            process_prefix,
             patching: Mutex::new(()),
             full_output_path,
             output_closed: AtomicBool::new(false),
@@ -445,6 +471,34 @@ impl ProcessManager {
         Ok(process)
     }
 
+    async fn spawn(
+        &self,
+        parent_handle: &ProcessHandle,
+        command: String,
+        cwd: PathBuf,
+        environment: CommandEnvironment,
+        process_id: atra_protocol::ProcessId,
+    ) -> Result<RunnerResponse> {
+        let parent = self.process(parent_handle).await?;
+        let process = self
+            .start(
+                command.clone(),
+                environment,
+                process_id.clone(),
+                parent.process_prefix.clone(),
+                Some(cwd),
+            )
+            .await?;
+        parent.spawned_processes.lock().await.push(SpawnedProcess {
+            process_id,
+            process_handle: process.handle.clone(),
+            command,
+        });
+        Ok(RunnerResponse::ProcessStarted {
+            process_handle: process.handle.clone(),
+        })
+    }
+
     async fn wait(&self, handle: &ProcessHandle, timeout: Duration) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
         let deadline = Instant::now() + timeout;
@@ -459,6 +513,7 @@ impl ProcessManager {
                     output: output.finish(process.full_output_path.clone()),
                     exit_code,
                     patch_results: process.take_patch_results().await,
+                    spawned_processes: process.take_spawned_processes().await,
                 });
             }
             if !output.bytes.is_empty() || output.omitted_bytes != 0 || Instant::now() >= deadline {
@@ -466,6 +521,7 @@ impl ProcessManager {
                     process_handle: handle.clone(),
                     output: output.finish(process.full_output_path.clone()),
                     patch_results: process.take_patch_results().await,
+                    spawned_processes: process.take_spawned_processes().await,
                 });
             }
             tokio::select! {
@@ -568,6 +624,8 @@ struct ManagedProcess {
     output: Mutex<OutputBuffer>,
     output_tail: Mutex<TailBuffer>,
     patch_results: Mutex<Vec<atra_patch::ApplyPatchResult>>,
+    spawned_processes: Mutex<Vec<SpawnedProcess>>,
+    process_prefix: String,
     patching: Mutex<()>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
@@ -582,6 +640,10 @@ impl ManagedProcess {
 
     async fn take_patch_results(&self) -> Vec<atra_patch::ApplyPatchResult> {
         std::mem::take(&mut *self.patch_results.lock().await)
+    }
+
+    async fn take_spawned_processes(&self) -> Vec<SpawnedProcess> {
+        std::mem::take(&mut *self.spawned_processes.lock().await)
     }
 
     async fn exit_code(&self) -> Result<Option<Option<i32>>> {
@@ -735,6 +797,7 @@ mod tests {
                 CommandEnvironment::default(),
                 atra_protocol::ProcessId("process".to_owned()),
                 "test-".to_owned(),
+                None,
             )
             .await
             .unwrap();

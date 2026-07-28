@@ -654,6 +654,13 @@ pub struct CommandEnvironment {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct SpawnedProcess {
+    pub process_id: ProcessId,
+    pub process_handle: ProcessHandle,
+    pub command: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RunnerRequest {
     Initialize,
@@ -670,6 +677,13 @@ pub enum RunnerRequest {
         environment: CommandEnvironment,
         process_id: ProcessId,
         process_prefix: String,
+    },
+    SpawnProcess {
+        parent_process_handle: ProcessHandle,
+        command: String,
+        cwd: PathBuf,
+        environment: CommandEnvironment,
+        process_id: ProcessId,
     },
     ApplyPatch {
         process_handle: ProcessHandle,
@@ -710,11 +724,13 @@ pub enum RunnerResponse {
         process_handle: ProcessHandle,
         output: CommandOutput,
         patch_results: Vec<ApplyPatchResult>,
+        spawned_processes: Vec<SpawnedProcess>,
     },
     ProcessFinished {
         output: CommandOutput,
         exit_code: Option<i32>,
         patch_results: Vec<ApplyPatchResult>,
+        spawned_processes: Vec<SpawnedProcess>,
     },
     ProcessStopped {
         output: CommandOutput,

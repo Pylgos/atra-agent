@@ -8,9 +8,6 @@ pub(super) struct Runner {
 }
 
 pub(super) enum CommandOutcome {
-    Started {
-        process_id: ProcessId,
-    },
     Running {
         process_id: ProcessId,
         output: CommandOutput,

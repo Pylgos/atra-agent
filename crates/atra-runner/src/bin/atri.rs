@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_protocol::{
-    CommandOutput, ProcessHandle, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
-    RunnerResponseEnvelope,
+    CommandEnvironment, CommandOutput, ProcessHandle, ProcessId, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
 };
 use clap::{Parser, Subcommand};
 use tokio::{
@@ -42,6 +42,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProcCommand {
+    Spawn {
+        #[arg(value_parser = process_id)]
+        process: String,
+        #[arg(allow_hyphen_values = true)]
+        command: String,
+    },
     Wait {
         #[arg(required = true, value_parser = process_id)]
         processes: Vec<String>,
@@ -96,10 +102,42 @@ async fn run(cli: Cli) -> Result<bool> {
 }
 
 async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
+    if let ProcCommand::Spawn { process, command } = command {
+        let parent_process_handle = ProcessHandle(
+            env::var("ATRI_PROCESS_HANDLE")
+                .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
+        );
+        let cwd = env::current_dir().context("failed to determine the current directory")?;
+        let environment = CommandEnvironment {
+            set: env::vars().collect(),
+            ..CommandEnvironment::default()
+        };
+        return match request(
+            &endpoint,
+            RunnerRequest::SpawnProcess {
+                parent_process_handle,
+                command,
+                cwd,
+                environment,
+                process_id: ProcessId(process.clone()),
+            },
+        )
+        .await?
+        {
+            RunnerResponse::ProcessStarted { .. } => {
+                println!("Process started with ID {process}");
+                Ok(true)
+            }
+            RunnerResponse::Error { message } => bail!("{message}"),
+            _ => bail!("Runner returned an invalid spawn response"),
+        };
+    }
+
     let prefix = env::var("ATRI_PROCESS_PREFIX")
         .context("ATRI_PROCESS_PREFIX is not set; atri must run on an Atra Runner")?;
     let processes = match &command {
         ProcCommand::Wait { processes, .. } | ProcCommand::Stop { processes } => processes,
+        ProcCommand::Spawn { .. } => unreachable!(),
     };
     let mut unique = HashSet::new();
     if let Some(process) = processes
@@ -133,6 +171,7 @@ async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
                 .collect::<Vec<_>>();
             collect_results(tasks).await
         }
+        ProcCommand::Spawn { .. } => unreachable!(),
     };
 
     let success = results

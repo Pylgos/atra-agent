@@ -983,25 +983,87 @@ impl State {
         let command = arguments.command.clone();
         let started_at_ms = checkpoint_time_ms();
         let runner = self.runners.get(&arguments.runner).await?;
-        if let ModelCommandMode::Background { process_id } = &arguments.mode
-            && self
-                .runners
-                .contains_process(&ProcessKey {
-                    thread_id,
-                    runner: runner_name.clone(),
-                    process_id: process_id.clone(),
-                })
-                .await
-        {
-            return Ok(ToolOutcome::text(format!(
-                "Process ID '{process_id}' is already in use on Runner {runner_name}"
-            )));
-        }
-        let response = match arguments.mode {
-            ModelCommandMode::Background { process_id } => {
-                let process_handle = runner
-                    .start_command(arguments.command, thread_id, &process_id)
-                    .await?;
+        let active = self
+            .turns
+            .get(thread_id)
+            .await
+            .context("thread has no active turn")?;
+        let process_id = self
+            .runners
+            .generate_process_id(thread_id, &runner_name)
+            .await;
+        let process_handle = runner
+            .start_command(arguments.command, thread_id, &process_id)
+            .await?;
+        active
+            .set_process(Arc::clone(&runner), process_handle.clone())
+            .await;
+        send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(FOREGROUND_TIMEOUT_MS);
+        let mut collected = None;
+        let mut patch_results = Vec::new();
+        let response = loop {
+            let timeout_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(1000)
+                .try_into()
+                .unwrap_or(1000);
+            match runner.wait(process_handle.clone(), timeout_ms).await? {
+                WaitOutcome::Running {
+                    output,
+                    patch_results: result_patch_results,
+                    spawned_processes,
+                    ..
+                } => {
+                    self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
+                        .await;
+                    send_operation_update(
+                        operation,
+                        updates,
+                        RunnerOperationUpdate::CommandOutput {
+                            content: output.content.clone(),
+                            omitted_bytes: output.omitted_bytes,
+                        },
+                    )?;
+                    append_command_output(&mut collected, output);
+                    patch_results.extend(result_patch_results);
+                    if Instant::now() >= deadline {
+                        break WaitOutcome::Running {
+                            process_handle: process_handle.clone(),
+                            output: collected.take().unwrap(),
+                            patch_results,
+                            spawned_processes: Vec::new(),
+                        };
+                    }
+                }
+                WaitOutcome::Finished {
+                    output,
+                    exit_code,
+                    patch_results: result_patch_results,
+                    spawned_processes,
+                } => {
+                    self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
+                        .await;
+                    append_command_output(&mut collected, output);
+                    patch_results.extend(result_patch_results);
+                    break WaitOutcome::Finished {
+                        output: collected.take().unwrap(),
+                        exit_code,
+                        patch_results,
+                        spawned_processes: Vec::new(),
+                    };
+                }
+            }
+        };
+        active.clear_process().await;
+        let response = match response {
+            WaitOutcome::Running {
+                process_handle,
+                output,
+                patch_results,
+                ..
+            } => {
                 self.runners
                     .insert_process(
                         ProcessKey {
@@ -1016,112 +1078,22 @@ impl State {
                         },
                     )
                     .await;
-                CommandOutcome::Started { process_id }
-            }
-            ModelCommandMode::Foreground { timeout_ms } => {
-                let active = self
-                    .turns
-                    .get(thread_id)
-                    .await
-                    .context("thread has no active turn")?;
-                let process_id = self
-                    .runners
-                    .generate_process_id(thread_id, &runner_name)
-                    .await;
-                let process_handle = runner
-                    .start_command(arguments.command, thread_id, &process_id)
-                    .await?;
-                active
-                    .set_process(Arc::clone(&runner), process_handle.clone())
-                    .await;
-                send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted)?;
-                let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-                let mut collected = None;
-                let mut patch_results = Vec::new();
-                let response = loop {
-                    let timeout_ms = deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .min(1000)
-                        .try_into()
-                        .unwrap_or(1000);
-                    match runner.wait(process_handle.clone(), timeout_ms).await? {
-                        WaitOutcome::Running {
-                            output,
-                            patch_results: result_patch_results,
-                            ..
-                        } => {
-                            send_operation_update(
-                                operation,
-                                updates,
-                                RunnerOperationUpdate::CommandOutput {
-                                    content: output.content.clone(),
-                                    omitted_bytes: output.omitted_bytes,
-                                },
-                            )?;
-                            append_command_output(&mut collected, output);
-                            patch_results.extend(result_patch_results);
-                            if Instant::now() >= deadline {
-                                break WaitOutcome::Running {
-                                    process_handle: process_handle.clone(),
-                                    output: collected.take().unwrap(),
-                                    patch_results,
-                                };
-                            }
-                        }
-                        WaitOutcome::Finished {
-                            output,
-                            exit_code,
-                            patch_results: result_patch_results,
-                        } => {
-                            append_command_output(&mut collected, output);
-                            patch_results.extend(result_patch_results);
-                            break WaitOutcome::Finished {
-                                output: collected.take().unwrap(),
-                                exit_code,
-                                patch_results,
-                            };
-                        }
-                    }
-                };
-                active.clear_process().await;
-                match response {
-                    WaitOutcome::Running {
-                        process_handle,
-                        output,
-                        patch_results,
-                    } => {
-                        self.runners
-                            .insert_process(
-                                ProcessKey {
-                                    thread_id,
-                                    runner: runner_name.clone(),
-                                    process_id: process_id.clone(),
-                                },
-                                ProcessRecord {
-                                    handle: process_handle,
-                                    command: command.clone(),
-                                    started_at_ms,
-                                },
-                            )
-                            .await;
-                        CommandOutcome::Running {
-                            process_id,
-                            output,
-                            patch_results,
-                        }
-                    }
-                    WaitOutcome::Finished {
-                        output,
-                        exit_code,
-                        patch_results,
-                    } => CommandOutcome::Finished {
-                        output,
-                        exit_code,
-                        patch_results,
-                    },
+                CommandOutcome::Running {
+                    process_id,
+                    output,
+                    patch_results,
                 }
             }
+            WaitOutcome::Finished {
+                output,
+                exit_code,
+                patch_results,
+                ..
+            } => CommandOutcome::Finished {
+                output,
+                exit_code,
+                patch_results,
+            },
         };
         let artifact = command_artifact(&response, &runner_name);
         let mut artifacts = vec![ToolArtifact::CommandExecution(artifact)];
@@ -1133,7 +1105,6 @@ impl State {
                     .cloned()
                     .map(ToolArtifact::PatchOperations),
             ),
-            CommandOutcome::Started { .. } => {}
         }
         Ok(ToolOutcome {
             result: serde_json::Value::String(format_command_response(&runner_name, response)),

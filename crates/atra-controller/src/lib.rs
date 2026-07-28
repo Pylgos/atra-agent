@@ -17,8 +17,8 @@ use atra_protocol::{
     CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
     ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
     RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
-    RunnersEvent, ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent, ToolArtifact,
-    ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
+    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent,
+    ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -444,13 +444,26 @@ impl State {
                     .wait(record.handle, timeout_ms)
                     .await?
                 {
-                    WaitOutcome::Running { output, .. } => Ok(ControllerResponse::ProcessRunning {
-                        process_id,
-                        output: format_command_output(&output),
-                    }),
-                    WaitOutcome::Finished {
-                        output, exit_code, ..
+                    WaitOutcome::Running {
+                        output,
+                        spawned_processes,
+                        ..
                     } => {
+                        self.register_spawned_processes(thread_id, &runner, spawned_processes)
+                            .await;
+                        Ok(ControllerResponse::ProcessRunning {
+                            process_id,
+                            output: format_command_output(&output),
+                        })
+                    }
+                    WaitOutcome::Finished {
+                        output,
+                        exit_code,
+                        spawned_processes,
+                        ..
+                    } => {
+                        self.register_spawned_processes(thread_id, &runner, spawned_processes)
+                            .await;
                         self.runners.remove_process(&key).await;
                         Ok(ControllerResponse::ProcessFinished {
                             output: format_command_output(&output),
@@ -529,7 +542,13 @@ impl State {
                     .unwrap_or(1000)
             });
             match runner.wait(process_handle.clone(), timeout_ms).await? {
-                WaitOutcome::Running { output, .. } => {
+                WaitOutcome::Running {
+                    output,
+                    spawned_processes,
+                    ..
+                } => {
+                    self.register_spawned_processes(thread_id, runner_name, spawned_processes)
+                        .await;
                     append_command_output(&mut collected, output);
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         self.runners
@@ -553,8 +572,13 @@ impl State {
                     }
                 }
                 WaitOutcome::Finished {
-                    output, exit_code, ..
+                    output,
+                    exit_code,
+                    spawned_processes,
+                    ..
                 } => {
+                    self.register_spawned_processes(thread_id, runner_name, spawned_processes)
+                        .await;
                     append_command_output(&mut collected, output);
                     let output = collected.take().unwrap();
                     tracing::info!(
@@ -568,6 +592,30 @@ impl State {
                     });
                 }
             }
+        }
+    }
+
+    async fn register_spawned_processes(
+        &self,
+        thread_id: ThreadId,
+        runner: &str,
+        spawned_processes: Vec<SpawnedProcess>,
+    ) {
+        for process in spawned_processes {
+            self.runners
+                .insert_process(
+                    ProcessKey {
+                        thread_id,
+                        runner: runner.to_owned(),
+                        process_id: process.process_id,
+                    },
+                    ProcessRecord {
+                        handle: process.process_handle,
+                        command: process.command,
+                        started_at_ms: checkpoint_time_ms(),
+                    },
+                )
+                .await;
         }
     }
 

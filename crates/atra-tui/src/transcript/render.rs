@@ -495,21 +495,13 @@ fn runner_tool_lines(
             }
             lines.push((Some('┌'), Line::from(runner.to_owned())));
             index += 1;
-        } else if input[index] == "*** Command"
-            || input[index].starts_with("*** Background Command ")
-        {
-            let header = input[index];
+        } else if input[index] == "*** Command" {
             operation += 1;
             separate_operation(&mut lines, operation);
-            let label = if let Some(process_id) = header.strip_prefix("*** Background Command ") {
-                format!("Background Command {process_id}")
-            } else {
-                "Command".to_owned()
-            };
             lines.push(runner_operation_header(
                 '◆',
                 operation,
-                &label,
+                "Command",
                 pending_approval == Some(operation),
             ));
             index += 1;
