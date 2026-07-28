@@ -523,7 +523,7 @@ fn logical_path(name: &str, relative: &Path) -> Result<String> {
 fn format_prompt(skills: &[Skill]) -> String {
     let mut lines = vec![
         "The following skills provide specialized instructions for specific tasks.".to_owned(),
-        "When a skill applies, read $ATRA_SKILLS/<name>/SKILL.md with exec_command. \
+        "When a skill applies, read $ATRA_SKILLS/<name>/SKILL.md with command. \
          $ATRA_SKILLS is available in every Runner; resolve relative references against the \
          directory containing SKILL.md."
             .to_owned(),

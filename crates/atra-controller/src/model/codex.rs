@@ -706,19 +706,18 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
         },
         {
             "type": "custom",
-            "name": "runner",
+            "name": "command",
             "description": indoc! {"
-                Execute one or more operations on named Atra Runners.
-                End the complete input with `*** Done` on its own line.
-                Start each group with `*** Runner <runner>`; repeat it to switch Runners.
+                Execute one or more Bash commands on named Atra Runners.
+                Start each command with `*** Runner <runner>`; repeat it to run another command or switch Runners.
+                A command ends at the next `*** Runner <runner>` line or the end of the tool input.
 
                 Processes:
-                Use `*** Command` to wait up to 120000 milliseconds for a Bash command and leave it running if unfinished.
-                End every command with `*** End`.
+                Each command waits up to 120000 milliseconds and is left running if unfinished.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
-                Use `atri proc spawn <process-id> '<command>'` in a foreground command to start a named managed process without waiting for it to finish.
-                Use `atri proc wait <process-id>... [--timeout <seconds>]` in a foreground command to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
-                Use `atri proc stop <process-id>...` in a foreground command to stop named processes.
+                Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
+                Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
+                Run `atri proc stop <process-id>...` to stop named processes.
                 These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
 
                 Patches:
@@ -732,25 +731,19 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 Use ordinary diff lines for small changes.
                 Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
 
-                Operations execute sequentially, and their results are returned together after all operations have finished.
+                Commands in one tool call execute sequentially, and their results are returned together after all commands have finished.
                 Use a separate tool call when a result is needed to decide the next operation.
             "},
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                // Give completion the same `***` prefix as another operation so the model can
-                // still choose to finish after it has started that common prefix.
                 "definition": indoc! {r#"
-                    start: runner_group+ TOOL_END LF?
-                    runner_group: runner operation+
+                    start: runner_group+
+                    runner_group: runner command_item+
                     runner: "*** Runner " name LF
-                    operation: command
 
-                    command: "*** Command" LF command_body
-                    command_body: command_item+ OPERATION_END
                     ?command_item: command_line | patch
-                    command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF | LF
-                    OPERATION_END: /\*\*\* End\r?\n/
+                    command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
 
                     patch: PATCH_BEGIN LF hunk+ PATCH_END LF
                     PATCH_BEGIN: "*** Begin Patch"
@@ -777,8 +770,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     range_start: "@ start " INT LF
                     range_end: "@ end " INT LF
                     remove_line: "-" /(.*)/ LF
-
-                    TOOL_END: "*** Done"
 
                     %import common.INT
                     %import common.LF
@@ -833,7 +824,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|tool| tool["name"] == "runner")
+                .any(|tool| tool["name"] == "command")
         );
     }
 }

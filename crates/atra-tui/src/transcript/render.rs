@@ -427,7 +427,7 @@ fn tool_call_lines(
 ) -> Vec<(Option<char>, Line<'static>)> {
     let object = arguments.and_then(serde_json::Value::as_object);
     match name {
-        "runner" => runner_tool_lines(
+        "command" => runner_tool_lines(
             arguments
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default(),
@@ -494,8 +494,6 @@ fn runner_tool_lines(
                 lines.push((None, Line::default()));
             }
             lines.push((Some('┌'), Line::from(runner.to_owned())));
-            index += 1;
-        } else if input[index] == "*** Command" {
             operation += 1;
             separate_operation(&mut lines, operation);
             lines.push(runner_operation_header(
@@ -507,7 +505,7 @@ fn runner_tool_lines(
             index += 1;
             let end = input[index..]
                 .iter()
-                .position(|line| *line == "*** End")
+                .position(|line| line.starts_with("*** Runner "))
                 .map_or(input.len(), |offset| index + offset);
             lines.extend(
                 bash_lines(&input[index..end].join("\n"))
@@ -515,7 +513,7 @@ fn runner_tool_lines(
                     .enumerate()
                     .map(|(index, line)| ((index == 0).then_some('$'), line)),
             );
-            index = (end + 1).min(input.len());
+            index = end;
             append_runner_result(&mut lines, results.get(&operation), expanded);
         } else {
             index += 1;

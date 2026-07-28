@@ -512,7 +512,7 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             };
             let name = sanitize(&name);
             let arguments = sanitize_value(arguments);
-            if name == "runner"
+            if name == "command"
                 && let serde_json::Value::String(input) = arguments
             {
                 Some(TranscriptItem::RunnerTool {
@@ -589,7 +589,7 @@ pub(crate) fn merge_runner_tool_result(
             ..
         } => (name, call_id, result, artifacts, masked_result),
     };
-    if name != "runner" {
+    if name != "command" {
         return false;
     }
     let Some(call_id) = call_id.as_deref() else {

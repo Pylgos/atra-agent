@@ -795,7 +795,7 @@ impl State {
                     call_id,
                 } => {
                     needs_follow_up = true;
-                    if name != "runner" {
+                    if name != "command" {
                         bail!("model requested unsupported custom tool {name}");
                     }
                     self.append_event(
@@ -813,7 +813,7 @@ impl State {
                     .context("failed to save tool call")?;
                     let mut results = Vec::new();
                     let mut artifacts = Vec::new();
-                    for (index, operation) in parse_runner_input(&input)?.into_iter().enumerate() {
+                    for (index, operation) in parse_command_input(&input)?.into_iter().enumerate() {
                         let operation_index = index + 1;
                         let runner = operation.runner().to_owned();
                         let operation_name = operation.name();

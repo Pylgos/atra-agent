@@ -123,9 +123,9 @@ fn markdown_and_patch_command_render_before_completion() {
                 .to_owned(),
         ),
         TranscriptEntry::new(TranscriptItem::ToolCall {
-            name: "runner".to_owned(),
+            name: "command".to_owned(),
             arguments: Some(serde_json::Value::String(
-                "*** Runner local\n*** Command\natri patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch\nPATCH\n*** End\n*** Done"
+                "*** Runner local\natri patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch\nPATCH"
                     .to_owned(),
             )),
         }),

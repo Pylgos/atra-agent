@@ -10,7 +10,7 @@ pub(super) const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
 
 impl ExecCommandArguments {
     pub(super) fn name(&self) -> &'static str {
-        "exec_command"
+        "command"
     }
 
     pub(super) fn runner(&self) -> &str {
@@ -22,63 +22,40 @@ impl ExecCommandArguments {
     }
 }
 
-pub(super) fn parse_runner_input(input: &str) -> Result<Vec<ExecCommandArguments>> {
+pub(super) fn parse_command_input(input: &str) -> Result<Vec<ExecCommandArguments>> {
     let lines = input.lines().collect::<Vec<_>>();
-    if lines.last() != Some(&"*** Done") {
-        bail!("runner input must end with '*** Done'");
-    }
-    let lines = &lines[..lines.len() - 1];
-    let mut index = 0;
     let mut runner = None;
-    let mut group_operations = 0;
+    let mut command_start = 0;
     let mut operations = Vec::new();
 
-    while index < lines.len() {
-        if let Some(name) = lines[index].strip_prefix("*** Runner ") {
-            if runner.is_some() && group_operations == 0 {
-                bail!("runner group must contain at least one operation");
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(name) = line.strip_prefix("*** Runner ") {
+            if let Some(runner) = runner.replace(name.to_owned()) {
+                if command_start == index {
+                    bail!("runner group must contain a command");
+                }
+                operations.push(ExecCommandArguments {
+                    runner,
+                    command: lines[command_start..index].join("\n"),
+                });
             }
             if name.is_empty() {
                 bail!("runner name cannot be empty");
             }
-            runner = Some(name.to_owned());
-            group_operations = 0;
-            index += 1;
-            continue;
-        }
-
-        let runner = runner
-            .as_ref()
-            .context("runner input must start with '*** Runner <runner>'")?
-            .clone();
-        match lines[index] {
-            "*** Command" => {
-                index += 1;
-                let end = lines[index..]
-                    .iter()
-                    .position(|line| *line == "*** End")
-                    .map(|offset| index + offset)
-                    .context("command must end with '*** End'")?;
-                if end == index {
-                    bail!("command cannot be empty");
-                }
-                operations.push(ExecCommandArguments {
-                    runner,
-                    command: lines[index..end].join("\n"),
-                });
-                group_operations += 1;
-                index = end + 1;
-            }
-            line => bail!("expected runner operation, got '{line}'"),
+            command_start = index + 1;
+        } else if runner.is_none() {
+            bail!("command input must start with '*** Runner <runner>'");
         }
     }
 
-    if runner.is_none() {
-        bail!("runner input must contain at least one runner group");
+    let runner = runner.context("command input must contain at least one runner group")?;
+    if command_start == lines.len() {
+        bail!("runner group must contain a command");
     }
-    if group_operations == 0 {
-        bail!("runner group must contain at least one operation");
-    }
+    operations.push(ExecCommandArguments {
+        runner,
+        command: lines[command_start..].join("\n"),
+    });
     Ok(operations)
 }
 
