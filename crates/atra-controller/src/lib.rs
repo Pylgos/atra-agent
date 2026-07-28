@@ -2332,6 +2332,10 @@ impl RunnerOperation {
 
 fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
     let lines = input.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"BEGIN") || lines.last() != Some(&"END") {
+        bail!("runner input must start with 'BEGIN' and end with 'END'");
+    }
+    let lines = &lines[1..lines.len() - 1];
     let mut index = 0;
     let mut runner = None;
     let mut group_operations = 0;

@@ -756,6 +756,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "name": "runner",
             "description": indoc! {"
                 Execute one or more operations on named Atra Runners.
+                Enclose the complete input with `BEGIN` and `END` on their own lines.
                 Start each group with `*** Runner <runner>`; repeat it to switch Runners.
 
                 Processes:
@@ -781,8 +782,11 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
+                // Requiring a textual END before the custom tool's special closing token
+                // discourages the model from continuing with unintended operations, notably
+                // repeated Waits, when it means to finish the tool call.
                 "definition": indoc! {r#"
-                    start: runner_group+
+                    start: "BEGIN" LF runner_group+ "END" LF?
                     runner_group: runner operation+
                     runner: "*** Runner " name LF
                     operation: command | patch | wait_process | stop_process
@@ -791,11 +795,11 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     foreground_command: "*** Command" LF command_body
                     background_command: "*** Background Command " process_id LF command_body
                     timed_command: "*** Timed Command " INT LF command_body
-                    command_body: command_line+ END
+                    command_body: command_line+ OPERATION_END
                     command_line: /(.+)/ LF | LF
-                    END: /\*\*\* End\r?\n/
+                    OPERATION_END: /\*\*\* End\r?\n/
 
-                    patch: "*** Patch" LF hunk+ END
+                    patch: "*** Patch" LF hunk+ OPERATION_END
                     hunk: add_hunk | delete_hunk | update_hunk
                     add_hunk: "*** Add File: " filename LF add_line+
                     delete_hunk: "*** Delete File: " filename LF
