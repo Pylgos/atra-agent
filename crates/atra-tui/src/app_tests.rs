@@ -5,6 +5,7 @@ use crate::transcript::{
     Author, ToolArtifact, TranscriptItem, TranscriptState, layout_transcript, prepare_transcript,
     sanitize, transcript_lines, transcript_text,
 };
+use crate::ui::preserve_transcript_viewport;
 use atra_protocol::CommandExecutionArtifact;
 use ratatui::{Terminal, layout::Rect, text::Line};
 
@@ -14,6 +15,21 @@ fn sanitizes_terminal_control_sequences() {
         sanitize("safe\x1b[31m red\x1b[0m\x1b]52;c;bad\x07\nnext"),
         "safe red\nnext"
     );
+}
+
+#[test]
+fn transcript_scroll_follows_new_content_from_bottom() {
+    assert_eq!(preserve_transcript_viewport(0, 20, 35), 0);
+}
+
+#[test]
+fn transcript_scroll_preserves_viewport_when_content_grows() {
+    assert_eq!(preserve_transcript_viewport(8, 20, 35), 23);
+}
+
+#[test]
+fn transcript_scroll_clamps_viewport_when_content_shrinks() {
+    assert_eq!(preserve_transcript_viewport(8, 20, 10), 0);
 }
 
 #[test]

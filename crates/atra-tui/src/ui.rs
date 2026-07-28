@@ -67,6 +67,20 @@ fn format_window_duration(minutes: i64) -> String {
     }
 }
 
+pub(crate) fn preserve_transcript_viewport(
+    current_scroll: usize,
+    previous_max_scroll: usize,
+    max_scroll: usize,
+) -> usize {
+    if current_scroll == 0 {
+        return 0;
+    }
+
+    let viewport_start =
+        previous_max_scroll.saturating_sub(current_scroll.min(previous_max_scroll));
+    max_scroll.saturating_sub(viewport_start.min(max_scroll))
+}
+
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         let input_height = if self.turn.approval().is_some() {
@@ -477,8 +491,12 @@ impl App {
         );
         let (content_length, item_ranges) = transcript_ranges(&self.transcript.entries);
         let max_scroll = content_length.saturating_sub(usize::from(inner.height));
+        self.view.transcript_scroll = preserve_transcript_viewport(
+            self.view.transcript_scroll,
+            self.layout.transcript_max_scroll,
+            max_scroll,
+        );
         self.layout.transcript_max_scroll = max_scroll;
-        self.view.transcript_scroll = self.view.transcript_scroll.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.view.transcript_scroll);
         let lines = transcript_lines(
             &self.transcript.entries,
