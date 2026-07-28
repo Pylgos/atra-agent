@@ -75,7 +75,7 @@
               ATRA_BUILD_COMMIT = self.rev;
             }
           );
-          atra = pkgs.runCommand "atra-${version}" { } ''
+          cli = pkgs.runCommand "atra-cli-${version}" { } ''
             mkdir -p "$out/bin"
             install -m755 ${binaries}/bin/atra "$out/bin/atra"
           '';
@@ -107,6 +107,12 @@
                   "$staging" \
                   "${platform}"
               '';
+          atra = pkgs.runCommand "atra-${version}" { } ''
+            mkdir -p "$out/bin" "$out/share"
+            install -m755 ${cli}/bin/atra "$out/bin/atra"
+            XDG_DATA_HOME="$out/share" ${cli}/bin/atra platform install \
+              ${platformBundle}/atra-platform-${platform}.zip
+          '';
         in
         {
           inherit atra runner;

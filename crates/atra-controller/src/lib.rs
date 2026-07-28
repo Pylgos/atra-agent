@@ -108,7 +108,12 @@ pub async fn codex_logout(auth_home: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<()> {
+pub async fn run(
+    endpoint: &Path,
+    database: &Path,
+    auth_home: &Path,
+    platform: Option<PlatformStore>,
+) -> Result<()> {
     let _ = set_default_originator("atra".to_owned());
     let workspace = env::current_dir().context("failed to determine controller workspace")?;
     let store = Store::open(database)
@@ -122,7 +127,7 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         Some(path) => Provider::fake(Path::new(&path))?,
         None => Provider::codex(auth_home.to_owned()).await,
     };
-    let platform = current_platform()?.map(Arc::new);
+    let platform = platform.map(Arc::new);
     let data_home = xdg::BaseDirectories::new()
         .get_data_home()
         .context("cannot determine the XDG data directory")?;
@@ -676,19 +681,6 @@ fn protocol_events(mut events: Vec<storage::Event>) -> Vec<ThreadEvent> {
         }
     }
     events.into_iter().map(protocol_event).collect()
-}
-
-fn current_platform() -> Result<Option<PlatformStore>> {
-    let platform = match env::consts::ARCH {
-        "x86_64" => "x86_64-linux-static",
-        "aarch64" => "aarch64-linux-static",
-        _ => return Ok(None),
-    };
-    let root = xdg::BaseDirectories::new()
-        .get_data_home()
-        .context("cannot determine the XDG data directory")?
-        .join("atra");
-    PlatformStore::load(root, platform)
 }
 
 struct SocketGuard<'a>(&'a Path);

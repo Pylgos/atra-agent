@@ -369,7 +369,13 @@ async fn run(command: Command) -> Result<()> {
             command: ControllerCommand::Run,
         } => {
             let database = workspace::database(&workspace_id)?;
-            atra_controller::run(&endpoint, &database, &codex_auth_home()?).await
+            atra_controller::run(
+                &endpoint,
+                &database,
+                &codex_auth_home()?,
+                platform::current_platform()?,
+            )
+            .await
         }
         Command::Controller {
             command: ControllerCommand::Status,

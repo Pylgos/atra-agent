@@ -55,7 +55,7 @@ pub(crate) async fn upload_runner(
     let binary = match binary_path {
         Some(path) => fs::read(&path)
             .with_context(|| format!("failed to read Runner binary {}", path.display()))?,
-        None => installed_platform()?
+        None => current_platform()?
             .context("no default platform is installed")?
             .runner()?,
     };
@@ -111,8 +111,19 @@ pub(crate) fn install(source: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn installed_platform() -> Result<Option<atra_platform::PlatformStore>> {
-    atra_platform::PlatformStore::load(data_directory()?, host_platform()?)
+pub(crate) fn current_platform() -> Result<Option<atra_platform::PlatformStore>> {
+    let platform = host_platform()?;
+    let executable = env::current_exe().context("failed to determine the atra executable path")?;
+    if let Some(root) = executable
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("share/atra"))
+        .filter(|root| root.is_dir())
+        && let Some(platform) = atra_platform::PlatformStore::load(root, platform)?
+    {
+        return Ok(Some(platform));
+    }
+    atra_platform::PlatformStore::load(data_directory()?, platform)
 }
 
 fn data_directory() -> Result<PathBuf> {
