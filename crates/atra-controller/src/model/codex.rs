@@ -18,7 +18,7 @@ use codex_login::{
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{
-    ContentItem, FunctionCallOutputPayload, MessagePhase, ResponseInputItem, ResponseItem,
+    ContentItem, FunctionCallOutputPayload, ResponseInputItem, ResponseItem,
 };
 use codex_protocol::openai_models::ModelVisibility;
 use futures_util::StreamExt;
@@ -29,12 +29,9 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 
 use atra_protocol::{Model, Runner};
 
-use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
+use super::{ModelCompletion, ModelStreamEvent, response_from_item};
 use crate::storage::Event;
-use atra_protocol::{
-    AssistantMessagePhase, InstructionEvent, RunnersEvent, ThreadEventData, ToolCallEvent,
-    ToolResultEvent,
-};
+use atra_protocol::{InstructionEvent, RunnersEvent, ThreadEventData, ToolResultEvent};
 
 const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
 
@@ -342,8 +339,8 @@ async fn read_completion(
     mut stream: ResponseStream,
     updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
 ) -> Result<ModelCompletion> {
-    let mut responses = Vec::new();
-    let mut reasoning = Vec::new();
+    let mut output = Vec::new();
+    let mut response_id = None;
     let mut token_usage = None;
     let mut rate_limits = Vec::new();
 
@@ -383,17 +380,14 @@ async fn read_completion(
                 }
             }
             ResponseEvent::OutputItemDone(item) => {
-                if matches!(item, ResponseItem::Reasoning { .. }) {
-                    reasoning.push(item);
-                } else if let Some(item_response) = response_from_item(item)? {
-                    responses.push(item_response);
-                }
+                output.push(item);
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id: id,
                 token_usage: usage,
                 ..
             } => {
+                response_id = Some(id);
                 token_usage = usage;
             }
             ResponseEvent::RateLimits(snapshot) => {
@@ -403,12 +397,20 @@ async fn read_completion(
         }
     }
 
-    if responses.is_empty() {
+    if !output
+        .iter()
+        .cloned()
+        .map(response_from_item)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .any(|response| !matches!(response, super::ModelResponse::Reasoning { .. }))
+    {
         anyhow::bail!("Codex response ended without an assistant message or tool call");
     }
     Ok(ModelCompletion {
-        responses,
-        reasoning,
+        output,
+        response_id,
         token_usage,
         rate_limits,
     })
@@ -530,6 +532,13 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
         })
         .unwrap_or_default();
     for event in events {
+        if let ThreadEventData::ModelOutput(event) = &event.data {
+            items.extend(
+                serde_json::from_value::<Vec<ResponseItem>>(event.output.clone())
+                    .context("stored model output contains invalid response items")?,
+            );
+            continue;
+        }
         let Some(item) = (|| {
             Some(match &event.data {
                 ThreadEventData::WorkspaceInstructions(instructions) => {
@@ -596,47 +605,6 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         phase: None,
                     })
                 }
-                ThreadEventData::AssistantMessage(message) => {
-                    ResponseItem::from(ResponseInputItem::Message {
-                        role: "assistant".to_owned(),
-                        content: vec![ContentItem::OutputText {
-                            text: message.content.clone(),
-                        }],
-                        phase: message.phase.map(|phase| match phase {
-                            AssistantMessagePhase::Commentary => MessagePhase::Commentary,
-                            AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
-                        }),
-                    })
-                }
-                ThreadEventData::WebSearch(event) => {
-                    serde_json::from_value(event.item.clone()).ok()?
-                }
-                ThreadEventData::ToolCall(ToolCallEvent::Custom {
-                    call_id,
-                    name,
-                    input,
-                    ..
-                }) => ResponseItem::CustomToolCall {
-                    id: None,
-                    status: Some("completed".to_owned()),
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    namespace: None,
-                    input: input.clone(),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-                ThreadEventData::ToolCall(ToolCallEvent::Function {
-                    name,
-                    arguments,
-                    call_id,
-                }) => ResponseItem::FunctionCall {
-                    id: None,
-                    name: name.clone(),
-                    namespace: None,
-                    arguments: arguments.to_string(),
-                    call_id: call_id.clone()?,
-                    internal_chat_message_metadata_passthrough: None,
-                },
                 ThreadEventData::ToolResult(ToolResultEvent::Custom { call_id, name, .. }) => {
                     ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
                         call_id: call_id.clone()?,
@@ -654,10 +622,12 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         )),
                     })
                 }
-                ThreadEventData::Reasoning(event) => {
-                    serde_json::from_value(event.item.clone()).ok()?
-                }
-                ThreadEventData::Compaction(_)
+                ThreadEventData::AssistantMessage(_)
+                | ThreadEventData::WebSearch(_)
+                | ThreadEventData::ToolCall(_)
+                | ThreadEventData::Reasoning(_)
+                | ThreadEventData::ModelOutput(_)
+                | ThreadEventData::Compaction(_)
                 | ThreadEventData::FrozenBoundary(_)
                 | ThreadEventData::ModelRequest(_)
                 | ThreadEventData::TokenUsage(_)
@@ -726,52 +696,6 @@ fn format_runners(runners: &[Runner]) -> String {
         ));
     }
     lines.join("\n")
-}
-
-fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
-    match item {
-        ResponseItem::Message { content, phase, .. } => {
-            let content = content
-                .into_iter()
-                .filter_map(|item| match item {
-                    ContentItem::OutputText { text } => Some(text),
-                    ContentItem::InputText { .. }
-                    | ContentItem::InputImage { .. }
-                    | ContentItem::InputAudio { .. } => None,
-                })
-                .collect::<String>();
-            let phase = phase.map(|phase| match phase {
-                MessagePhase::Commentary => AssistantMessagePhase::Commentary,
-                MessagePhase::FinalAnswer => AssistantMessagePhase::FinalAnswer,
-            });
-            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content, phase }))
-        }
-        ResponseItem::FunctionCall {
-            name,
-            arguments,
-            call_id,
-            ..
-        } => Ok(Some(ModelResponse::ToolCall {
-            name,
-            arguments: serde_json::from_str(&arguments)
-                .context("Codex returned invalid tool arguments")?,
-            call_id: Some(call_id),
-        })),
-        ResponseItem::CustomToolCall {
-            id,
-            name,
-            input,
-            call_id,
-            ..
-        } => Ok(Some(ModelResponse::CustomToolCall {
-            item_id: id.map(String::from),
-            name,
-            input,
-            call_id,
-        })),
-        item @ ResponseItem::WebSearchCall { .. } => Ok(Some(ModelResponse::WebSearch { item })),
-        _ => Ok(None),
-    }
 }
 
 fn tool_definitions() -> Result<ResponsesApiTools> {

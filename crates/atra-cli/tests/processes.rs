@@ -255,15 +255,17 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
+            "model_output",
             "tool_call",
             "tool_result",
             "model_request",
+            "model_output",
             "assistant_message"
         ]
     );
-    assert_eq!(tool_result(&events[5]), serde_json::json!("model-output"));
+    assert_eq!(tool_result(&events[6]), serde_json::json!("model-output"));
     assert_eq!(
-        match &events[7].data {
+        match &events[9].data {
             ThreadEventData::AssistantMessage(message) => message.content.as_str(),
             _ => panic!("expected assistant message"),
         },
@@ -280,14 +282,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
+            "model_output",
             "tool_call",
             "tool_result",
             "model_request",
+            "model_output",
             "assistant_message",
         ]
     );
     assert_eq!(
-        tool_result(&denied_events[5]),
+        tool_result(&denied_events[6]),
         serde_json::json!("user denied the tool call: not in this environment")
     );
     let allowed_events = system.events(allowed_thread).await;
@@ -301,14 +305,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
+            "model_output",
             "tool_call",
             "tool_result",
             "model_request",
+            "model_output",
             "assistant_message",
         ]
     );
     assert_eq!(
-        tool_result(&allowed_events[5]),
+        tool_result(&allowed_events[6]),
         serde_json::json!("approved-output")
     );
 }

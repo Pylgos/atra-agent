@@ -392,6 +392,7 @@ pub enum ThreadEventData {
     ToolResult(ToolResultEvent),
     FrozenBoundary(FrozenBoundaryEvent),
     Reasoning(ItemEvent),
+    ModelOutput(ModelOutputEvent),
     Compaction(CompactionEvent),
     ModelRequest(ModelRequestEvent),
     TokenUsage(TokenUsageEvent),
@@ -411,6 +412,7 @@ impl ThreadEventData {
             Self::ToolResult(_) => "tool_result",
             Self::FrozenBoundary(_) => "frozen_boundary",
             Self::Reasoning(_) => "reasoning",
+            Self::ModelOutput(_) => "model_output",
             Self::Compaction(_) => "compaction",
             Self::ModelRequest(_) => "model_request",
             Self::TokenUsage(_) => "token_usage",
@@ -466,6 +468,14 @@ pub enum AssistantMessagePhase {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ItemEvent {
     pub item: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ModelOutputEvent {
+    pub request_sequence: EventSequence,
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

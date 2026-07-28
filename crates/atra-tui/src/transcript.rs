@@ -577,6 +577,7 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
         | ThreadEventData::Skills(_)
         | ThreadEventData::Runners(_)
         | ThreadEventData::FrozenBoundary(_)
+        | ThreadEventData::ModelOutput(_)
         | ThreadEventData::ModelRequest(_)
         | ThreadEventData::TokenUsage(_)
         | ThreadEventData::RateLimits(_) => None,

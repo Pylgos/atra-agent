@@ -380,17 +380,18 @@ impl State {
                     &prompt_cache_key,
                 )
                 .await?;
-            for item in completion.reasoning {
-                self.store
-                    .append(
-                        thread_id,
-                        ThreadEventData::Reasoning(ItemEvent {
-                            item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
-                        }),
-                    )
-                    .await
-                    .context("failed to save encrypted reasoning")?;
-            }
+            self.store
+                .append(
+                    thread_id,
+                    ThreadEventData::ModelOutput(ModelOutputEvent {
+                        request_sequence,
+                        output: serde_json::to_value(&completion.output)
+                            .map_err(|error| anyhow!(error))?,
+                        response_id: completion.response_id,
+                    }),
+                )
+                .await
+                .context("failed to save model output")?;
             if let Some(usage) = completion.token_usage {
                 self.append_event(
                     thread_id,
@@ -417,8 +418,16 @@ impl State {
                 .context("failed to save rate limits")?;
             }
 
+            let responses = completion
+                .output
+                .into_iter()
+                .map(response_from_item)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
             if let Some(response) = self
-                .execute_model_responses(thread_id, completion.responses.into(), updates)
+                .execute_model_responses(thread_id, responses, updates)
                 .await?
             {
                 return Ok(response);
@@ -918,6 +927,17 @@ impl State {
                         updates,
                     )
                     .await?;
+                }
+                ModelResponse::Reasoning { item } => {
+                    self.store
+                        .append(
+                            thread_id,
+                            ThreadEventData::Reasoning(ItemEvent {
+                                item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
+                            }),
+                        )
+                        .await
+                        .context("failed to save reasoning projection")?;
                 }
             }
         }

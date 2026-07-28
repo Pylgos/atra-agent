@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::storage::Event;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use atra_protocol::{
     ApprovalId, AssistantMessagePhase, Model, RunnerOperationUpdate, ThreadEvent, ThreadId,
 };
-use codex_protocol::models::ResponseItem;
+use codex_protocol::models::{ContentItem, MessagePhase, ResponseItem};
 use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
 use serde::Deserialize;
 
@@ -38,6 +38,9 @@ pub(crate) enum ModelResponse {
         name: String,
         input: String,
         call_id: String,
+    },
+    Reasoning {
+        item: ResponseItem,
     },
 }
 
@@ -73,10 +76,57 @@ pub(crate) enum ModelStreamEvent {
 }
 
 pub(crate) struct ModelCompletion {
-    pub responses: Vec<ModelResponse>,
-    pub reasoning: Vec<ResponseItem>,
+    pub output: Vec<ResponseItem>,
+    pub response_id: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub rate_limits: Vec<RateLimitSnapshot>,
+}
+
+pub(crate) fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
+    match item {
+        ResponseItem::Message { content, phase, .. } => {
+            let content = content
+                .into_iter()
+                .filter_map(|item| match item {
+                    ContentItem::OutputText { text } => Some(text),
+                    ContentItem::InputText { .. }
+                    | ContentItem::InputImage { .. }
+                    | ContentItem::InputAudio { .. } => None,
+                })
+                .collect::<String>();
+            let phase = phase.map(|phase| match phase {
+                MessagePhase::Commentary => AssistantMessagePhase::Commentary,
+                MessagePhase::FinalAnswer => AssistantMessagePhase::FinalAnswer,
+            });
+            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content, phase }))
+        }
+        ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        } => Ok(Some(ModelResponse::ToolCall {
+            name,
+            arguments: serde_json::from_str(&arguments)
+                .context("Codex returned invalid tool arguments")?,
+            call_id: Some(call_id),
+        })),
+        ResponseItem::CustomToolCall {
+            id,
+            name,
+            input,
+            call_id,
+            ..
+        } => Ok(Some(ModelResponse::CustomToolCall {
+            item_id: id.map(String::from),
+            name,
+            input,
+            call_id,
+        })),
+        item @ ResponseItem::WebSearchCall { .. } => Ok(Some(ModelResponse::WebSearch { item })),
+        item @ ResponseItem::Reasoning { .. } => Ok(Some(ModelResponse::Reasoning { item })),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) enum Provider {

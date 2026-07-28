@@ -15,10 +15,10 @@ use atra_protocol::{
     ApprovalId, ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
     CommandExecutionArtifact, CommandMode, CommandOutput, CompactionEvent, ControllerResponse,
     CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
-    ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, RateLimitsEvent,
-    Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent,
-    ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent, ToolArtifact, ToolCallEvent,
-    ToolResultEvent, TurnRequest, UnaryRequest,
+    ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
+    RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
+    RunnersEvent, ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent, ToolArtifact,
+    ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -49,7 +49,7 @@ mod tools;
 mod turn;
 
 use lifecycle::{ApprovalDecision, TurnLifecycle};
-use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
+use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider, response_from_item};
 use runner::{CommandOutcome, Runner, RunnerConfig};
 use runner_client::{PrepareTreeResult, RunnerClient, WaitOutcome};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
