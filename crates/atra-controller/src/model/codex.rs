@@ -716,9 +716,10 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 Use `*** Command` to wait up to 120000 milliseconds for a Bash command and leave it running if unfinished.
                 Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
                 End every command with `*** End`.
-                Use `*** Wait <process-id>` to wait up to 120 seconds for more output or completion.
-                Use `*** Stop <process-id>` to stop a managed process.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+                Use `atri proc wait <process-id>... [--timeout <seconds>]` in a foreground command to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
+                Use `atri proc stop <process-id>...` in a foreground command to stop named processes.
+                These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
 
                 Patches:
                 Use `*** Patch` and `*** End` to add, update, delete, or move files.
@@ -740,7 +741,7 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     start: runner_group+ TOOL_END LF?
                     runner_group: runner operation+
                     runner: "*** Runner " name LF
-                    operation: command | patch | wait_process | stop_process
+                    operation: command | patch
 
                     command: foreground_command | background_command
                     foreground_command: "*** Command" LF command_body
@@ -773,8 +774,6 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     range_end: "@ end " INT LF
                     remove_line: "-" /(.*)/ LF
 
-                    wait_process: "*** Wait " process_id LF
-                    stop_process: "*** Stop " process_id LF
                     TOOL_END: "*** Done"
                     process_id: /[a-z][a-z0-9_-]{0,63}/
 

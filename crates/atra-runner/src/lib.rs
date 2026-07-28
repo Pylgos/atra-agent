@@ -25,7 +25,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::UnixStream,
+    net::{UnixListener, UnixStream},
     process::{Child, Command},
     sync::{Mutex, Notify, watch},
     time::{Instant, sleep, sleep_until, timeout},
@@ -66,6 +66,13 @@ async fn serve(
     .await?;
 
     let processes = Arc::new(ProcessManager::new()?);
+    let listener = UnixListener::bind(&processes.control_endpoint).with_context(|| {
+        format!(
+            "failed to bind Runner control socket {}",
+            processes.control_endpoint.display()
+        )
+    })?;
+    tokio::spawn(serve_control(listener, Arc::clone(&processes)));
     loop {
         line.clear();
         if reader
@@ -148,9 +155,13 @@ async fn handle_request(
         RunnerRequest::StartCommand {
             command,
             environment,
+            process_id,
+            process_prefix,
         } => {
             tracing::debug!(%command, "starting command");
-            let process = processes.start(command, environment).await?;
+            let process = processes
+                .start(command, environment, process_id, process_prefix)
+                .await?;
             Ok(RunnerResponse::ProcessStarted {
                 process_handle: process.handle.clone(),
             })
@@ -178,6 +189,65 @@ async fn handle_request(
         }
         RunnerRequest::ProcessStatus { process_handle } => processes.status(&process_handle).await,
     }
+}
+
+async fn serve_control(listener: UnixListener, processes: Arc<ProcessManager>) {
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(%error, "failed to accept Runner control connection");
+                return;
+            }
+        };
+        let processes = Arc::clone(&processes);
+        tokio::spawn(async move {
+            if let Err(error) = serve_control_connection(stream, &processes).await {
+                tracing::warn!(error = %format!("{error:#}"), "Runner control request failed");
+            }
+        });
+    }
+}
+
+async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    if reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read Runner control request")?
+        == 0
+    {
+        bail!("Runner control client disconnected before sending a request");
+    }
+    let envelope: RunnerRequestEnvelope =
+        serde_json::from_str(&line).context("failed to decode Runner control request")?;
+    let response = match envelope.request {
+        RunnerRequest::WaitProcess {
+            process_handle,
+            timeout_ms,
+        } => {
+            processes
+                .wait(&process_handle, Duration::from_millis(timeout_ms))
+                .await
+        }
+        RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
+        _ => bail!("unsupported Runner control request"),
+    }
+    .unwrap_or_else(|error| RunnerResponse::Error {
+        message: format!("{error:#}"),
+    });
+    let mut response = serde_json::to_vec(&RunnerResponseEnvelope {
+        request_id: envelope.request_id,
+        response,
+    })
+    .context("failed to encode Runner control response")?;
+    response.push(b'\n');
+    writer
+        .write_all(&response)
+        .await
+        .context("failed to write Runner control response")
 }
 
 async fn write_response(
@@ -223,14 +293,18 @@ fn runner_store() -> Result<Store> {
 struct ProcessManager {
     processes: Mutex<HashMap<ProcessHandle, Arc<ManagedProcess>>>,
     output_directory: tempfile::TempDir,
+    control_endpoint: PathBuf,
 }
 
 impl ProcessManager {
     fn new() -> Result<Self> {
+        let output_directory =
+            tempfile::tempdir().context("failed to create command output directory")?;
+        let control_endpoint = output_directory.path().join("control.sock");
         Ok(Self {
             processes: Mutex::new(HashMap::new()),
-            output_directory: tempfile::tempdir()
-                .context("failed to create command output directory")?,
+            output_directory,
+            control_endpoint,
         })
     }
 
@@ -238,7 +312,14 @@ impl ProcessManager {
         &self,
         command: String,
         environment: CommandEnvironment,
+        process_id: atra_protocol::ProcessId,
+        process_prefix: String,
     ) -> Result<Arc<ManagedProcess>> {
+        let handle = ProcessHandle(format!("{process_prefix}{process_id}"));
+        let mut processes = self.processes.lock().await;
+        if processes.contains_key(&handle) {
+            bail!("process handle {handle} is already managed by this runner");
+        }
         let (output_reader, output_writer) =
             StdUnixStream::pair().context("failed to create command output stream")?;
         output_reader
@@ -276,6 +357,8 @@ impl ProcessManager {
                 env::join_paths(paths).context("command PATH contains an invalid path")?,
             );
         }
+        child.env("ATRI_RUNNER_ENDPOINT", &self.control_endpoint);
+        child.env("ATRI_PROCESS_PREFIX", process_prefix);
         let child = child
             .spawn()
             .context("failed to execute command with bash")?;
@@ -287,13 +370,6 @@ impl ProcessManager {
                 .context("command PID is out of range")?,
         )
         .context("command PID was zero")?;
-        let mut processes = self.processes.lock().await;
-        let handle = loop {
-            let handle = ProcessHandle(atra_id::generate());
-            if !processes.contains_key(&handle) {
-                break handle;
-            }
-        };
         let full_output_path = self.output_directory.path().join(handle.as_ref());
         let full_output = std::fs::File::create(&full_output_path)
             .context("failed to create full command output file")?;
@@ -624,7 +700,12 @@ mod tests {
     async fn stop_does_not_wait_for_inherited_output_descriptors() {
         let processes = ProcessManager::new().unwrap();
         let process = processes
-            .start("setsid sleep 2 &".to_owned(), CommandEnvironment::default())
+            .start(
+                "setsid sleep 2 &".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("process".to_owned()),
+                "test-".to_owned(),
+            )
             .await
             .unwrap();
         sleep(Duration::from_millis(100)).await;

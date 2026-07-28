@@ -582,7 +582,6 @@ name = "atra-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "atra-id",
  "atra-patch",
  "atra-protocol",
  "atra-store",

@@ -238,17 +238,10 @@ pub(crate) enum TranscriptItem {
 #[derive(Clone)]
 pub(crate) enum RunnerResult {
     Running {
-        activity: RunnerActivity,
         output: String,
         omitted_bytes: usize,
     },
     Completed(ToolArtifact),
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum RunnerActivity {
-    Running,
-    Waiting,
 }
 
 impl TranscriptItem {
@@ -367,17 +360,6 @@ impl TranscriptEntry {
                 results.insert(
                     operation_index,
                     RunnerResult::Running {
-                        activity: RunnerActivity::Running,
-                        output: String::new(),
-                        omitted_bytes: 0,
-                    },
-                );
-            }
-            RunnerOperationUpdate::WaitStarted => {
-                results.insert(
-                    operation_index,
-                    RunnerResult::Running {
-                        activity: RunnerActivity::Waiting,
                         output: String::new(),
                         omitted_bytes: 0,
                     },
@@ -391,12 +373,10 @@ impl TranscriptEntry {
                     results
                         .entry(operation_index)
                         .or_insert_with(|| RunnerResult::Running {
-                            activity: RunnerActivity::Running,
                             output: String::new(),
                             omitted_bytes: 0,
                         });
                 let RunnerResult::Running {
-                    activity: _,
                     output,
                     omitted_bytes: total_omitted,
                 } = result

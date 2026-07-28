@@ -21,8 +21,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     layout::{MappedRow, TranscriptLayout},
     transcript::{
-        Author, DisplayedLine, RenderedItem, RunnerActivity, RunnerResult, TranscriptEntry,
-        TranscriptItem,
+        Author, DisplayedLine, RenderedItem, RunnerResult, TranscriptEntry, TranscriptItem,
     },
 };
 
@@ -476,14 +475,6 @@ fn tool_call_lines(
             lines
         }
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
-        "wait_process" => vec![(
-            Some('…'),
-            Line::from(format!("wait #{}", tool_argument(object, "process_handle"))),
-        )],
-        "stop_process" => vec![(
-            Some('■'),
-            Line::from(format!("stop #{}", tool_argument(object, "process_handle"))),
-        )],
         _ => {
             let mut lines = vec![(
                 Some('◆'),
@@ -554,29 +545,6 @@ fn runner_tool_lines(
             );
             index = (end + 1).min(input.len());
             append_runner_result(&mut lines, results.get(&operation), expanded);
-        } else if let Some(process) = input[index].strip_prefix("*** Wait ") {
-            let (process_id, timeout) = process.split_once(' ').unwrap_or((process, ""));
-            operation += 1;
-            separate_operation(&mut lines, operation);
-            lines.push(runner_operation_header(
-                '…',
-                operation,
-                &format!("Wait {process_id} {timeout}"),
-                pending_approval == Some(operation),
-            ));
-            index += 1;
-            append_runner_result(&mut lines, results.get(&operation), expanded);
-        } else if let Some(process_id) = input[index].strip_prefix("*** Stop ") {
-            operation += 1;
-            separate_operation(&mut lines, operation);
-            lines.push(runner_operation_header(
-                '■',
-                operation,
-                &format!("Stop {process_id}"),
-                pending_approval == Some(operation),
-            ));
-            index += 1;
-            append_runner_result(&mut lines, results.get(&operation), expanded);
         } else if input[index] == "*** Patch" {
             operation += 1;
             separate_operation(&mut lines, operation);
@@ -646,17 +614,13 @@ fn append_runner_result(
     };
     let result_lines = match result {
         RunnerResult::Running {
-            activity,
             output,
             omitted_bytes,
         } => {
             let status = (
                 Some('…'),
                 Line::from(Span::styled(
-                    match activity {
-                        RunnerActivity::Running => "running",
-                        RunnerActivity::Waiting => "waiting",
-                    },
+                    "running",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -883,12 +847,6 @@ fn command_execution_lines(
                 output.as_str(),
             )
         }
-        CommandExecutionArtifact::Stopped { output, .. } => (
-            '■',
-            "stopped".to_owned(),
-            Style::default().fg(Color::Yellow),
-            output.as_str(),
-        ),
     };
     let status = (
         Some(marker),
@@ -1204,16 +1162,6 @@ fn patch_lines(patch: &str) -> Vec<Line<'static>> {
             Line::from(Span::styled(line.to_owned(), style))
         })
         .collect()
-}
-
-fn tool_argument(
-    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
-    key: &str,
-) -> String {
-    arguments
-        .and_then(|arguments| arguments.get(key))
-        .map(format_tool_value)
-        .unwrap_or_default()
 }
 
 fn format_tool_value(value: &serde_json::Value) -> String {

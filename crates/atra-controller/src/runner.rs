@@ -19,9 +19,6 @@ pub(super) enum CommandOutcome {
         output: CommandOutput,
         exit_code: Option<i32>,
     },
-    Stopped {
-        output: CommandOutput,
-    },
 }
 
 pub(super) struct RunnerConfig {
@@ -118,9 +115,20 @@ impl Runner {
         })
     }
 
-    pub(super) async fn start_command(&self, command: String) -> Result<ProcessHandle> {
+    pub(super) async fn start_command(
+        &self,
+        command: String,
+        thread_id: ThreadId,
+        process_id: &ProcessId,
+    ) -> Result<ProcessHandle> {
+        let process_prefix = format!("thread-{thread_id}-");
         self.client
-            .start(command, self.environment.lock().await.clone())
+            .start(
+                command,
+                self.environment.lock().await.clone(),
+                process_id.clone(),
+                process_prefix,
+            )
             .await
     }
 

@@ -321,7 +321,6 @@ pub enum ControllerResponse {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunnerOperationUpdate {
     CommandStarted,
-    WaitStarted,
     CommandOutput {
         content: String,
         omitted_bytes: usize,
@@ -353,11 +352,6 @@ pub enum CommandExecutionArtifact {
     Finished {
         output: String,
         exit_code: Option<i32>,
-        runner: String,
-        full_output_path: PathBuf,
-    },
-    Stopped {
-        output: String,
         runner: String,
         full_output_path: PathBuf,
     },
@@ -674,6 +668,8 @@ pub enum RunnerRequest {
     StartCommand {
         command: String,
         environment: CommandEnvironment,
+        process_id: ProcessId,
+        process_prefix: String,
     },
     ApplyPatch {
         patch: String,

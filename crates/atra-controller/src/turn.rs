@@ -809,40 +809,6 @@ impl State {
                                 return Ok(Some(response));
                             }
                         }
-                        "wait_process" => {
-                            let arguments: WaitProcessArguments = serde_json::from_value(arguments)
-                                .context("model returned invalid wait_process arguments")?;
-                            if let Some(response) = self
-                                .route_tool(
-                                    thread_id,
-                                    name,
-                                    call_id,
-                                    ToolArguments::WaitProcess(arguments),
-                                    false,
-                                    updates,
-                                )
-                                .await?
-                            {
-                                return Ok(Some(response));
-                            }
-                        }
-                        "stop_process" => {
-                            let arguments: StopProcessArguments = serde_json::from_value(arguments)
-                                .context("model returned invalid stop_process arguments")?;
-                            if let Some(response) = self
-                                .route_tool(
-                                    thread_id,
-                                    name,
-                                    call_id,
-                                    ToolArguments::StopProcess(arguments),
-                                    false,
-                                    updates,
-                                )
-                                .await?
-                            {
-                                return Ok(Some(response));
-                            }
-                        }
                         _ => bail!("model requested unsupported tool {name}"),
                     }
                 }
@@ -1074,7 +1040,9 @@ impl State {
                 }
                 let response = match arguments.mode {
                     ModelCommandMode::Background { process_id } => {
-                        let process_handle = runner.start_command(arguments.command).await?;
+                        let process_handle = runner
+                            .start_command(arguments.command, thread_id, &process_id)
+                            .await?;
                         self.runners
                             .insert_process(
                                 ProcessKey {
@@ -1097,7 +1065,13 @@ impl State {
                             .get(thread_id)
                             .await
                             .context("thread has no active turn")?;
-                        let process_handle = runner.start_command(arguments.command).await?;
+                        let process_id = self
+                            .runners
+                            .generate_process_id(thread_id, &runner_name)
+                            .await;
+                        let process_handle = runner
+                            .start_command(arguments.command, thread_id, &process_id)
+                            .await?;
                         active
                             .set_process(Arc::clone(&runner), process_handle.clone())
                             .await;
@@ -1149,14 +1123,18 @@ impl State {
                                 process_handle,
                                 output,
                             } => {
-                                let process_id = self
-                                    .runners
-                                    .register_generated_process(
-                                        thread_id,
-                                        &runner_name,
-                                        process_handle,
-                                        command.clone(),
-                                        started_at_ms,
+                                self.runners
+                                    .insert_process(
+                                        ProcessKey {
+                                            thread_id,
+                                            runner: runner_name.clone(),
+                                            process_id: process_id.clone(),
+                                        },
+                                        ProcessRecord {
+                                            handle: process_handle,
+                                            command: command.clone(),
+                                            started_at_ms,
+                                        },
                                     )
                                     .await;
                                 CommandOutcome::Running { process_id, output }
@@ -1185,122 +1163,6 @@ impl State {
                 Ok(ToolOutcome::with_artifact(
                     output,
                     ToolArtifact::PatchOperations(result),
-                ))
-            }
-            ToolArguments::WaitProcess(arguments) => {
-                let runner_name = arguments.runner.clone();
-                let process_handle = self
-                    .runners
-                    .process(&ProcessKey {
-                        thread_id,
-                        runner: runner_name.clone(),
-                        process_id: arguments.process_id.clone(),
-                    })
-                    .await
-                    .map(|process| process.handle.clone());
-                let Some(process_handle) = process_handle else {
-                    return Ok(ToolOutcome::text(format!(
-                        "Process ID '{}' is not running on Runner {runner_name}",
-                        arguments.process_id
-                    )));
-                };
-                let runner = self.runners.get(&arguments.runner).await?;
-                send_operation_update(operation, updates, RunnerOperationUpdate::WaitStarted)?;
-                let deadline =
-                    Instant::now() + std::time::Duration::from_millis(arguments.timeout_ms);
-                let mut collected = None;
-                let response = loop {
-                    let timeout_ms = deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .min(1000)
-                        .try_into()
-                        .unwrap_or(1000);
-                    match runner.wait(process_handle.clone(), timeout_ms).await? {
-                        WaitOutcome::Running { output, .. } => {
-                            send_operation_update(
-                                operation,
-                                updates,
-                                RunnerOperationUpdate::CommandOutput {
-                                    content: output.content.clone(),
-                                    omitted_bytes: output.omitted_bytes,
-                                },
-                            )?;
-                            append_command_output(&mut collected, output);
-                            if Instant::now() >= deadline {
-                                break CommandOutcome::Running {
-                                    process_id: arguments.process_id.clone(),
-                                    output: collected.take().unwrap(),
-                                };
-                            }
-                        }
-                        WaitOutcome::Finished { output, exit_code } => {
-                            append_command_output(&mut collected, output);
-                            break CommandOutcome::Finished {
-                                output: collected.take().unwrap(),
-                                exit_code,
-                            };
-                        }
-                    }
-                };
-                let response = match response {
-                    CommandOutcome::Running { output, .. } => CommandOutcome::Running {
-                        process_id: arguments.process_id.clone(),
-                        output,
-                    },
-                    response @ CommandOutcome::Finished { .. } => {
-                        self.runners
-                            .remove_process(&ProcessKey {
-                                thread_id,
-                                runner: runner_name.clone(),
-                                process_id: arguments.process_id.clone(),
-                            })
-                            .await;
-                        response
-                    }
-                    response => response,
-                };
-                let artifact = command_artifact(&response, &runner_name);
-                Ok(ToolOutcome::with_artifact(
-                    format_command_response(&runner_name, response),
-                    ToolArtifact::CommandExecution(artifact),
-                ))
-            }
-            ToolArguments::StopProcess(arguments) => {
-                let runner_name = arguments.runner.clone();
-                let process_handle = self
-                    .runners
-                    .process(&ProcessKey {
-                        thread_id,
-                        runner: runner_name.clone(),
-                        process_id: arguments.process_id.clone(),
-                    })
-                    .await
-                    .map(|process| process.handle.clone());
-                let Some(process_handle) = process_handle else {
-                    return Ok(ToolOutcome::text(format!(
-                        "Process ID '{}' is not running on Runner {runner_name}",
-                        arguments.process_id
-                    )));
-                };
-                let response = self
-                    .runners
-                    .get(&arguments.runner)
-                    .await?
-                    .stop(process_handle)
-                    .await?;
-                self.runners
-                    .remove_process(&ProcessKey {
-                        thread_id,
-                        runner: runner_name.clone(),
-                        process_id: arguments.process_id,
-                    })
-                    .await;
-                let response = CommandOutcome::Stopped { output: response };
-                let artifact = command_artifact(&response, &runner_name);
-                Ok(ToolOutcome::with_artifact(
-                    format_command_response(&runner_name, response),
-                    ToolArtifact::CommandExecution(artifact),
                 ))
             }
         }

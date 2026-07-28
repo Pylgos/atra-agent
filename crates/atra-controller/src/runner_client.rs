@@ -145,11 +145,15 @@ impl RunnerClient {
         &self,
         command: String,
         environment: atra_protocol::CommandEnvironment,
+        process_id: atra_protocol::ProcessId,
+        process_prefix: String,
     ) -> Result<ProcessHandle> {
         match self
             .request_raw(RunnerRequest::StartCommand {
                 command,
                 environment,
+                process_id,
+                process_prefix,
             })
             .await?
         {

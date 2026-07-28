@@ -21,27 +21,11 @@ pub(super) struct ApplyPatchArguments {
     pub(super) patch: String,
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(super) struct WaitProcessArguments {
-    pub(super) runner: String,
-    pub(super) process_id: ProcessId,
-    pub(super) timeout_ms: u64,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub(super) struct StopProcessArguments {
-    pub(super) runner: String,
-    pub(super) process_id: ProcessId,
-}
-
 const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
-const WAIT_TIMEOUT_MS: u64 = 120_000;
 
 pub(super) enum RunnerOperation {
     Command(ExecCommandArguments),
     Patch(ApplyPatchArguments),
-    Wait(WaitProcessArguments),
-    Stop(StopProcessArguments),
 }
 
 impl RunnerOperation {
@@ -49,8 +33,6 @@ impl RunnerOperation {
         match self {
             Self::Command(_) => "exec_command",
             Self::Patch(_) => "apply_patch",
-            Self::Wait(_) => "wait_process",
-            Self::Stop(_) => "stop_process",
         }
     }
 
@@ -58,8 +40,6 @@ impl RunnerOperation {
         match self {
             Self::Command(arguments) => &arguments.runner,
             Self::Patch(arguments) => &arguments.runner,
-            Self::Wait(arguments) => &arguments.runner,
-            Self::Stop(arguments) => &arguments.runner,
         }
     }
 
@@ -72,8 +52,6 @@ impl RunnerOperation {
                 }
             },
             Self::Patch(_) => "Patch".to_owned(),
-            Self::Wait(arguments) => format!("Wait {}", arguments.process_id),
-            Self::Stop(arguments) => format!("Stop {}", arguments.process_id),
         }
     }
 
@@ -81,8 +59,6 @@ impl RunnerOperation {
         match self {
             Self::Command(arguments) => ToolArguments::ExecCommand(arguments),
             Self::Patch(arguments) => ToolArguments::ApplyPatch(arguments),
-            Self::Wait(arguments) => ToolArguments::WaitProcess(arguments),
-            Self::Stop(arguments) => ToolArguments::StopProcess(arguments),
         }
     }
 }
@@ -148,31 +124,6 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
                 group_operations += 1;
                 index = end + 1;
             }
-            header if header.starts_with("*** Wait ") => {
-                let process_id = &header["*** Wait ".len()..];
-                if !valid_process_id(process_id) {
-                    bail!("invalid wait process ID '{process_id}'");
-                }
-                operations.push(RunnerOperation::Wait(WaitProcessArguments {
-                    runner,
-                    process_id: ProcessId(process_id.to_owned()),
-                    timeout_ms: WAIT_TIMEOUT_MS,
-                }));
-                group_operations += 1;
-                index += 1;
-            }
-            header if header.starts_with("*** Stop ") => {
-                let process_id = &header["*** Stop ".len()..];
-                if !valid_process_id(process_id) {
-                    bail!("invalid stop process ID '{process_id}'");
-                }
-                operations.push(RunnerOperation::Stop(StopProcessArguments {
-                    runner,
-                    process_id: ProcessId(process_id.to_owned()),
-                }));
-                group_operations += 1;
-                index += 1;
-            }
             "*** Patch" => {
                 index += 1;
                 let end = lines[index..]
@@ -220,8 +171,6 @@ pub(super) fn valid_process_id(process_id: &str) -> bool {
 pub(super) enum ToolArguments {
     ExecCommand(ExecCommandArguments),
     ApplyPatch(ApplyPatchArguments),
-    WaitProcess(WaitProcessArguments),
-    StopProcess(StopProcessArguments),
 }
 
 pub(super) struct ToolOutcome {
@@ -250,8 +199,6 @@ impl ToolArguments {
         match self {
             Self::ExecCommand(arguments) => &arguments.runner,
             Self::ApplyPatch(arguments) => &arguments.runner,
-            Self::WaitProcess(arguments) => &arguments.runner,
-            Self::StopProcess(arguments) => &arguments.runner,
         }
     }
 
@@ -422,16 +369,6 @@ pub(super) fn masked_command_result(command: &CommandExecutionArtifact) -> Optio
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
         ),
-        CommandExecutionArtifact::Stopped {
-            output,
-            runner,
-            full_output_path,
-        } => (
-            output,
-            runner,
-            full_output_path,
-            "Process stopped".to_owned(),
-        ),
     };
     if output.is_empty() {
         return None;
@@ -489,11 +426,6 @@ pub(super) fn command_artifact(
             runner: runner.to_owned(),
             full_output_path: output.full_output_path.clone(),
         },
-        CommandOutcome::Stopped { output } => CommandExecutionArtifact::Stopped {
-            output: format_command_output(output),
-            runner: runner.to_owned(),
-            full_output_path: output.full_output_path.clone(),
-        },
     }
 }
 
@@ -526,9 +458,6 @@ pub(super) fn format_command_response(runner: &str, response: CommandOutcome) ->
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
         ),
-        CommandOutcome::Stopped { output } => {
-            append_process_status(model_command_output(&output, runner), "Process stopped")
-        }
     }
 }
 

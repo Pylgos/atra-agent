@@ -136,7 +136,17 @@ impl RunnerPool {
     }
 
     pub(super) async fn contains_process(&self, key: &ProcessKey) -> bool {
-        self.processes.lock().await.contains_key(key)
+        let Some(record) = self.process(key).await else {
+            return false;
+        };
+        let available = match self.get(&key.runner).await {
+            Ok(runner) => runner.client.status(record.handle).await.is_ok(),
+            Err(_) => false,
+        };
+        if !available {
+            self.remove_process(key).await;
+        }
+        available
     }
 
     pub(super) async fn process(&self, key: &ProcessKey) -> Option<ProcessRecord> {
@@ -151,15 +161,8 @@ impl RunnerPool {
         self.processes.lock().await.remove(key);
     }
 
-    pub(super) async fn register_generated_process(
-        &self,
-        thread_id: ThreadId,
-        runner: &str,
-        handle: ProcessHandle,
-        command: String,
-        started_at_ms: i64,
-    ) -> ProcessId {
-        let mut processes = self.processes.lock().await;
+    pub(super) async fn generate_process_id(&self, thread_id: ThreadId, runner: &str) -> ProcessId {
+        let processes = self.processes.lock().await;
         loop {
             let process_id = ProcessId(atra_id::generate().replace(' ', "-"));
             let key = ProcessKey {
@@ -168,14 +171,6 @@ impl RunnerPool {
                 process_id: process_id.clone(),
             };
             if crate::valid_process_id(process_id.as_ref()) && !processes.contains_key(&key) {
-                processes.insert(
-                    key,
-                    ProcessRecord {
-                        handle,
-                        command,
-                        started_at_ms,
-                    },
-                );
                 return process_id;
             }
         }
@@ -191,8 +186,13 @@ impl RunnerPool {
             .map(|(key, record)| (key.clone(), record.clone()))
             .collect::<Vec<_>>();
         let mut processes = Vec::with_capacity(records.len());
+        let mut unavailable = Vec::new();
         for (key, record) in records {
             let status = self.process_status(&key, &record).await;
+            if matches!(status, ProcessStatus::Unavailable { .. }) {
+                unavailable.push(key);
+                continue;
+            }
             processes.push(BackgroundProcess {
                 runner: key.runner,
                 process_id: key.process_id,
@@ -201,6 +201,11 @@ impl RunnerPool {
                 status,
             });
         }
+        let mut records = self.processes.lock().await;
+        for key in unavailable {
+            records.remove(&key);
+        }
+        drop(records);
         processes.sort_by(|left, right| {
             left.started_at_ms
                 .cmp(&right.started_at_ms)

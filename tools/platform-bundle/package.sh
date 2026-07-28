@@ -40,7 +40,7 @@ EOF
 add_object atra-runner "$root/bin/atra-runner"
 runner_digest=$digest
 
-for name in bash fd jq rg tmux; do
+for name in atri bash fd jq rg tmux; do
     add_object "$name" "$root/bin/$name"
     entries=$(jq \
         --arg path "bin/$name" \

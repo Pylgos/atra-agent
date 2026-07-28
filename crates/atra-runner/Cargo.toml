@@ -9,9 +9,12 @@ rust-version.workspace = true
 name = "atra-runner"
 path = "src/main.rs"
 
+[[bin]]
+name = "atri"
+path = "src/bin/atri.rs"
+
 [dependencies]
 anyhow.workspace = true
-atra-id.workspace = true
 atra-patch.workspace = true
 atra-protocol.workspace = true
 atra-store.workspace = true

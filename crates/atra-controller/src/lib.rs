@@ -486,16 +486,26 @@ impl State {
         mode: CommandMode,
     ) -> Result<ControllerResponse> {
         let started_at_ms = checkpoint_time_ms();
-        let process_handle = runner.start_command(command.clone()).await?;
+        let process_id = self
+            .runners
+            .generate_process_id(thread_id, runner_name)
+            .await;
+        let process_handle = runner
+            .start_command(command.clone(), thread_id, &process_id)
+            .await?;
         if mode == CommandMode::Background {
-            let process_id = self
-                .runners
-                .register_generated_process(
-                    thread_id,
-                    runner_name,
-                    process_handle,
-                    command,
-                    started_at_ms,
+            self.runners
+                .insert_process(
+                    ProcessKey {
+                        thread_id,
+                        runner: runner_name.to_owned(),
+                        process_id: process_id.clone(),
+                    },
+                    ProcessRecord {
+                        handle: process_handle,
+                        command,
+                        started_at_ms,
+                    },
                 )
                 .await;
             return Ok(ControllerResponse::ProcessStarted { process_id });
@@ -520,14 +530,18 @@ impl State {
                 WaitOutcome::Running { output, .. } => {
                     append_command_output(&mut collected, output);
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        let process_id = self
-                            .runners
-                            .register_generated_process(
-                                thread_id,
-                                runner_name,
-                                process_handle,
-                                command,
-                                started_at_ms,
+                        self.runners
+                            .insert_process(
+                                ProcessKey {
+                                    thread_id,
+                                    runner: runner_name.to_owned(),
+                                    process_id: process_id.clone(),
+                                },
+                                ProcessRecord {
+                                    handle: process_handle,
+                                    command,
+                                    started_at_ms,
+                                },
                             )
                             .await;
                         return Ok(ControllerResponse::ProcessRunning {

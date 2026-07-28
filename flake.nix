@@ -60,7 +60,7 @@
             src = cargoSource;
             inherit cargoVendorDir;
             strictDeps = true;
-            cargoExtraArgs = "-p atra-cli -p atra-runner --bin atra --bin atra-runner";
+            cargoExtraArgs = "-p atra-cli -p atra-runner --bin atra --bin atra-runner --bin atri";
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ static.openssl ];
             doCheck = false;
@@ -82,6 +82,7 @@
           runner = pkgs.runCommand "atra-runner-${version}" { } ''
             mkdir -p "$out/bin"
             install -m755 ${binaries}/bin/atra-runner "$out/bin/atra-runner"
+            install -m755 ${binaries}/bin/atri "$out/bin/atri"
           '';
           platformBundle =
             pkgs.runCommand "atra-platform-${platform}"
@@ -97,6 +98,7 @@
                 staging=$TMPDIR/staging
                 mkdir -p "$staging/bin" "$out"
                 install -m755 ${runner}/bin/atra-runner "$staging/bin/atra-runner"
+                install -m755 ${runner}/bin/atri "$staging/bin/atri"
                 install -m755 ${static.bash}/bin/bash "$staging/bin/bash"
                 install -m755 ${static.fd}/bin/fd "$staging/bin/fd"
                 install -m755 ${static.jq}/bin/jq "$staging/bin/jq"
