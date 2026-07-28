@@ -482,6 +482,7 @@ dependencies = [
  "atra-store",
  "atra-tui",
  "clap",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",

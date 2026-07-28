@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+      - run: cargo +1.96.0 fmt --all -- --check
+      - run: cargo +1.96.0 check --workspace --locked
+      - run: cargo +1.96.0 test --workspace --locked
+
+  build:
+    if: github.event_name == 'push'
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            container_arch: amd64
+            platform: x86_64-linux-static
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            container_arch: arm64
+            platform: aarch64-linux-static
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Build Atra
+        env:
+          ATRA_BUILD_COMMIT: ${{ github.sha }}
+        run: cargo +1.96.0 build --locked --release -p atra-cli --bin atra
+      - name: Package Atra
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/atra-${{ matrix.architecture }}-linux.tar.gz" atra
+      - uses: docker/setup-buildx-action@v4
+      - name: Build platform bundle
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tools/platform-bundle/Containerfile
+          platforms: linux/${{ matrix.container_arch }}
+          outputs: type=local,dest=platform-dist
+          cache-from: type=gha,scope=platform-${{ matrix.container_arch }}
+          cache-to: type=gha,mode=max,scope=platform-${{ matrix.container_arch }}
+      - run: mv platform-dist/* dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: |
+          for asset in atra-*; do
+            sha256sum "$asset"
+          done > SHA256SUMS
+      - name: Publish commit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: build-${{ github.sha }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --prerelease \
+              --target "${{ github.sha }}" \
+              --title "$RELEASE_TAG" \
+              --notes "Automated build for ${{ github.sha }}."
+          fi

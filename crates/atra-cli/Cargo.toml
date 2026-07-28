@@ -19,6 +19,7 @@ atra-runner.workspace = true
 atra-store.workspace = true
 atra-tui.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +27,5 @@ sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing-subscriber.workspace = true
-xdg.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+xdg.workspace = true

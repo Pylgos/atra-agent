@@ -8,6 +8,46 @@ use anyhow::{Context, Result, bail};
 use atra_store::object_digest;
 use tokio::{io::AsyncWriteExt, process::Command};
 
+const BUILD_COMMIT: Option<&str> = option_env!("ATRA_BUILD_COMMIT");
+const RELEASES_URL: &str = "https://github.com/Pylgos/atra-agent/releases/download";
+
+pub(crate) async fn download() -> Result<()> {
+    let commit = BUILD_COMMIT
+        .context("platform download is only available in Atra binaries built by the official CI")?;
+    let asset = format!("atra-platform-{}.zip", host_platform()?);
+    let url = format!("{RELEASES_URL}/build-{commit}/{asset}");
+    let mut response = reqwest::Client::new()
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, "atra")
+        .send()
+        .await
+        .with_context(|| format!("failed to download platform bundle from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("failed to download platform bundle from {url}"))?;
+    let temporary =
+        tempfile::NamedTempFile::new().context("failed to create temporary platform bundle")?;
+    let mut destination = tokio::fs::File::from_std(
+        temporary
+            .reopen()
+            .context("failed to open temporary platform bundle")?,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read platform bundle download")?
+    {
+        destination
+            .write_all(&chunk)
+            .await
+            .context("failed to write temporary platform bundle")?;
+    }
+    destination
+        .flush()
+        .await
+        .context("failed to flush temporary platform bundle")?;
+    install(temporary.path())
+}
+
 pub(crate) async fn upload_runner(
     binary_path: Option<PathBuf>,
     command: Vec<String>,

@@ -179,6 +179,7 @@ enum ApprovalCommand {
 
 #[derive(Subcommand)]
 enum PlatformCommand {
+    Download,
     Install { bundle: PathBuf },
 }
 
@@ -285,6 +286,15 @@ async fn run(command: Command) -> Result<()> {
         }
         return atra_runner::run_stdio().await;
     }
+    match &command {
+        Command::Platform {
+            command: PlatformCommand::Download,
+        } => return platform::download().await,
+        Command::Platform {
+            command: PlatformCommand::Install { bundle },
+        } => return platform::install(bundle),
+        _ => {}
+    }
     let workspace = workspace::root()?;
     if matches!(
         &command,
@@ -335,9 +345,9 @@ async fn run(command: Command) -> Result<()> {
                 Ok(())
             }
         },
-        Command::Platform {
-            command: PlatformCommand::Install { bundle },
-        } => platform::install(&bundle),
+        Command::Platform { .. } => {
+            unreachable!("platform commands are handled before workspace setup")
+        }
         Command::Controller {
             command: ControllerCommand::Start,
         } => {
