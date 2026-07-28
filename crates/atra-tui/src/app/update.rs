@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use atra_client::{CancelResult, CodexLoginStatus, TurnResult};
+use atra_client::{CancelResult, CodexLoginStatus, TurnEvent, TurnResult};
 use atra_protocol::ThreadEventData;
 use tokio::sync::mpsc;
 
@@ -18,7 +18,7 @@ impl App {
         update: TurnUpdate,
         effects: &mpsc::UnboundedSender<Effect>,
     ) -> Result<()> {
-        let completion = match update {
+        match update {
             TurnUpdate::Started {
                 message,
                 thread_id,
@@ -40,133 +40,11 @@ impl App {
                 }
                 return Ok(());
             }
-            TurnUpdate::StreamStarted { thread_id } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    if matches!(self.turn, TurnState::Cancelling) {
-                        effects
-                            .send(Effect::CancelTurn {
-                                endpoint: self.endpoint.clone(),
-                                thread_id,
-                            })
-                            .ok();
-                    } else {
-                        self.turn = TurnState::Running;
-                        self.activity = Some(Activity::Info(
-                            "Waiting for Atra Controller… · Esc cancels".to_owned(),
-                        ));
-                    }
-                }
+            TurnUpdate::Stream(update) => {
+                self.apply_turn_update(update, effects)?;
                 return Ok(());
             }
-            TurnUpdate::Delta { thread_id, content } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript.append_assistant_delta(&content);
-                }
-                return Ok(());
-            }
-            TurnUpdate::ReasoningSummaryDelta { thread_id, content } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript.append_reasoning_delta(&content);
-                }
-                return Ok(());
-            }
-            TurnUpdate::ReasoningSummaryPartAdded { thread_id } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript.finish_reasoning_part();
-                }
-                return Ok(());
-            }
-            TurnUpdate::ToolCallStarted {
-                thread_id,
-                item_id,
-                name,
-            } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript.start_tool_preview(item_id, &name);
-                }
-                return Ok(());
-            }
-            TurnUpdate::ToolCallDelta {
-                thread_id,
-                item_id,
-                content,
-            } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript.append_tool_preview(&item_id, &content);
-                }
-                return Ok(());
-            }
-            TurnUpdate::Event { thread_id, event } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    let usage_matches_selected_model = match &event.data {
-                        ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
-                            .and_then(|sequence| {
-                                self.transcript
-                                    .events
-                                    .iter()
-                                    .find(|event| event.sequence == sequence)
-                            })
-                            .and_then(|event| match &event.data {
-                                ThreadEventData::ModelRequest(request) => {
-                                    request.request.pointer("/model")
-                                }
-                                _ => None,
-                            })
-                            .and_then(serde_json::Value::as_str)
-                            .zip(
-                                self.threads
-                                    .iter()
-                                    .find(|thread| thread.id == thread_id)
-                                    .map(|thread| thread.model.as_str()),
-                            )
-                            .is_some_and(|(request_model, selected_model)| {
-                                request_model == selected_model
-                            }),
-                        _ => false,
-                    };
-                    if usage_matches_selected_model {
-                        self.metrics_stale = false;
-                    }
-                    self.transcript.apply_event(event);
-                }
-                return Ok(());
-            }
-            TurnUpdate::RunnerOperationUpdate {
-                thread_id,
-                call_id,
-                operation_index,
-                update,
-            } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    self.transcript
-                        .update_runner_operation(&call_id, operation_index, update);
-                }
-                return Ok(());
-            }
-            TurnUpdate::ApprovalRequired {
-                approval_id,
-                thread_id,
-                runner,
-                label,
-                operation_index,
-            } => {
-                if self.target.thread_id() == Some(thread_id) {
-                    if operation_index.is_some() {
-                        self.transcript.set_pending_approval(operation_index);
-                    }
-                    self.turn = TurnState::AwaitingApproval(Approval {
-                        id: approval_id,
-                        runner,
-                        label,
-                        operation_index,
-                        state: ApprovalState::Pending,
-                    });
-                    self.activity = None;
-                }
-                return Ok(());
-            }
-            TurnUpdate::Completed(Ok(completion)) => completion,
-            TurnUpdate::Completed(Err(error)) => {
+            TurnUpdate::StreamFailed(error) => {
                 self.transcript.discard_tool_previews();
                 self.turn = TurnState::Idle;
                 self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
@@ -449,23 +327,147 @@ impl App {
                 self.activity = Some(Activity::Info(message));
                 return Ok(());
             }
-        };
-        self.turn = TurnState::Idle;
-        if self.target.thread_id() == Some(completion.thread_id) {
-            match completion.result {
-                TurnResult::Completed { .. }
-                    if self
-                        .transcript
-                        .entries
-                        .last()
-                        .is_some_and(TranscriptEntry::is_assistant_message) =>
-                {
+        }
+    }
+
+    fn apply_turn_update(
+        &mut self,
+        update: atra_client::TurnUpdate,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<()> {
+        let thread_id = update.thread_id;
+        match update.event {
+            TurnEvent::Started => {
+                if self.target.thread_id() == Some(thread_id) {
+                    if matches!(self.turn, TurnState::Cancelling) {
+                        effects
+                            .send(Effect::CancelTurn {
+                                endpoint: self.endpoint.clone(),
+                                thread_id,
+                            })
+                            .ok();
+                    } else {
+                        self.turn = TurnState::Running;
+                        self.activity = Some(Activity::Info(
+                            "Waiting for Atra Controller… · Esc cancels".to_owned(),
+                        ));
+                    }
+                }
+            }
+            TurnEvent::Delta { content } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_assistant_delta(&content);
+                }
+            }
+            TurnEvent::ReasoningSummaryDelta { content } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_reasoning_delta(&content);
+                }
+            }
+            TurnEvent::ReasoningSummaryPartAdded => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.finish_reasoning_part();
+                }
+            }
+            TurnEvent::ToolCallStarted { item_id, name } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.start_tool_preview(item_id, &name);
+                }
+            }
+            TurnEvent::ToolCallDelta { item_id, delta } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_tool_preview(&item_id, &delta);
+                }
+            }
+            TurnEvent::Event { event } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    let usage_matches_selected_model = match &event.data {
+                        ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
+                            .and_then(|sequence| {
+                                self.transcript
+                                    .events
+                                    .iter()
+                                    .find(|event| event.sequence == sequence)
+                            })
+                            .and_then(|event| match &event.data {
+                                ThreadEventData::ModelRequest(request) => {
+                                    request.request.pointer("/model")
+                                }
+                                _ => None,
+                            })
+                            .and_then(serde_json::Value::as_str)
+                            .zip(
+                                self.threads
+                                    .iter()
+                                    .find(|thread| thread.id == thread_id)
+                                    .map(|thread| thread.model.as_str()),
+                            )
+                            .is_some_and(|(request_model, selected_model)| {
+                                request_model == selected_model
+                            }),
+                        _ => false,
+                    };
+                    if usage_matches_selected_model {
+                        self.metrics_stale = false;
+                    }
+                    self.transcript.apply_event(event);
+                }
+            }
+            TurnEvent::RunnerOperation {
+                call_id,
+                operation_index,
+                update,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript
+                        .update_runner_operation(&call_id, operation_index, update);
+                }
+            }
+            TurnEvent::ApprovalRequired {
+                approval_id,
+                tool,
+                arguments,
+                operation_index,
+                operation_label,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    if operation_index.is_some() {
+                        self.transcript.set_pending_approval(operation_index);
+                    }
+                    let runner = arguments
+                        .get("runner")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.turn = TurnState::AwaitingApproval(Approval {
+                        id: approval_id,
+                        runner,
+                        label: operation_label.unwrap_or(tool),
+                        operation_index,
+                        state: ApprovalState::Pending,
+                    });
                     self.activity = None;
                 }
-                result => self.accept_turn_result(result)?,
             }
-        } else {
-            self.activity = None;
+            TurnEvent::Finished(result) => {
+                self.turn = TurnState::Idle;
+                if self.target.thread_id() == Some(thread_id) {
+                    match result {
+                        TurnResult::Completed { .. }
+                            if self
+                                .transcript
+                                .entries
+                                .last()
+                                .is_some_and(TranscriptEntry::is_assistant_message) =>
+                        {
+                            self.activity = None;
+                        }
+                        result => self.accept_turn_result(result)?,
+                    }
+                } else {
+                    self.activity = None;
+                }
+            }
         }
         Ok(())
     }

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use atra_protocol::{
-    CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, InstructionEvent,
-    RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
+    CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, HistoryTarget,
+    InstructionEvent, RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
 };
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -447,35 +447,61 @@ impl Store {
             .await
     }
 
-    pub async fn rewind(
+    pub async fn replace_history(
         &self,
         thread_id: ThreadId,
-        checkpoint_id: Option<CheckpointId>,
-        sequence: EventSequence,
+        target: HistoryTarget,
         created_at_ms: i64,
     ) -> tokio_rusqlite::Result<CheckpointId> {
         self.connection
             .call(move |connection| {
                 let thread_id = thread_id.0;
-                let checkpoint_id = checkpoint_id.map(|id| id.0);
-                let sequence = sequence.0;
                 let transaction = connection.transaction()?;
-                let kind =
-                    validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
-                let saved = create_checkpoint(&transaction, thread_id, created_at_ms, "rewind")?;
-                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
-                if let Some(checkpoint_id) = checkpoint_id {
-                    transaction.execute(
-                        "
-                        UPDATE threads
-                        SET (display_name, model, reasoning_effort) = (
+                let (checkpoint_id, through_sequence, reason) = match target {
+                    HistoryTarget::Message {
+                        checkpoint_id,
+                        sequence,
+                    } => {
+                        let checkpoint_id = checkpoint_id.map(|id| id.0);
+                        let kind = validate_history_point(
+                            &transaction,
+                            thread_id,
+                            checkpoint_id,
+                            sequence.0,
+                        )?;
+                        (
+                            checkpoint_id,
+                            Some(history_end_sequence(kind, sequence.0)),
+                            "rewind",
+                        )
+                    }
+                    HistoryTarget::Checkpoint { checkpoint_id } => {
+                        (Some(checkpoint_id.0), None, "restore")
+                    }
+                };
+                let checkpoint_settings: Option<(Option<String>, String, String)> = checkpoint_id
+                    .map(|checkpoint_id| {
+                        transaction.query_row(
+                            "
                             SELECT display_name, model, reasoning_effort
                             FROM checkpoints
                             WHERE id = ?1 AND thread_id = ?2
+                            ",
+                            params![checkpoint_id, thread_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
-                        WHERE id = ?2
+                    })
+                    .transpose()?;
+                let saved = create_checkpoint(&transaction, thread_id, created_at_ms, reason)?;
+                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
+                if let Some((display_name, model, reasoning_effort)) = checkpoint_settings {
+                    transaction.execute(
+                        "
+                        UPDATE threads
+                        SET display_name = ?1, model = ?2, reasoning_effort = ?3
+                        WHERE id = ?4
                         ",
-                        params![checkpoint_id, thread_id],
+                        params![display_name, model, reasoning_effort, thread_id],
                     )?;
                 }
                 copy_events(
@@ -483,51 +509,7 @@ impl Store {
                     thread_id,
                     thread_id,
                     Some(checkpoint_id.unwrap_or(saved)),
-                    Some(history_end_sequence(kind, sequence)),
-                )?;
-                transaction.commit()?;
-                Ok(CheckpointId(saved))
-            })
-            .await
-    }
-
-    pub async fn restore_checkpoint(
-        &self,
-        thread_id: ThreadId,
-        checkpoint_id: CheckpointId,
-        created_at_ms: i64,
-    ) -> tokio_rusqlite::Result<CheckpointId> {
-        self.connection
-            .call(move |connection| {
-                let thread_id = thread_id.0;
-                let checkpoint_id = checkpoint_id.0;
-                let transaction = connection.transaction()?;
-                let (display_name, model, reasoning_effort): (Option<String>, String, String) =
-                    transaction.query_row(
-                        "
-                        SELECT display_name, model, reasoning_effort
-                        FROM checkpoints
-                        WHERE id = ?1 AND thread_id = ?2
-                        ",
-                        params![checkpoint_id, thread_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?;
-                let saved = create_checkpoint(&transaction, thread_id, created_at_ms, "restore")?;
-                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
-                transaction.execute(
-                    "
-                    UPDATE threads
-                    SET display_name = ?1, model = ?2, reasoning_effort = ?3
-                    WHERE id = ?4
-                    ",
-                    params![display_name, model, reasoning_effort, thread_id],
-                )?;
-                copy_events(
-                    &transaction,
-                    thread_id,
-                    thread_id,
-                    Some(checkpoint_id),
-                    None,
+                    through_sequence,
                 )?;
                 transaction.commit()?;
                 Ok(CheckpointId(saved))

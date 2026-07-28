@@ -7,7 +7,8 @@ impl State {
         updates: &mpsc::UnboundedSender<ModelStreamEvent>,
     ) -> Result<ControllerResponse> {
         let thread_id = match &request {
-            TurnRequest::Send { thread_id, .. } | TurnRequest::Continue { thread_id } => *thread_id,
+            TurnRequest::ThreadSend { thread_id, .. }
+            | TurnRequest::ThreadContinue { thread_id } => *thread_id,
         };
         let active = self.turns.start(thread_id).await?;
         updates
@@ -17,10 +18,10 @@ impl State {
         let mut cancellation = active.cancellation();
         let mut turn = Box::pin(async {
             match request {
-                TurnRequest::Send { thread_id, message } => {
+                TurnRequest::ThreadSend { thread_id, message } => {
                     self.run_turn(thread_id, message, Some(updates)).await
                 }
-                TurnRequest::Continue { thread_id } => {
+                TurnRequest::ThreadContinue { thread_id } => {
                     self.continue_thread(thread_id, Some(updates)).await
                 }
             }
@@ -1056,9 +1057,7 @@ impl State {
                                 },
                             )
                             .await;
-                        RunnerResponse::ProcessStarted {
-                            process_handle: ProcessHandle(process_id.0),
-                        }
+                        CommandOutcome::Started { process_id }
                     }
                     ModelCommandMode::Foreground { timeout_ms } => {
                         let active = self
@@ -1085,8 +1084,8 @@ impl State {
                                 .min(1000)
                                 .try_into()
                                 .unwrap_or(1000);
-                            match runner.wait_raw(process_handle.clone(), timeout_ms).await? {
-                                RunnerResponse::ProcessRunning { output, .. } => {
+                            match runner.wait(process_handle.clone(), timeout_ms).await? {
+                                WaitOutcome::Running { output, .. } => {
                                     send_operation_update(
                                         operation,
                                         updates,
@@ -1097,52 +1096,48 @@ impl State {
                                     )?;
                                     append_command_output(&mut collected, output);
                                     if Instant::now() >= deadline {
-                                        break RunnerResponse::ProcessRunning {
+                                        break WaitOutcome::Running {
                                             process_handle: process_handle.clone(),
                                             output: collected.take().unwrap(),
                                         };
                                     }
                                 }
-                                RunnerResponse::ProcessFinished { output, exit_code } => {
+                                WaitOutcome::Finished { output, exit_code } => {
                                     append_command_output(&mut collected, output);
-                                    break RunnerResponse::ProcessFinished {
+                                    break WaitOutcome::Finished {
                                         output: collected.take().unwrap(),
                                         exit_code,
                                     };
                                 }
-                                response => break response,
                             }
                         };
                         active.clear_process().await;
-                        response
-                    }
-                };
-                let response = match response {
-                    response @ RunnerResponse::ProcessStarted { .. } => response,
-                    RunnerResponse::ProcessRunning {
-                        process_handle,
-                        output,
-                    } => {
-                        let process_id = self
-                            .runners
-                            .register_generated_process(
-                                thread_id,
-                                &runner_name,
+                        match response {
+                            WaitOutcome::Running {
                                 process_handle,
-                                command,
-                                started_at_ms,
-                            )
-                            .await;
-                        RunnerResponse::ProcessRunning {
-                            process_handle: ProcessHandle(process_id.0),
-                            output,
+                                output,
+                            } => {
+                                let process_id = self
+                                    .runners
+                                    .register_generated_process(
+                                        thread_id,
+                                        &runner_name,
+                                        process_handle,
+                                        command.clone(),
+                                        started_at_ms,
+                                    )
+                                    .await;
+                                CommandOutcome::Running { process_id, output }
+                            }
+                            WaitOutcome::Finished { output, exit_code } => {
+                                CommandOutcome::Finished { output, exit_code }
+                            }
                         }
                     }
-                    response => response,
                 };
-                let artifact = command_artifact(&response, &runner_name)?;
+                let artifact = command_artifact(&response, &runner_name);
                 Ok(ToolOutcome::with_artifact(
-                    format_exec_response(&runner_name, response)?,
+                    format_command_response(&runner_name, response),
                     ToolArtifact::CommandExecution(artifact),
                 ))
             }
@@ -1189,8 +1184,8 @@ impl State {
                         .min(1000)
                         .try_into()
                         .unwrap_or(1000);
-                    match runner.wait_raw(process_handle.clone(), timeout_ms).await? {
-                        RunnerResponse::ProcessRunning { output, .. } => {
+                    match runner.wait(process_handle.clone(), timeout_ms).await? {
+                        WaitOutcome::Running { output, .. } => {
                             send_operation_update(
                                 operation,
                                 updates,
@@ -1201,30 +1196,27 @@ impl State {
                             )?;
                             append_command_output(&mut collected, output);
                             if Instant::now() >= deadline {
-                                break RunnerResponse::ProcessRunning {
-                                    process_handle,
+                                break CommandOutcome::Running {
+                                    process_id: arguments.process_id.clone(),
                                     output: collected.take().unwrap(),
                                 };
                             }
                         }
-                        RunnerResponse::ProcessFinished { output, exit_code } => {
+                        WaitOutcome::Finished { output, exit_code } => {
                             append_command_output(&mut collected, output);
-                            break RunnerResponse::ProcessFinished {
+                            break CommandOutcome::Finished {
                                 output: collected.take().unwrap(),
                                 exit_code,
                             };
                         }
-                        response => break response,
                     }
                 };
                 let response = match response {
-                    RunnerResponse::ProcessRunning { output, .. } => {
-                        RunnerResponse::ProcessRunning {
-                            process_handle: ProcessHandle(arguments.process_id.0.clone()),
-                            output,
-                        }
-                    }
-                    response @ RunnerResponse::ProcessFinished { .. } => {
+                    CommandOutcome::Running { output, .. } => CommandOutcome::Running {
+                        process_id: arguments.process_id.clone(),
+                        output,
+                    },
+                    response @ CommandOutcome::Finished { .. } => {
                         self.runners
                             .remove_process(&ProcessKey {
                                 thread_id,
@@ -1236,9 +1228,9 @@ impl State {
                     }
                     response => response,
                 };
-                let artifact = command_artifact(&response, &runner_name)?;
+                let artifact = command_artifact(&response, &runner_name);
                 Ok(ToolOutcome::with_artifact(
-                    format_process_response("wait_process", &runner_name, response)?,
+                    format_command_response(&runner_name, response),
                     ToolArtifact::CommandExecution(artifact),
                 ))
             }
@@ -1272,10 +1264,10 @@ impl State {
                         process_id: arguments.process_id,
                     })
                     .await;
-                let response = RunnerResponse::ProcessStopped { output: response };
-                let artifact = command_artifact(&response, &runner_name)?;
+                let response = CommandOutcome::Stopped { output: response };
+                let artifact = command_artifact(&response, &runner_name);
                 Ok(ToolOutcome::with_artifact(
-                    format_process_response("stop_process", &runner_name, response)?,
+                    format_command_response(&runner_name, response),
                     ToolArtifact::CommandExecution(artifact),
                 ))
             }

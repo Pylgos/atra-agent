@@ -477,61 +477,53 @@ pub(super) fn truncate_mask_tail(output: &str) -> &str {
 }
 
 pub(super) fn command_artifact(
-    response: &RunnerResponse,
+    response: &CommandOutcome,
     runner: &str,
-) -> Result<CommandExecutionArtifact> {
-    Ok(match response {
-        RunnerResponse::ProcessStarted { .. } => CommandExecutionArtifact::Started {
+) -> CommandExecutionArtifact {
+    match response {
+        CommandOutcome::Started { .. } => CommandExecutionArtifact::Started {
             runner: runner.to_owned(),
         },
-        RunnerResponse::ProcessRunning { output, .. } => CommandExecutionArtifact::Running {
+        CommandOutcome::Running { output, .. } => CommandExecutionArtifact::Running {
             output: format_command_output(output),
             runner: runner.to_owned(),
             full_output_path: output.full_output_path.clone(),
         },
-        RunnerResponse::ProcessFinished { output, exit_code } => {
-            CommandExecutionArtifact::Finished {
-                output: format_command_output(output),
-                exit_code: *exit_code,
-                runner: runner.to_owned(),
-                full_output_path: output.full_output_path.clone(),
-            }
-        }
-        RunnerResponse::ProcessStopped { output } => CommandExecutionArtifact::Stopped {
+        CommandOutcome::Finished { output, exit_code } => CommandExecutionArtifact::Finished {
+            output: format_command_output(output),
+            exit_code: *exit_code,
+            runner: runner.to_owned(),
+            full_output_path: output.full_output_path.clone(),
+        },
+        CommandOutcome::Stopped { output } => CommandExecutionArtifact::Stopped {
             output: format_command_output(output),
             runner: runner.to_owned(),
             full_output_path: output.full_output_path.clone(),
         },
-        RunnerResponse::Error { message } => bail!("{message}"),
-        _ => bail!("runner returned an invalid command response"),
-    })
+    }
 }
 
-pub(super) fn format_process_response(
-    tool: &str,
-    runner: &str,
-    response: RunnerResponse,
-) -> Result<String> {
+pub(super) fn format_command_response(runner: &str, response: CommandOutcome) -> String {
     match response {
-        RunnerResponse::ProcessRunning {
-            process_handle,
-            output,
-        } => Ok(append_process_status(
+        CommandOutcome::Started { process_id } => {
+            format!("Process started with ID {process_id}")
+        }
+        CommandOutcome::Running { process_id, output } => append_process_status(
             model_command_output(&output, runner),
-            &format!("Process {process_handle} is still running"),
-        )),
-        RunnerResponse::ProcessFinished {
+            &format!("Process {process_id} is still running"),
+        ),
+        CommandOutcome::Finished {
             output,
             exit_code: Some(0),
         } => {
             let output = model_command_output(&output, runner);
-            Ok(if output.is_empty() {
+            if output.is_empty() {
                 "Process completed with no output".to_owned()
             } else {
                 output
-            })
+            }
         }
-        RunnerResponse::ProcessFinished { output, exit_code } => Ok(append_process_status(
+        CommandOutcome::Finished { output, exit_code } => append_process_status(
             model_command_output(&output, runner),
             &format!(
                 "Process exited with code {}",
@@ -539,13 +531,10 @@ pub(super) fn format_process_response(
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "unknown".to_owned())
             ),
-        )),
-        RunnerResponse::ProcessStopped { output } => Ok(append_process_status(
-            model_command_output(&output, runner),
-            "Process stopped",
-        )),
-        RunnerResponse::Error { message } => bail!("{message}"),
-        _ => bail!("runner returned an invalid {tool} response"),
+        ),
+        CommandOutcome::Stopped { output } => {
+            append_process_status(model_command_output(&output, runner), "Process stopped")
+        }
     }
 }
 

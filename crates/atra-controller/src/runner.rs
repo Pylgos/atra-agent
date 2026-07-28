@@ -1,12 +1,27 @@
 use super::*;
-use crate::tools::format_command_output;
-
 pub(super) struct Runner {
     pub(super) config: Mutex<RunnerConfig>,
     pub(super) child: Mutex<Child>,
     pub(super) client: RunnerClient,
     pub(super) environment: Mutex<CommandEnvironment>,
     skill_digest: Mutex<Option<String>>,
+}
+
+pub(super) enum CommandOutcome {
+    Started {
+        process_id: ProcessId,
+    },
+    Running {
+        process_id: ProcessId,
+        output: CommandOutput,
+    },
+    Finished {
+        output: CommandOutput,
+        exit_code: Option<i32>,
+    },
+    Stopped {
+        output: CommandOutput,
+    },
 }
 
 pub(super) struct RunnerConfig {
@@ -109,33 +124,16 @@ impl Runner {
             .await
     }
 
-    pub(super) async fn wait_raw(
-        &self,
-        process_handle: ProcessHandle,
-        timeout_ms: u64,
-    ) -> Result<RunnerResponse> {
-        self.client.wait(process_handle, timeout_ms).await
-    }
-
     pub(super) async fn wait(
         &self,
         process_handle: ProcessHandle,
         timeout_ms: u64,
-    ) -> Result<ControllerResponse> {
-        map_runner_response(self.wait_raw(process_handle, timeout_ms).await?)
+    ) -> Result<WaitOutcome> {
+        self.client.wait(process_handle, timeout_ms).await
     }
 
     pub(super) async fn stop(&self, process_handle: ProcessHandle) -> Result<CommandOutput> {
         self.client.stop(process_handle).await
-    }
-
-    pub(super) async fn stop_response(
-        &self,
-        process_handle: ProcessHandle,
-    ) -> Result<ControllerResponse> {
-        map_runner_response(RunnerResponse::ProcessStopped {
-            output: self.stop(process_handle).await?,
-        })
     }
 
     pub(super) async fn approval(&self) -> ApprovalPolicy {
@@ -215,97 +213,6 @@ async fn deploy_tree(
                 }
                 return Ok(path);
             }
-        }
-    }
-}
-
-pub(super) fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
-    match response {
-        RunnerResponse::Ready => Ok(ControllerResponse::Running),
-        RunnerResponse::MissingObjects { .. }
-        | RunnerResponse::TreeReady { .. }
-        | RunnerResponse::ObjectStored => {
-            bail!("runner returned an initialization response after becoming ready")
-        }
-        RunnerResponse::ProcessStarted { process_handle } => {
-            Ok(ControllerResponse::ProcessStarted { process_handle })
-        }
-        RunnerResponse::ProcessRunning {
-            process_handle,
-            output,
-        } => Ok(ControllerResponse::ProcessRunning {
-            process_handle,
-            output: format_command_output(&output),
-        }),
-        RunnerResponse::ProcessFinished { output, exit_code } => {
-            tracing::info!(
-                ?exit_code,
-                output_bytes = output.content.len(),
-                "process finished"
-            );
-            Ok(ControllerResponse::ProcessFinished {
-                output: format_command_output(&output),
-                exit_code,
-            })
-        }
-        RunnerResponse::ProcessStopped { output } => Ok(ControllerResponse::ProcessStopped {
-            output: format_command_output(&output),
-        }),
-        RunnerResponse::PatchCompleted { .. } => {
-            bail!("runner returned an unexpected patch response")
-        }
-        RunnerResponse::ProcessInspected { .. } => {
-            bail!("runner returned an unexpected process inspection response")
-        }
-        RunnerResponse::ProcessStatus { .. } => {
-            bail!("runner returned an unexpected process status response")
-        }
-        RunnerResponse::Error { message } => bail!("{message}"),
-    }
-}
-
-pub(super) fn format_exec_response(runner: &str, response: RunnerResponse) -> Result<String> {
-    match response {
-        RunnerResponse::ProcessStarted { process_handle } => {
-            Ok(format!("Process started with ID {process_handle}"))
-        }
-        RunnerResponse::ProcessRunning {
-            process_handle,
-            output,
-        } => Ok(append_process_status(
-            model_command_output(&output, runner),
-            &format!("Process {process_handle} is still running"),
-        )),
-        RunnerResponse::ProcessFinished {
-            output,
-            exit_code: Some(0),
-        } => {
-            let output = model_command_output(&output, runner);
-            Ok(if output.is_empty() {
-                "Process completed with no output".to_owned()
-            } else {
-                output
-            })
-        }
-        RunnerResponse::ProcessFinished { output, exit_code } => {
-            let exit_code = exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
-            Ok(append_process_status(
-                model_command_output(&output, runner),
-                &format!("Process exited with code {exit_code}"),
-            ))
-        }
-        RunnerResponse::Error { message } => bail!("{message}"),
-        RunnerResponse::Ready
-        | RunnerResponse::MissingObjects { .. }
-        | RunnerResponse::TreeReady { .. }
-        | RunnerResponse::ObjectStored
-        | RunnerResponse::ProcessStopped { .. }
-        | RunnerResponse::ProcessInspected { .. }
-        | RunnerResponse::ProcessStatus { .. }
-        | RunnerResponse::PatchCompleted { .. } => {
-            bail!("runner returned an invalid tool response")
         }
     }
 }

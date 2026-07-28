@@ -104,10 +104,29 @@ pub enum CommandMode {
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
 pub enum ControllerRequest {
-    Status,
     Shutdown,
+    Turn(TurnRequest),
+    Unary(UnaryRequest),
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum TurnRequest {
+    ThreadSend {
+        thread_id: ThreadId,
+        message: String,
+    },
+    ThreadContinue {
+        thread_id: ThreadId,
+    },
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum UnaryRequest {
+    Status,
     ThreadCreate {
         display_name: Option<String>,
     },
@@ -122,10 +141,6 @@ pub enum ControllerRequest {
         model: String,
         reasoning_effort: String,
     },
-    ThreadSend {
-        thread_id: ThreadId,
-        message: String,
-    },
     ThreadEvents {
         thread_id: ThreadId,
     },
@@ -138,23 +153,15 @@ pub enum ControllerRequest {
     ThreadCheckpointEvents {
         checkpoint_id: CheckpointId,
     },
-    ThreadCheckpointRestore {
-        thread_id: ThreadId,
-        checkpoint_id: CheckpointId,
-    },
     ThreadFork {
         thread_id: ThreadId,
         checkpoint_id: Option<CheckpointId>,
         sequence: EventSequence,
         display_name: Option<String>,
     },
-    ThreadRewind {
+    ThreadReplaceHistory {
         thread_id: ThreadId,
-        checkpoint_id: Option<CheckpointId>,
-        sequence: EventSequence,
-    },
-    ThreadContinue {
-        thread_id: ThreadId,
+        target: HistoryTarget,
     },
     ThreadCancel {
         thread_id: ThreadId,
@@ -163,11 +170,6 @@ pub enum ControllerRequest {
         thread_id: ThreadId,
     },
     ThreadProcessInspect {
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    },
-    ThreadProcessStop {
         thread_id: ThreadId,
         runner: String,
         process_id: ProcessId,
@@ -190,18 +192,21 @@ pub enum ControllerRequest {
         command: Vec<String>,
     },
     ExecCommand {
+        thread_id: ThreadId,
         runner: String,
         command: String,
         mode: CommandMode,
     },
     WaitProcess {
+        thread_id: ThreadId,
         runner: String,
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
         timeout_ms: u64,
     },
     StopProcess {
+        thread_id: ThreadId,
         runner: String,
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
     },
 }
 
@@ -253,7 +258,6 @@ pub enum ControllerResponse {
     ThreadProcessInspect {
         process: BackgroundProcessDetail,
     },
-    ThreadProcessStopped,
     ApprovalResolved,
     ApprovalRequired {
         approval_id: ApprovalId,
@@ -280,21 +284,20 @@ pub enum ControllerResponse {
     ThreadCheckpointEvents {
         events: Vec<ThreadEvent>,
     },
-    ThreadCheckpointRestored,
     ThreadForked {
         thread_id: ThreadId,
     },
-    ThreadRewound,
+    ThreadHistoryReplaced,
     RunnerList {
         runners: Vec<Runner>,
     },
     Launched,
     AlreadyRunning,
     ProcessStarted {
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
     },
     ProcessRunning {
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
         output: String,
     },
     ProcessFinished {
@@ -554,6 +557,18 @@ pub struct ThreadCheckpoint {
     pub thread_id: ThreadId,
     pub created_at_ms: i64,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryTarget {
+    Message {
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
+    },
+    Checkpoint {
+        checkpoint_id: CheckpointId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

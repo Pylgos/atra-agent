@@ -6,10 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use atra_client::{
-    CodexLoginStatus, LaunchResult, ProcessResult, TurnResult, TurnStream, TurnUpdate,
+    CodexLoginStatus, LaunchResult, ProcessResult, TurnEvent, TurnResult, TurnStream,
 };
 use atra_protocol::{
-    ApprovalId, ApprovalPolicy, CheckpointId, CommandMode, EventSequence, ProcessHandle, ThreadId,
+    ApprovalId, ApprovalPolicy, CheckpointId, CommandMode, EventSequence, ProcessId, ThreadId,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
@@ -207,6 +207,8 @@ enum RunnerCommand {
     },
     Exec {
         #[arg(long)]
+        thread: i64,
+        #[arg(long)]
         name: String,
         #[arg(long)]
         command: String,
@@ -217,17 +219,21 @@ enum RunnerCommand {
     },
     Wait {
         #[arg(long)]
+        thread: i64,
+        #[arg(long)]
         name: String,
         #[arg(long)]
-        process_handle: String,
+        process_id: String,
         #[arg(long)]
         timeout_ms: u64,
     },
     Stop {
         #[arg(long)]
+        thread: i64,
+        #[arg(long)]
         name: String,
         #[arg(long)]
-        process_handle: String,
+        process_id: String,
     },
 }
 
@@ -419,6 +425,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Runner {
             command:
                 RunnerCommand::Exec {
+                    thread,
                     name,
                     command,
                     background,
@@ -430,7 +437,11 @@ async fn run(command: Command) -> Result<()> {
                 (false, timeout_ms) => CommandMode::Foreground { timeout_ms },
                 (true, Some(_)) => bail!("background commands cannot have timeout options"),
             };
-            display_process_result(client(&endpoint).exec_command(name, command, mode).await?)
+            display_process_result(
+                client(&endpoint)
+                    .exec_command(ThreadId(thread), name, command, mode)
+                    .await?,
+            )
         }
         Command::Tui => {
             if workspace::prepare_tui(&workspace, &endpoint, &workspace_id).await? {
@@ -445,24 +456,26 @@ async fn run(command: Command) -> Result<()> {
         Command::Runner {
             command:
                 RunnerCommand::Wait {
+                    thread,
                     name,
-                    process_handle,
+                    process_id,
                     timeout_ms,
                 },
         } => display_process_result(
             client(&endpoint)
-                .wait_process(name, ProcessHandle(process_handle), timeout_ms)
+                .wait_process(ThreadId(thread), name, ProcessId(process_id), timeout_ms)
                 .await?,
         ),
         Command::Runner {
             command:
                 RunnerCommand::Stop {
+                    thread,
                     name,
-                    process_handle,
+                    process_id,
                 },
         } => display_process_result(
             client(&endpoint)
-                .stop_process(name, ProcessHandle(process_handle))
+                .stop_process(ThreadId(thread), name, ProcessId(process_id))
                 .await?,
         ),
     }
@@ -629,19 +642,20 @@ fn display_turn_result(result: TurnResult) -> Result<()> {
 
 async fn display_turn_stream(mut stream: TurnStream) -> Result<()> {
     loop {
-        match stream.receive().await? {
-            TurnUpdate::Started { .. }
-            | TurnUpdate::Delta { .. }
-            | TurnUpdate::ReasoningSummaryDelta { .. }
-            | TurnUpdate::ReasoningSummaryPartAdded
-            | TurnUpdate::ToolCallStarted { .. }
-            | TurnUpdate::ToolCallDelta { .. }
-            | TurnUpdate::RunnerOperation { .. }
-            | TurnUpdate::Event { .. } => {}
-            TurnUpdate::ApprovalRequired {
+        match stream.receive().await?.event {
+            TurnEvent::Started
+            | TurnEvent::Delta { .. }
+            | TurnEvent::ReasoningSummaryDelta { .. }
+            | TurnEvent::ReasoningSummaryPartAdded
+            | TurnEvent::ToolCallStarted { .. }
+            | TurnEvent::ToolCallDelta { .. }
+            | TurnEvent::RunnerOperation { .. }
+            | TurnEvent::Event { .. } => {}
+            TurnEvent::ApprovalRequired {
                 approval_id,
                 tool,
                 arguments,
+                ..
             } => {
                 println!("{approval_id}");
                 println!("tool: {tool}");
@@ -653,23 +667,20 @@ async fn display_turn_stream(mut stream: TurnStream) -> Result<()> {
                     .flush()
                     .context("failed to flush approval request")?;
             }
-            TurnUpdate::Finished(result) => return display_turn_result(result),
+            TurnEvent::Finished(result) => return display_turn_result(result),
         }
     }
 }
 
 fn display_process_result(result: ProcessResult) -> Result<()> {
     match result {
-        ProcessResult::Started { process_handle } => {
-            println!("{process_handle}");
+        ProcessResult::Started { process_id } => {
+            println!("{process_id}");
             Ok(())
         }
-        ProcessResult::Running {
-            process_handle,
-            output,
-        } => {
+        ProcessResult::Running { process_id, output } => {
             print!("{output}");
-            eprintln!("process \"{process_handle}\" is still running");
+            eprintln!("process \"{process_id}\" is still running");
             Ok(())
         }
         ProcessResult::Finished { output, exit_code } => {

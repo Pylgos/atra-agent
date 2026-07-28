@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use atra_client::{CancelResult, CodexLoginStatus, TurnResult};
 use atra_protocol::{
-    ApprovalId, BackgroundProcess, BackgroundProcessDetail, Model, ProcessId,
-    RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadId,
+    ApprovalId, BackgroundProcess, BackgroundProcessDetail, Model, ProcessId, Thread,
+    ThreadCheckpoint, ThreadEvent, ThreadId,
 };
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
 
@@ -34,11 +34,6 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
     ("/help", "Show this command list"),
     ("/exit", "Exit Atra"),
 ];
-
-pub(crate) struct TurnCompletion {
-    pub(super) thread_id: ThreadId,
-    pub(super) result: TurnResult,
-}
 
 pub(crate) struct HistoryChange {
     pub(super) message: String,
@@ -130,48 +125,8 @@ pub(crate) enum TurnUpdate {
         thread_id: ThreadId,
         threads: Vec<Thread>,
     },
-    StreamStarted {
-        thread_id: ThreadId,
-    },
-    Delta {
-        thread_id: ThreadId,
-        content: String,
-    },
-    ReasoningSummaryDelta {
-        thread_id: ThreadId,
-        content: String,
-    },
-    ReasoningSummaryPartAdded {
-        thread_id: ThreadId,
-    },
-    ToolCallStarted {
-        thread_id: ThreadId,
-        item_id: String,
-        name: String,
-    },
-    ToolCallDelta {
-        thread_id: ThreadId,
-        item_id: String,
-        content: String,
-    },
-    Event {
-        thread_id: ThreadId,
-        event: ThreadEvent,
-    },
-    ApprovalRequired {
-        approval_id: ApprovalId,
-        thread_id: ThreadId,
-        runner: String,
-        label: String,
-        operation_index: Option<usize>,
-    },
-    RunnerOperationUpdate {
-        thread_id: ThreadId,
-        call_id: String,
-        operation_index: usize,
-        update: RunnerOperationUpdate,
-    },
-    Completed(Result<TurnCompletion>),
+    Stream(atra_client::TurnUpdate),
+    StreamFailed(anyhow::Error),
     ApprovalResolved {
         approval_id: ApprovalId,
         result: Result<TurnResult>,

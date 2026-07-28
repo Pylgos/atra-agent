@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
     ApprovalId, ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CheckpointId,
-    CommandMode, ControllerRequest, ControllerResponse, EventSequence, Model, ProcessHandle,
+    CommandMode, ControllerRequest, ControllerResponse, EventSequence, HistoryTarget, Model,
     ProcessId, Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadId,
+    TurnRequest, UnaryRequest,
 };
 use serde_json::Value;
 use tokio::{
@@ -26,13 +27,7 @@ pub struct Client {
 
 pub struct TurnStream {
     connection: Connection,
-    approval_context: Option<ApprovalContext>,
-}
-
-pub struct ApprovalContext {
-    pub thread_id: ThreadId,
-    pub operation_index: Option<usize>,
-    pub operation_label: Option<String>,
+    thread_id: ThreadId,
 }
 
 #[derive(Debug)]
@@ -68,10 +63,14 @@ pub enum TurnResult {
 }
 
 #[derive(Debug)]
-pub enum TurnUpdate {
-    Started {
-        thread_id: ThreadId,
-    },
+pub struct TurnUpdate {
+    pub thread_id: ThreadId,
+    pub event: TurnEvent,
+}
+
+#[derive(Debug)]
+pub enum TurnEvent {
+    Started,
     Delta {
         content: String,
     },
@@ -99,6 +98,8 @@ pub enum TurnUpdate {
         approval_id: ApprovalId,
         tool: String,
         arguments: Value,
+        operation_index: Option<usize>,
+        operation_label: Option<String>,
     },
     Finished(TurnResult),
 }
@@ -106,10 +107,10 @@ pub enum TurnUpdate {
 #[derive(Debug)]
 pub enum ProcessResult {
     Started {
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
     },
     Running {
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
         output: String,
     },
     Finished {
@@ -152,36 +153,33 @@ impl Connection {
 }
 
 impl TurnStream {
-    pub fn take_approval_context(&mut self) -> Option<ApprovalContext> {
-        self.approval_context.take()
-    }
-
     pub async fn receive(&mut self) -> Result<TurnUpdate> {
-        match self.connection.receive().await? {
-            ControllerResponse::TurnStarted { thread_id } => Ok(TurnUpdate::Started { thread_id }),
-            ControllerResponse::TurnDelta { content } => Ok(TurnUpdate::Delta { content }),
+        let event = match self.connection.receive().await? {
+            ControllerResponse::TurnStarted { thread_id } => {
+                self.ensure_thread(thread_id)?;
+                TurnEvent::Started
+            }
+            ControllerResponse::TurnDelta { content } => TurnEvent::Delta { content },
             ControllerResponse::ReasoningSummaryDelta { content } => {
-                Ok(TurnUpdate::ReasoningSummaryDelta { content })
+                TurnEvent::ReasoningSummaryDelta { content }
             }
-            ControllerResponse::ReasoningSummaryPartAdded => {
-                Ok(TurnUpdate::ReasoningSummaryPartAdded)
-            }
+            ControllerResponse::ReasoningSummaryPartAdded => TurnEvent::ReasoningSummaryPartAdded,
             ControllerResponse::ToolCallStarted { item_id, name } => {
-                Ok(TurnUpdate::ToolCallStarted { item_id, name })
+                TurnEvent::ToolCallStarted { item_id, name }
             }
             ControllerResponse::ToolCallDelta { item_id, delta } => {
-                Ok(TurnUpdate::ToolCallDelta { item_id, delta })
+                TurnEvent::ToolCallDelta { item_id, delta }
             }
             ControllerResponse::RunnerOperationUpdate {
                 call_id,
                 operation_index,
                 update,
-            } => Ok(TurnUpdate::RunnerOperation {
+            } => TurnEvent::RunnerOperation {
                 call_id,
                 operation_index,
                 update,
-            }),
-            ControllerResponse::TurnEvent { event } => Ok(TurnUpdate::Event { event }),
+            },
+            ControllerResponse::TurnEvent { event } => TurnEvent::Event { event },
             ControllerResponse::ApprovalRequired {
                 approval_id,
                 thread_id,
@@ -190,27 +188,39 @@ impl TurnStream {
                 operation_index,
                 operation_label,
             } => {
-                self.approval_context = Some(ApprovalContext {
-                    thread_id,
-                    operation_index,
-                    operation_label,
-                });
-                Ok(TurnUpdate::ApprovalRequired {
+                self.ensure_thread(thread_id)?;
+                TurnEvent::ApprovalRequired {
                     approval_id,
                     tool,
                     arguments,
-                })
+                    operation_index,
+                    operation_label,
+                }
             }
             ControllerResponse::ApprovalResolved => {
-                Ok(TurnUpdate::Finished(TurnResult::ApprovalResolved))
+                TurnEvent::Finished(TurnResult::ApprovalResolved)
             }
-            ControllerResponse::ThreadCancelled => Ok(TurnUpdate::Finished(TurnResult::Cancelled)),
+            ControllerResponse::ThreadCancelled => TurnEvent::Finished(TurnResult::Cancelled),
             ControllerResponse::TurnCompleted { content } => {
-                Ok(TurnUpdate::Finished(TurnResult::Completed { content }))
+                TurnEvent::Finished(TurnResult::Completed { content })
             }
             ControllerResponse::Error { message } => bail!("{message}"),
-            response => unexpected(response),
+            response => return unexpected(response),
+        };
+        Ok(TurnUpdate {
+            thread_id: self.thread_id,
+            event,
+        })
+    }
+
+    fn ensure_thread(&self, thread_id: ThreadId) -> Result<()> {
+        if thread_id != self.thread_id {
+            bail!(
+                "controller returned update for thread {thread_id} on thread {} stream",
+                self.thread_id
+            );
         }
+        Ok(())
     }
 }
 
@@ -222,31 +232,31 @@ impl Client {
     }
 
     pub async fn status(&self) -> Result<()> {
-        match self.unary(ControllerRequest::Status).await? {
+        match self.unary(UnaryRequest::Status).await? {
             ControllerResponse::Running => Ok(()),
             response => unexpected(response),
         }
     }
 
     pub async fn thread_send(&self, thread_id: ThreadId, message: String) -> Result<TurnStream> {
-        self.turn_stream(ControllerRequest::ThreadSend { thread_id, message })
+        self.turn_stream(TurnRequest::ThreadSend { thread_id, message })
             .await
     }
 
     pub async fn thread_continue(&self, thread_id: ThreadId) -> Result<TurnStream> {
-        self.turn_stream(ControllerRequest::ThreadContinue { thread_id })
+        self.turn_stream(TurnRequest::ThreadContinue { thread_id })
             .await
     }
 
     pub async fn codex_logout(&self) -> Result<()> {
         expect_unit(
-            self.unary(ControllerRequest::CodexLogout).await?,
+            self.unary(UnaryRequest::CodexLogout).await?,
             ControllerResponse::CodexLoggedOut,
         )
     }
 
     pub async fn codex_login(&self) -> Result<CodexLoginStatus> {
-        match self.unary(ControllerRequest::CodexLogin).await? {
+        match self.unary(UnaryRequest::CodexLogin).await? {
             ControllerResponse::CodexLoggedIn { email } => Ok(CodexLoginStatus::LoggedIn { email }),
             ControllerResponse::CodexLoginRequired => Ok(CodexLoginStatus::LoginRequired),
             response => unexpected(response),
@@ -254,14 +264,14 @@ impl Client {
     }
 
     pub async fn model_list(&self) -> Result<Vec<Model>> {
-        match self.unary(ControllerRequest::ModelList).await? {
+        match self.unary(UnaryRequest::ModelList).await? {
             ControllerResponse::ModelList { models } => Ok(models),
             response => unexpected(response),
         }
     }
 
     pub async fn codex_login_status(&self) -> Result<CodexLoginStatus> {
-        match self.unary(ControllerRequest::CodexLoginStatus).await? {
+        match self.unary(UnaryRequest::CodexLoginStatus).await? {
             ControllerResponse::CodexLoggedIn { email } => Ok(CodexLoginStatus::LoggedIn { email }),
             ControllerResponse::CodexLoginRequired => Ok(CodexLoginStatus::LoginRequired),
             response => unexpected(response),
@@ -270,7 +280,7 @@ impl Client {
 
     pub async fn thread_create(&self, display_name: Option<String>) -> Result<ThreadId> {
         match self
-            .unary(ControllerRequest::ThreadCreate { display_name })
+            .unary(UnaryRequest::ThreadCreate { display_name })
             .await?
         {
             ControllerResponse::ThreadCreated { thread_id } => Ok(thread_id),
@@ -279,7 +289,7 @@ impl Client {
     }
 
     pub async fn thread_list(&self) -> Result<Vec<Thread>> {
-        match self.unary(ControllerRequest::ThreadList).await? {
+        match self.unary(UnaryRequest::ThreadList).await? {
             ControllerResponse::ThreadList { threads } => Ok(threads),
             response => unexpected(response),
         }
@@ -287,7 +297,7 @@ impl Client {
 
     pub async fn thread_rename(&self, thread_id: ThreadId, display_name: String) -> Result<()> {
         expect_unit(
-            self.unary(ControllerRequest::ThreadRename {
+            self.unary(UnaryRequest::ThreadRename {
                 thread_id,
                 display_name,
             })
@@ -303,7 +313,7 @@ impl Client {
         reasoning_effort: String,
     ) -> Result<()> {
         expect_unit(
-            self.unary(ControllerRequest::ThreadSetModel {
+            self.unary(UnaryRequest::ThreadSetModel {
                 thread_id,
                 model,
                 reasoning_effort,
@@ -314,20 +324,14 @@ impl Client {
     }
 
     pub async fn thread_events(&self, thread_id: ThreadId) -> Result<Vec<ThreadEvent>> {
-        match self
-            .unary(ControllerRequest::ThreadEvents { thread_id })
-            .await?
-        {
+        match self.unary(UnaryRequest::ThreadEvents { thread_id }).await? {
             ControllerResponse::ThreadEvents { events } => Ok(events),
             response => unexpected(response),
         }
     }
 
     pub async fn thread_cancel(&self, thread_id: ThreadId) -> Result<CancelResult> {
-        match self
-            .unary(ControllerRequest::ThreadCancel { thread_id })
-            .await?
-        {
+        match self.unary(UnaryRequest::ThreadCancel { thread_id }).await? {
             ControllerResponse::ThreadCancelled => Ok(CancelResult::Cancelled),
             ControllerResponse::ThreadNotActive => Ok(CancelResult::NotActive),
             response => unexpected(response),
@@ -336,7 +340,7 @@ impl Client {
 
     pub async fn thread_process_list(&self, thread_id: ThreadId) -> Result<Vec<BackgroundProcess>> {
         match self
-            .unary(ControllerRequest::ThreadProcessList { thread_id })
+            .unary(UnaryRequest::ThreadProcessList { thread_id })
             .await?
         {
             ControllerResponse::ThreadProcessList { processes } => Ok(processes),
@@ -351,7 +355,7 @@ impl Client {
         process_id: ProcessId,
     ) -> Result<BackgroundProcessDetail> {
         match self
-            .unary(ControllerRequest::ThreadProcessInspect {
+            .unary(UnaryRequest::ThreadProcessInspect {
                 thread_id,
                 runner,
                 process_id,
@@ -363,26 +367,9 @@ impl Client {
         }
     }
 
-    pub async fn thread_process_stop(
-        &self,
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    ) -> Result<()> {
-        expect_unit(
-            self.unary(ControllerRequest::ThreadProcessStop {
-                thread_id,
-                runner,
-                process_id,
-            })
-            .await?,
-            ControllerResponse::ThreadProcessStopped,
-        )
-    }
-
     pub async fn checkpoint_create(&self, thread_id: ThreadId) -> Result<CheckpointId> {
         match self
-            .unary(ControllerRequest::ThreadCheckpointCreate { thread_id })
+            .unary(UnaryRequest::ThreadCheckpointCreate { thread_id })
             .await?
         {
             ControllerResponse::ThreadCheckpointCreated { checkpoint_id } => Ok(checkpoint_id),
@@ -392,7 +379,7 @@ impl Client {
 
     pub async fn checkpoint_list(&self, thread_id: ThreadId) -> Result<Vec<ThreadCheckpoint>> {
         match self
-            .unary(ControllerRequest::ThreadCheckpointList { thread_id })
+            .unary(UnaryRequest::ThreadCheckpointList { thread_id })
             .await?
         {
             ControllerResponse::ThreadCheckpointList { checkpoints } => Ok(checkpoints),
@@ -402,7 +389,7 @@ impl Client {
 
     pub async fn checkpoint_events(&self, checkpoint_id: CheckpointId) -> Result<Vec<ThreadEvent>> {
         match self
-            .unary(ControllerRequest::ThreadCheckpointEvents { checkpoint_id })
+            .unary(UnaryRequest::ThreadCheckpointEvents { checkpoint_id })
             .await?
         {
             ControllerResponse::ThreadCheckpointEvents { events } => Ok(events),
@@ -416,12 +403,12 @@ impl Client {
         checkpoint_id: CheckpointId,
     ) -> Result<()> {
         expect_unit(
-            self.unary(ControllerRequest::ThreadCheckpointRestore {
+            self.unary(UnaryRequest::ThreadReplaceHistory {
                 thread_id,
-                checkpoint_id,
+                target: HistoryTarget::Checkpoint { checkpoint_id },
             })
             .await?,
-            ControllerResponse::ThreadCheckpointRestored,
+            ControllerResponse::ThreadHistoryReplaced,
         )
     }
 
@@ -433,7 +420,7 @@ impl Client {
         display_name: Option<String>,
     ) -> Result<ThreadId> {
         match self
-            .unary(ControllerRequest::ThreadFork {
+            .unary(UnaryRequest::ThreadFork {
                 thread_id,
                 checkpoint_id,
                 sequence,
@@ -453,19 +440,21 @@ impl Client {
         sequence: EventSequence,
     ) -> Result<()> {
         expect_unit(
-            self.unary(ControllerRequest::ThreadRewind {
+            self.unary(UnaryRequest::ThreadReplaceHistory {
                 thread_id,
-                checkpoint_id,
-                sequence,
+                target: HistoryTarget::Message {
+                    checkpoint_id,
+                    sequence,
+                },
             })
             .await?,
-            ControllerResponse::ThreadRewound,
+            ControllerResponse::ThreadHistoryReplaced,
         )
     }
 
     pub async fn approval_allow(&self, approval_id: ApprovalId) -> Result<TurnResult> {
         decode_turn(
-            self.unary(ControllerRequest::ApprovalAllow { approval_id })
+            self.unary(UnaryRequest::ApprovalAllow { approval_id })
                 .await?,
         )
     }
@@ -476,7 +465,7 @@ impl Client {
         reason: Option<String>,
     ) -> Result<TurnResult> {
         decode_turn(
-            self.unary(ControllerRequest::ApprovalDeny {
+            self.unary(UnaryRequest::ApprovalDeny {
                 approval_id,
                 reason,
             })
@@ -485,7 +474,7 @@ impl Client {
     }
 
     pub async fn runner_list(&self) -> Result<Vec<Runner>> {
-        match self.unary(ControllerRequest::RunnerList).await? {
+        match self.unary(UnaryRequest::RunnerList).await? {
             ControllerResponse::RunnerList { runners } => Ok(runners),
             response => unexpected(response),
         }
@@ -499,7 +488,7 @@ impl Client {
         command: Vec<String>,
     ) -> Result<LaunchResult> {
         match self
-            .unary(ControllerRequest::RunnerLaunch {
+            .unary(UnaryRequest::RunnerLaunch {
                 name,
                 description,
                 approval,
@@ -515,12 +504,14 @@ impl Client {
 
     pub async fn exec_command(
         &self,
+        thread_id: ThreadId,
         runner: String,
         command: String,
         mode: CommandMode,
     ) -> Result<ProcessResult> {
         decode_process(
-            self.unary(ControllerRequest::ExecCommand {
+            self.unary(UnaryRequest::ExecCommand {
+                thread_id,
                 runner,
                 command,
                 mode,
@@ -531,14 +522,16 @@ impl Client {
 
     pub async fn wait_process(
         &self,
+        thread_id: ThreadId,
         runner: String,
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
         timeout_ms: u64,
     ) -> Result<ProcessResult> {
         decode_process(
-            self.unary(ControllerRequest::WaitProcess {
+            self.unary(UnaryRequest::WaitProcess {
+                thread_id,
                 runner,
-                process_handle,
+                process_id,
                 timeout_ms,
             })
             .await?,
@@ -547,19 +540,22 @@ impl Client {
 
     pub async fn stop_process(
         &self,
+        thread_id: ThreadId,
         runner: String,
-        process_handle: ProcessHandle,
+        process_id: ProcessId,
     ) -> Result<ProcessResult> {
         decode_process(
-            self.unary(ControllerRequest::StopProcess {
+            self.unary(UnaryRequest::StopProcess {
+                thread_id,
                 runner,
-                process_handle,
+                process_id,
             })
             .await?,
         )
     }
 
-    async fn unary(&self, request: ControllerRequest) -> Result<ControllerResponse> {
+    async fn unary(&self, request: UnaryRequest) -> Result<ControllerResponse> {
+        let request = ControllerRequest::Unary(request);
         let mut connection = Connection::open(&self.endpoint, &request).await?;
         loop {
             match connection.receive().await? {
@@ -576,10 +572,15 @@ impl Client {
         }
     }
 
-    async fn turn_stream(&self, request: ControllerRequest) -> Result<TurnStream> {
+    async fn turn_stream(&self, request: TurnRequest) -> Result<TurnStream> {
+        let thread_id = match &request {
+            TurnRequest::ThreadSend { thread_id, .. }
+            | TurnRequest::ThreadContinue { thread_id } => *thread_id,
+        };
+        let request = ControllerRequest::Turn(request);
         Ok(TurnStream {
             connection: Connection::open(&self.endpoint, &request).await?,
-            approval_context: None,
+            thread_id,
         })
     }
 }
@@ -613,16 +614,12 @@ fn decode_turn(response: ControllerResponse) -> Result<TurnResult> {
 
 fn decode_process(response: ControllerResponse) -> Result<ProcessResult> {
     match response {
-        ControllerResponse::ProcessStarted { process_handle } => {
-            Ok(ProcessResult::Started { process_handle })
+        ControllerResponse::ProcessStarted { process_id } => {
+            Ok(ProcessResult::Started { process_id })
         }
-        ControllerResponse::ProcessRunning {
-            process_handle,
-            output,
-        } => Ok(ProcessResult::Running {
-            process_handle,
-            output,
-        }),
+        ControllerResponse::ProcessRunning { process_id, output } => {
+            Ok(ProcessResult::Running { process_id, output })
+        }
         ControllerResponse::ProcessFinished { output, exit_code } => {
             Ok(ProcessResult::Finished { output, exit_code })
         }

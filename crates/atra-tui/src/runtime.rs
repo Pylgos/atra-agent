@@ -9,7 +9,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use crate::{
-    app::{App, HistoryChange, TurnCompletion, TurnUpdate, load_transcript},
+    app::{App, HistoryChange, TurnUpdate, load_transcript},
     controller::forward_turn,
 };
 
@@ -197,9 +197,11 @@ impl Effect {
                     new_thread_model,
                     message,
                 } => {
-                    let result =
-                        send_turn(&endpoint, thread_id, new_thread_model, message, &updates).await;
-                    let _ = updates.send(TurnUpdate::Completed(result));
+                    if let Err(error) =
+                        send_turn(&endpoint, thread_id, new_thread_model, message, &updates).await
+                    {
+                        let _ = updates.send(TurnUpdate::StreamFailed(error));
+                    }
                 }
                 Self::ContinueTurn {
                     endpoint,
@@ -207,11 +209,12 @@ impl Effect {
                 } => {
                     let result = async {
                         let stream = Client::new(&endpoint).thread_continue(thread_id).await?;
-                        let result = forward_turn(stream, thread_id, &updates).await?;
-                        Ok(TurnCompletion { thread_id, result })
+                        forward_turn(stream, &updates).await
                     }
                     .await;
-                    let _ = updates.send(TurnUpdate::Completed(result));
+                    if let Err(error) = result {
+                        let _ = updates.send(TurnUpdate::StreamFailed(error));
+                    }
                 }
                 Self::ResolveApproval {
                     endpoint,
@@ -348,8 +351,9 @@ impl Effect {
                     process_id,
                 } => {
                     let result = Client::new(&endpoint)
-                        .thread_process_stop(thread_id, runner.clone(), process_id.clone())
-                        .await;
+                        .stop_process(thread_id, runner.clone(), process_id.clone())
+                        .await
+                        .map(|_| ());
                     let _ = updates.send(TurnUpdate::ProcessStopped {
                         thread_id,
                         runner,
@@ -368,7 +372,7 @@ async fn send_turn(
     new_thread_model: Option<(String, String)>,
     message: String,
     updates: &mpsc::UnboundedSender<TurnUpdate>,
-) -> Result<TurnCompletion> {
+) -> Result<()> {
     let client = Client::new(endpoint);
     let thread_id = match existing_thread_id {
         Some(thread_id) => thread_id,
@@ -391,6 +395,5 @@ async fn send_turn(
         }
     };
     let stream = client.thread_send(thread_id, message).await?;
-    let result = forward_turn(stream, thread_id, updates).await?;
-    Ok(TurnCompletion { thread_id, result })
+    forward_turn(stream, updates).await
 }

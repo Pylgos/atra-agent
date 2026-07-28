@@ -16,8 +16,9 @@ use atra_protocol::{
     CommandOutput, CompactionEvent, ControllerResponse, CustomToolType, EventSequence,
     FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent, ModelRequestEvent,
     ModelRequestKind, ProcessHandle, ProcessId, RateLimitsEvent, Runner as RunnerInfo,
-    RunnerOperationArtifact, RunnerOperationUpdate, RunnerResponse, RunnersEvent, ThreadEvent,
-    ThreadEventData, ThreadId, TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
+    RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent, ThreadEvent, ThreadEventData,
+    ThreadId, TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest,
+    UnaryRequest,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -39,7 +40,6 @@ use tokio::{
 mod connection;
 mod lifecycle;
 mod model;
-mod request;
 mod runner;
 mod runner_client;
 mod runner_pool;
@@ -50,9 +50,8 @@ mod turn;
 
 use lifecycle::{ApprovalDecision, TurnLifecycle};
 use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
-use request::{TurnRequest, UnaryRequest};
-use runner::{Runner, RunnerConfig, format_exec_response, map_runner_response};
-use runner_client::{PrepareTreeResult, RunnerClient};
+use runner::{CommandOutcome, Runner, RunnerConfig};
+use runner_client::{PrepareTreeResult, RunnerClient, WaitOutcome};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
 use storage::Store;
 use tools::*;
@@ -320,18 +319,6 @@ impl State {
                 );
                 Ok(ControllerResponse::ThreadCheckpointEvents { events })
             }
-            UnaryRequest::ThreadCheckpointRestore {
-                thread_id,
-                checkpoint_id,
-            } => {
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                self.ensure_no_pending_approval(thread_id).await?;
-                self.store
-                    .restore_checkpoint(thread_id, checkpoint_id, checkpoint_time_ms())
-                    .await
-                    .context("failed to restore checkpoint")?;
-                Ok(ControllerResponse::ThreadCheckpointRestored)
-            }
             UnaryRequest::ThreadFork {
                 thread_id,
                 checkpoint_id,
@@ -347,18 +334,14 @@ impl State {
                     .context("failed to fork thread")?;
                 Ok(ControllerResponse::ThreadForked { thread_id })
             }
-            UnaryRequest::ThreadRewind {
-                thread_id,
-                checkpoint_id,
-                sequence,
-            } => {
+            UnaryRequest::ThreadReplaceHistory { thread_id, target } => {
                 let _guard = self.thread_lock(thread_id).lock_owned().await;
                 self.ensure_no_pending_approval(thread_id).await?;
                 self.store
-                    .rewind(thread_id, checkpoint_id, sequence, checkpoint_time_ms())
+                    .replace_history(thread_id, target, checkpoint_time_ms())
                     .await
-                    .context("failed to rewind thread")?;
-                Ok(ControllerResponse::ThreadRewound)
+                    .context("failed to replace thread history")?;
+                Ok(ControllerResponse::ThreadHistoryReplaced)
             }
             UnaryRequest::ThreadCancel { thread_id } => self.cancel_thread(thread_id).await,
             UnaryRequest::ThreadProcessList { thread_id } => {
@@ -383,19 +366,6 @@ impl State {
                 Ok(ControllerResponse::ThreadProcessInspect {
                     process: self.runners.inspect_process(key, record).await,
                 })
-            }
-            UnaryRequest::ThreadProcessStop {
-                thread_id,
-                runner,
-                process_id,
-            } => {
-                let key = ProcessKey {
-                    thread_id,
-                    runner,
-                    process_id,
-                };
-                self.runners.stop_public_process(&key).await?;
-                Ok(ControllerResponse::ThreadProcessStopped)
             }
             UnaryRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
@@ -427,53 +397,103 @@ impl State {
                     .await
             }
             UnaryRequest::ExecCommand {
+                thread_id,
                 runner,
                 command,
                 mode,
             } => {
+                self.store
+                    .thread_model(thread_id)
+                    .await
+                    .context("thread does not exist")?;
                 tracing::debug!(
                     runner,
                     %command,
                     ?mode,
                     "executing command"
                 );
-                let runner = self.runners.get(&runner).await?;
-                self.execute_controller_command(&runner, command, mode)
+                let active_runner = self.runners.get(&runner).await?;
+                self.execute_controller_command(thread_id, &runner, &active_runner, command, mode)
                     .await
             }
             UnaryRequest::WaitProcess {
+                thread_id,
                 runner,
-                process_handle,
+                process_id,
                 timeout_ms,
             } => {
-                self.runners
+                let key = ProcessKey {
+                    thread_id,
+                    runner: runner.clone(),
+                    process_id: process_id.clone(),
+                };
+                let record = self
+                    .runners
+                    .process(&key)
+                    .await
+                    .context("background process is no longer available")?;
+                match self
+                    .runners
                     .get(&runner)
                     .await?
-                    .wait(process_handle, timeout_ms)
-                    .await
+                    .wait(record.handle, timeout_ms)
+                    .await?
+                {
+                    WaitOutcome::Running { output, .. } => Ok(ControllerResponse::ProcessRunning {
+                        process_id,
+                        output: format_command_output(&output),
+                    }),
+                    WaitOutcome::Finished { output, exit_code } => {
+                        self.runners.remove_process(&key).await;
+                        Ok(ControllerResponse::ProcessFinished {
+                            output: format_command_output(&output),
+                            exit_code,
+                        })
+                    }
+                }
             }
             UnaryRequest::StopProcess {
+                thread_id,
                 runner,
-                process_handle,
+                process_id,
             } => {
-                self.runners
-                    .get(&runner)
-                    .await?
-                    .stop_response(process_handle)
-                    .await
+                let output = self
+                    .runners
+                    .stop_process(&ProcessKey {
+                        thread_id,
+                        runner,
+                        process_id,
+                    })
+                    .await?;
+                Ok(ControllerResponse::ProcessStopped {
+                    output: format_command_output(&output),
+                })
             }
         }
     }
 
     async fn execute_controller_command(
         &self,
+        thread_id: ThreadId,
+        runner_name: &str,
         runner: &Runner,
         command: String,
         mode: CommandMode,
     ) -> Result<ControllerResponse> {
-        let process_handle = runner.start_command(command).await?;
+        let started_at_ms = checkpoint_time_ms();
+        let process_handle = runner.start_command(command.clone()).await?;
         if mode == CommandMode::Background {
-            return Ok(ControllerResponse::ProcessStarted { process_handle });
+            let process_id = self
+                .runners
+                .register_generated_process(
+                    thread_id,
+                    runner_name,
+                    process_handle,
+                    command,
+                    started_at_ms,
+                )
+                .await;
+            return Ok(ControllerResponse::ProcessStarted { process_id });
         }
 
         let deadline = match mode {
@@ -491,25 +511,39 @@ impl State {
                     .try_into()
                     .unwrap_or(1000)
             });
-            match runner.wait_raw(process_handle.clone(), timeout_ms).await? {
-                RunnerResponse::ProcessRunning { output, .. } => {
+            match runner.wait(process_handle.clone(), timeout_ms).await? {
+                WaitOutcome::Running { output, .. } => {
                     append_command_output(&mut collected, output);
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        let response = RunnerResponse::ProcessRunning {
-                            process_handle,
-                            output: collected.take().unwrap(),
-                        };
-                        return map_runner_response(response);
+                        let process_id = self
+                            .runners
+                            .register_generated_process(
+                                thread_id,
+                                runner_name,
+                                process_handle,
+                                command,
+                                started_at_ms,
+                            )
+                            .await;
+                        return Ok(ControllerResponse::ProcessRunning {
+                            process_id,
+                            output: format_command_output(&collected.take().unwrap()),
+                        });
                     }
                 }
-                RunnerResponse::ProcessFinished { output, exit_code } => {
+                WaitOutcome::Finished { output, exit_code } => {
                     append_command_output(&mut collected, output);
-                    return map_runner_response(RunnerResponse::ProcessFinished {
-                        output: collected.take().unwrap(),
+                    let output = collected.take().unwrap();
+                    tracing::info!(
+                        ?exit_code,
+                        output_bytes = output.content.len(),
+                        "process finished"
+                    );
+                    return Ok(ControllerResponse::ProcessFinished {
+                        output: format_command_output(&output),
                         exit_code,
                     });
                 }
-                _ => unreachable!("typed wait only returns process lifecycle responses"),
             }
         }
     }

@@ -156,9 +156,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .args([
             "runner",
             "wait",
+            "--thread",
+            "1",
             "--name",
             "one",
-            "--process-handle",
+            "--process-id",
             &sleeper,
             "--timeout-ms",
             "300",
@@ -184,6 +186,8 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .args([
             "runner",
             "exec",
+            "--thread",
+            "1",
             "--name",
             "one",
             "--timeout-ms",
@@ -582,7 +586,16 @@ impl TestSystem {
 
     async fn exec(&self, runner: &str, command: &str) -> std::io::Result<std::process::Output> {
         self.atra()
-            .args(["runner", "exec", "--name", runner, "--command", command])
+            .args([
+                "runner",
+                "exec",
+                "--thread",
+                "1",
+                "--name",
+                runner,
+                "--command",
+                command,
+            ])
             .output()
             .await
     }
@@ -593,6 +606,8 @@ impl TestSystem {
             .args([
                 "runner",
                 "exec",
+                "--thread",
+                "1",
                 "--name",
                 runner,
                 "--background",
@@ -616,9 +631,11 @@ impl TestSystem {
             .args([
                 "runner",
                 "wait",
+                "--thread",
+                "1",
                 "--name",
                 runner,
-                "--process-handle",
+                "--process-id",
                 process_handle,
                 "--timeout-ms",
                 &timeout_ms.to_string(),
@@ -634,9 +651,11 @@ impl TestSystem {
             .args([
                 "runner",
                 "stop",
+                "--thread",
+                "1",
                 "--name",
                 runner,
-                "--process-handle",
+                "--process-id",
                 process_handle,
             ])
             .output()

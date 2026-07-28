@@ -3,8 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result, bail};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, ProcessHandle, ProcessId,
-    ProcessStatus, Runner as RunnerInfo, ThreadId,
+    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CommandOutput, ProcessHandle,
+    ProcessId, ProcessStatus, Runner as RunnerInfo, ThreadId,
 };
 use atra_store::Store;
 use tokio::sync::Mutex;
@@ -258,13 +258,13 @@ impl RunnerPool {
         }
     }
 
-    pub(super) async fn stop_public_process(&self, key: &ProcessKey) -> Result<()> {
+    pub(super) async fn stop_process(&self, key: &ProcessKey) -> Result<CommandOutput> {
         let record = self
             .process(key)
             .await
             .context("background process is no longer available")?;
-        self.get(&key.runner).await?.stop(record.handle).await?;
+        let output = self.get(&key.runner).await?.stop(record.handle).await?;
         self.remove_process(key).await;
-        Ok(())
+        Ok(output)
     }
 }

@@ -1,6 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ControllerRequest, ControllerResponse, Thread, ThreadEventData, ThreadId};
+use atra_protocol::{
+    ControllerRequest, ControllerResponse, Thread, ThreadEventData, ThreadId, TurnRequest,
+    UnaryRequest,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -23,14 +26,14 @@ async fn lists_threads_newest_first() {
     let controller = TestController::start().await;
     let first = request(
         &controller.endpoint,
-        ControllerRequest::ThreadCreate {
+        unary(UnaryRequest::ThreadCreate {
             display_name: Some("Named".to_owned()),
-        },
+        }),
     )
     .await;
     let second = request(
         &controller.endpoint,
-        ControllerRequest::ThreadCreate { display_name: None },
+        unary(UnaryRequest::ThreadCreate { display_name: None }),
     )
     .await;
 
@@ -46,7 +49,7 @@ async fn lists_threads_newest_first() {
         )
     );
     assert_eq!(
-        request(&controller.endpoint, ControllerRequest::ThreadList).await,
+        request(&controller.endpoint, unary(UnaryRequest::ThreadList)).await,
         ControllerResponse::ThreadList {
             threads: vec![
                 Thread {
@@ -68,19 +71,19 @@ async fn lists_threads_newest_first() {
     assert_eq!(
         request(
             &controller.endpoint,
-            ControllerRequest::ThreadRename {
+            unary(UnaryRequest::ThreadRename {
                 thread_id: ThreadId(1),
                 display_name: "Renamed".to_owned(),
-            },
+            }),
         )
         .await,
         ControllerResponse::ThreadRenamed
     );
     let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
-    let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
+    let mut encoded_request = serde_json::to_vec(&turn(TurnRequest::ThreadSend {
         thread_id: ThreadId(2),
         message: "First prompt".to_owned(),
-    })
+    }))
     .unwrap();
     encoded_request.push(b'\n');
     stream.write_all(&encoded_request).await.unwrap();
@@ -119,7 +122,7 @@ async fn lists_threads_newest_first() {
             .unwrap();
     assert!(matches!(response, ControllerResponse::Error { .. }));
     assert_eq!(
-        request(&controller.endpoint, ControllerRequest::ThreadList).await,
+        request(&controller.endpoint, unary(UnaryRequest::ThreadList)).await,
         ControllerResponse::ThreadList {
             threads: vec![
                 Thread {
@@ -145,7 +148,7 @@ async fn active_turn_can_be_cancelled_after_starting() {
     assert_eq!(
         request(
             &controller.endpoint,
-            ControllerRequest::ThreadCreate { display_name: None },
+            unary(UnaryRequest::ThreadCreate { display_name: None }),
         )
         .await,
         ControllerResponse::ThreadCreated {
@@ -153,10 +156,10 @@ async fn active_turn_can_be_cancelled_after_starting() {
         }
     );
     let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
-    let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
+    let mut encoded_request = serde_json::to_vec(&turn(TurnRequest::ThreadSend {
         thread_id: ThreadId(1),
         message: "Cancel this".to_owned(),
-    })
+    }))
     .unwrap();
     encoded_request.push(b'\n');
     stream.write_all(&encoded_request).await.unwrap();
@@ -174,9 +177,9 @@ async fn active_turn_can_be_cancelled_after_starting() {
             Duration::from_secs(1),
             request(
                 &controller.endpoint,
-                ControllerRequest::ThreadCancel {
+                unary(UnaryRequest::ThreadCancel {
                     thread_id: ThreadId(1),
-                },
+                }),
             ),
         )
         .await
@@ -230,7 +233,15 @@ async fn invalid_message_does_not_stop_controller() {
 }
 
 async fn status(endpoint: &PathBuf) -> ControllerResponse {
-    request(endpoint, ControllerRequest::Status).await
+    request(endpoint, unary(UnaryRequest::Status)).await
+}
+
+fn unary(request: UnaryRequest) -> ControllerRequest {
+    ControllerRequest::Unary(request)
+}
+
+fn turn(request: TurnRequest) -> ControllerRequest {
+    ControllerRequest::Turn(request)
 }
 
 async fn request(endpoint: &PathBuf, request: ControllerRequest) -> ControllerResponse {

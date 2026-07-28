@@ -1,16 +1,12 @@
 use anyhow::{Context, Result};
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use atra_protocol::{ControllerRequest, ControllerResponse, TurnRequest};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     sync::{mpsc, watch},
 };
 
-use crate::{
-    State,
-    model::ModelStreamEvent,
-    request::{Request, TurnRequest},
-};
+use crate::{State, model::ModelStreamEvent};
 
 pub(crate) async fn handle_client(
     mut stream: UnixStream,
@@ -24,8 +20,8 @@ pub(crate) async fn handle_client(
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
-    match Request::from(request) {
-        Request::Shutdown => {
+    match request {
+        ControllerRequest::Shutdown => {
             let response = write_response(&mut stream, &ControllerResponse::Stopping).await;
             let closed = stream
                 .shutdown()
@@ -36,8 +32,8 @@ pub(crate) async fn handle_client(
             response?;
             closed
         }
-        Request::Turn(request) => handle_turn(&mut stream, state, request).await,
-        Request::Unary(request) => {
+        ControllerRequest::Turn(request) => handle_turn(&mut stream, state, request).await,
+        ControllerRequest::Unary(request) => {
             let response = match state.handle(request).await {
                 Ok(response) => response,
                 Err(error) => ControllerResponse::Error {

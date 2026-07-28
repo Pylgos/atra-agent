@@ -37,6 +37,17 @@ pub(super) struct ProcessInspection {
     pub(super) omitted_bytes: usize,
 }
 
+pub(super) enum WaitOutcome {
+    Running {
+        process_handle: ProcessHandle,
+        output: CommandOutput,
+    },
+    Finished {
+        output: CommandOutput,
+        exit_code: Option<i32>,
+    },
+}
+
 impl RunnerClient {
     pub(super) fn new(stdin: ChildStdin, stdout: ChildStdout, name: &str) -> Self {
         let stdin = Arc::new(Mutex::new(stdin));
@@ -152,7 +163,7 @@ impl RunnerClient {
         &self,
         process_handle: ProcessHandle,
         timeout_ms: u64,
-    ) -> Result<RunnerResponse> {
+    ) -> Result<WaitOutcome> {
         match self
             .request_raw(RunnerRequest::WaitProcess {
                 process_handle,
@@ -160,8 +171,16 @@ impl RunnerClient {
             })
             .await?
         {
-            response @ (RunnerResponse::ProcessRunning { .. }
-            | RunnerResponse::ProcessFinished { .. }) => Ok(response),
+            RunnerResponse::ProcessRunning {
+                process_handle,
+                output,
+            } => Ok(WaitOutcome::Running {
+                process_handle,
+                output,
+            }),
+            RunnerResponse::ProcessFinished { output, exit_code } => {
+                Ok(WaitOutcome::Finished { output, exit_code })
+            }
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid wait_process response"),
         }
