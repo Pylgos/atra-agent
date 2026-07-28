@@ -7,13 +7,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_protocol::{
     CommandOutput, ProcessHandle, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
     RunnerResponseEnvelope,
 };
 use clap::{Parser, Subcommand};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     task::JoinHandle,
     time::Instant,
@@ -36,6 +37,7 @@ enum Command {
         #[command(subcommand)]
         command: ProcCommand,
     },
+    Patch,
 }
 
 #[derive(Subcommand)]
@@ -87,12 +89,15 @@ async fn run(cli: Cli) -> Result<bool> {
         env::var_os("ATRI_RUNNER_ENDPOINT")
             .context("ATRI_RUNNER_ENDPOINT is not set; atri must run on an Atra Runner")?,
     );
+    match cli.command {
+        Command::Proc { command } => run_proc(endpoint, command).await,
+        Command::Patch => run_patch(&endpoint).await,
+    }
+}
+
+async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
     let prefix = env::var("ATRI_PROCESS_PREFIX")
         .context("ATRI_PROCESS_PREFIX is not set; atri must run on an Atra Runner")?;
-
-    let command = match cli.command {
-        Command::Proc { command } => command,
-    };
     let processes = match &command {
         ProcCommand::Wait { processes, .. } | ProcCommand::Stop { processes } => processes,
     };
@@ -135,6 +140,95 @@ async fn run(cli: Cli) -> Result<bool> {
         .all(|result| !matches!(result.state, ProcessState::Error(_)));
     display_results(results);
     Ok(success)
+}
+
+async fn run_patch(endpoint: &Path) -> Result<bool> {
+    let process_handle = ProcessHandle(
+        env::var("ATRI_PROCESS_HANDLE")
+            .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
+    );
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let mut patch = String::new();
+    io::stdin()
+        .read_to_string(&mut patch)
+        .await
+        .context("failed to read patch from stdin")?;
+    let patch = patch
+        .strip_prefix("*** Begin Patch\n")
+        .context("patch must start with '*** Begin Patch'")?;
+    let patch = patch
+        .strip_suffix("*** End Patch\n")
+        .or_else(|| patch.strip_suffix("*** End Patch"))
+        .context("patch must end with '*** End Patch'")?
+        .to_owned();
+    match request(
+        endpoint,
+        RunnerRequest::ApplyPatch {
+            process_handle,
+            cwd,
+            patch,
+        },
+    )
+    .await?
+    {
+        RunnerResponse::PatchCompleted { result } => Ok(display_patch_result(&result)),
+        RunnerResponse::Error { message } => bail!("{message}"),
+        _ => bail!("Runner returned an invalid patch response"),
+    }
+}
+
+fn display_patch_result(result: &ApplyPatchResult) -> bool {
+    let results = match result {
+        ApplyPatchResult::ParseError { error } => {
+            println!("atri patch failed:\n{error}");
+            return false;
+        }
+        ApplyPatchResult::Operations { results } => results,
+    };
+    let success = results.iter().all(|result| {
+        matches!(
+            result,
+            PatchOperationResult::Added {
+                outcome: PatchOperationOutcome::Applied { .. },
+                ..
+            } | PatchOperationResult::Deleted {
+                outcome: PatchOperationOutcome::Applied { .. },
+                ..
+            } | PatchOperationResult::Updated {
+                outcome: PatchOperationOutcome::Applied { .. },
+                ..
+            } | PatchOperationResult::Moved {
+                outcome: PatchOperationOutcome::Applied { .. },
+                ..
+            }
+        )
+    });
+    if success {
+        println!("Success. Updated the following files:");
+    } else {
+        println!("atri patch completed with errors:");
+    }
+    for result in results {
+        let (label, outcome) = match result {
+            PatchOperationResult::Added { path, outcome } => {
+                (format!("A {}", path.display()), outcome)
+            }
+            PatchOperationResult::Deleted { path, outcome } => {
+                (format!("D {}", path.display()), outcome)
+            }
+            PatchOperationResult::Updated { path, outcome } => {
+                (format!("M {}", path.display()), outcome)
+            }
+            PatchOperationResult::Moved { from, to, outcome } => {
+                (format!("R {} -> {}", from.display(), to.display()), outcome)
+            }
+        };
+        match outcome {
+            PatchOperationOutcome::Applied { .. } => println!("{label}"),
+            PatchOperationOutcome::Failed { error } => println!("{label}: {error}"),
+        }
+    }
+    success
 }
 
 async fn collect_results(tasks: Vec<JoinHandle<ProcessResult>>) -> Vec<ProcessResult> {
@@ -183,6 +277,7 @@ async fn wait_process(
             Ok(RunnerResponse::ProcessFinished {
                 output: command_output,
                 exit_code,
+                ..
             }) => {
                 output.append(command_output);
                 return ProcessResult {

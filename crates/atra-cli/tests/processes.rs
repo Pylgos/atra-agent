@@ -95,24 +95,6 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(allowed.status.success(), "{allowed:?}");
     assert_eq!(allowed.stdout, b"approved approved-output\n");
 
-    let patch_thread = system.create_thread().await;
-    let mut pending = system.start_message(patch_thread, "request an approved patch");
-    let pending_stdout = pending.approval().await;
-    assert!(
-        pending_stdout.contains("tool: apply_patch"),
-        "{pending_stdout:?}"
-    );
-    let patch_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
-    let approval = system.allow(patch_approval_id).await;
-    assert!(approval.status.success(), "{approval:?}");
-    let approved_patch = pending.finish().await;
-    assert!(approved_patch.status.success(), "{approved_patch:?}");
-    assert_eq!(approved_patch.stdout, b"patched patch-ok\n");
-    assert_eq!(
-        fs::read_to_string(system.workspace.path().join("model-patched.txt")).unwrap(),
-        "patch-ok\n"
-    );
-
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
     let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
     let (one, two) = tokio::join!(one, two);
@@ -420,20 +402,6 @@ impl TestSystem {
                 {
                     "assistant_message": {
                         "content": "approved {{tool_output}}"
-                    }
-                },
-                {
-                    "tool_call": {
-                        "name": "apply_patch",
-                        "arguments": {
-                            "runner": "two",
-                            "patch": "*** Add File: model-patched.txt\n+patch-ok"
-                        }
-                    }
-                },
-                {
-                    "assistant_message": {
-                        "content": "patched patch-ok"
                     }
                 }
             ]"#,

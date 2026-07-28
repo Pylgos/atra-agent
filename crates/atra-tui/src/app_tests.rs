@@ -115,7 +115,7 @@ fn layout_mapping_does_not_insert_soft_wraps() {
 }
 
 #[test]
-fn markdown_and_partial_patch_render_before_completion() {
+fn markdown_and_patch_command_render_before_completion() {
     let mut items = vec![
         TranscriptEntry::message(
             Author::Assistant,
@@ -123,11 +123,11 @@ fn markdown_and_partial_patch_render_before_completion() {
                 .to_owned(),
         ),
         TranscriptEntry::new(TranscriptItem::ToolCall {
-            name: "apply_patch".to_owned(),
-            arguments: Some(serde_json::json!({
-                "runner": "local",
-                "patch": "*** Update File: src/main.rs\n@@\n-old\n+new",
-            })),
+            name: "runner".to_owned(),
+            arguments: Some(serde_json::Value::String(
+                "*** Runner local\n*** Command\natri patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch\nPATCH\n*** End\n*** Done"
+                    .to_owned(),
+            )),
         }),
     ];
 

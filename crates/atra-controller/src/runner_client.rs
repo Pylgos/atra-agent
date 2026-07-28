@@ -41,10 +41,12 @@ pub(super) enum WaitOutcome {
     Running {
         process_handle: ProcessHandle,
         output: CommandOutput,
+        patch_results: Vec<ApplyPatchResult>,
     },
     Finished {
         output: CommandOutput,
         exit_code: Option<i32>,
+        patch_results: Vec<ApplyPatchResult>,
     },
 }
 
@@ -178,13 +180,21 @@ impl RunnerClient {
             RunnerResponse::ProcessRunning {
                 process_handle,
                 output,
+                patch_results,
             } => Ok(WaitOutcome::Running {
                 process_handle,
                 output,
+                patch_results,
             }),
-            RunnerResponse::ProcessFinished { output, exit_code } => {
-                Ok(WaitOutcome::Finished { output, exit_code })
-            }
+            RunnerResponse::ProcessFinished {
+                output,
+                exit_code,
+                patch_results,
+            } => Ok(WaitOutcome::Finished {
+                output,
+                exit_code,
+                patch_results,
+            }),
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid wait_process response"),
         }
@@ -228,17 +238,6 @@ impl RunnerClient {
             RunnerResponse::ProcessStatus { process_status } => Ok(process_status),
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid process_status response"),
-        }
-    }
-
-    pub(super) async fn apply_patch(&self, patch: String) -> Result<ApplyPatchResult> {
-        match self
-            .request_raw(RunnerRequest::ApplyPatch { patch })
-            .await?
-        {
-            RunnerResponse::PatchCompleted { result } => Ok(result),
-            RunnerResponse::Error { message } => bail!("{message}"),
-            _ => bail!("runner returned an invalid apply_patch response"),
         }
     }
 

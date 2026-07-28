@@ -454,26 +454,6 @@ fn tool_call_lines(
             );
             lines
         }
-        "apply_patch" => {
-            let runner = object
-                .and_then(|arguments| arguments.get("runner"))
-                .and_then(serde_json::Value::as_str);
-            let patch = arguments
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    object
-                        .and_then(|arguments| arguments.get("patch"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or_default();
-            let mut lines = runner
-                .map(|runner| (Some('┌'), Line::from(runner.to_owned())))
-                .into_iter()
-                .collect::<Vec<_>>();
-            lines.push((Some('±'), Line::from("apply patch")));
-            lines.extend(patch_lines(patch).into_iter().map(|line| (None, line)));
-            lines
-        }
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
         _ => {
             let mut lines = vec![(
@@ -542,27 +522,6 @@ fn runner_tool_lines(
                     .into_iter()
                     .enumerate()
                     .map(|(index, line)| ((index == 0).then_some('$'), line)),
-            );
-            index = (end + 1).min(input.len());
-            append_runner_result(&mut lines, results.get(&operation), expanded);
-        } else if input[index] == "*** Patch" {
-            operation += 1;
-            separate_operation(&mut lines, operation);
-            index += 1;
-            let end = input[index..]
-                .iter()
-                .position(|line| *line == "*** End")
-                .map_or(input.len(), |offset| index + offset);
-            lines.push(runner_operation_header(
-                '±',
-                operation,
-                "Patch",
-                pending_approval == Some(operation),
-            ));
-            lines.extend(
-                patch_lines(&input[index..end].join("\n"))
-                    .into_iter()
-                    .map(|line| (None, line)),
             );
             index = (end + 1).min(input.len());
             append_runner_result(&mut lines, results.get(&operation), expanded);
@@ -1134,34 +1093,6 @@ fn highlighted_spans(
             })
             .collect(),
     )
-}
-
-fn patch_lines(patch: &str) -> Vec<Line<'static>> {
-    patch
-        .lines()
-        .map(|line| {
-            let style = if line.starts_with("*** Add File:")
-                || line.starts_with("*** Update File:")
-                || line.starts_with("*** Delete File:")
-                || line.starts_with("*** Move to:")
-            {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if line.starts_with("@@") {
-                Style::default().fg(Color::Magenta)
-            } else if line.starts_with('+') {
-                Style::default().fg(Color::Green)
-            } else if line.starts_with('-') {
-                Style::default().fg(Color::Red)
-            } else if line.starts_with("***") {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(line.to_owned(), style))
-        })
-        .collect()
 }
 
 fn format_tool_value(value: &serde_json::Value) -> String {

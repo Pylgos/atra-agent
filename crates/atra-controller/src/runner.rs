@@ -14,10 +14,12 @@ pub(super) enum CommandOutcome {
     Running {
         process_id: ProcessId,
         output: CommandOutput,
+        patch_results: Vec<ApplyPatchResult>,
     },
     Finished {
         output: CommandOutput,
         exit_code: Option<i32>,
+        patch_results: Vec<ApplyPatchResult>,
     },
 }
 

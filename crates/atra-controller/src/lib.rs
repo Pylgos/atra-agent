@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
+use atra_patch::ApplyPatchResult;
 use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalId, ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
@@ -448,7 +448,9 @@ impl State {
                         process_id,
                         output: format_command_output(&output),
                     }),
-                    WaitOutcome::Finished { output, exit_code } => {
+                    WaitOutcome::Finished {
+                        output, exit_code, ..
+                    } => {
                         self.runners.remove_process(&key).await;
                         Ok(ControllerResponse::ProcessFinished {
                             output: format_command_output(&output),
@@ -550,7 +552,9 @@ impl State {
                         });
                     }
                 }
-                WaitOutcome::Finished { output, exit_code } => {
+                WaitOutcome::Finished {
+                    output, exit_code, ..
+                } => {
                     append_command_output(&mut collected, output);
                     let output = collected.take().unwrap();
                     tracing::info!(

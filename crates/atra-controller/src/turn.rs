@@ -779,31 +779,7 @@ impl State {
                             let arguments: ExecCommandArguments = serde_json::from_value(arguments)
                                 .context("fake model returned invalid exec_command arguments")?;
                             if let Some(response) = self
-                                .route_tool(
-                                    thread_id,
-                                    name,
-                                    call_id,
-                                    ToolArguments::ExecCommand(arguments),
-                                    false,
-                                    updates,
-                                )
-                                .await?
-                            {
-                                return Ok(Some(response));
-                            }
-                        }
-                        "apply_patch" => {
-                            let arguments: ApplyPatchArguments = serde_json::from_value(arguments)
-                                .context("fake model returned invalid apply_patch arguments")?;
-                            if let Some(response) = self
-                                .route_tool(
-                                    thread_id,
-                                    name,
-                                    call_id,
-                                    ToolArguments::ApplyPatch(arguments),
-                                    false,
-                                    updates,
-                                )
+                                .route_tool(thread_id, name, call_id, arguments, false, updates)
                                 .await?
                             {
                                 return Ok(Some(response));
@@ -851,7 +827,7 @@ impl State {
                             .approve_and_execute(
                                 thread_id,
                                 operation_name,
-                                operation.into_arguments(),
+                                operation,
                                 Some(&operation_context),
                                 updates,
                             )
@@ -918,7 +894,7 @@ impl State {
         thread_id: ThreadId,
         name: String,
         call_id: Option<String>,
-        arguments: ToolArguments,
+        arguments: ExecCommandArguments,
         custom: bool,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<Option<ControllerResponse>> {
@@ -941,50 +917,35 @@ impl State {
         &self,
         thread_id: ThreadId,
         name: &str,
-        arguments: ToolArguments,
+        arguments: ExecCommandArguments,
         operation: Option<&OperationContext>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ToolOutcome> {
         let runner = self.runners.get(arguments.runner()).await?;
-        let decision =
-            if arguments.requires_approval() && runner.approval().await == ApprovalPolicy::Ask {
-                let arguments_json = serde_json::to_value(&arguments)
-                    .context("failed to encode approval arguments")?;
-                let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
-                updates
-                    .context("approval requires a streaming turn")?
-                    .send(ModelStreamEvent::ApprovalRequired {
-                        approval_id,
-                        thread_id,
-                        tool: name.to_owned(),
-                        arguments: arguments_json,
-                        operation_index: operation.map(|operation| operation.index),
-                        operation_label: operation.map(|operation| operation.label.clone()),
-                    })
-                    .context("turn stream closed while waiting for approval")?;
-                Some(
-                    approval
-                        .await
-                        .context("approval was removed before it was resolved")?,
-                )
-            } else {
-                None
-            };
-        let allowed = decision.as_ref().is_none_or(|decision| decision.allowed);
-        let active = if allowed && matches!(&arguments, ToolArguments::ApplyPatch(_)) {
+        let decision = if runner.approval().await == ApprovalPolicy::Ask {
+            let arguments_json =
+                serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
+            let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
+            updates
+                .context("approval requires a streaming turn")?
+                .send(ModelStreamEvent::ApprovalRequired {
+                    approval_id,
+                    thread_id,
+                    tool: name.to_owned(),
+                    arguments: arguments_json,
+                    operation_index: operation.map(|operation| operation.index),
+                    operation_label: operation.map(|operation| operation.label.clone()),
+                })
+                .context("turn stream closed while waiting for approval")?;
             Some(
-                self.turns
-                    .get(thread_id)
+                approval
                     .await
-                    .context("thread has no active turn")?,
+                    .context("approval was removed before it was resolved")?,
             )
         } else {
             None
         };
-        let _uncancellable = match &active {
-            Some(active) => Some(active.lock_uncancellable().await),
-            None => None,
-        };
+        let allowed = decision.as_ref().is_none_or(|decision| decision.allowed);
         let result = if allowed {
             self.execute(thread_id, arguments, operation, updates)
                 .await?
@@ -1014,35 +975,122 @@ impl State {
     pub(super) async fn execute(
         &self,
         thread_id: ThreadId,
-        arguments: ToolArguments,
+        arguments: ExecCommandArguments,
         operation: Option<&OperationContext>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ToolOutcome> {
-        match arguments {
-            ToolArguments::ExecCommand(arguments) => {
-                let runner_name = arguments.runner.clone();
-                let command = arguments.command.clone();
-                let started_at_ms = checkpoint_time_ms();
-                let runner = self.runners.get(&arguments.runner).await?;
-                if let ModelCommandMode::Background { process_id } = &arguments.mode
-                    && self
-                        .runners
-                        .contains_process(&ProcessKey {
+        let runner_name = arguments.runner.clone();
+        let command = arguments.command.clone();
+        let started_at_ms = checkpoint_time_ms();
+        let runner = self.runners.get(&arguments.runner).await?;
+        if let ModelCommandMode::Background { process_id } = &arguments.mode
+            && self
+                .runners
+                .contains_process(&ProcessKey {
+                    thread_id,
+                    runner: runner_name.clone(),
+                    process_id: process_id.clone(),
+                })
+                .await
+        {
+            return Ok(ToolOutcome::text(format!(
+                "Process ID '{process_id}' is already in use on Runner {runner_name}"
+            )));
+        }
+        let response = match arguments.mode {
+            ModelCommandMode::Background { process_id } => {
+                let process_handle = runner
+                    .start_command(arguments.command, thread_id, &process_id)
+                    .await?;
+                self.runners
+                    .insert_process(
+                        ProcessKey {
                             thread_id,
                             runner: runner_name.clone(),
                             process_id: process_id.clone(),
-                        })
-                        .await
-                {
-                    return Ok(ToolOutcome::text(format!(
-                        "Process ID '{process_id}' is already in use on Runner {runner_name}"
-                    )));
-                }
-                let response = match arguments.mode {
-                    ModelCommandMode::Background { process_id } => {
-                        let process_handle = runner
-                            .start_command(arguments.command, thread_id, &process_id)
-                            .await?;
+                        },
+                        ProcessRecord {
+                            handle: process_handle,
+                            command: command.clone(),
+                            started_at_ms,
+                        },
+                    )
+                    .await;
+                CommandOutcome::Started { process_id }
+            }
+            ModelCommandMode::Foreground { timeout_ms } => {
+                let active = self
+                    .turns
+                    .get(thread_id)
+                    .await
+                    .context("thread has no active turn")?;
+                let process_id = self
+                    .runners
+                    .generate_process_id(thread_id, &runner_name)
+                    .await;
+                let process_handle = runner
+                    .start_command(arguments.command, thread_id, &process_id)
+                    .await?;
+                active
+                    .set_process(Arc::clone(&runner), process_handle.clone())
+                    .await;
+                send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted)?;
+                let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                let mut collected = None;
+                let mut patch_results = Vec::new();
+                let response = loop {
+                    let timeout_ms = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(1000)
+                        .try_into()
+                        .unwrap_or(1000);
+                    match runner.wait(process_handle.clone(), timeout_ms).await? {
+                        WaitOutcome::Running {
+                            output,
+                            patch_results: result_patch_results,
+                            ..
+                        } => {
+                            send_operation_update(
+                                operation,
+                                updates,
+                                RunnerOperationUpdate::CommandOutput {
+                                    content: output.content.clone(),
+                                    omitted_bytes: output.omitted_bytes,
+                                },
+                            )?;
+                            append_command_output(&mut collected, output);
+                            patch_results.extend(result_patch_results);
+                            if Instant::now() >= deadline {
+                                break WaitOutcome::Running {
+                                    process_handle: process_handle.clone(),
+                                    output: collected.take().unwrap(),
+                                    patch_results,
+                                };
+                            }
+                        }
+                        WaitOutcome::Finished {
+                            output,
+                            exit_code,
+                            patch_results: result_patch_results,
+                        } => {
+                            append_command_output(&mut collected, output);
+                            patch_results.extend(result_patch_results);
+                            break WaitOutcome::Finished {
+                                output: collected.take().unwrap(),
+                                exit_code,
+                                patch_results,
+                            };
+                        }
+                    }
+                };
+                active.clear_process().await;
+                match response {
+                    WaitOutcome::Running {
+                        process_handle,
+                        output,
+                        patch_results,
+                    } => {
                         self.runners
                             .insert_process(
                                 ProcessKey {
@@ -1057,115 +1105,40 @@ impl State {
                                 },
                             )
                             .await;
-                        CommandOutcome::Started { process_id }
-                    }
-                    ModelCommandMode::Foreground { timeout_ms } => {
-                        let active = self
-                            .turns
-                            .get(thread_id)
-                            .await
-                            .context("thread has no active turn")?;
-                        let process_id = self
-                            .runners
-                            .generate_process_id(thread_id, &runner_name)
-                            .await;
-                        let process_handle = runner
-                            .start_command(arguments.command, thread_id, &process_id)
-                            .await?;
-                        active
-                            .set_process(Arc::clone(&runner), process_handle.clone())
-                            .await;
-                        send_operation_update(
-                            operation,
-                            updates,
-                            RunnerOperationUpdate::CommandStarted,
-                        )?;
-                        let deadline =
-                            Instant::now() + std::time::Duration::from_millis(timeout_ms);
-                        let mut collected = None;
-                        let response = loop {
-                            let timeout_ms = deadline
-                                .saturating_duration_since(Instant::now())
-                                .as_millis()
-                                .min(1000)
-                                .try_into()
-                                .unwrap_or(1000);
-                            match runner.wait(process_handle.clone(), timeout_ms).await? {
-                                WaitOutcome::Running { output, .. } => {
-                                    send_operation_update(
-                                        operation,
-                                        updates,
-                                        RunnerOperationUpdate::CommandOutput {
-                                            content: output.content.clone(),
-                                            omitted_bytes: output.omitted_bytes,
-                                        },
-                                    )?;
-                                    append_command_output(&mut collected, output);
-                                    if Instant::now() >= deadline {
-                                        break WaitOutcome::Running {
-                                            process_handle: process_handle.clone(),
-                                            output: collected.take().unwrap(),
-                                        };
-                                    }
-                                }
-                                WaitOutcome::Finished { output, exit_code } => {
-                                    append_command_output(&mut collected, output);
-                                    break WaitOutcome::Finished {
-                                        output: collected.take().unwrap(),
-                                        exit_code,
-                                    };
-                                }
-                            }
-                        };
-                        active.clear_process().await;
-                        match response {
-                            WaitOutcome::Running {
-                                process_handle,
-                                output,
-                            } => {
-                                self.runners
-                                    .insert_process(
-                                        ProcessKey {
-                                            thread_id,
-                                            runner: runner_name.clone(),
-                                            process_id: process_id.clone(),
-                                        },
-                                        ProcessRecord {
-                                            handle: process_handle,
-                                            command: command.clone(),
-                                            started_at_ms,
-                                        },
-                                    )
-                                    .await;
-                                CommandOutcome::Running { process_id, output }
-                            }
-                            WaitOutcome::Finished { output, exit_code } => {
-                                CommandOutcome::Finished { output, exit_code }
-                            }
+                        CommandOutcome::Running {
+                            process_id,
+                            output,
+                            patch_results,
                         }
                     }
-                };
-                let artifact = command_artifact(&response, &runner_name);
-                Ok(ToolOutcome::with_artifact(
-                    format_command_response(&runner_name, response),
-                    ToolArtifact::CommandExecution(artifact),
-                ))
+                    WaitOutcome::Finished {
+                        output,
+                        exit_code,
+                        patch_results,
+                    } => CommandOutcome::Finished {
+                        output,
+                        exit_code,
+                        patch_results,
+                    },
+                }
             }
-            ToolArguments::ApplyPatch(arguments) => {
-                let result = self
-                    .runners
-                    .get(&arguments.runner)
-                    .await?
-                    .client
-                    .apply_patch(arguments.patch)
-                    .await?;
-                let output = format_patch_result(&result);
-                Ok(ToolOutcome::with_artifact(
-                    output,
-                    ToolArtifact::PatchOperations(result),
-                ))
-            }
+        };
+        let artifact = command_artifact(&response, &runner_name);
+        let mut artifacts = vec![ToolArtifact::CommandExecution(artifact)];
+        match &response {
+            CommandOutcome::Running { patch_results, .. }
+            | CommandOutcome::Finished { patch_results, .. } => artifacts.extend(
+                patch_results
+                    .iter()
+                    .cloned()
+                    .map(ToolArtifact::PatchOperations),
+            ),
+            CommandOutcome::Started { .. } => {}
         }
+        Ok(ToolOutcome {
+            result: serde_json::Value::String(format_command_response(&runner_name, response)),
+            artifacts,
+        })
     }
 
     pub(super) async fn save_tool_result(

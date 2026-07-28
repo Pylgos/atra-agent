@@ -672,6 +672,8 @@ pub enum RunnerRequest {
         process_prefix: String,
     },
     ApplyPatch {
+        process_handle: ProcessHandle,
+        cwd: PathBuf,
         patch: String,
     },
     WaitProcess {
@@ -707,10 +709,12 @@ pub enum RunnerResponse {
     ProcessRunning {
         process_handle: ProcessHandle,
         output: CommandOutput,
+        patch_results: Vec<ApplyPatchResult>,
     },
     ProcessFinished {
         output: CommandOutput,
         exit_code: Option<i32>,
+        patch_results: Vec<ApplyPatchResult>,
     },
     ProcessStopped {
         output: CommandOutput,

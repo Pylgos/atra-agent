@@ -166,15 +166,11 @@ async fn handle_request(
                 process_handle: process.handle.clone(),
             })
         }
-        RunnerRequest::ApplyPatch { patch } => {
-            tracing::info!(patch_bytes = patch.len(), "applying patch");
-            tracing::trace!(%patch, "patch content");
-            let cwd = std::env::current_dir().context("failed to determine runner cwd")?;
-            let result = tokio::task::spawn_blocking(move || apply(&patch, &cwd))
-                .await
-                .context("patch task failed")?;
-            Ok(RunnerResponse::PatchCompleted { result })
-        }
+        RunnerRequest::ApplyPatch {
+            process_handle,
+            cwd,
+            patch,
+        } => processes.apply_patch(&process_handle, cwd, patch).await,
         RunnerRequest::WaitProcess {
             process_handle,
             timeout_ms,
@@ -233,6 +229,11 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
                 .await
         }
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
+        RunnerRequest::ApplyPatch {
+            process_handle,
+            cwd,
+            patch,
+        } => processes.apply_patch(&process_handle, cwd, patch).await,
         _ => bail!("unsupported Runner control request"),
     }
     .unwrap_or_else(|error| RunnerResponse::Error {
@@ -359,6 +360,7 @@ impl ProcessManager {
         }
         child.env("ATRI_RUNNER_ENDPOINT", &self.control_endpoint);
         child.env("ATRI_PROCESS_PREFIX", process_prefix);
+        child.env("ATRI_PROCESS_HANDLE", handle.as_ref());
         let child = child
             .spawn()
             .context("failed to execute command with bash")?;
@@ -380,6 +382,8 @@ impl ProcessManager {
             child: Mutex::new(child),
             output: Mutex::new(OutputBuffer::default()),
             output_tail: Mutex::new(TailBuffer::default()),
+            patch_results: Mutex::new(Vec::new()),
+            patching: Mutex::new(()),
             full_output_path,
             output_closed: AtomicBool::new(false),
             output_shutdown,
@@ -454,12 +458,14 @@ impl ProcessManager {
                 return Ok(RunnerResponse::ProcessFinished {
                     output: output.finish(process.full_output_path.clone()),
                     exit_code,
+                    patch_results: process.take_patch_results().await,
                 });
             }
             if !output.bytes.is_empty() || output.omitted_bytes != 0 || Instant::now() >= deadline {
                 return Ok(RunnerResponse::ProcessRunning {
                     process_handle: handle.clone(),
                     output: output.finish(process.full_output_path.clone()),
+                    patch_results: process.take_patch_results().await,
                 });
             }
             tokio::select! {
@@ -490,12 +496,30 @@ impl ProcessManager {
             sleep(Duration::from_millis(10)).await;
         }
         process.finish_output().await;
+        let _patching = process.patching.lock().await;
         let output = process.take_output().await;
         self.processes.lock().await.remove(handle);
         tracing::info!(process_handle = %handle, "process stopped");
         Ok(RunnerResponse::ProcessStopped {
             output: output.finish(process.full_output_path.clone()),
         })
+    }
+
+    async fn apply_patch(
+        &self,
+        handle: &ProcessHandle,
+        cwd: PathBuf,
+        patch: String,
+    ) -> Result<RunnerResponse> {
+        let process = self.process(handle).await?;
+        let _patching = process.patching.lock().await;
+        tracing::info!(process_handle = %handle, patch_bytes = patch.len(), "applying patch");
+        tracing::trace!(%patch, "patch content");
+        let result = tokio::task::spawn_blocking(move || apply(&patch, &cwd))
+            .await
+            .context("patch task failed")?;
+        process.patch_results.lock().await.push(result.clone());
+        Ok(RunnerResponse::PatchCompleted { result })
     }
 
     async fn inspect(&self, handle: &ProcessHandle) -> Result<RunnerResponse> {
@@ -543,6 +567,8 @@ struct ManagedProcess {
     child: Mutex<Child>,
     output: Mutex<OutputBuffer>,
     output_tail: Mutex<TailBuffer>,
+    patch_results: Mutex<Vec<atra_patch::ApplyPatchResult>>,
+    patching: Mutex<()>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
     output_shutdown: watch::Sender<bool>,
@@ -552,6 +578,10 @@ struct ManagedProcess {
 impl ManagedProcess {
     async fn take_output(&self) -> OutputBuffer {
         std::mem::take(&mut *self.output.lock().await)
+    }
+
+    async fn take_patch_results(&self) -> Vec<atra_patch::ApplyPatchResult> {
+        std::mem::take(&mut *self.patch_results.lock().await)
     }
 
     async fn exit_code(&self) -> Result<Option<Option<i32>>> {

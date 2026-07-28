@@ -722,8 +722,11 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
 
                 Patches:
-                Use `*** Patch` and `*** End` to add, update, delete, or move files.
-                Paths in patches are relative to the current Runner's working directory unless absolute.
+                Run `atri patch` as a foreground command and pass the patch on standard input to add, update, delete, or move files.
+                Use a quoted Bash heredoc so the patch is passed literally.
+                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>`.
+                Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
+                Paths in patches are relative to the command's working directory unless absolute.
                 Use line ranges for large deletions or replacements when the line numbers are already known.
                 When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
                 Use ordinary diff lines for small changes.
@@ -741,16 +744,19 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     start: runner_group+ TOOL_END LF?
                     runner_group: runner operation+
                     runner: "*** Runner " name LF
-                    operation: command | patch
+                    operation: command
 
                     command: foreground_command | background_command
                     foreground_command: "*** Command" LF command_body
                     background_command: "*** Background Command " process_id LF command_body
-                    command_body: command_line+ OPERATION_END
-                    command_line: /(.+)/ LF | LF
+                    command_body: command_item+ OPERATION_END
+                    ?command_item: command_line | patch
+                    command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF | LF
                     OPERATION_END: /\*\*\* End\r?\n/
 
-                    patch: "*** Patch" LF hunk+ OPERATION_END
+                    patch: PATCH_BEGIN LF hunk+ PATCH_END LF
+                    PATCH_BEGIN: "*** Begin Patch"
+                    PATCH_END: "*** End Patch"
                     hunk: add_hunk | delete_hunk | update_hunk
                     add_hunk: "*** Add File: " filename LF add_line+
                     delete_hunk: "*** Delete File: " filename LF

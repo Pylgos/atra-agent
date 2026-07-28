@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use atra_protocol::{ApprovalId, ProcessHandle, ThreadId};
-use tokio::sync::{Mutex, MutexGuard, oneshot, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::Runner;
 
@@ -22,7 +22,6 @@ pub(super) struct ActiveTurn {
     cancel_requested: watch::Sender<bool>,
     cancellation: watch::Sender<Option<Result<(), String>>>,
     cancelling: AtomicBool,
-    uncancellable: Mutex<()>,
     process: Mutex<Option<(Arc<Runner>, ProcessHandle)>>,
 }
 
@@ -145,7 +144,6 @@ impl ActiveTurn {
             cancel_requested,
             cancellation,
             cancelling: AtomicBool::new(false),
-            uncancellable: Mutex::new(()),
             process: Mutex::new(None),
         }
     }
@@ -162,10 +160,6 @@ impl ActiveTurn {
         self.cancelling.load(Ordering::Acquire)
     }
 
-    pub(super) async fn lock_uncancellable(&self) -> MutexGuard<'_, ()> {
-        self.uncancellable.lock().await
-    }
-
     pub(super) async fn set_process(&self, runner: Arc<Runner>, process_handle: ProcessHandle) {
         *self.process.lock().await = Some((runner, process_handle));
     }
@@ -175,7 +169,6 @@ impl ActiveTurn {
     }
 
     pub(super) async fn request_cancellation(&self) -> Result<()> {
-        let _uncancellable = self.uncancellable.lock().await;
         let process = self.process.lock().await.take();
         self.cancel_requested.send_replace(true);
         if let Some((runner, process_handle)) = process {

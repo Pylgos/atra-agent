@@ -15,55 +15,28 @@ pub(super) enum ModelCommandMode {
     Background { process_id: ProcessId },
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(super) struct ApplyPatchArguments {
-    pub(super) runner: String,
-    pub(super) patch: String,
-}
-
 const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
 
-pub(super) enum RunnerOperation {
-    Command(ExecCommandArguments),
-    Patch(ApplyPatchArguments),
-}
-
-impl RunnerOperation {
+impl ExecCommandArguments {
     pub(super) fn name(&self) -> &'static str {
-        match self {
-            Self::Command(_) => "exec_command",
-            Self::Patch(_) => "apply_patch",
-        }
+        "exec_command"
     }
 
     pub(super) fn runner(&self) -> &str {
-        match self {
-            Self::Command(arguments) => &arguments.runner,
-            Self::Patch(arguments) => &arguments.runner,
-        }
+        &self.runner
     }
 
     pub(super) fn result_label(&self) -> String {
-        match self {
-            Self::Command(arguments) => match &arguments.mode {
-                ModelCommandMode::Foreground { .. } => "Command".to_owned(),
-                ModelCommandMode::Background { process_id } => {
-                    format!("Background Command {process_id}")
-                }
-            },
-            Self::Patch(_) => "Patch".to_owned(),
-        }
-    }
-
-    pub(super) fn into_arguments(self) -> ToolArguments {
-        match self {
-            Self::Command(arguments) => ToolArguments::ExecCommand(arguments),
-            Self::Patch(arguments) => ToolArguments::ApplyPatch(arguments),
+        match &self.mode {
+            ModelCommandMode::Foreground { .. } => "Command".to_owned(),
+            ModelCommandMode::Background { process_id } => {
+                format!("Background Command {process_id}")
+            }
         }
     }
 }
 
-pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
+pub(super) fn parse_runner_input(input: &str) -> Result<Vec<ExecCommandArguments>> {
     let lines = input.lines().collect::<Vec<_>>();
     if lines.last() != Some(&"*** Done") {
         bail!("runner input must end with '*** Done'");
@@ -116,29 +89,11 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
                 if end == index {
                     bail!("command cannot be empty");
                 }
-                operations.push(RunnerOperation::Command(ExecCommandArguments {
+                operations.push(ExecCommandArguments {
                     runner,
                     command: lines[index..end].join("\n"),
                     mode,
-                }));
-                group_operations += 1;
-                index = end + 1;
-            }
-            "*** Patch" => {
-                index += 1;
-                let end = lines[index..]
-                    .iter()
-                    .position(|line| *line == "*** End")
-                    .map(|offset| index + offset)
-                    .context("patch must end with '*** End'")?;
-                if end == index {
-                    bail!("patch cannot be empty");
-                }
-                let patch = lines[index..end].join("\n");
-                operations.push(RunnerOperation::Patch(ApplyPatchArguments {
-                    runner,
-                    patch,
-                }));
+                });
                 group_operations += 1;
                 index = end + 1;
             }
@@ -166,13 +121,6 @@ pub(super) fn valid_process_id(process_id: &str) -> bool {
         })
 }
 
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-pub(super) enum ToolArguments {
-    ExecCommand(ExecCommandArguments),
-    ApplyPatch(ApplyPatchArguments),
-}
-
 pub(super) struct ToolOutcome {
     pub(super) result: serde_json::Value,
     pub(super) artifacts: Vec<ToolArtifact>,
@@ -184,26 +132,6 @@ impl ToolOutcome {
             result: serde_json::Value::String(result),
             artifacts: Vec::new(),
         }
-    }
-
-    pub(super) fn with_artifact(result: String, artifact: ToolArtifact) -> Self {
-        Self {
-            result: serde_json::Value::String(result),
-            artifacts: vec![artifact],
-        }
-    }
-}
-
-impl ToolArguments {
-    pub(super) fn runner(&self) -> &str {
-        match self {
-            Self::ExecCommand(arguments) => &arguments.runner,
-            Self::ApplyPatch(arguments) => &arguments.runner,
-        }
-    }
-
-    pub(super) fn requires_approval(&self) -> bool {
-        matches!(self, Self::ExecCommand(_) | Self::ApplyPatch(_))
     }
 }
 
@@ -229,61 +157,6 @@ pub(super) fn send_operation_update(
             .context("turn stream closed during runner operation")?;
     }
     Ok(())
-}
-
-pub(super) fn format_patch_result(result: &ApplyPatchResult) -> String {
-    let results = match result {
-        ApplyPatchResult::ParseError { error } => {
-            return format!("apply_patch failed:\n{error}");
-        }
-        ApplyPatchResult::Operations { results } => results,
-    };
-    let failed = results.iter().any(|result| {
-        matches!(
-            result,
-            PatchOperationResult::Added {
-                outcome: PatchOperationOutcome::Failed { .. },
-                ..
-            } | PatchOperationResult::Deleted {
-                outcome: PatchOperationOutcome::Failed { .. },
-                ..
-            } | PatchOperationResult::Updated {
-                outcome: PatchOperationOutcome::Failed { .. },
-                ..
-            } | PatchOperationResult::Moved {
-                outcome: PatchOperationOutcome::Failed { .. },
-                ..
-            }
-        )
-    });
-    let mut output = if failed {
-        String::from("apply_patch completed with errors:\n")
-    } else {
-        String::from("Success. Updated the following files:\n")
-    };
-    for result in results {
-        let (label, outcome) = match result {
-            PatchOperationResult::Added { path, outcome } => {
-                (format!("A {}", path.display()), outcome)
-            }
-            PatchOperationResult::Deleted { path, outcome } => {
-                (format!("D {}", path.display()), outcome)
-            }
-            PatchOperationResult::Updated { path, outcome } => {
-                (format!("M {}", path.display()), outcome)
-            }
-            PatchOperationResult::Moved { from, to, outcome } => {
-                (format!("R {} -> {}", from.display(), to.display()), outcome)
-            }
-        };
-        match outcome {
-            PatchOperationOutcome::Applied { .. } => output.push_str(&format!("{label}\n")),
-            PatchOperationOutcome::Failed { error } => {
-                output.push_str(&format!("{label}: {error}\n"));
-            }
-        }
-    }
-    output
 }
 
 pub(super) fn masked_tool_result(payload: &ToolResultEvent) -> Option<String> {
@@ -420,7 +293,9 @@ pub(super) fn command_artifact(
             runner: runner.to_owned(),
             full_output_path: output.full_output_path.clone(),
         },
-        CommandOutcome::Finished { output, exit_code } => CommandExecutionArtifact::Finished {
+        CommandOutcome::Finished {
+            output, exit_code, ..
+        } => CommandExecutionArtifact::Finished {
             output: format_command_output(output),
             exit_code: *exit_code,
             runner: runner.to_owned(),
@@ -434,13 +309,16 @@ pub(super) fn format_command_response(runner: &str, response: CommandOutcome) ->
         CommandOutcome::Started { process_id } => {
             format!("Process started with ID {process_id}")
         }
-        CommandOutcome::Running { process_id, output } => append_process_status(
+        CommandOutcome::Running {
+            process_id, output, ..
+        } => append_process_status(
             model_command_output(&output, runner),
             &format!("Process {process_id} is still running"),
         ),
         CommandOutcome::Finished {
             output,
             exit_code: Some(0),
+            ..
         } => {
             let output = model_command_output(&output, runner);
             if output.is_empty() {
@@ -449,7 +327,9 @@ pub(super) fn format_command_response(runner: &str, response: CommandOutcome) ->
                 output
             }
         }
-        CommandOutcome::Finished { output, exit_code } => append_process_status(
+        CommandOutcome::Finished {
+            output, exit_code, ..
+        } => append_process_status(
             model_command_output(&output, runner),
             &format!(
                 "Process exited with code {}",
