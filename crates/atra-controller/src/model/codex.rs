@@ -33,13 +33,15 @@ use super::{ModelCompletion, ModelStreamEvent, response_from_item};
 use crate::storage::Event;
 use atra_protocol::{InstructionEvent, RunnersEvent, ThreadEventData, ToolResultEvent};
 
-const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
+const INSTRUCTIONS: &str = indoc! {r#"
+    You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
 
-Commands, managed processes, and patches execute on Atra Runners. The available Runners are provided in the conversation context. For each tool call, choose a suitable Runner with no more access than the operation requires.
+    Commands execute on Atra Runners. The available Runners are provided in the conversation context. For each tool call, choose a suitable Runner with no more access than the operation requires.
 
-Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
-
-Use tool results to determine the next action, then return a final answer."#;
+    Guidelines:
+    - Be concise in your responses.
+    - Show file paths clearly when working with files.
+    - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct CodexProvider {
