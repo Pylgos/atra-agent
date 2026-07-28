@@ -62,6 +62,9 @@ pub(crate) enum TurnUpdate {
         thread_id: i64,
         threads: Vec<Thread>,
     },
+    StreamStarted {
+        thread_id: i64,
+    },
     Delta {
         thread_id: i64,
         content: String,
@@ -105,9 +108,9 @@ pub(crate) enum TurnUpdate {
         approval_id: u64,
         result: Result<ControllerResponse>,
     },
-    CancelRequestFailed {
+    CancelCompleted {
         thread_id: i64,
-        error: anyhow::Error,
+        result: Result<ControllerResponse>,
     },
     LoginCompleted(Result<ControllerResponse>),
     ThreadSelected {
@@ -246,7 +249,8 @@ impl App {
         key: KeyEvent,
         effects: &mpsc::UnboundedSender<Effect>,
     ) -> Result<bool> {
-        if matches!(self.turn, TurnState::Running) && key.code == KeyCode::Esc {
+        if matches!(self.turn, TurnState::Starting | TurnState::Running) && key.code == KeyCode::Esc
+        {
             self.cancel_turn(effects);
             return Ok(false);
         }
@@ -978,8 +982,8 @@ impl App {
         if self.turn.is_running() {
             bail!("a turn is already running");
         }
-        self.turn = TurnState::Running;
-        self.activity = Some(Activity::Info("Continuing turn…".to_owned()));
+        self.turn = TurnState::Starting;
+        self.activity = Some(Activity::Info("Starting turn… · Esc cancels".to_owned()));
         effects
             .send(Effect::ContinueTurn {
                 endpoint: self.endpoint.clone(),
@@ -1204,10 +1208,8 @@ impl App {
             &mut self.message_input,
             message.clone(),
         )?;
-        self.turn = TurnState::Running;
-        self.activity = Some(Activity::Info(
-            "Waiting for Atra Controller… · Esc cancels".to_owned(),
-        ));
+        self.turn = TurnState::Starting;
+        self.activity = Some(Activity::Info("Starting turn… · Esc cancels".to_owned()));
         effects
             .send(Effect::SendTurn {
                 endpoint: self.endpoint.clone(),
@@ -1220,16 +1222,18 @@ impl App {
     }
 
     fn cancel_turn(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
-        let thread_id = self.thread_id.expect("active turn belongs to a thread");
         self.overlay = Overlay::None;
+        let started = matches!(self.turn, TurnState::Running);
         self.turn = TurnState::Cancelling;
         self.activity = Some(Activity::Info("Cancelling…".to_owned()));
-        effects
-            .send(Effect::CancelTurn {
-                endpoint: self.endpoint.clone(),
-                thread_id,
-            })
-            .ok();
+        if started {
+            effects
+                .send(Effect::CancelTurn {
+                    endpoint: self.endpoint.clone(),
+                    thread_id: self.thread_id.expect("active turn belongs to a thread"),
+                })
+                .ok();
+        }
     }
 
     fn rename(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
@@ -1316,7 +1320,11 @@ impl App {
             .ok();
     }
 
-    pub(super) fn update(&mut self, update: TurnUpdate) -> Result<()> {
+    pub(super) fn update(
+        &mut self,
+        update: TurnUpdate,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<()> {
         let completion = match update {
             TurnUpdate::Started {
                 message,
@@ -1333,6 +1341,24 @@ impl App {
                     .find(|thread| thread.id == thread_id)
                 {
                     thread.display_name = Some(message);
+                }
+                return Ok(());
+            }
+            TurnUpdate::StreamStarted { thread_id } => {
+                if self.thread_id == Some(thread_id) {
+                    if matches!(self.turn, TurnState::Cancelling) {
+                        effects
+                            .send(Effect::CancelTurn {
+                                endpoint: self.endpoint.clone(),
+                                thread_id,
+                            })
+                            .ok();
+                    } else {
+                        self.turn = TurnState::Running;
+                        self.activity = Some(Activity::Info(
+                            "Waiting for Atra Controller… · Esc cancels".to_owned(),
+                        ));
+                    }
                 }
                 return Ok(());
             }
@@ -1589,10 +1615,30 @@ impl App {
                 }
                 return Ok(());
             }
-            TurnUpdate::CancelRequestFailed { thread_id, error } => {
+            TurnUpdate::CancelCompleted { thread_id, result } => {
                 if self.thread_id == Some(thread_id) {
-                    self.turn = TurnState::Running;
-                    self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    match result {
+                        Ok(ControllerResponse::ThreadCancelled) => {}
+                        Ok(ControllerResponse::ThreadNotActive) => {
+                            self.turn = TurnState::Idle;
+                            self.activity =
+                                Some(Activity::Info("Turn already finished".to_owned()));
+                        }
+                        Ok(ControllerResponse::Error { message }) => {
+                            self.turn = TurnState::Idle;
+                            self.activity = Some(Activity::Error(sanitize(&message)));
+                        }
+                        Ok(response) => {
+                            self.turn = TurnState::Idle;
+                            self.activity = Some(Activity::Error(format!(
+                                "Unexpected cancellation response: {response:?}"
+                            )));
+                        }
+                        Err(error) => {
+                            self.turn = TurnState::Idle;
+                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        }
+                    }
                 }
                 return Ok(());
             }

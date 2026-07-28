@@ -23,6 +23,7 @@ pub(crate) enum FocusPane {
 pub(crate) enum TurnState {
     #[default]
     Idle,
+    Starting,
     Running,
     Cancelling,
 }

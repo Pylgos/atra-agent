@@ -69,6 +69,9 @@ pub(crate) async fn handle_client(
 
 async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) -> Result<()> {
     let response = match update {
+        ModelStreamEvent::TurnStarted { thread_id } => {
+            ControllerResponse::TurnStarted { thread_id }
+        }
         ModelStreamEvent::AssistantDelta(content) => ControllerResponse::TurnDelta { content },
         ModelStreamEvent::ReasoningSummaryDelta(content) => {
             ControllerResponse::ReasoningSummaryDelta { content }

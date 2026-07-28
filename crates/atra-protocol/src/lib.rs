@@ -139,6 +139,9 @@ pub enum ControllerResponse {
     },
     ThreadRenamed,
     ThreadModelChanged,
+    TurnStarted {
+        thread_id: i64,
+    },
     TurnDelta {
         content: String,
     },

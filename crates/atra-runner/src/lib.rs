@@ -27,8 +27,8 @@ use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
-    sync::{Mutex, Notify},
-    time::{Instant, sleep, sleep_until},
+    sync::{Mutex, Notify, watch},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
 pub async fn run_stdio() -> Result<()> {
@@ -319,6 +319,7 @@ impl ProcessManager {
         let full_output_path = self.output_directory.path().join(&handle);
         let full_output = std::fs::File::create(&full_output_path)
             .context("failed to create full command output file")?;
+        let (output_shutdown, mut output_shutdown_requested) = watch::channel(false);
         let process = Arc::new(ManagedProcess {
             handle: handle.clone(),
             os_pid,
@@ -327,6 +328,7 @@ impl ProcessManager {
             output_tail: Mutex::new(TailBuffer::default()),
             full_output_path,
             output_closed: AtomicBool::new(false),
+            output_shutdown,
             changed: Notify::new(),
         });
         processes.insert(handle.clone(), Arc::clone(&process));
@@ -339,7 +341,16 @@ impl ProcessManager {
                 .expect("nonblocking command output stream should be valid");
             let mut buffer = [0_u8; 8192];
             loop {
-                match reader.read(&mut buffer).await {
+                let read = tokio::select! {
+                    read = reader.read(&mut buffer) => read,
+                    changed = output_shutdown_requested.changed() => {
+                        if changed.is_err() || *output_shutdown_requested.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                match read {
                     Ok(0) => break,
                     Ok(length) => {
                         if let Err(error) = full_output.write_all(&buffer[..length]).await {
@@ -384,7 +395,8 @@ impl ProcessManager {
     ) -> Result<RunnerResponse> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            if let Some(exit_code) = process.finished().await? {
+            if let Some(exit_code) = process.exit_code().await? {
+                process.finish_output().await;
                 let output = process.take_output().await;
                 self.processes.lock().await.remove(&process.handle);
                 return Ok(RunnerResponse::ProcessFinished {
@@ -433,7 +445,8 @@ impl ProcessManager {
         let deadline = Instant::now() + timeout;
         loop {
             let output = process.take_output().await;
-            if let Some(exit_code) = process.finished().await? {
+            if let Some(exit_code) = process.exit_code().await? {
+                process.finish_output().await;
                 let mut output = output;
                 output.append_output(process.take_output().await);
                 self.processes.lock().await.remove(handle);
@@ -460,21 +473,22 @@ impl ProcessManager {
         let process = self.process(handle).await?;
         let _ = kill_process_group(process.os_pid, Signal::TERM);
         let deadline = Instant::now() + Duration::from_millis(200);
+        let kill_deadline = deadline + Duration::from_secs(1);
+        let mut killed = false;
         loop {
-            if process.finished().await?.is_some() {
+            if process.exit_code().await?.is_some() {
                 break;
             }
-            if Instant::now() >= deadline {
+            if !killed && Instant::now() >= deadline {
                 let _ = kill_process_group(process.os_pid, Signal::KILL);
+                killed = true;
+            }
+            if Instant::now() >= kill_deadline {
+                bail!("process {handle} did not exit after SIGKILL");
             }
             sleep(Duration::from_millis(10)).await;
         }
-        while !process.output_closed.load(Ordering::Acquire) {
-            tokio::select! {
-                () = process.changed.notified() => {}
-                () = sleep(Duration::from_millis(10)) => {}
-            }
-        }
+        process.finish_output().await;
         let output = process.take_output().await;
         self.processes.lock().await.remove(handle);
         tracing::info!(process_handle = %handle, "process stopped");
@@ -485,8 +499,11 @@ impl ProcessManager {
 
     async fn inspect(&self, handle: &str) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
-        let process_status = match process.finished().await? {
-            Some(exit_code) => ProcessStatus::Exited { exit_code },
+        let process_status = match process.exit_code().await? {
+            Some(exit_code) => {
+                process.finish_output().await;
+                ProcessStatus::Exited { exit_code }
+            }
             None => ProcessStatus::Running,
         };
         let (output_tail, omitted_bytes) = process.output_tail.lock().await.snapshot();
@@ -499,8 +516,11 @@ impl ProcessManager {
 
     async fn status(&self, handle: &str) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
-        let process_status = match process.finished().await? {
-            Some(exit_code) => ProcessStatus::Exited { exit_code },
+        let process_status = match process.exit_code().await? {
+            Some(exit_code) => {
+                process.finish_output().await;
+                ProcessStatus::Exited { exit_code }
+            }
             None => ProcessStatus::Running,
         };
         Ok(RunnerResponse::ProcessStatus { process_status })
@@ -524,6 +544,7 @@ struct ManagedProcess {
     output_tail: Mutex<TailBuffer>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
+    output_shutdown: watch::Sender<bool>,
     changed: Notify,
 }
 
@@ -532,16 +553,49 @@ impl ManagedProcess {
         std::mem::take(&mut *self.output.lock().await)
     }
 
-    async fn finished(&self) -> Result<Option<Option<i32>>> {
+    async fn exit_code(&self) -> Result<Option<Option<i32>>> {
         let status = self
             .child
             .lock()
             .await
             .try_wait()
             .context("failed to inspect command process")?;
-        Ok(status
-            .filter(|_| self.output_closed.load(Ordering::Acquire))
-            .map(|status| status.code()))
+        Ok(status.map(|status| status.code()))
+    }
+
+    async fn finish_output(&self) {
+        if self.output_closed.load(Ordering::Acquire) {
+            return;
+        }
+        let drained = timeout(Duration::from_millis(50), async {
+            while !self.output_closed.load(Ordering::Acquire) {
+                tokio::select! {
+                    () = self.changed.notified() => {}
+                    () = sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            self.output_shutdown.send_replace(true);
+            if timeout(Duration::from_secs(1), async {
+                while !self.output_closed.load(Ordering::Acquire) {
+                    tokio::select! {
+                        () = self.changed.notified() => {}
+                        () = sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+            })
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    process_handle = %self.handle,
+                    "timed out while stopping process output reader"
+                );
+            }
+        }
     }
 }
 
@@ -632,6 +686,29 @@ impl TailBuffer {
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
+        self.output_shutdown.send_replace(true);
         let _ = kill_process_group(self.os_pid, Signal::KILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_does_not_wait_for_inherited_output_descriptors() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start("setsid sleep 2 &".to_owned(), CommandEnvironment::default())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        let response = timeout(Duration::from_secs(1), processes.stop(&process.handle))
+            .await
+            .expect("stop waited for an escaped child's output descriptors")
+            .unwrap();
+
+        assert!(matches!(response, RunnerResponse::ProcessStopped { .. }));
     }
 }

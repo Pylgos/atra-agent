@@ -107,7 +107,7 @@ pub(super) async fn run(
                 dirty = true;
             }
             Some(update) = pending_updates.recv() => {
-                app.update(update)?;
+                app.update(update, &effects)?;
                 dirty = true;
             }
             Some(effect) = pending_effects.recv() => {
@@ -220,11 +220,9 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    if let Err(error) =
-                        request(&endpoint, ControllerRequest::ThreadCancel { thread_id }).await
-                    {
-                        let _ = updates.send(TurnUpdate::CancelRequestFailed { thread_id, error });
-                    }
+                    let result =
+                        request(&endpoint, ControllerRequest::ThreadCancel { thread_id }).await;
+                    let _ = updates.send(TurnUpdate::CancelCompleted { thread_id, result });
                 }
                 Self::LoadCheckpoints {
                     endpoint,

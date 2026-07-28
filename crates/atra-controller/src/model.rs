@@ -38,6 +38,9 @@ pub(crate) enum ModelResponse {
 }
 
 pub(crate) enum ModelStreamEvent {
+    TurnStarted {
+        thread_id: i64,
+    },
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
     ReasoningSummaryPartAdded,

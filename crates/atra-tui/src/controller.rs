@@ -28,6 +28,15 @@ pub(super) async fn request_stream(
     loop {
         let response = connection.receive().await?;
         match response {
+            ControllerResponse::TurnStarted {
+                thread_id: started_thread_id,
+            } => {
+                updates
+                    .send(TurnUpdate::StreamStarted {
+                        thread_id: started_thread_id,
+                    })
+                    .ok();
+            }
             ControllerResponse::TurnDelta { content } => {
                 updates.send(TurnUpdate::Delta { thread_id, content }).ok();
             }

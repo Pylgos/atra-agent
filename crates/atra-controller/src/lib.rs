@@ -257,9 +257,12 @@ impl State {
         }
         active_turns.insert(thread_id, Arc::clone(&active));
         drop(active_turns);
+        updates
+            .send(ModelStreamEvent::TurnStarted { thread_id })
+            .context("turn stream closed before turn started")?;
         let mut cancel_requested = active.cancel_requested.subscribe();
         let mut cancellation = active.cancellation.subscribe();
-        let response = async {
+        let mut turn = Box::pin(async {
             match request {
                 ControllerRequest::ThreadSend { thread_id, message } => {
                     self.run_turn(thread_id, message, Some(updates)).await
@@ -269,19 +272,31 @@ impl State {
                 }
                 _ => unreachable!("non-streaming request dispatched as streaming"),
             }
-        };
-        tokio::pin!(response);
-        let mut response = tokio::select! {
+        });
+        let completed = tokio::select! {
             biased;
             changed = cancel_requested.changed() => {
                 changed.context("turn cancellation channel closed")?;
-                cancellation.changed().await.context("turn cancellation channel closed")?;
-                match cancellation.borrow().clone().expect("cancellation completed") {
-                    Ok(()) => Ok(ControllerResponse::ThreadCancelled),
-                    Err(message) => bail!("{message}"),
-                }
+                None
             }
-            response = &mut response => response,
+            response = &mut turn => Some(response),
+        };
+        let mut response = if let Some(response) = completed {
+            response
+        } else {
+            drop(turn);
+            cancellation
+                .changed()
+                .await
+                .context("turn cancellation channel closed")?;
+            match cancellation
+                .borrow()
+                .clone()
+                .expect("cancellation completed")
+            {
+                Ok(()) => Ok(ControllerResponse::ThreadCancelled),
+                Err(message) => Err(anyhow!(message)),
+            }
         };
         if active.cancelling.load(Ordering::Acquire)
             && !matches!(response, Ok(ControllerResponse::ThreadCancelled))
@@ -825,7 +840,7 @@ impl State {
             active.cancelling.store(true, Ordering::Release);
             active
         };
-        let result = async {
+        let stop = async {
             let _uncancellable = active.uncancellable.lock().await;
             let mut process = active.process.lock().await;
             active.cancel_requested.send_replace(true);
@@ -839,7 +854,10 @@ impl State {
                     _ => bail!("runner returned an invalid stop_process response"),
                 }
             }
-            drop(process);
+            Ok(())
+        }
+        .await;
+        let cleanup = async {
             let _guard = self.thread_lock(thread_id).lock_owned().await;
             self.approvals
                 .lock()
@@ -848,6 +866,14 @@ impl State {
             self.prepare_thread_for_turn(thread_id, None).await
         }
         .await;
+        let result = match (stop, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(stop), Ok(())) => Err(stop),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(stop), Err(cleanup)) => {
+                Err(stop.context(format!("turn cleanup also failed: {cleanup:#}")))
+            }
+        };
         let mut active_turns = self.active_turns.lock().await;
         if active_turns
             .get(&thread_id)

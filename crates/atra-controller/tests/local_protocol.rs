@@ -81,6 +81,11 @@ async fn lists_threads_newest_first() {
     encoded_request.push(b'\n');
     stream.write_all(&encoded_request).await.unwrap();
     let mut responses = BufReader::new(stream).lines();
+    assert_eq!(
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap(),
+        ControllerResponse::TurnStarted { thread_id: 2 }
+    );
     let skills =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap();
@@ -127,6 +132,63 @@ async fn lists_threads_newest_first() {
             ]
         }
     );
+}
+
+#[tokio::test]
+async fn active_turn_can_be_cancelled_after_starting() {
+    let controller = TestController::start().await;
+    assert_eq!(
+        request(
+            &controller.endpoint,
+            ControllerRequest::ThreadCreate { display_name: None },
+        )
+        .await,
+        ControllerResponse::ThreadCreated { thread_id: 1 }
+    );
+    let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
+    let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
+        thread_id: 1,
+        message: "Cancel this".to_owned(),
+    })
+    .unwrap();
+    encoded_request.push(b'\n');
+    stream.write_all(&encoded_request).await.unwrap();
+    let mut responses = BufReader::new(stream).lines();
+    assert_eq!(
+        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
+            .unwrap(),
+        ControllerResponse::TurnStarted { thread_id: 1 }
+    );
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            request(
+                &controller.endpoint,
+                ControllerRequest::ThreadCancel { thread_id: 1 },
+            ),
+        )
+        .await
+        .expect("cancellation did not complete"),
+        ControllerResponse::ThreadCancelled
+    );
+    let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let response = serde_json::from_str::<ControllerResponse>(
+                &responses.next_line().await.unwrap().unwrap(),
+            )
+            .unwrap();
+            if matches!(
+                response,
+                ControllerResponse::ThreadCancelled | ControllerResponse::Error { .. }
+            ) {
+                break response;
+            }
+        }
+    })
+    .await
+    .expect("turn stream did not complete");
+    assert_eq!(terminal, ControllerResponse::ThreadCancelled);
 }
 
 #[tokio::test]

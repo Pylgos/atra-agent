@@ -799,7 +799,8 @@ async fn display_turn_stream(endpoint: &Path, request: ControllerRequest) -> Res
     let mut connection = atra_client::Connection::open(endpoint, &request).await?;
     loop {
         match connection.receive().await? {
-            ControllerResponse::TurnDelta { .. }
+            ControllerResponse::TurnStarted { .. }
+            | ControllerResponse::TurnDelta { .. }
             | ControllerResponse::ReasoningSummaryDelta { .. }
             | ControllerResponse::ReasoningSummaryPartAdded
             | ControllerResponse::ToolCallStarted { .. }
@@ -1225,6 +1226,7 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         ControllerResponse::ThreadCreated { .. }
         | ControllerResponse::ThreadList { .. }
         | ControllerResponse::ModelList { .. }
+        | ControllerResponse::TurnStarted { .. }
         | ControllerResponse::TurnDelta { .. }
         | ControllerResponse::ReasoningSummaryDelta { .. }
         | ControllerResponse::ReasoningSummaryPartAdded
