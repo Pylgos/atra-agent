@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
-use atra_protocol::{RunnerOperationUpdate, ThreadEvent};
+use atra_protocol::{
+    RunnerOperationUpdate, ThreadEvent, ThreadEventData, ToolCallEvent, ToolResultEvent,
+};
 use ratatui::text::Line;
 
 mod render;
 
+pub(crate) use atra_protocol::ToolArtifact;
 pub(crate) use render::{
     layout_transcript, prepare_transcript, transcript_lines, transcript_ranges, transcript_text,
 };
@@ -43,12 +46,6 @@ pub(crate) enum TranscriptItem {
         masked: bool,
     },
     Compaction,
-}
-
-#[derive(Clone)]
-pub(crate) struct ToolArtifact {
-    pub(crate) kind: String,
-    pub(crate) data: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -224,10 +221,10 @@ impl TranscriptEntry {
                 truncate_live_output(output, total_omitted);
             }
             RunnerOperationUpdate::Completed { artifact } => {
-                let Some(artifact) = tool_artifact(artifact) else {
-                    return true;
-                };
-                results.insert(operation_index, RunnerResult::Completed(artifact));
+                results.insert(
+                    operation_index,
+                    RunnerResult::Completed(sanitize_artifact(artifact)),
+                );
             }
         }
         self.rendered = None;
@@ -304,17 +301,17 @@ pub(crate) struct DisplayedLine {
 }
 
 pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
-    match event.kind.as_str() {
-        "user_message" => Some(TranscriptItem::message(
+    match event.data {
+        ThreadEventData::UserMessage(message) => Some(TranscriptItem::message(
             Author::User,
-            sanitize(event.payload.get("content")?.as_str()?),
+            sanitize(&message.content),
         )),
-        "assistant_message" => Some(TranscriptItem::message(
+        ThreadEventData::AssistantMessage(message) => Some(TranscriptItem::message(
             Author::Assistant,
-            sanitize(event.payload.get("content")?.as_str()?),
+            sanitize(&message.content),
         )),
-        "reasoning" => {
-            let summary = event.payload.pointer("/item/summary")?.as_array()?;
+        ThreadEventData::Reasoning(reasoning) => {
+            let summary = reasoning.item.pointer("/summary")?.as_array()?;
             let text = summary
                 .iter()
                 .filter_map(|part| part.get("text")?.as_str())
@@ -323,29 +320,36 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 .join("\n\n");
             (!text.is_empty()).then_some(TranscriptItem::ReasoningSummary { text })
         }
-        "web_search" => Some(TranscriptItem::WebSearch {
+        ThreadEventData::WebSearch(search) => Some(TranscriptItem::WebSearch {
             action: sanitize_value(
-                event
-                    .payload
-                    .pointer("/item/action")
+                search
+                    .item
+                    .get("action")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             ),
         }),
-        "tool_call" => {
-            let name = sanitize(event.payload.get("name")?.as_str()?);
-            let arguments = sanitize_value(
-                event
-                    .payload
-                    .get("input")
-                    .cloned()
-                    .or_else(|| event.payload.get("arguments").cloned())?,
-            );
+        ThreadEventData::ToolCall(call) => {
+            let (name, arguments, call_id) = match call {
+                ToolCallEvent::Custom {
+                    name,
+                    input,
+                    call_id,
+                    ..
+                } => (name, serde_json::Value::String(input), Some(call_id)),
+                ToolCallEvent::Function {
+                    name,
+                    arguments,
+                    call_id,
+                } => (name, arguments, call_id),
+            };
+            let name = sanitize(&name);
+            let arguments = sanitize_value(arguments);
             if name == "runner"
                 && let serde_json::Value::String(input) = arguments
             {
                 Some(TranscriptItem::RunnerTool {
-                    call_id: sanitize(event.payload.get("call_id")?.as_str()?),
+                    call_id: sanitize(call_id.as_deref()?),
                     input,
                     results: BTreeMap::new(),
                     pending_approval: None,
@@ -358,28 +362,30 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 })
             }
         }
-        "tool_result" => {
-            let masked = event
-                .payload
-                .get("masked_result")
-                .is_some_and(|masked| Some(masked) != event.payload.get("result"));
+        ThreadEventData::ToolResult(result) => {
+            let (result, artifacts, masked_result) = match result {
+                ToolResultEvent::Custom {
+                    result,
+                    artifacts,
+                    masked_result,
+                    ..
+                }
+                | ToolResultEvent::Function {
+                    result,
+                    artifacts,
+                    masked_result,
+                    ..
+                } => (result, artifacts, masked_result),
+            };
+            let masked = masked_result
+                .as_ref()
+                .is_some_and(|masked| masked != &result);
             Some(TranscriptItem::ToolResult {
-                artifacts: event
-                    .payload
-                    .get("artifacts")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|artifact| {
-                        Some(ToolArtifact {
-                            kind: sanitize(artifact.get("kind")?.as_str()?),
-                            data: sanitize_value(artifact.get("data")?.clone()),
-                        })
-                    })
-                    .collect(),
+                artifacts: artifacts.iter().cloned().map(sanitize_artifact).collect(),
                 masked,
             })
         }
-        "compaction" => Some(TranscriptItem::Compaction),
+        ThreadEventData::Compaction(_) => Some(TranscriptItem::Compaction),
         _ => None,
     }
 }
@@ -388,16 +394,31 @@ pub(crate) fn merge_runner_tool_result(
     transcript: &mut [TranscriptEntry],
     event: &ThreadEvent,
 ) -> bool {
-    if event.kind != "tool_result"
-        || event.payload.get("name").and_then(|name| name.as_str()) != Some("runner")
-    {
+    let ThreadEventData::ToolResult(result) = &event.data else {
+        return false;
+    };
+    let (name, call_id, result, artifacts, masked_result) = match result {
+        ToolResultEvent::Custom {
+            name,
+            call_id,
+            result,
+            artifacts,
+            masked_result,
+            ..
+        }
+        | ToolResultEvent::Function {
+            name,
+            call_id,
+            result,
+            artifacts,
+            masked_result,
+            ..
+        } => (name, call_id, result, artifacts, masked_result),
+    };
+    if name != "runner" {
         return false;
     }
-    let Some(call_id) = event
-        .payload
-        .get("call_id")
-        .and_then(|call_id| call_id.as_str())
-    else {
+    let Some(call_id) = call_id.as_deref() else {
         return false;
     };
     let Some(entry) = transcript.iter_mut().rev().find(|entry| {
@@ -417,22 +438,17 @@ pub(crate) fn merge_runner_tool_result(
     else {
         unreachable!();
     };
-    for artifact in event.payload["artifacts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|artifact| tool_artifact(artifact.clone()))
-    {
-        if artifact.kind == "runner_operation"
-            && let Some(operation) = artifact.data["operation"].as_u64()
-        {
-            results.insert(operation as usize, RunnerResult::Completed(artifact));
+    for artifact in artifacts.iter().cloned().map(sanitize_artifact) {
+        match &artifact {
+            ToolArtifact::RunnerOperation(operation) => {
+                results.insert(operation.operation, RunnerResult::Completed(artifact));
+            }
+            ToolArtifact::CommandExecution(_) | ToolArtifact::PatchOperations(_) => {}
         }
     }
-    *masked = event
-        .payload
-        .get("masked_result")
-        .is_some_and(|masked| Some(masked) != event.payload.get("result"));
+    *masked = masked_result
+        .as_ref()
+        .is_some_and(|masked| masked != result);
     entry.rendered = None;
     true
 }
@@ -450,11 +466,11 @@ pub(crate) fn transcript_from_events(events: &[ThreadEvent]) -> Vec<TranscriptEn
     transcript
 }
 
-fn tool_artifact(artifact: serde_json::Value) -> Option<ToolArtifact> {
-    Some(ToolArtifact {
-        kind: sanitize(artifact.get("kind")?.as_str()?),
-        data: sanitize_value(artifact.get("data")?.clone()),
-    })
+fn sanitize_artifact(artifact: ToolArtifact) -> ToolArtifact {
+    serde_json::from_value(sanitize_value(
+        serde_json::to_value(artifact).expect("tool artifacts serialize"),
+    ))
+    .expect("sanitizing strings preserves tool artifact structure")
 }
 
 fn truncate_live_output(output: &mut String, omitted_bytes: &mut usize) {
@@ -538,12 +554,12 @@ mod tests {
     fn event_conversion_sanitizes_nested_tool_input() {
         let event = ThreadEvent {
             sequence: 1,
-            kind: "tool_call".to_owned(),
-            payload: serde_json::json!({
-                "name": "exec\u{1b}[31m_command",
-                "input": {
+            data: ThreadEventData::ToolCall(ToolCallEvent::Function {
+                name: "exec\u{1b}[31m_command".to_owned(),
+                arguments: serde_json::json!({
                     "command": "safe\u{1b}]52;c;bad\u{7}"
-                }
+                }),
+                call_id: None,
             }),
         };
 

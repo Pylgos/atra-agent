@@ -1,4 +1,4 @@
-use atra_protocol::ProcessStatus;
+use atra_protocol::{ModelRequestKind, ProcessStatus, ThreadEventData};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -16,8 +16,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{Activity, App, COMMAND_HELP},
     state::{
-        CheckpointPicker, FocusPane, ModelPicker, Overlay, ProcessPicker, ThreadPicker,
-        TranscriptMode,
+        ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
+        ProcessPicker, ProcessPickerState, ThreadPicker, TranscriptMode,
     },
     transcript::{
         layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
@@ -91,7 +91,7 @@ impl App {
             ])
             .areas(frame.area());
         self.layout.input_area = input;
-        let transcript_area = if self.checkpoint_picker.is_some() {
+        let transcript_area = if self.target.checkpoint_picker().is_some() {
             let [_, transcript] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(30), Constraint::Min(20)])
@@ -108,15 +108,15 @@ impl App {
 
         let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.overlay
         {
-            Overlay::Approval(approval) => match &approval.deny_reason {
-                Some(reason) => (
+            Overlay::Approval(approval) => match &approval.state {
+                ApprovalState::EnteringDenyReason(reason) => (
                     "Deny reason (optional)".to_owned(),
                     Some(Line::from("Enter: deny · Esc: back").right_aligned()),
                     reason.value.as_str(),
                     reason.cursor,
                     true,
                 ),
-                None => {
+                ApprovalState::Pending => {
                     let operation = approval
                         .operation_index
                         .map(|index| format!("Operation {index} · "))
@@ -219,7 +219,7 @@ impl App {
         if let Overlay::Processes(picker) = &self.overlay {
             render_process_picker(frame, picker, &self.processes);
         }
-        if let Some(picker) = &self.checkpoint_picker {
+        if let Some(picker) = self.target.checkpoint_picker() {
             let [list, _] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(30), Constraint::Min(20)])
@@ -259,11 +259,11 @@ impl App {
         let selected = self
             .threads
             .iter()
-            .find(|thread| Some(thread.id) == self.thread_id)
+            .find(|thread| Some(thread.id) == self.target.thread_id())
             .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
             .or_else(|| {
-                self.new_thread_model
-                    .as_ref()
+                self.target
+                    .new_thread_model()
                     .map(|(model, effort)| (model.as_str(), effort.as_str()))
             });
         let Some((model, effort)) = selected else {
@@ -272,11 +272,11 @@ impl App {
         let usage = (!self.metrics_stale)
             .then(|| {
                 self.events.iter().rev().find_map(|event| {
-                    if event.kind == "model_request"
-                        && event.payload["kind"] == "response"
-                        && event
-                            .payload
-                            .pointer("/request/model")
+                    if let ThreadEventData::ModelRequest(request) = &event.data
+                        && request.kind == ModelRequestKind::Response
+                        && request
+                            .request
+                            .pointer("/model")
                             .and_then(|value| value.as_str())
                             == Some(model)
                     {
@@ -291,13 +291,17 @@ impl App {
             || ("—".to_owned(), "—".to_owned()),
             |(request, usage)| {
                 let input = usage["input_tokens"].as_f64().unwrap_or_default();
-                let context = request.payload["context_window"]
-                    .as_f64()
-                    .filter(|window| *window > 0.0)
-                    .map_or_else(
-                        || "—".to_owned(),
-                        |window| format!("{:.0}%", input / window * 100.0),
-                    );
+                let context = match &request.data {
+                    ThreadEventData::ModelRequest(request) => {
+                        request.context_window.map(|value| value as f64)
+                    }
+                    _ => None,
+                }
+                .filter(|window| *window > 0.0)
+                .map_or_else(
+                    || "—".to_owned(),
+                    |window| format!("{:.0}%", input / window * 100.0),
+                );
                 let cache = if input > 0.0 {
                     format!(
                         "{:.0}%",
@@ -340,7 +344,7 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
-        if let Some(checkpoint) = &self.checkpoint {
+        if let Some(checkpoint) = self.target.checkpoint() {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 format!("checkpoint {} ({})", checkpoint.id, checkpoint.reason),
@@ -355,8 +359,10 @@ impl App {
             .events
             .iter()
             .rev()
-            .find(|event| event.kind == "rate_limits")
-            .and_then(|event| event.payload["snapshots"].as_array());
+            .find_map(|event| match &event.data {
+                ThreadEventData::RateLimits(event) => event.snapshots.as_array(),
+                _ => None,
+            });
         let Some(snapshot) = snapshots.and_then(|snapshots| {
             snapshots
                 .iter()
@@ -369,8 +375,10 @@ impl App {
         let first_snapshot = self
             .events
             .iter()
-            .find(|event| event.kind == "rate_limits")
-            .and_then(|event| event.payload["snapshots"].as_array())
+            .find_map(|event| match &event.data {
+                ThreadEventData::RateLimits(event) => event.snapshots.as_array(),
+                _ => None,
+            })
             .and_then(|snapshots| {
                 snapshots
                     .iter()
@@ -529,7 +537,7 @@ impl App {
         let request_events = self
             .events
             .iter()
-            .filter(|event| event.kind == "model_request")
+            .filter(|event| matches!(event.data, ThreadEventData::ModelRequest(_)))
             .collect::<Vec<_>>();
         if !request_events.is_empty() && self.view.selected_request.is_none() {
             self.view.selected_request = Some(request_events.len() - 1);
@@ -545,10 +553,16 @@ impl App {
             .enumerate()
             .flat_map(|(index, event)| {
                 let marker = if index == selected { "●" } else { " " };
-                let kind = event.payload["kind"].as_str().unwrap_or("request");
-                let model = event
-                    .payload
-                    .pointer("/request/model")
+                let ThreadEventData::ModelRequest(request) = &event.data else {
+                    unreachable!()
+                };
+                let kind = match request.kind {
+                    ModelRequestKind::Compaction => "compaction",
+                    ModelRequestKind::Response => "response",
+                };
+                let model = request
+                    .request
+                    .pointer("/model")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let usage = self.usage_for(event.sequence);
@@ -568,9 +582,8 @@ impl App {
                         )
                     },
                 );
-                let started = event.payload["started_at_ms"].as_u64().unwrap_or_default();
-                let seconds = started / 1_000;
-                let millis = started % 1_000;
+                let seconds = request.started_at_ms / 1_000;
+                let millis = request.started_at_ms % 1_000;
                 [
                     Line::from(Span::styled(
                         format!("{marker} {kind}"),
@@ -619,17 +632,19 @@ impl App {
     }
 
     fn usage_for(&self, request_sequence: i64) -> Option<&serde_json::Value> {
-        self.events
-            .iter()
-            .find(|event| {
-                event.kind == "token_usage"
-                    && event.payload["request_sequence"].as_i64() == Some(request_sequence)
-            })
-            .map(|event| &event.payload["usage"])
+        self.events.iter().find_map(|event| match &event.data {
+            ThreadEventData::TokenUsage(event) if event.request_sequence == request_sequence => {
+                Some(&event.usage)
+            }
+            _ => None,
+        })
     }
 
     fn request_detail_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
-        let request = &event.payload["request"];
+        let ThreadEventData::ModelRequest(model_request) = &event.data else {
+            return Vec::new();
+        };
+        let request = &model_request.request;
         if self.view.raw_request {
             return serde_json::to_string_pretty(request)
                 .unwrap_or_else(|_| request.to_string())
@@ -638,8 +653,11 @@ impl App {
                 .collect();
         }
         let mut lines = Vec::new();
-        let kind = event.payload["kind"].as_str().unwrap_or("request");
-        let started = event.payload["started_at_ms"].as_u64().unwrap_or_default();
+        let kind = match model_request.kind {
+            ModelRequestKind::Compaction => "compaction",
+            ModelRequestKind::Response => "response",
+        };
+        let started = model_request.started_at_ms;
         let model = request["model"].as_str().unwrap_or("?");
         lines.push(Line::from(Span::styled(
             format!("{kind} · {model}"),
@@ -650,9 +668,13 @@ impl App {
         lines.push(Line::from(format!("started_at_ms: {started}")));
         lines.push(Line::from(format!(
             "context window: {} · auto compact: {} · compacted: {}",
-            value_or_dash(&event.payload["context_window"]),
-            value_or_dash(&event.payload["auto_compact_token_limit"]),
-            event.payload["compacted"].as_bool().unwrap_or(false),
+            model_request
+                .context_window
+                .map_or_else(|| "—".to_owned(), |value| value.to_string()),
+            model_request
+                .auto_compact_token_limit
+                .map_or_else(|| "—".to_owned(), |value| value.to_string()),
+            model_request.compacted,
         )));
         if let Some(usage) = self.usage_for(event.sequence) {
             let input = usage["input_tokens"].as_f64().unwrap_or_default();
@@ -662,8 +684,9 @@ impl App {
             } else {
                 0.0
             };
-            let utilization = event.payload["context_window"]
-                .as_f64()
+            let utilization = model_request
+                .context_window
+                .map(|value| value as f64)
                 .filter(|window| *window > 0.0)
                 .map(|window| input / window * 100.0);
             lines.push(Line::from(format!(
@@ -935,7 +958,7 @@ fn render_process_picker(
         output_area,
     );
 
-    if picker.confirming_stop {
+    if matches!(picker.state, ProcessPickerState::ConfirmingStop { .. }) {
         let width = area.width.saturating_sub(8).min(54);
         let confirmation = Rect::new(
             area.x + (area.width - width) / 2,
@@ -1030,7 +1053,7 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
     );
     frame.render_widget(Clear, area);
     let selected_model = &picker.models[picker.model_index];
-    if picker.selecting_effort {
+    if matches!(picker.stage, ModelPickerStage::Effort) {
         let items = selected_model
             .supported_reasoning_efforts
             .iter()

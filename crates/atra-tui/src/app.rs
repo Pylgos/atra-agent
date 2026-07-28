@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
     BackgroundProcess, BackgroundProcessDetail, ControllerRequest, ControllerResponse, Model,
-    ProcessStatus, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent,
+    ProcessStatus, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadEventData,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -19,10 +19,11 @@ use crate::{
     history,
     input::{InputAction, InputBuffer},
     layout::{SelectionPoint, ViewLayout},
-    runtime::Effect,
+    runtime::{ApprovalDecision, Effect, HistoryOperation},
     state::{
-        Approval, CheckpointPicker, FocusPane, HistoryAction, ModelPicker, Overlay, ProcessPicker,
-        ThreadPicker, TranscriptMode, TurnState, ViewState,
+        Approval, ApprovalState, CheckpointPicker, FocusPane, HistoryAction, ModelPicker,
+        ModelPickerStage, Overlay, ProcessPicker, ProcessPickerState, ThreadPicker, TranscriptMode,
+        TurnState, ViewState,
     },
     transcript::{
         Author, TranscriptEntry, TranscriptItem, item_from_event, merge_runner_tool_result,
@@ -51,9 +52,88 @@ pub(crate) struct TurnCompletion {
     pub(super) response: ControllerResponse,
 }
 
+pub(crate) struct HistoryChange {
+    pub(super) response: ControllerResponse,
+    pub(super) thread_id: i64,
+    pub(super) threads: Vec<Thread>,
+    pub(super) transcript: Vec<TranscriptEntry>,
+    pub(super) events: Vec<ThreadEvent>,
+}
+
 pub(crate) enum Activity {
     Info(String),
     Error(String),
+}
+
+pub(crate) enum Target {
+    New { model: Option<(String, String)> },
+    Thread { id: i64, view: ThreadView },
+}
+
+pub(crate) enum ThreadView {
+    Live,
+    Checkpoint {
+        checkpoint: ThreadCheckpoint,
+        picker: CheckpointPicker,
+    },
+}
+
+impl Target {
+    pub(crate) fn thread_id(&self) -> Option<i64> {
+        match self {
+            Self::New { .. } => None,
+            Self::Thread { id, .. } => Some(*id),
+        }
+    }
+
+    pub(crate) fn checkpoint(&self) -> Option<&ThreadCheckpoint> {
+        match self {
+            Self::Thread {
+                view: ThreadView::Checkpoint { checkpoint, .. },
+                ..
+            } => Some(checkpoint),
+            Self::New { .. }
+            | Self::Thread {
+                view: ThreadView::Live,
+                ..
+            } => None,
+        }
+    }
+
+    pub(crate) fn checkpoint_picker(&self) -> Option<&CheckpointPicker> {
+        match self {
+            Self::Thread {
+                view: ThreadView::Checkpoint { picker, .. },
+                ..
+            } => Some(picker),
+            Self::New { .. }
+            | Self::Thread {
+                view: ThreadView::Live,
+                ..
+            } => None,
+        }
+    }
+
+    fn checkpoint_picker_mut(&mut self) -> Option<&mut CheckpointPicker> {
+        match self {
+            Self::Thread {
+                view: ThreadView::Checkpoint { picker, .. },
+                ..
+            } => Some(picker),
+            Self::New { .. }
+            | Self::Thread {
+                view: ThreadView::Live,
+                ..
+            } => None,
+        }
+    }
+
+    pub(crate) fn new_thread_model(&self) -> Option<&(String, String)> {
+        match self {
+            Self::New { model } => model.as_ref(),
+            Self::Thread { .. } => None,
+        }
+    }
 }
 
 pub(crate) enum TurnUpdate {
@@ -136,12 +216,7 @@ pub(crate) enum TurnUpdate {
     HistoryChanged {
         source_thread_id: i64,
         draft: Option<String>,
-        result: Result<(
-            ControllerResponse,
-            i64,
-            Vec<Thread>,
-            (Vec<TranscriptEntry>, Vec<ThreadEvent>),
-        )>,
+        result: Result<HistoryChange>,
     },
     ProcessesLoaded {
         thread_id: i64,
@@ -161,18 +236,15 @@ pub(crate) struct App {
     pub(crate) command_history_path: PathBuf,
     pub(crate) threads: Vec<Thread>,
     pub(crate) models: Vec<Model>,
-    pub(crate) thread_id: Option<i64>,
+    pub(crate) target: Target,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
-    pub(crate) checkpoint: Option<ThreadCheckpoint>,
-    pub(crate) checkpoint_picker: Option<CheckpointPicker>,
     pub(crate) tool_call_previews: HashMap<String, usize>,
     pub(crate) message_input: InputBuffer,
     pub(crate) command_input: InputBuffer,
     pub(crate) overlay: Overlay,
     pub(crate) word_segmenter: WordSegmenterBorrowed<'static>,
     pub(crate) activity: Option<Activity>,
-    pub(crate) new_thread_model: Option<(String, String)>,
     pub(crate) login_required: bool,
     pub(crate) view: ViewState,
     pub(crate) layout: ViewLayout,
@@ -209,12 +281,16 @@ impl App {
             ControllerResponse::Error { .. } => Vec::new(),
             response => bail!("controller returned an unexpected response: {response:?}"),
         };
-        let new_thread_model = if thread_id.is_none() {
-            models
-                .first()
-                .map(|model| (model.id.clone(), model.default_reasoning_effort.clone()))
-        } else {
-            None
+        let target = match thread_id {
+            Some(id) => Target::Thread {
+                id,
+                view: ThreadView::Live,
+            },
+            None => Target::New {
+                model: models
+                    .first()
+                    .map(|model| (model.id.clone(), model.default_reasoning_effort.clone())),
+            },
         };
         let message_history = history::load(&message_history_path)?;
         let command_history = history::load(&command_history_path)?;
@@ -224,11 +300,9 @@ impl App {
             command_history_path,
             threads,
             models,
-            thread_id,
+            target,
             transcript,
             events,
-            checkpoint: None,
-            checkpoint_picker: None,
             tool_call_previews: HashMap::new(),
             message_input: InputBuffer::new(message_history, true),
             command_input: InputBuffer::new(command_history, false),
@@ -240,7 +314,6 @@ impl App {
                 "/thread · /new · /model · Ctrl-P/Ctrl-/ command · Tab focus · Ctrl-C copies"
                     .to_owned()
             })),
-            new_thread_model,
             login_required,
             view: ViewState::default(),
             layout: ViewLayout::default(),
@@ -292,57 +365,56 @@ impl App {
         }
 
         if let Overlay::Approval(approval) = &mut self.overlay {
-            if key.code == KeyCode::Esc && approval.deny_reason.is_none() {
+            if key.code == KeyCode::Esc && matches!(approval.state, ApprovalState::Pending) {
                 self.cancel_turn(effects);
                 return Ok(false);
             }
-            if let Some(reason) = &mut approval.deny_reason {
-                match key.code {
+            match &mut approval.state {
+                ApprovalState::EnteringDenyReason(reason) => match key.code {
                     KeyCode::Enter => {
                         let id = approval.id;
                         let reason = reason.take();
                         let reason = (!reason.trim().is_empty()).then_some(reason);
                         self.resolve_approval(id, false, reason, effects);
                     }
-                    KeyCode::Esc => approval.deny_reason = None,
+                    KeyCode::Esc => approval.state = ApprovalState::Pending,
                     _ => {
                         reason.handle_key(key, &self.word_segmenter);
                     }
-                }
-            } else {
-                match key.code {
+                },
+                ApprovalState::Pending => match key.code {
                     KeyCode::Char('y') => {
                         let id = approval.id;
                         self.resolve_approval(id, true, None, effects);
                     }
                     KeyCode::Char('n') => {
-                        approval.deny_reason = Some(InputBuffer::new(Vec::new(), false));
+                        approval.state =
+                            ApprovalState::EnteringDenyReason(InputBuffer::new(Vec::new(), false));
                     }
                     _ => {}
-                }
+                },
             }
             return Ok(false);
         }
 
         if let Overlay::Processes(picker) = &mut self.overlay {
-            if picker.confirming_stop {
+            if let ProcessPickerState::ConfirmingStop { runner, process_id } = &picker.state {
                 match key.code {
                     KeyCode::Char('y') => {
-                        picker.confirming_stop = false;
-                        if let Some(process) = self.processes.get(picker.selected) {
-                            self.activity =
-                                Some(Activity::Info(format!("Stopping {}…", process.process_id)));
-                            effects
-                                .send(Effect::StopProcess {
-                                    endpoint: self.endpoint.clone(),
-                                    thread_id: self.thread_id.unwrap(),
-                                    runner: process.runner.clone(),
-                                    process_id: process.process_id.clone(),
-                                })
-                                .ok();
-                        }
+                        self.activity = Some(Activity::Info(format!("Stopping {process_id}…")));
+                        effects
+                            .send(Effect::StopProcess {
+                                endpoint: self.endpoint.clone(),
+                                thread_id: self.target.thread_id().unwrap(),
+                                runner: runner.clone(),
+                                process_id: process_id.clone(),
+                            })
+                            .ok();
+                        picker.state = ProcessPickerState::Browsing;
                     }
-                    KeyCode::Char('n') | KeyCode::Esc => picker.confirming_stop = false,
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        picker.state = ProcessPickerState::Browsing
+                    }
                     _ => {}
                 }
                 return Ok(false);
@@ -367,7 +439,11 @@ impl App {
                         matches!(process.status, ProcessStatus::Running)
                     }) =>
                 {
-                    picker.confirming_stop = true;
+                    let process = &self.processes[picker.selected];
+                    picker.state = ProcessPickerState::ConfirmingStop {
+                        runner: process.runner.clone(),
+                        process_id: process.process_id.clone(),
+                    };
                 }
                 KeyCode::Esc => {
                     self.overlay = Overlay::None;
@@ -399,7 +475,7 @@ impl App {
             }
             if matches!(key.code, KeyCode::Enter | KeyCode::Char('g'))
                 && self.overlay.is_none()
-                && self.checkpoint_picker.is_none()
+                && self.target.checkpoint_picker().is_none()
                 && self.view.focus == FocusPane::Input
                 && !self.message_input.value.trim().is_empty()
             {
@@ -412,13 +488,13 @@ impl App {
                 return Ok(false);
             }
             match key.code {
-                KeyCode::Char('r') if self.thread_id.is_some() => {
+                KeyCode::Char('r') if self.target.thread_id().is_some() => {
                     self.overlay = Overlay::Rename;
                     self.view.focus = FocusPane::Input;
                     let display_name = self
                         .threads
                         .iter()
-                        .find(|thread| Some(thread.id) == self.thread_id)
+                        .find(|thread| Some(thread.id) == self.target.thread_id())
                         .and_then(|thread| thread.display_name.clone())
                         .unwrap_or_default();
                     self.message_input.set(display_name);
@@ -489,7 +565,7 @@ impl App {
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             match key.code {
                 KeyCode::Up => {
-                    if picker.selecting_effort {
+                    if matches!(picker.stage, ModelPickerStage::Effort) {
                         picker.effort_index = picker.effort_index.saturating_sub(1);
                     } else {
                         picker.model_index = picker.model_index.saturating_sub(1);
@@ -502,7 +578,7 @@ impl App {
                     }
                 }
                 KeyCode::Down => {
-                    if picker.selecting_effort {
+                    if matches!(picker.stage, ModelPickerStage::Effort) {
                         let count = picker.models[picker.model_index]
                             .supported_reasoning_efforts
                             .len();
@@ -519,16 +595,18 @@ impl App {
                             .unwrap_or(0);
                     }
                 }
-                KeyCode::Enter if picker.selecting_effort => self.change_model(effects)?,
+                KeyCode::Enter if matches!(picker.stage, ModelPickerStage::Effort) => {
+                    self.change_model(effects)?
+                }
                 KeyCode::Enter => {
-                    picker.selecting_effort = true;
+                    picker.stage = ModelPickerStage::Effort;
                     self.activity = Some(Activity::Info(
                         "Select reasoning effort · Enter applies · Esc goes back".to_owned(),
                     ));
                 }
                 KeyCode::Esc => {
-                    if picker.selecting_effort {
-                        picker.selecting_effort = false;
+                    if matches!(picker.stage, ModelPickerStage::Effort) {
+                        picker.stage = ModelPickerStage::Model;
                         self.activity = Some(Activity::Info(
                             "Select model · Enter chooses effort · Esc cancels".to_owned(),
                         ));
@@ -563,7 +641,7 @@ impl App {
         }
 
         if self.view.focus == FocusPane::Checkpoints
-            && let Some(picker) = &mut self.checkpoint_picker
+            && let Some(picker) = self.target.checkpoint_picker_mut()
         {
             match key.code {
                 KeyCode::Up => {
@@ -623,9 +701,16 @@ impl App {
         }
 
         if key.code == KeyCode::Esc
-            && let (Some(thread_id), Some(_)) = (self.thread_id, self.checkpoint.take())
+            && let Target::Thread {
+                id: thread_id,
+                view: ThreadView::Checkpoint { .. },
+            } = &self.target
         {
-            self.checkpoint_picker = None;
+            let thread_id = *thread_id;
+            self.target = Target::Thread {
+                id: thread_id,
+                view: ThreadView::Live,
+            };
             self.select_thread(thread_id, effects);
             return Ok(false);
         }
@@ -716,12 +801,12 @@ impl App {
     }
 
     fn open_processes(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        self.thread_id.context("no thread is selected")?;
+        self.target.thread_id().context("no thread is selected")?;
         self.overlay = Overlay::Processes(ProcessPicker {
             selected: 0,
             detail: None,
             output_scroll: 0,
-            confirming_stop: false,
+            state: ProcessPickerState::Browsing,
         });
         self.activity = Some(Activity::Info(
             "↑/↓ select · PageUp/PageDown output · x stop · Esc close".to_owned(),
@@ -731,7 +816,7 @@ impl App {
     }
 
     pub(super) fn poll_processes(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
-        let Some(thread_id) = self.thread_id else {
+        let Some(thread_id) = self.target.thread_id() else {
             self.processes.clear();
             return;
         };
@@ -756,19 +841,18 @@ impl App {
     }
 
     fn start_new_thread(&mut self) {
-        self.thread_id = None;
+        self.target = Target::New {
+            model: self
+                .models
+                .first()
+                .map(|model| (model.id.clone(), model.default_reasoning_effort.clone())),
+        };
         self.processes.clear();
         self.transcript.clear();
         self.events.clear();
-        self.checkpoint = None;
-        self.checkpoint_picker = None;
         self.tool_call_previews.clear();
         self.message_input.clear();
         self.overlay = Overlay::None;
-        self.new_thread_model = self
-            .models
-            .first()
-            .map(|model| (model.id.clone(), model.default_reasoning_effort.clone()));
         self.clear_selection();
         self.reset_view();
         self.metrics_stale = false;
@@ -784,11 +868,11 @@ impl App {
         let selected = self
             .threads
             .iter()
-            .find(|thread| Some(thread.id) == self.thread_id)
+            .find(|thread| Some(thread.id) == self.target.thread_id())
             .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
             .or_else(|| {
-                self.new_thread_model
-                    .as_ref()
+                self.target
+                    .new_thread_model()
                     .map(|(model, effort)| (model.as_str(), effort.as_str()))
             });
         let model_index = self
@@ -805,7 +889,7 @@ impl App {
             models: self.models.clone(),
             model_index,
             effort_index,
-            selecting_effort: false,
+            stage: ModelPickerStage::Model,
         });
         self.activity = Some(Activity::Info(
             "Select model · Enter chooses effort · Esc cancels".to_owned(),
@@ -822,7 +906,7 @@ impl App {
         let selected = self
             .threads
             .iter()
-            .position(|thread| Some(thread.id) == self.thread_id)
+            .position(|thread| Some(thread.id) == self.target.thread_id())
             .unwrap_or(0);
         self.overlay = Overlay::ThreadPicker(ThreadPicker { selected });
         self.activity = Some(Activity::Info(
@@ -841,8 +925,8 @@ impl App {
     }
 
     fn create_checkpoint(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
-        if self.checkpoint.is_some() {
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
+        if self.target.checkpoint().is_some() {
             bail!("cannot checkpoint a checkpoint view");
         }
         if self.turn.is_running() {
@@ -854,14 +938,14 @@ impl App {
                 endpoint: self.endpoint.clone(),
                 thread_id,
                 draft: None,
-                request: ControllerRequest::ThreadCheckpointCreate { thread_id },
+                operation: HistoryOperation::CreateCheckpoint,
             })
             .ok();
         Ok(())
     }
 
     fn open_checkpoints(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
         if self.turn.is_running() {
             bail!("cannot browse checkpoints while a turn is running");
         }
@@ -891,7 +975,7 @@ impl App {
     }
 
     fn fork_selected(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
         if self.turn.is_running() {
             bail!("cannot fork while a turn is running");
         }
@@ -902,11 +986,13 @@ impl App {
                 endpoint: self.endpoint.clone(),
                 thread_id,
                 draft,
-                request: ControllerRequest::ThreadFork {
-                    thread_id,
-                    checkpoint_id: self.checkpoint.as_ref().map(|checkpoint| checkpoint.id),
+                operation: HistoryOperation::Fork {
+                    checkpoint_id: self
+                        .target
+                        .checkpoint()
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.id),
                     sequence,
-                    display_name: None,
                 },
             })
             .ok();
@@ -919,7 +1005,11 @@ impl App {
         }
         let (sequence, draft) = self.selected_history_point()?;
         self.overlay = Overlay::HistoryConfirmation(HistoryAction::Rewind {
-            checkpoint_id: self.checkpoint.as_ref().map(|checkpoint| checkpoint.id),
+            checkpoint_id: self
+                .target
+                .checkpoint()
+                .as_ref()
+                .map(|checkpoint| checkpoint.id),
             sequence,
             draft,
         });
@@ -934,8 +1024,8 @@ impl App {
             bail!("cannot restore while a turn is running");
         }
         let checkpoint_id = self
-            .checkpoint
-            .as_ref()
+            .target
+            .checkpoint()
             .context("open a checkpoint with /checkpoints first")?
             .id;
         self.overlay = Overlay::HistoryConfirmation(HistoryAction::Restore { checkpoint_id });
@@ -950,27 +1040,22 @@ impl App {
         action: HistoryAction,
         effects: &mpsc::UnboundedSender<Effect>,
     ) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
-        let (request, draft) = match action {
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
+        let (operation, draft) = match action {
             HistoryAction::Rewind {
                 checkpoint_id,
                 sequence,
                 draft,
             } => (
-                ControllerRequest::ThreadRewind {
-                    thread_id,
+                HistoryOperation::Rewind {
                     checkpoint_id,
                     sequence,
                 },
                 draft,
             ),
-            HistoryAction::Restore { checkpoint_id } => (
-                ControllerRequest::ThreadCheckpointRestore {
-                    thread_id,
-                    checkpoint_id,
-                },
-                None,
-            ),
+            HistoryAction::Restore { checkpoint_id } => {
+                (HistoryOperation::Restore { checkpoint_id }, None)
+            }
         };
         self.activity = Some(Activity::Info("Updating thread history…".to_owned()));
         effects
@@ -978,15 +1063,15 @@ impl App {
                 endpoint: self.endpoint.clone(),
                 thread_id,
                 draft,
-                request,
+                operation,
             })
             .ok();
         Ok(())
     }
 
     fn continue_thread(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
-        if self.checkpoint.is_some() {
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
+        if self.target.checkpoint().is_some() {
             bail!("cannot continue a checkpoint view");
         }
         if self.turn.is_running() {
@@ -998,7 +1083,6 @@ impl App {
             .send(Effect::ContinueTurn {
                 endpoint: self.endpoint.clone(),
                 thread_id,
-                request: ControllerRequest::ThreadContinue { thread_id },
             })
             .ok();
         Ok(())
@@ -1111,7 +1195,7 @@ impl App {
             _ => {}
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.checkpoint_picker.is_none()
+            && self.target.checkpoint_picker().is_none()
             && self
                 .layout
                 .input_area
@@ -1223,8 +1307,11 @@ impl App {
         effects
             .send(Effect::SendTurn {
                 endpoint: self.endpoint.clone(),
-                thread_id: self.thread_id,
-                new_thread_model: self.new_thread_model.take(),
+                thread_id: self.target.thread_id(),
+                new_thread_model: match &mut self.target {
+                    Target::New { model } => model.take(),
+                    Target::Thread { .. } => None,
+                },
                 message,
             })
             .ok();
@@ -1240,14 +1327,17 @@ impl App {
             effects
                 .send(Effect::CancelTurn {
                     endpoint: self.endpoint.clone(),
-                    thread_id: self.thread_id.expect("active turn belongs to a thread"),
+                    thread_id: self
+                        .target
+                        .thread_id()
+                        .expect("active turn belongs to a thread"),
                 })
                 .ok();
         }
     }
 
     fn rename(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
-        let thread_id = self.thread_id.context("no thread is selected")?;
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
         let display_name = self.message_input.take();
         self.overlay = Overlay::None;
         self.activity = Some(Activity::Info("Renaming thread…".to_owned()));
@@ -1273,8 +1363,10 @@ impl App {
             .get(picker.effort_index)
             .cloned()
             .unwrap_or_else(|| selected.default_reasoning_effort.clone());
-        let Some(thread_id) = self.thread_id else {
-            self.new_thread_model = Some((model, reasoning_effort));
+        let Some(thread_id) = self.target.thread_id() else {
+            self.target = Target::New {
+                model: Some((model, reasoning_effort)),
+            };
             self.overlay = Overlay::None;
             self.metrics_stale = true;
             self.activity = Some(Activity::Info("Model selected for new thread".to_owned()));
@@ -1300,13 +1392,10 @@ impl App {
         reason: Option<String>,
         effects: &mpsc::UnboundedSender<Effect>,
     ) {
-        let request_message = if allowed {
-            ControllerRequest::ApprovalAllow { approval_id }
+        let decision = if allowed {
+            ApprovalDecision::Allow
         } else {
-            ControllerRequest::ApprovalDeny {
-                approval_id,
-                reason,
-            }
+            ApprovalDecision::Deny { reason }
         };
         if let Some(entry) = self
             .transcript
@@ -1325,7 +1414,7 @@ impl App {
             .send(Effect::ResolveApproval {
                 endpoint: self.endpoint.clone(),
                 approval_id,
-                request: request_message,
+                decision,
             })
             .ok();
     }
@@ -1342,8 +1431,11 @@ impl App {
                 threads,
             } => {
                 self.threads = threads;
-                if self.thread_id.is_none() {
-                    self.thread_id = Some(thread_id);
+                if self.target.thread_id().is_none() {
+                    self.target = Target::Thread {
+                        id: thread_id,
+                        view: ThreadView::Live,
+                    };
                 }
                 if let Some(thread) = self
                     .threads
@@ -1355,7 +1447,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::StreamStarted { thread_id } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     if matches!(self.turn, TurnState::Cancelling) {
                         effects
                             .send(Effect::CancelTurn {
@@ -1373,7 +1465,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::Delta { thread_id, content } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     if self
                         .transcript
                         .last()
@@ -1393,7 +1485,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::ReasoningSummaryDelta { thread_id, content } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     let content = sanitize(&content);
                     if self
                         .transcript
@@ -1410,7 +1502,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::ReasoningSummaryPartAdded { thread_id } => {
-                if self.thread_id == Some(thread_id)
+                if self.target.thread_id() == Some(thread_id)
                     && let Some(entry) = self.transcript.last_mut()
                     && entry.is_reasoning_summary()
                     && !entry.is_empty_reasoning_summary()
@@ -1424,7 +1516,7 @@ impl App {
                 item_id,
                 name,
             } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     let index = self.transcript.len();
                     self.transcript
                         .push(TranscriptEntry::new(TranscriptItem::ToolCall {
@@ -1440,7 +1532,7 @@ impl App {
                 item_id,
                 content,
             } => {
-                if self.thread_id == Some(thread_id)
+                if self.target.thread_id() == Some(thread_id)
                     && let Some(index) = self.tool_call_previews.get(&item_id)
                 {
                     self.transcript[*index].append_tool_input(&sanitize(&content));
@@ -1448,14 +1540,18 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::Event { thread_id, event } => {
-                if self.thread_id == Some(thread_id) {
-                    let usage_matches_selected_model = event.kind == "token_usage"
-                        && event.payload["request_sequence"]
-                            .as_i64()
+                if self.target.thread_id() == Some(thread_id) {
+                    let usage_matches_selected_model = match &event.data {
+                        ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
                             .and_then(|sequence| {
                                 self.events.iter().find(|event| event.sequence == sequence)
                             })
-                            .and_then(|event| event.payload.pointer("/request/model"))
+                            .and_then(|event| match &event.data {
+                                ThreadEventData::ModelRequest(request) => {
+                                    request.request.pointer("/model")
+                                }
+                                _ => None,
+                            })
                             .and_then(serde_json::Value::as_str)
                             .zip(
                                 self.threads
@@ -1465,7 +1561,9 @@ impl App {
                             )
                             .is_some_and(|(request_model, selected_model)| {
                                 request_model == selected_model
-                            });
+                            }),
+                        _ => false,
+                    };
                     if usage_matches_selected_model {
                         self.metrics_stale = false;
                     }
@@ -1489,11 +1587,13 @@ impl App {
                         return Ok(());
                     }
                     self.events.push(event.clone());
-                    let item_id = event
-                        .payload
-                        .get("item_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
+                    let item_id = match &event.data {
+                        ThreadEventData::ToolCall(atra_protocol::ToolCallEvent::Custom {
+                            item_id,
+                            ..
+                        }) => item_id.clone(),
+                        _ => None,
+                    };
                     let sequence = event.sequence;
                     if merge_runner_tool_result(&mut self.transcript, &event) {
                         return Ok(());
@@ -1537,7 +1637,7 @@ impl App {
                 operation_index,
                 update,
             } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     if let Some(entry) = self
                         .transcript
                         .iter_mut()
@@ -1556,7 +1656,7 @@ impl App {
                 label,
                 operation_index,
             } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     if operation_index.is_some() {
                         if let Some(entry) = self
                             .transcript
@@ -1572,7 +1672,7 @@ impl App {
                         runner,
                         label,
                         operation_index,
-                        deny_reason: None,
+                        state: ApprovalState::Pending,
                     });
                     self.activity = None;
                 }
@@ -1605,7 +1705,7 @@ impl App {
                             runner: String::new(),
                             label: String::new(),
                             operation_index: None,
-                            deny_reason: None,
+                            state: ApprovalState::Pending,
                         });
                         self.activity = Some(Activity::Error(sanitize(&message)));
                     }
@@ -1618,7 +1718,7 @@ impl App {
                             runner: String::new(),
                             label: String::new(),
                             operation_index: None,
-                            deny_reason: None,
+                            state: ApprovalState::Pending,
                         });
                         self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                     }
@@ -1626,7 +1726,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::CancelCompleted { thread_id, result } => {
-                if self.thread_id == Some(thread_id) {
+                if self.target.thread_id() == Some(thread_id) {
                     match result {
                         Ok(ControllerResponse::ThreadCancelled) => {}
                         Ok(ControllerResponse::ThreadNotActive) => {
@@ -1667,12 +1767,13 @@ impl App {
             }
             TurnUpdate::ThreadSelected { thread_id, result } => {
                 let (transcript, events) = result?;
-                self.thread_id = Some(thread_id);
+                self.target = Target::Thread {
+                    id: thread_id,
+                    view: ThreadView::Live,
+                };
                 self.processes.clear();
                 self.transcript = transcript;
                 self.events = events;
-                self.checkpoint = None;
-                self.checkpoint_picker = None;
                 self.tool_call_previews.clear();
                 self.overlay = Overlay::None;
                 self.clear_selection();
@@ -1683,7 +1784,7 @@ impl App {
             }
             TurnUpdate::ProcessesLoaded { thread_id, result } => {
                 self.process_refresh_pending = false;
-                if self.thread_id != Some(thread_id) {
+                if self.target.thread_id() != Some(thread_id) {
                     return Ok(());
                 }
                 let (processes, detail) = match result {
@@ -1729,7 +1830,7 @@ impl App {
                 process_id,
                 result,
             } => {
-                if self.thread_id != Some(thread_id) {
+                if self.target.thread_id() != Some(thread_id) {
                     return Ok(());
                 }
                 match result {
@@ -1807,7 +1908,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::CheckpointsLoaded { thread_id, result } => {
-                if self.thread_id != Some(thread_id) {
+                if self.target.thread_id() != Some(thread_id) {
                     return Ok(());
                 }
                 let (checkpoints, events) = result?;
@@ -1817,14 +1918,19 @@ impl App {
                     let checkpoint = checkpoints[0].clone();
                     self.transcript = transcript_from_events(&events);
                     self.events = events;
-                    self.checkpoint = Some(checkpoint);
+                    self.target = Target::Thread {
+                        id: thread_id,
+                        view: ThreadView::Checkpoint {
+                            checkpoint,
+                            picker: CheckpointPicker {
+                                checkpoints,
+                                selected: 0,
+                            },
+                        },
+                    };
                     self.clear_selection();
                     self.reset_view();
                     self.view.transcript_mode = TranscriptMode::Coding;
-                    self.checkpoint_picker = Some(CheckpointPicker {
-                        checkpoints,
-                        selected: 0,
-                    });
                     self.view.focus = FocusPane::Checkpoints;
                     self.activity = Some(Activity::Info(
                         "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
@@ -1834,20 +1940,31 @@ impl App {
             }
             TurnUpdate::CheckpointLoaded(result) => {
                 let (checkpoint, events) = result?;
-                if self.thread_id != Some(checkpoint.thread_id) {
+                if self.target.thread_id() != Some(checkpoint.thread_id) {
                     return Ok(());
                 }
-                if let Some(picker) = &self.checkpoint_picker
+                if let Some(picker) = self.target.checkpoint_picker()
                     && picker.checkpoints[picker.selected].id != checkpoint.id
                 {
                     return Ok(());
                 }
                 self.transcript = transcript_from_events(&events);
                 self.events = events;
-                self.checkpoint = Some(checkpoint);
+                let Target::Thread {
+                    view:
+                        ThreadView::Checkpoint {
+                            checkpoint: displayed,
+                            ..
+                        },
+                    ..
+                } = &mut self.target
+                else {
+                    return Ok(());
+                };
+                *displayed = checkpoint;
                 self.clear_selection();
                 self.reset_view();
-                if self.checkpoint_picker.is_some() {
+                if self.target.checkpoint_picker().is_some() {
                     self.view.focus = FocusPane::Checkpoints;
                 }
                 self.activity = Some(Activity::Info(
@@ -1860,10 +1977,16 @@ impl App {
                 draft,
                 result,
             } => {
-                if self.thread_id != Some(source_thread_id) {
+                if self.target.thread_id() != Some(source_thread_id) {
                     return Ok(());
                 }
-                let (response, thread_id, threads, (transcript, events)) = result?;
+                let HistoryChange {
+                    response,
+                    thread_id,
+                    threads,
+                    transcript,
+                    events,
+                } = result?;
                 let message = match response {
                     ControllerResponse::ThreadCheckpointCreated { checkpoint_id } => {
                         format!("Checkpoint {checkpoint_id} created")
@@ -1877,13 +2000,14 @@ impl App {
                         bail!("controller returned an unexpected history response: {response:?}")
                     }
                 };
-                self.thread_id = Some(thread_id);
+                self.target = Target::Thread {
+                    id: thread_id,
+                    view: ThreadView::Live,
+                };
                 self.processes.clear();
                 self.threads = threads;
                 self.transcript = transcript;
                 self.events = events;
-                self.checkpoint = None;
-                self.checkpoint_picker = None;
                 self.overlay = Overlay::None;
                 self.tool_call_previews.clear();
                 self.clear_selection();
@@ -1898,7 +2022,7 @@ impl App {
             }
         };
         self.turn = TurnState::Idle;
-        if self.thread_id == Some(completion.thread_id) {
+        if self.target.thread_id() == Some(completion.thread_id) {
             match completion.response {
                 ControllerResponse::TurnCompleted { .. }
                     if self
@@ -1992,7 +2116,7 @@ impl App {
     }
 
     fn cycle_focus(&mut self, reverse: bool) {
-        let panes: &[FocusPane] = if self.checkpoint_picker.is_some() {
+        let panes: &[FocusPane] = if self.target.checkpoint_picker().is_some() {
             &[FocusPane::Checkpoints, FocusPane::Transcript]
         } else {
             match self.view.transcript_mode {
@@ -2094,7 +2218,7 @@ impl App {
     fn request_count(&self) -> usize {
         self.events
             .iter()
-            .filter(|event| event.kind == "model_request")
+            .filter(|event| matches!(event.data, ThreadEventData::ModelRequest(_)))
             .count()
     }
 

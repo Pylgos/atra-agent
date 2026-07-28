@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use atra_protocol::ThreadEvent;
+use atra_protocol::{ThreadEvent, ThreadEventData, ToolResultEvent};
 use rustix::process::{Pid, test_kill_process};
 use tempfile::TempDir;
 use tokio::{
@@ -15,6 +15,14 @@ use tokio::{
 };
 
 const ATRA: &str = env!("CARGO_BIN_EXE_atra");
+
+fn tool_result(event: &ThreadEvent) -> serde_json::Value {
+    match &event.data {
+        ThreadEventData::ToolResult(ToolResultEvent::Custom { result, .. })
+        | ThreadEventData::ToolResult(ToolResultEvent::Function { result, .. }) => result.clone(),
+        _ => panic!("expected tool result"),
+    }
+}
 
 #[tokio::test]
 async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
@@ -273,7 +281,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert_eq!(
         events
             .iter()
-            .map(|event| event.kind.as_str())
+            .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
             "skills",
@@ -286,19 +294,19 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "assistant_message"
         ]
     );
+    assert_eq!(tool_result(&events[5]), serde_json::json!("model-output"));
     assert_eq!(
-        events[5].payload["result"],
-        serde_json::json!("model-output")
-    );
-    assert_eq!(
-        events[7].payload["content"],
-        serde_json::json!("observed model-output")
+        match &events[7].data {
+            ThreadEventData::AssistantMessage(message) => message.content.as_str(),
+            _ => panic!("expected assistant message"),
+        },
+        "observed model-output"
     );
     let denied_events = system.events(denied_thread).await;
     assert_eq!(
         denied_events
             .iter()
-            .map(|event| event.kind.as_str())
+            .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
             "skills",
@@ -312,14 +320,14 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        denied_events[5].payload["result"],
+        tool_result(&denied_events[5]),
         serde_json::json!("user denied the tool call: not in this environment")
     );
     let allowed_events = system.events(allowed_thread).await;
     assert_eq!(
         allowed_events
             .iter()
-            .map(|event| event.kind.as_str())
+            .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
             "skills",
@@ -333,7 +341,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        allowed_events[5].payload["result"],
+        tool_result(&allowed_events[5]),
         serde_json::json!("approved-output")
     );
 }
@@ -398,7 +406,9 @@ impl TestSystem {
                         "name": "exec_command",
                         "arguments": {
                             "runner": "one",
-                            "command": "printf model-output"
+                            "command": "printf model-output",
+                            "mode": "foreground",
+                            "timeout_ms": 10000
                         }
                     }
                 },
@@ -412,7 +422,9 @@ impl TestSystem {
                         "name": "exec_command",
                         "arguments": {
                             "runner": "two",
-                            "command": "printf should-not-run > denied-marker"
+                            "command": "printf should-not-run > denied-marker",
+                            "mode": "foreground",
+                            "timeout_ms": 10000
                         }
                     }
                 },
@@ -426,7 +438,9 @@ impl TestSystem {
                         "name": "exec_command",
                         "arguments": {
                             "runner": "two",
-                            "command": "printf approved-output"
+                            "command": "printf approved-output",
+                            "mode": "foreground",
+                            "timeout_ms": 10000
                         }
                     }
                 },

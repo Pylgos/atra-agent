@@ -27,9 +27,9 @@ struct ManifestObject {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlatformProfile {
-    pub runner: String,
-    pub tools: String,
+struct PlatformProfile {
+    runner: String,
+    tools: String,
 }
 
 pub struct PlatformBundle {
@@ -39,7 +39,7 @@ pub struct PlatformBundle {
     objects: HashMap<String, Object>,
 }
 
-pub struct Object {
+struct Object {
     executable: bool,
     compressed: Vec<u8>,
 }
@@ -101,18 +101,6 @@ impl PlatformBundle {
             tools: manifest.tools,
             objects,
         })
-    }
-
-    pub fn platform(&self) -> &str {
-        &self.platform
-    }
-
-    pub fn runner_digest(&self) -> &str {
-        &self.runner
-    }
-
-    pub fn tools(&self) -> &TreeManifest {
-        &self.tools
     }
 
     pub fn install(&self, root: &Path) -> Result<PathBuf> {

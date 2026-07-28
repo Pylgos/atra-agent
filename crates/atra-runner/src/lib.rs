@@ -17,8 +17,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    CommandEnvironment, CommandOutput, ProcessStatus, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope, TimeoutAction,
+    CommandEnvironment, CommandMode, CommandOutput, ProcessStatus, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
 };
 use atra_store::{PreparedTree, Store};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -147,25 +147,26 @@ async fn handle_request(
         }
         RunnerRequest::ExecCommand {
             command,
-            background,
-            timeout_ms,
-            timeout_action,
+            mode,
             environment,
         } => {
             tracing::debug!(%command, "executing command");
             let process = processes.start(command, environment).await?;
-            if background {
-                return Ok(RunnerResponse::ProcessStarted {
+            match mode {
+                CommandMode::Background => Ok(RunnerResponse::ProcessStarted {
                     process_handle: process.handle.clone(),
-                });
+                }),
+                CommandMode::Foreground { timeout_ms } => {
+                    processes
+                        .wait_foreground(process, timeout_ms.map(Duration::from_millis), false)
+                        .await
+                }
+                CommandMode::Timed { timeout_ms } => {
+                    processes
+                        .wait_foreground(process, Some(Duration::from_millis(timeout_ms)), true)
+                        .await
+                }
             }
-            processes
-                .wait_foreground(
-                    process,
-                    timeout_ms.map(Duration::from_millis),
-                    timeout_action,
-                )
-                .await
         }
         RunnerRequest::StartCommand {
             command,
@@ -391,7 +392,7 @@ impl ProcessManager {
         &self,
         process: Arc<ManagedProcess>,
         timeout: Option<Duration>,
-        timeout_action: TimeoutAction,
+        terminate_on_timeout: bool,
     ) -> Result<RunnerResponse> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
@@ -407,20 +408,21 @@ impl ProcessManager {
 
             match deadline {
                 Some(deadline) if Instant::now() >= deadline => {
-                    return match timeout_action {
-                        TimeoutAction::ReturnRunning => Ok(RunnerResponse::ProcessRunning {
+                    return if terminate_on_timeout {
+                        match self.stop(&process.handle).await? {
+                            RunnerResponse::ProcessStopped { output } => {
+                                Ok(RunnerResponse::ProcessTimedOut { output })
+                            }
+                            _ => unreachable!("stop always returns ProcessStopped"),
+                        }
+                    } else {
+                        Ok(RunnerResponse::ProcessRunning {
                             process_handle: process.handle.clone(),
                             output: process
                                 .take_output()
                                 .await
                                 .finish(process.full_output_path.clone()),
-                        }),
-                        TimeoutAction::Terminate => match self.stop(&process.handle).await? {
-                            RunnerResponse::ProcessStopped { output } => {
-                                Ok(RunnerResponse::ProcessTimedOut { output })
-                            }
-                            _ => unreachable!("stop always returns ProcessStopped"),
-                        },
+                        })
                     };
                 }
                 Some(deadline) => {

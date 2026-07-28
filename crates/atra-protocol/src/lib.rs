@@ -13,10 +13,11 @@ pub enum ApprovalPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimeoutAction {
-    ReturnRunning,
-    Terminate,
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CommandMode {
+    Foreground { timeout_ms: Option<u64> },
+    Background,
+    Timed { timeout_ms: u64 },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -108,9 +109,7 @@ pub enum ControllerRequest {
     ExecCommand {
         runner: String,
         command: String,
-        background: bool,
-        timeout_ms: Option<u64>,
-        timeout_action: TimeoutAction,
+        mode: CommandMode,
     },
     WaitProcess {
         runner: String,
@@ -245,15 +244,220 @@ pub enum RunnerOperationUpdate {
         omitted_bytes: usize,
     },
     Completed {
-        artifact: Value,
+        artifact: ToolArtifact,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum ToolArtifact {
+    CommandExecution(CommandExecutionArtifact),
+    PatchOperations(ApplyPatchResult),
+    RunnerOperation(RunnerOperationArtifact),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CommandExecutionArtifact {
+    Started {
+        runner: String,
+    },
+    Running {
+        output: String,
+        runner: String,
+        full_output_path: PathBuf,
+    },
+    Finished {
+        output: String,
+        exit_code: Option<i32>,
+        runner: String,
+        full_output_path: PathBuf,
+    },
+    TimedOut {
+        output: String,
+        runner: String,
+        full_output_path: PathBuf,
+    },
+    Stopped {
+        output: String,
+        runner: String,
+        full_output_path: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RunnerOperationArtifact {
+    pub operation: usize,
+    pub runner: String,
+    pub label: String,
+    pub result: Value,
+    pub artifacts: Vec<ToolArtifact>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThreadEvent {
     pub sequence: i64,
-    pub kind: String,
-    pub payload: Value,
+    #[serde(flatten)]
+    pub data: ThreadEventData,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum ThreadEventData {
+    WorkspaceInstructions(InstructionEvent),
+    Skills(InstructionEvent),
+    Runners(RunnersEvent),
+    UserMessage(MessageEvent),
+    AssistantMessage(MessageEvent),
+    WebSearch(ItemEvent),
+    ToolCall(ToolCallEvent),
+    ToolResult(ToolResultEvent),
+    FrozenBoundary(FrozenBoundaryEvent),
+    Reasoning(ItemEvent),
+    Compaction(CompactionEvent),
+    ModelRequest(ModelRequestEvent),
+    TokenUsage(TokenUsageEvent),
+    RateLimits(RateLimitsEvent),
+}
+
+impl ThreadEventData {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::WorkspaceInstructions(_) => "workspace_instructions",
+            Self::Skills(_) => "skills",
+            Self::Runners(_) => "runners",
+            Self::UserMessage(_) => "user_message",
+            Self::AssistantMessage(_) => "assistant_message",
+            Self::WebSearch(_) => "web_search",
+            Self::ToolCall(_) => "tool_call",
+            Self::ToolResult(_) => "tool_result",
+            Self::FrozenBoundary(_) => "frozen_boundary",
+            Self::Reasoning(_) => "reasoning",
+            Self::Compaction(_) => "compaction",
+            Self::ModelRequest(_) => "model_request",
+            Self::TokenUsage(_) => "token_usage",
+            Self::RateLimits(_) => "rate_limits",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InstructionEvent {
+    pub content: Option<String>,
+    pub transition: InstructionTransition,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionTransition {
+    Initial,
+    Replacement,
+    Removal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RunnersEvent {
+    pub runners: Vec<Runner>,
+    pub transition: InstructionTransition,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MessageEvent {
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ItemEvent {
+    pub item: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ToolCallEvent {
+    Custom {
+        #[serde(rename = "type")]
+        call_type: CustomToolType,
+        item_id: Option<String>,
+        name: String,
+        input: String,
+        call_id: String,
+    },
+    Function {
+        name: String,
+        arguments: Value,
+        call_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomToolType {
+    Custom,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ToolResultEvent {
+    Custom {
+        #[serde(rename = "type")]
+        call_type: CustomToolType,
+        name: String,
+        call_id: Option<String>,
+        result: Value,
+        artifacts: Vec<ToolArtifact>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        masked_result: Option<Value>,
+    },
+    Function {
+        #[serde(rename = "type")]
+        call_type: Option<CustomToolType>,
+        name: String,
+        call_id: Option<String>,
+        result: Value,
+        artifacts: Vec<ToolArtifact>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        masked_result: Option<Value>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FrozenBoundaryEvent {
+    pub through_sequence: i64,
+    pub masked_sequences: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CompactionEvent {
+    pub items: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ModelRequestEvent {
+    pub kind: ModelRequestKind,
+    pub started_at_ms: u64,
+    pub request: Value,
+    pub context_window: Option<i64>,
+    pub auto_compact_token_limit: Option<i64>,
+    pub compacted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRequestKind {
+    Compaction,
+    Response,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TokenUsageEvent {
+    pub request_sequence: i64,
+    pub usage: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RateLimitsEvent {
+    pub request_sequence: i64,
+    pub snapshots: Value,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -350,9 +554,7 @@ pub enum RunnerRequest {
     },
     ExecCommand {
         command: String,
-        background: bool,
-        timeout_ms: Option<u64>,
-        timeout_action: TimeoutAction,
+        mode: CommandMode,
         environment: CommandEnvironment,
     },
     StartCommand {

@@ -94,14 +94,24 @@ pub(crate) struct Approval {
     pub(crate) runner: String,
     pub(crate) label: String,
     pub(crate) operation_index: Option<usize>,
-    pub(crate) deny_reason: Option<InputBuffer>,
+    pub(crate) state: ApprovalState,
+}
+
+pub(crate) enum ApprovalState {
+    Pending,
+    EnteringDenyReason(InputBuffer),
 }
 
 pub(crate) struct ModelPicker {
     pub(crate) models: Vec<Model>,
     pub(crate) model_index: usize,
     pub(crate) effort_index: usize,
-    pub(crate) selecting_effort: bool,
+    pub(crate) stage: ModelPickerStage,
+}
+
+pub(crate) enum ModelPickerStage {
+    Model,
+    Effort,
 }
 
 pub(crate) struct ThreadPicker {
@@ -112,7 +122,12 @@ pub(crate) struct ProcessPicker {
     pub(crate) selected: usize,
     pub(crate) detail: Option<BackgroundProcessDetail>,
     pub(crate) output_scroll: usize,
-    pub(crate) confirming_stop: bool,
+    pub(crate) state: ProcessPickerState,
+}
+
+pub(crate) enum ProcessPickerState {
+    Browsing,
+    ConfirmingStop { runner: String, process_id: String },
 }
 
 pub(crate) struct CheckpointPicker {

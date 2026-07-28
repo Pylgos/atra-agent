@@ -1,32 +1,22 @@
 use std::{
-    env, fs,
-    io::{IsTerminal, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    env,
+    io::Write,
     path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ApprovalPolicy, ControllerRequest, ControllerResponse, TimeoutAction};
+use atra_protocol::{ApprovalPolicy, CommandMode, ControllerRequest, ControllerResponse};
 use clap::{Parser, Subcommand, ValueEnum};
-use rustix::process::getuid;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use tokio::{
-    io::AsyncWriteExt,
-    net::UnixStream,
-    process::Command as TokioCommand,
-    time::{Instant, sleep},
-};
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 
 mod controller_client;
 mod platform;
+mod workspace;
 
 use controller_client::{
     not_running as controller_not_running, request as send_controller_request,
 };
+use workspace::ControllerStart;
 
 #[derive(Parser)]
 #[command(name = "atra")]
@@ -261,15 +251,6 @@ impl From<Approval> for ApprovalPolicy {
     }
 }
 
-impl From<OnTimeout> for TimeoutAction {
-    fn from(value: OnTimeout) -> Self {
-        match value {
-            OnTimeout::ReturnRunning => Self::ReturnRunning,
-            OnTimeout::Terminate => Self::Terminate,
-        }
-    }
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let command = Cli::parse().command;
@@ -303,17 +284,17 @@ async fn run(command: Command) -> Result<()> {
         }
         return atra_runner::run_stdio().await;
     }
-    let workspace = workspace_root()?;
+    let workspace = workspace::root()?;
     if matches!(
         &command,
         Command::Workspace {
             command: WorkspaceCommand::Init
         }
     ) {
-        return workspace_init(&workspace);
+        return workspace::init(&workspace);
     }
-    let workspace_id = workspace_id(&workspace);
-    let endpoint = controller_endpoint(&workspace_id)?;
+    let workspace_id = workspace::id(&workspace);
+    let endpoint = workspace::endpoint(&workspace_id)?;
 
     match command {
         Command::Codex {
@@ -365,8 +346,8 @@ async fn run(command: Command) -> Result<()> {
         Command::Controller {
             command: ControllerCommand::Start,
         } => {
-            let database = controller_database(&workspace_id)?;
-            match controller_start(&workspace, &endpoint, &database).await? {
+            let database = workspace::database(&workspace_id)?;
+            match workspace::start_controller(&workspace, &endpoint, &database).await? {
                 ControllerStart::Started => println!("started"),
                 ControllerStart::AlreadyRunning => println!("already running"),
             }
@@ -375,25 +356,25 @@ async fn run(command: Command) -> Result<()> {
         Command::Controller {
             command: ControllerCommand::Stop,
         } => {
-            controller_stop(&endpoint).await?;
+            workspace::stop_controller(&endpoint).await?;
             println!("stopped");
             Ok(())
         }
         Command::Controller {
             command: ControllerCommand::Run,
         } => {
-            let database = controller_database(&workspace_id)?;
+            let database = workspace::database(&workspace_id)?;
             atra_controller::run(&endpoint, &database, &codex_auth_home()?).await
         }
         Command::Controller {
             command: ControllerCommand::Status,
-        } => controller_status(&endpoint).await,
+        } => workspace::controller_status(&endpoint).await,
         Command::Workspace {
             command: WorkspaceCommand::Init,
         } => unreachable!("workspace init is handled before controller endpoint setup"),
         Command::Workspace {
             command: WorkspaceCommand::Start,
-        } => workspace_start(&workspace, &endpoint, &workspace_id).await,
+        } => workspace::start(&workspace, &endpoint, &workspace_id).await,
         Command::Thread {
             command: ThreadCommand::Create { name },
         } => {
@@ -703,22 +684,33 @@ async fn run(command: Command) -> Result<()> {
                     on_timeout,
                 },
         } => {
+            let mode = match (background, timeout_ms, on_timeout) {
+                (true, None, OnTimeout::ReturnRunning) => CommandMode::Background,
+                (false, timeout_ms, OnTimeout::ReturnRunning) => {
+                    CommandMode::Foreground { timeout_ms }
+                }
+                (false, Some(timeout_ms), OnTimeout::Terminate) => {
+                    CommandMode::Timed { timeout_ms }
+                }
+                (true, _, _) => bail!("background commands cannot have timeout options"),
+                (false, None, OnTimeout::Terminate) => {
+                    bail!("--on-timeout terminate requires --timeout-ms")
+                }
+            };
             let response = send_controller_request(
                 &endpoint,
                 ControllerRequest::ExecCommand {
                     runner: name,
                     command,
-                    background,
-                    timeout_ms,
-                    timeout_action: on_timeout.into(),
+                    mode,
                 },
             )
             .await?;
             display_process_response(response)
         }
         Command::Tui => {
-            if prepare_tui(&workspace, &endpoint, &workspace_id).await? {
-                let database = controller_database(&workspace_id)?;
+            if workspace::prepare_tui(&workspace, &endpoint, &workspace_id).await? {
+                let database = workspace::database(&workspace_id)?;
                 let message_history = database.with_file_name("tui-history.jsonl");
                 let command_history = database.with_file_name("tui-command-history.jsonl");
                 atra_tui::run(endpoint, message_history, command_history).await
@@ -891,331 +883,8 @@ fn codex_auth_home() -> Result<PathBuf> {
         .join("atra/codex"))
 }
 
-const WORKSPACE_CONFIG: &str = ".config/atra.toml";
-const WORKSPACE_SETUP: &str = ".config/atra-setup.bash";
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkspaceConfig {
-    setup: String,
-}
-
-#[derive(Clone, Copy)]
-enum ControllerStart {
-    Started,
-    AlreadyRunning,
-}
-
-fn workspace_root() -> Result<PathBuf> {
-    let cwd = env::current_dir().context("failed to determine the current directory")?;
-    fs::canonicalize(&cwd)
-        .with_context(|| format!("failed to resolve workspace directory {}", cwd.display()))
-}
-
-fn workspace_id(workspace: &Path) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(workspace.as_os_str().as_encoded_bytes())
-    )[..16]
-        .to_owned()
-}
-
-fn workspace_init(workspace: &Path) -> Result<()> {
-    let config_path = workspace.join(WORKSPACE_CONFIG);
-    let setup_path = workspace.join(WORKSPACE_SETUP);
-    if config_path.exists() {
-        bail!(
-            "workspace is already initialized at {}",
-            config_path.display()
-        );
-    }
-    if setup_path.exists() {
-        bail!("refusing to overwrite {}", setup_path.display());
-    }
-
-    let config_directory = config_path
-        .parent()
-        .expect("workspace config path should have a parent");
-    fs::create_dir_all(config_directory).with_context(|| {
-        format!(
-            "failed to create workspace config directory {}",
-            config_directory.display()
-        )
-    })?;
-    fs::write(
-        &config_path,
-        format!("setup = \"bash {WORKSPACE_SETUP}\"\n"),
-    )
-    .with_context(|| format!("failed to write workspace config {}", config_path.display()))?;
-    fs::write(
-        &setup_path,
-        concat!(
-            "#!/usr/bin/env bash\n",
-            "set -euo pipefail\n",
-            "\n",
-            "\"${ATRA_BINARY:-atra}\" runner launch \\\n",
-            "  --name host \\\n",
-            "  --description \"Run commands directly in the workspace host environment\" \\\n",
-            "  --approval ask\n",
-        ),
-    )
-    .with_context(|| format!("failed to write workspace setup {}", setup_path.display()))?;
-    fs::set_permissions(&setup_path, fs::Permissions::from_mode(0o755)).with_context(|| {
-        format!(
-            "failed to make workspace setup executable {}",
-            setup_path.display()
-        )
-    })?;
-    println!("initialized {}", config_path.display());
-    Ok(())
-}
-
-fn load_workspace_config(workspace: &Path) -> Result<WorkspaceConfig> {
-    let path = workspace.join(WORKSPACE_CONFIG);
-    let config = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read workspace config {}", path.display()))?;
-    toml::from_str(&config)
-        .with_context(|| format!("failed to parse workspace config {}", path.display()))
-}
-
-async fn workspace_start(workspace: &Path, endpoint: &Path, workspace_id: &str) -> Result<()> {
-    let config = load_workspace_config(workspace)?;
-    let database = controller_database(workspace_id)?;
-    controller_start(workspace, endpoint, &database).await?;
-
-    let atra_binary = env::current_exe().context("failed to determine the atra executable path")?;
-    let status = TokioCommand::new("bash")
-        .args(["-c", &config.setup])
-        .current_dir(workspace)
-        .env("ATRA_BINARY", &atra_binary)
-        .env("ATRA_CONTROLLER_ENDPOINT", endpoint)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .context("failed to start workspace setup command")?;
-    if !status.success() {
-        bail!("workspace setup command exited with {status}");
-    }
-    println!("workspace started");
-    Ok(())
-}
-
-async fn prepare_tui(workspace: &Path, endpoint: &Path, workspace_id: &str) -> Result<bool> {
-    if controller_is_running(endpoint).await? {
-        return Ok(true);
-    }
-    if !workspace.join(WORKSPACE_CONFIG).is_file() {
-        bail!("controller is not running");
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!("controller is not running");
-    }
-
-    print!("Controller is not running. Start this workspace? [y/N] ");
-    std::io::stdout()
-        .flush()
-        .context("failed to display workspace start prompt")?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .context("failed to read workspace start confirmation")?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        return Ok(false);
-    }
-    workspace_start(workspace, endpoint, workspace_id).await?;
-    Ok(true)
-}
-
-fn controller_endpoint(workspace_id: &str) -> Result<PathBuf> {
-    if let Some(endpoint) = env::var_os("ATRA_CONTROLLER_ENDPOINT") {
-        return Ok(PathBuf::from(endpoint));
-    }
-
-    let runtime_dir = match xdg::BaseDirectories::new().get_runtime_directory() {
-        Ok(path) => path.join("atra"),
-        Err(_) => PathBuf::from(format!("/tmp/atra-{}", getuid().as_raw())),
-    };
-
-    ensure_private_directory(&runtime_dir)?;
-    let workspace_dir = runtime_dir.join(workspace_id);
-    ensure_private_directory(&workspace_dir)?;
-    Ok(workspace_dir.join("controller.sock"))
-}
-
-fn controller_database(workspace_id: &str) -> Result<PathBuf> {
-    if let Some(database) = env::var_os("ATRA_CONTROLLER_STATE") {
-        return Ok(PathBuf::from(database));
-    }
-
-    let state_home = xdg::BaseDirectories::new()
-        .get_state_home()
-        .context("cannot determine the XDG state directory")?;
-    fs::create_dir_all(&state_home)
-        .with_context(|| format!("failed to create state directory {}", state_home.display()))?;
-    let atra_dir = state_home.join("atra");
-    ensure_private_directory(&atra_dir)?;
-    let workspace_dir = atra_dir.join(workspace_id);
-    ensure_private_directory(&workspace_dir)?;
-    Ok(workspace_dir.join("controller.sqlite3"))
-}
-
-fn ensure_private_directory(path: &Path) -> Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to create directory {}", path.display()));
-        }
-    }
-
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect directory {}", path.display()))?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != getuid().as_raw()
-        || metadata.mode() & 0o777 != 0o700
-    {
-        bail!(
-            "{} must be a directory owned by the current user with mode 0700",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-async fn controller_start(
-    workspace: &Path,
-    endpoint: &Path,
-    database: &Path,
-) -> Result<ControllerStart> {
-    if controller_is_running(endpoint).await? {
-        return Ok(ControllerStart::AlreadyRunning);
-    }
-
-    let log_path = database.with_file_name("controller.log");
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-        .with_context(|| format!("failed to open controller log {}", log_path.display()))?;
-    fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to secure controller log {}", log_path.display()))?;
-    let stderr = log
-        .try_clone()
-        .with_context(|| format!("failed to clone controller log {}", log_path.display()))?;
-    let executable = env::current_exe().context("failed to determine the atra executable path")?;
-    let mut command = TokioCommand::new(executable);
-    command
-        .args(["controller", "run"])
-        .current_dir(workspace)
-        .env("ATRA_CONTROLLER_ENDPOINT", endpoint)
-        .env("ATRA_CONTROLLER_STATE", database)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr));
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid()
-                .map(|_| ())
-                .map_err(std::io::Error::from)
-        });
-    }
-    let mut child = command
-        .spawn()
-        .context("failed to start background controller")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if controller_is_running(endpoint).await? {
-            return Ok(ControllerStart::Started);
-        }
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to inspect background controller")?
-        {
-            bail!(
-                "controller exited with {status}; see {}",
-                log_path.display()
-            );
-        }
-        if Instant::now() >= deadline {
-            child
-                .kill()
-                .await
-                .context("failed to stop controller after startup timeout")?;
-            let _ = child.wait().await;
-            bail!(
-                "controller did not become ready within 10 seconds; see {}",
-                log_path.display()
-            );
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn controller_stop(endpoint: &Path) -> Result<()> {
-    match send_controller_shutdown(endpoint).await {
-        Ok(()) => {}
-        Err(error) if controller_not_running(&error) => return Ok(()),
-        Err(error) => return Err(error),
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while controller_is_running(endpoint).await? {
-        if Instant::now() >= deadline {
-            bail!("controller did not stop within 10 seconds");
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-    Ok(())
-}
-
-async fn send_controller_shutdown(endpoint: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(endpoint)
-        .await
-        .with_context(|| format!("failed to connect to controller at {}", endpoint.display()))?;
-    let mut request = serde_json::to_vec(&ControllerRequest::Shutdown)
-        .context("failed to encode controller shutdown request")?;
-    request.push(b'\n');
-    stream
-        .write_all(&request)
-        .await
-        .context("failed to write controller shutdown request")?;
-    stream
-        .shutdown()
-        .await
-        .context("failed to close controller shutdown request")
-}
-
-async fn controller_is_running(endpoint: &Path) -> Result<bool> {
-    match send_controller_request(endpoint, ControllerRequest::Status).await {
-        Ok(ControllerResponse::Running) => Ok(true),
-        Ok(ControllerResponse::Error { message }) => bail!("{message}"),
-        Ok(response) => bail!("controller returned an unexpected response: {response:?}"),
-        Err(error) if controller_not_running(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-async fn controller_status(endpoint: &Path) -> Result<()> {
-    controller_request(endpoint, ControllerRequest::Status).await
-}
-
 async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Result<()> {
-    let is_status = matches!(request, ControllerRequest::Status);
-    let response = send_controller_request(endpoint, request).await;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) if is_status && controller_not_running(&error) => {
-            println!("stopped");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
+    let response = send_controller_request(endpoint, request).await?;
     match response {
         ControllerResponse::Running => println!("running"),
         ControllerResponse::Stopping => println!("stopping"),

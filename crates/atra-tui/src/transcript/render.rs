@@ -3,12 +3,12 @@ use std::{collections::HashSet, sync::LazyLock};
 use atra_patch::{
     ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
 };
+use atra_protocol::{CommandExecutionArtifact, RunnerOperationArtifact, ToolArtifact};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use serde::Deserialize;
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, ThemeSet},
@@ -329,12 +329,16 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
             lines.extend(fold_result_lines(
                 artifacts
                     .iter()
-                    .filter_map(|artifact| match artifact.kind.as_str() {
-                        "runner_operation" => runner_operation_lines(&artifact.data),
-                        "command_execution" => command_execution_lines(&artifact.data, false),
-                        "patch_operations" => patch_operation_lines(&artifact.data),
-                        "runner_list" => runner_list_lines(&artifact.data),
-                        _ => None,
+                    .filter_map(|artifact| match artifact {
+                        ToolArtifact::RunnerOperation(operation) => {
+                            Some(runner_operation_lines(operation))
+                        }
+                        ToolArtifact::CommandExecution(command) => {
+                            Some(command_execution_lines(command, false))
+                        }
+                        ToolArtifact::PatchOperations(result) => {
+                            Some(patch_operation_lines(result))
+                        }
                     })
                     .flatten()
                     .collect(),
@@ -688,10 +692,12 @@ fn append_runner_result(
             result_lines.push(status);
             result_lines
         }
-        RunnerResult::Completed(artifact) if artifact.kind == "runner_operation" => {
-            runner_operation_result_lines(&artifact.data).unwrap_or_default()
+        RunnerResult::Completed(ToolArtifact::RunnerOperation(operation)) => {
+            runner_operation_result_lines(operation)
         }
-        RunnerResult::Completed(_) => Vec::new(),
+        RunnerResult::Completed(
+            ToolArtifact::CommandExecution(_) | ToolArtifact::PatchOperations(_),
+        ) => Vec::new(),
     };
     lines.extend(fold_result_lines(result_lines, expanded));
 }
@@ -847,96 +853,60 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-#[derive(Deserialize)]
-struct CommandExecution {
-    state: String,
-    #[serde(default)]
-    output: String,
-    exit_code: Option<i32>,
-}
-
-#[derive(Deserialize)]
-struct RunnerList {
-    runners: Vec<Runner>,
-}
-
-#[derive(Deserialize)]
-struct Runner {
-    name: String,
-    description: String,
-}
-
-fn runner_list_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
-    let runners: RunnerList = serde_json::from_value(data.clone()).ok()?;
-    if runners.runners.is_empty() {
-        return Some(vec![(
-            Some('◇'),
-            Line::from(Span::styled(
-                "no runners available",
-                Style::default().fg(Color::DarkGray),
-            )),
-        )]);
-    }
-    Some(
-        runners
-            .runners
-            .into_iter()
-            .map(|runner| {
-                (
-                    Some('◆'),
-                    Line::from(vec![
-                        Span::styled(
-                            runner.name,
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!(" · {}", runner.description)),
-                    ]),
-                )
-            })
-            .collect(),
-    )
-}
-
 fn command_execution_lines(
-    data: &serde_json::Value,
+    command: &CommandExecutionArtifact,
     status_last: bool,
-) -> Option<Vec<(Option<char>, Line<'static>)>> {
-    let command: CommandExecution = serde_json::from_value(data.clone()).ok()?;
-    let (marker, label, style) = match command.state.as_str() {
-        "started" => ('›', "started".to_owned(), Style::default().fg(Color::Cyan)),
-        "running" => (
+) -> Vec<(Option<char>, Line<'static>)> {
+    let (marker, label, style, output) = match command {
+        CommandExecutionArtifact::Started { .. } => (
+            '›',
+            "started".to_owned(),
+            Style::default().fg(Color::Cyan),
+            "",
+        ),
+        CommandExecutionArtifact::Running { output, .. } => (
             '…',
             "running".to_owned(),
             Style::default().fg(Color::Yellow),
+            output.as_str(),
         ),
-        "finished" => {
-            let exit_code = command
-                .exit_code
+        CommandExecutionArtifact::Finished {
+            output, exit_code, ..
+        } => {
+            let success = *exit_code == Some(0);
+            let exit_code = exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
-            let style = if command.exit_code == Some(0) {
+            let style = if success {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::Red)
             };
-            ('✓', format!("finished · exit {exit_code}"), style)
+            (
+                '✓',
+                format!("finished · exit {exit_code}"),
+                style,
+                output.as_str(),
+            )
         }
-        "timed_out" => ('!', "timed out".to_owned(), Style::default().fg(Color::Red)),
-        "stopped" => (
+        CommandExecutionArtifact::TimedOut { output, .. } => (
+            '!',
+            "timed out".to_owned(),
+            Style::default().fg(Color::Red),
+            output.as_str(),
+        ),
+        CommandExecutionArtifact::Stopped { output, .. } => (
             '■',
             "stopped".to_owned(),
             Style::default().fg(Color::Yellow),
+            output.as_str(),
         ),
-        _ => return None,
     };
     let status = (
         Some(marker),
         Line::from(Span::styled(label, style.add_modifier(Modifier::BOLD))),
     );
-    let mut lines = command
-        .output
+    let mut lines = output
         .lines()
         .map(|output| {
             (
@@ -953,48 +923,49 @@ fn command_execution_lines(
     } else {
         lines.insert(0, status);
     }
-    Some(lines)
+    lines
 }
 
-fn runner_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
-    let operation = data.get("operation")?.as_u64()?;
-    let runner = data.get("runner")?.as_str()?;
-    let label = data.get("label")?.as_str()?;
+fn runner_operation_lines(data: &RunnerOperationArtifact) -> Vec<(Option<char>, Line<'static>)> {
     let mut lines = Vec::new();
-    if operation > 1 {
+    if data.operation > 1 {
         lines.push((None, Line::default()));
     }
     lines.push((
         Some('◆'),
         Line::from(Span::styled(
-            format!("Operation {operation} · {runner} · {label}"),
+            format!(
+                "Operation {} · {} · {}",
+                data.operation, data.runner, data.label
+            ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
     ));
 
-    lines.extend(runner_operation_result_lines(data)?);
-    Some(lines)
+    lines.extend(runner_operation_result_lines(data));
+    lines
 }
 
 fn runner_operation_result_lines(
-    data: &serde_json::Value,
-) -> Option<Vec<(Option<char>, Line<'static>)>> {
+    data: &RunnerOperationArtifact,
+) -> Vec<(Option<char>, Line<'static>)> {
     let mut lines = Vec::new();
-    let artifacts = data.get("artifacts")?.as_array()?;
-    for artifact in artifacts {
-        let rendered = match artifact.get("kind")?.as_str()? {
-            "command_execution" => command_execution_lines(artifact.get("data")?, true),
-            "patch_operations" => patch_operation_lines(artifact.get("data")?),
-            _ => None,
+    for artifact in &data.artifacts {
+        let rendered = match artifact {
+            ToolArtifact::CommandExecution(command) => command_execution_lines(command, true),
+            ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
+            ToolArtifact::RunnerOperation(operation) => runner_operation_lines(operation),
         };
-        if let Some(rendered) = rendered {
-            lines.extend(rendered);
-        }
+        lines.extend(rendered);
     }
-    if artifacts.is_empty() {
-        let result = data.get("result")?.as_str()?;
+    if data.artifacts.is_empty() {
+        let result = data
+            .result
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| data.result.to_string());
         lines.extend(result.lines().map(|line| {
             (
                 None,
@@ -1005,11 +976,10 @@ fn runner_operation_result_lines(
             )
         }));
     }
-    Some(lines)
+    lines
 }
 
-fn patch_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, Line<'static>)>> {
-    let result: ApplyPatchResult = serde_json::from_value(data.clone()).ok()?;
+fn patch_operation_lines(result: &ApplyPatchResult) -> Vec<(Option<char>, Line<'static>)> {
     let results = match result {
         ApplyPatchResult::ParseError { error } => {
             let mut lines = vec![(
@@ -1024,7 +994,7 @@ fn patch_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, 
                     .lines()
                     .map(|line| (None, Line::from(line.to_owned()))),
             );
-            return Some(lines);
+            return lines;
         }
         ApplyPatchResult::Operations { results } => results,
     };
@@ -1046,7 +1016,7 @@ fn patch_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, 
         };
         match outcome {
             PatchOperationOutcome::Applied { diff: Ok(diff) } => {
-                rendered.extend(file_diff_lines(&diff));
+                rendered.extend(file_diff_lines(diff));
             }
             PatchOperationOutcome::Applied { diff: Err(_) } => rendered.push((
                 Some('✓'),
@@ -1073,7 +1043,7 @@ fn patch_operation_lines(data: &serde_json::Value) -> Option<Vec<(Option<char>, 
             }
         }
     }
-    Some(rendered)
+    rendered
 }
 
 fn file_diff_lines(diff: &FileDiff) -> Vec<(Option<char>, Line<'static>)> {

@@ -30,7 +30,8 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use atra_protocol::{Model, Runner};
 
 use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
-use crate::storage::{Event, EventKind};
+use crate::storage::Event;
+use atra_protocol::{InstructionTransition, ThreadEventData, ToolCallEvent, ToolResultEvent};
 
 const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
 
@@ -504,11 +505,14 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
     let mut items = Vec::new();
     let events = if let Some(index) = events
         .iter()
-        .rposition(|event| event.kind == EventKind::Compaction)
+        .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
     {
         items.extend(
-            serde_json::from_value::<Vec<ResponseItem>>(events[index].payload["items"].clone())
-                .context("stored compaction contains invalid response items")?,
+            serde_json::from_value::<Vec<ResponseItem>>(match &events[index].data {
+                ThreadEventData::Compaction(compaction) => compaction.items.clone(),
+                _ => unreachable!(),
+            })
+            .context("stored compaction contains invalid response items")?,
         );
         &events[index + 1..]
     } else {
@@ -524,21 +528,19 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
         .unwrap_or_default();
     for event in events {
         let Some(item) = (|| {
-            Some(match event.kind {
-                EventKind::WorkspaceInstructions => {
-                    let transition = event.payload["transition"].as_str()?;
-                    let text = match transition {
-                        "initial" => event.payload["content"].as_str()?.to_owned(),
-                        "replacement" => format!(
+            Some(match &event.data {
+                ThreadEventData::WorkspaceInstructions(instructions) => {
+                    let text = match instructions.transition {
+                        InstructionTransition::Initial => instructions.content.clone()?,
+                        InstructionTransition::Replacement => format!(
                             "These AGENTS.md instructions replace all previously provided \
                                  AGENTS.md instructions.\n\n{}",
-                            event.payload["content"].as_str()?
+                            instructions.content.as_deref()?
                         ),
-                        "removal" => {
+                        InstructionTransition::Removal => {
                             "The previously provided AGENTS.md instructions no longer apply."
                                 .to_owned()
                         }
-                        _ => return None,
                     };
                     ResponseItem::from(ResponseInputItem::Message {
                         role: "developer".to_owned(),
@@ -550,18 +552,16 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         phase: None,
                     })
                 }
-                EventKind::Skills => {
-                    let transition = event.payload["transition"].as_str()?;
-                    let text = match transition {
-                        "initial" => event.payload["content"].as_str()?.to_owned(),
-                        "replacement" => format!(
+                ThreadEventData::Skills(instructions) => {
+                    let text = match instructions.transition {
+                        InstructionTransition::Initial => instructions.content.clone()?,
+                        InstructionTransition::Replacement => format!(
                             "This skills list replaces all previously provided skills.\n\n{}",
-                            event.payload["content"].as_str()?
+                            instructions.content.as_deref()?
                         ),
-                        "removal" => {
+                        InstructionTransition::Removal => {
                             "The previously provided skills are no longer available.".to_owned()
                         }
-                        _ => return None,
                     };
                     ResponseItem::from(ResponseInputItem::Message {
                         role: "developer".to_owned(),
@@ -569,19 +569,15 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         phase: None,
                     })
                 }
-                EventKind::Runners => {
-                    let transition = event.payload["transition"].as_str()?;
-                    let runners =
-                        serde_json::from_value::<Vec<Runner>>(event.payload["runners"].clone())
-                            .ok()?;
-                    let list = format_runners(&runners);
-                    let text = match transition {
-                        "initial" => list,
-                        "replacement" => format!(
+                ThreadEventData::Runners(event) => {
+                    let list = format_runners(&event.runners);
+                    let text = match event.transition {
+                        InstructionTransition::Initial => list,
+                        InstructionTransition::Replacement => format!(
                             "The available Atra Runner list has changed. This list replaces \
                                  the previously provided list.\n\n{list}"
                         ),
-                        _ => return None,
+                        InstructionTransition::Removal => return None,
                     };
                     ResponseItem::from(ResponseInputItem::Message {
                         role: "developer".to_owned(),
@@ -589,67 +585,78 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                         phase: None,
                     })
                 }
-                EventKind::UserMessage => ResponseItem::from(ResponseInputItem::Message {
-                    role: "user".to_owned(),
-                    content: vec![ContentItem::InputText {
-                        text: event.payload["content"].as_str()?.to_owned(),
-                    }],
-                    phase: None,
-                }),
-                EventKind::AssistantMessage => ResponseItem::from(ResponseInputItem::Message {
-                    role: "assistant".to_owned(),
-                    content: vec![ContentItem::OutputText {
-                        text: event.payload["content"].as_str()?.to_owned(),
-                    }],
-                    phase: None,
-                }),
-                EventKind::WebSearch => {
-                    serde_json::from_value(event.payload["item"].clone()).ok()?
+                ThreadEventData::UserMessage(message) => {
+                    ResponseItem::from(ResponseInputItem::Message {
+                        role: "user".to_owned(),
+                        content: vec![ContentItem::InputText {
+                            text: message.content.clone(),
+                        }],
+                        phase: None,
+                    })
                 }
-                EventKind::ToolCall if event.payload["type"] == "custom" => {
-                    ResponseItem::CustomToolCall {
-                        id: None,
-                        status: Some("completed".to_owned()),
-                        call_id: event.payload["call_id"].as_str()?.to_owned(),
-                        name: event.payload["name"].as_str()?.to_owned(),
-                        namespace: None,
-                        input: event.payload["input"].as_str()?.to_owned(),
-                        internal_chat_message_metadata_passthrough: None,
-                    }
+                ThreadEventData::AssistantMessage(message) => {
+                    ResponseItem::from(ResponseInputItem::Message {
+                        role: "assistant".to_owned(),
+                        content: vec![ContentItem::OutputText {
+                            text: message.content.clone(),
+                        }],
+                        phase: None,
+                    })
                 }
-                EventKind::ToolCall => ResponseItem::FunctionCall {
+                ThreadEventData::WebSearch(event) => {
+                    serde_json::from_value(event.item.clone()).ok()?
+                }
+                ThreadEventData::ToolCall(ToolCallEvent::Custom {
+                    call_id,
+                    name,
+                    input,
+                    ..
+                }) => ResponseItem::CustomToolCall {
                     id: None,
-                    name: event.payload["name"].as_str()?.to_owned(),
+                    status: Some("completed".to_owned()),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
                     namespace: None,
-                    arguments: event.payload["arguments"].to_string(),
-                    call_id: event.payload["call_id"].as_str()?.to_owned(),
+                    input: input.clone(),
                     internal_chat_message_metadata_passthrough: None,
                 },
-                EventKind::ToolResult if event.payload["type"] == "custom" => {
+                ThreadEventData::ToolCall(ToolCallEvent::Function {
+                    name,
+                    arguments,
+                    call_id,
+                }) => ResponseItem::FunctionCall {
+                    id: None,
+                    name: name.clone(),
+                    namespace: None,
+                    arguments: arguments.to_string(),
+                    call_id: call_id.clone()?,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ThreadEventData::ToolResult(ToolResultEvent::Custom { call_id, name, .. }) => {
                     ResponseItem::from(ResponseInputItem::CustomToolCallOutput {
-                        call_id: event.payload["call_id"].as_str()?.to_owned(),
-                        name: event.payload["name"].as_str().map(str::to_owned),
+                        call_id: call_id.clone()?,
+                        name: Some(name.clone()),
                         output: FunctionCallOutputPayload::from_text(tool_result_text(
                             projected_tool_result(event, &masked_sequences),
                         )),
                     })
                 }
-                EventKind::ToolResult => {
+                ThreadEventData::ToolResult(ToolResultEvent::Function { call_id, .. }) => {
                     ResponseItem::from(ResponseInputItem::FunctionCallOutput {
-                        call_id: event.payload["call_id"].as_str()?.to_owned(),
+                        call_id: call_id.clone()?,
                         output: FunctionCallOutputPayload::from_text(tool_result_text(
                             projected_tool_result(event, &masked_sequences),
                         )),
                     })
                 }
-                EventKind::Reasoning => {
-                    serde_json::from_value(event.payload["item"].clone()).ok()?
+                ThreadEventData::Reasoning(event) => {
+                    serde_json::from_value(event.item.clone()).ok()?
                 }
-                EventKind::Compaction
-                | EventKind::FrozenBoundary
-                | EventKind::ModelRequest
-                | EventKind::TokenUsage
-                | EventKind::RateLimits => return None,
+                ThreadEventData::Compaction(_)
+                | ThreadEventData::FrozenBoundary(_)
+                | ThreadEventData::ModelRequest(_)
+                | ThreadEventData::TokenUsage(_)
+                | ThreadEventData::RateLimits(_) => return None,
             })
         })() else {
             continue;
@@ -663,10 +670,23 @@ fn projected_tool_result<'a>(
     event: &'a Event,
     masked_sequences: &HashSet<i64>,
 ) -> &'a serde_json::Value {
+    let (result, masked_result) = match &event.data {
+        ThreadEventData::ToolResult(ToolResultEvent::Custom {
+            result,
+            masked_result,
+            ..
+        })
+        | ThreadEventData::ToolResult(ToolResultEvent::Function {
+            result,
+            masked_result,
+            ..
+        }) => (result, masked_result),
+        _ => unreachable!("projected tool result called with another event"),
+    };
     if masked_sequences.contains(&event.sequence) {
-        &event.payload["masked_result"]
+        masked_result.as_ref().unwrap_or(result)
     } else {
-        &event.payload["result"]
+        result
     }
 }
 
@@ -848,13 +868,20 @@ mod tests {
         let events = vec![
             Event {
                 sequence: 0,
-                kind: EventKind::UserMessage,
-                payload: json!({"content": "hello"}),
+                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "hello".to_owned(),
+                }),
             },
             Event {
                 sequence: 1,
-                kind: EventKind::ModelRequest,
-                payload: json!({"request": "observer-only"}),
+                data: ThreadEventData::ModelRequest(atra_protocol::ModelRequestEvent {
+                    kind: atra_protocol::ModelRequestKind::Response,
+                    started_at_ms: 0,
+                    request: json!("observer-only"),
+                    context_window: None,
+                    auto_compact_token_limit: None,
+                    compacted: false,
+                }),
             },
         ];
 

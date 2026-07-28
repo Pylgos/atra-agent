@@ -1,68 +1,20 @@
 use std::path::Path;
 
-use atra_protocol::{Thread, ThreadCheckpoint};
-use serde::{Deserialize, Serialize};
+use atra_protocol::{
+    CompactionEvent, FrozenBoundaryEvent, InstructionEvent, RunnersEvent, Thread, ThreadCheckpoint,
+    ThreadEventData,
+};
 use serde_json::Value;
 use tokio_rusqlite::{
     Connection, params,
     rusqlite::{self, types::Type},
 };
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EventKind {
-    WorkspaceInstructions,
-    Skills,
-    Runners,
-    UserMessage,
-    AssistantMessage,
-    WebSearch,
-    ToolCall,
-    ToolResult,
-    FrozenBoundary,
-    Reasoning,
-    Compaction,
-    ModelRequest,
-    TokenUsage,
-    RateLimits,
-}
-
-impl EventKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::WorkspaceInstructions => "workspace_instructions",
-            Self::Skills => "skills",
-            Self::Runners => "runners",
-            Self::UserMessage => "user_message",
-            Self::AssistantMessage => "assistant_message",
-            Self::WebSearch => "web_search",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::FrozenBoundary => "frozen_boundary",
-            Self::Reasoning => "reasoning",
-            Self::Compaction => "compaction",
-            Self::ModelRequest => "model_request",
-            Self::TokenUsage => "token_usage",
-            Self::RateLimits => "rate_limits",
-        }
-    }
-}
-
-impl TryFrom<&str> for EventKind {
-    type Error = rusqlite::Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        serde_json::from_value(Value::String(value.to_owned())).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-        })
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub(crate) struct Event {
     pub sequence: i64,
-    pub kind: EventKind,
-    pub payload: Value,
+    #[serde(flatten)]
+    pub data: ThreadEventData,
 }
 
 pub(crate) struct FrozenBoundary {
@@ -72,25 +24,14 @@ pub(crate) struct FrozenBoundary {
 
 pub(crate) fn latest_frozen_boundary(events: &[Event]) -> Option<FrozenBoundary> {
     for event in events.iter().rev() {
-        match event.kind {
-            EventKind::FrozenBoundary => {
+        match &event.data {
+            ThreadEventData::FrozenBoundary(boundary) => {
                 return Some(FrozenBoundary {
-                    through_sequence: event.payload["through_sequence"]
-                        .as_i64()
-                        .expect("frozen boundary has a through sequence"),
-                    masked_sequences: event.payload["masked_sequences"]
-                        .as_array()
-                        .expect("frozen boundary has masked sequences")
-                        .iter()
-                        .map(|sequence| {
-                            sequence
-                                .as_i64()
-                                .expect("masked result sequence is an integer")
-                        })
-                        .collect(),
+                    through_sequence: boundary.through_sequence,
+                    masked_sequences: boundary.masked_sequences.clone(),
                 });
             }
-            EventKind::Compaction => return None,
+            ThreadEventData::Compaction(_) => return None,
             _ => {}
         }
     }
@@ -260,9 +201,9 @@ impl Store {
     pub async fn append(
         &self,
         thread_id: i64,
-        kind: EventKind,
-        payload: Value,
+        data: ThreadEventData,
     ) -> tokio_rusqlite::Result<i64> {
+        let (kind, payload) = event_columns(&data)?;
         let payload = serde_json::to_string(&payload).map_err(|error| {
             tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
@@ -312,14 +253,7 @@ impl Store {
                     let (sequence, kind, payload) = row?;
                     Ok(Event {
                         sequence,
-                        kind: EventKind::try_from(kind.as_str())?,
-                        payload: serde_json::from_str(&payload).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
+                        data: event_data(&kind, &payload)?,
                     })
                 })
                 .collect()
@@ -330,12 +264,13 @@ impl Store {
     pub async fn freeze_event_payloads(
         &self,
         thread_id: i64,
-        events: Vec<(i64, Value)>,
-        boundary: Value,
+        events: Vec<(i64, ThreadEventData)>,
+        boundary: FrozenBoundaryEvent,
     ) -> tokio_rusqlite::Result<i64> {
         let events = events
             .into_iter()
-            .map(|(sequence, payload)| {
+            .map(|(sequence, data)| {
+                let (_, payload) = event_columns(&data)?;
                 serde_json::to_string(&payload)
                     .map(|payload| (sequence, payload))
                     .map_err(to_sql_error)
@@ -369,12 +304,7 @@ impl Store {
                     INSERT INTO events (thread_id, sequence, kind, payload)
                     VALUES (?1, ?2, ?3, ?4)
                     ",
-                    params![
-                        thread_id,
-                        sequence,
-                        EventKind::FrozenBoundary.as_str(),
-                        boundary
-                    ],
+                    params![thread_id, sequence, "frozen_boundary", boundary],
                 )?;
                 transaction.commit()?;
                 Ok(sequence)
@@ -587,12 +517,12 @@ impl Store {
     pub async fn replace_with_compaction(
         &self,
         thread_id: i64,
-        items: Value,
-        workspace_instructions: Option<Value>,
-        skills: Option<Value>,
-        runners: Option<Value>,
+        compaction: CompactionEvent,
+        workspace_instructions: Option<InstructionEvent>,
+        skills: Option<InstructionEvent>,
+        runners: Option<RunnersEvent>,
     ) -> tokio_rusqlite::Result<()> {
-        let items = serde_json::to_string(&items).map_err(to_sql_error)?;
+        let items = serde_json::to_string(&compaction).map_err(to_sql_error)?;
         let workspace_instructions = workspace_instructions
             .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
             .transpose()?;
@@ -611,7 +541,7 @@ impl Store {
                     INSERT INTO events (thread_id, sequence, kind, payload)
                     VALUES (?1, 0, ?2, ?3)
                     ",
-                    params![thread_id, EventKind::Compaction.as_str(), items],
+                    params![thread_id, "compaction", items],
                 )?;
                 if let Some(workspace_instructions) = workspace_instructions {
                     transaction.execute(
@@ -621,7 +551,7 @@ impl Store {
                         ",
                         params![
                             thread_id,
-                            EventKind::WorkspaceInstructions.as_str(),
+                            "workspace_instructions",
                             workspace_instructions
                         ],
                     )?;
@@ -637,7 +567,7 @@ impl Store {
                             ?3
                         )
                         ",
-                        params![thread_id, EventKind::Skills.as_str(), skills],
+                        params![thread_id, "skills", skills],
                     )?;
                 }
                 if let Some(runners) = runners {
@@ -651,7 +581,7 @@ impl Store {
                             ?3
                         )
                         ",
-                        params![thread_id, EventKind::Runners.as_str(), runners],
+                        params![thread_id, "runners", runners],
                     )?;
                 }
                 transaction.commit()
@@ -662,6 +592,28 @@ impl Store {
 
 fn to_sql_error(error: serde_json::Error) -> tokio_rusqlite::Error {
     tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn event_columns(data: &ThreadEventData) -> tokio_rusqlite::Result<(String, Value)> {
+    let Value::Object(mut event) = serde_json::to_value(data).map_err(to_sql_error)? else {
+        unreachable!("thread event data serializes as an object");
+    };
+    let kind = event
+        .remove("kind")
+        .and_then(|kind| kind.as_str().map(str::to_owned))
+        .expect("thread event data has a kind");
+    let payload = event
+        .remove("payload")
+        .expect("thread event data has a payload");
+    Ok((kind, payload))
+}
+
+fn event_data(kind: &str, payload: &str) -> rusqlite::Result<ThreadEventData> {
+    let payload: Value = serde_json::from_str(payload).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+    })?;
+    serde_json::from_value(serde_json::json!({ "kind": kind, "payload": payload }))
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error)))
 }
 
 fn create_checkpoint(
@@ -709,12 +661,17 @@ fn create_checkpoint(
     Ok(checkpoint_id)
 }
 
+enum HistoryPoint {
+    UserMessage,
+    AssistantMessage,
+}
+
 fn validate_history_point(
     transaction: &rusqlite::Transaction<'_>,
     thread_id: i64,
     checkpoint_id: Option<i64>,
     sequence: i64,
-) -> rusqlite::Result<EventKind> {
+) -> rusqlite::Result<HistoryPoint> {
     let kind: String = match checkpoint_id {
         Some(checkpoint_id) => transaction.query_row(
             "
@@ -735,19 +692,17 @@ fn validate_history_point(
             |row| row.get(0),
         )?,
     };
-    let kind = EventKind::try_from(kind.as_str())?;
-    if !matches!(kind, EventKind::UserMessage | EventKind::AssistantMessage) {
-        Err(rusqlite::Error::InvalidQuery)
-    } else {
-        Ok(kind)
+    match kind.as_str() {
+        "user_message" => Ok(HistoryPoint::UserMessage),
+        "assistant_message" => Ok(HistoryPoint::AssistantMessage),
+        _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
 
-fn history_end_sequence(kind: EventKind, sequence: i64) -> i64 {
+fn history_end_sequence(kind: HistoryPoint, sequence: i64) -> i64 {
     match kind {
-        EventKind::UserMessage => sequence - 1,
-        EventKind::AssistantMessage => sequence,
-        _ => unreachable!(),
+        HistoryPoint::UserMessage => sequence - 1,
+        HistoryPoint::AssistantMessage => sequence,
     }
 }
 
@@ -806,10 +761,7 @@ fn read_events(
         let (sequence, kind, payload) = row?;
         Ok(Event {
             sequence,
-            kind: EventKind::try_from(kind.as_str())?,
-            payload: serde_json::from_str(&payload).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
-            })?,
+            data: event_data(&kind, &payload)?,
         })
     })
     .collect()
@@ -817,8 +769,6 @@ fn read_events(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     #[tokio::test]
@@ -831,7 +781,12 @@ mod tests {
 
         assert_eq!(
             store
-                .append(thread, EventKind::UserMessage, json!({"content": "one"}))
+                .append(
+                    thread,
+                    ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                        content: "one".to_owned()
+                    })
+                )
                 .await
                 .unwrap(),
             0
@@ -840,8 +795,9 @@ mod tests {
             store
                 .append(
                     thread,
-                    EventKind::AssistantMessage,
-                    json!({"content": "two"})
+                    ThreadEventData::AssistantMessage(atra_protocol::MessageEvent {
+                        content: "two".to_owned()
+                    })
                 )
                 .await
                 .unwrap(),
@@ -852,13 +808,15 @@ mod tests {
             vec![
                 Event {
                     sequence: 0,
-                    kind: EventKind::UserMessage,
-                    payload: json!({"content": "one"}),
+                    data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                        content: "one".to_owned()
+                    }),
                 },
                 Event {
                     sequence: 1,
-                    kind: EventKind::AssistantMessage,
-                    payload: json!({"content": "two"}),
+                    data: ThreadEventData::AssistantMessage(atra_protocol::MessageEvent {
+                        content: "two".to_owned()
+                    }),
                 },
             ]
         );
@@ -874,7 +832,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .append(thread, EventKind::UserMessage, json!({"content": "saved"}))
+            .append(
+                thread,
+                ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "saved".to_owned(),
+                }),
+            )
             .await
             .unwrap();
         drop(store);
@@ -885,8 +848,9 @@ mod tests {
             reopened.events(thread).await.unwrap(),
             vec![Event {
                 sequence: 0,
-                kind: EventKind::UserMessage,
-                payload: json!({"content": "saved"}),
+                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "saved".to_owned()
+                }),
             }]
         );
     }

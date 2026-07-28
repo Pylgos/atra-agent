@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use super::{ModelCompletion, ModelResponse};
-use crate::storage::{Event, EventKind};
+use crate::storage::Event;
+use atra_protocol::{ThreadEventData, ToolResultEvent};
 
 pub(crate) struct FakeProvider {
     responses: Mutex<VecDeque<ModelResponse>>,
@@ -33,17 +34,29 @@ impl FakeProvider {
             .unwrap_or_default();
         if let ModelResponse::AssistantMessage { content } = &mut response
             && let Some(output) = events.iter().rev().find_map(|event| {
-                (event.kind == EventKind::ToolResult)
-                    .then(|| {
-                        if masked_sequences.contains(&event.sequence) {
-                            &event.payload["masked_result"]
-                        } else {
-                            &event.payload["result"]
-                        }
-                        .as_str()
-                        .or_else(|| event.payload.pointer("/result/output")?.as_str())
-                    })
-                    .flatten()
+                let ThreadEventData::ToolResult(result) = &event.data else {
+                    return None;
+                };
+                let (result, masked_result) = match result {
+                    ToolResultEvent::Custom {
+                        result,
+                        masked_result,
+                        ..
+                    }
+                    | ToolResultEvent::Function {
+                        result,
+                        masked_result,
+                        ..
+                    } => (result, masked_result),
+                };
+                let projected = if masked_sequences.contains(&event.sequence) {
+                    masked_result.as_ref().unwrap_or(result)
+                } else {
+                    result
+                };
+                projected
+                    .as_str()
+                    .or_else(|| projected.pointer("/output")?.as_str())
             })
         {
             *content = content.replace("{{tool_output}}", output);

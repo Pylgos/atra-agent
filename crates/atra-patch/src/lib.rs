@@ -14,14 +14,14 @@ const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
 const MOVE: &str = "*** Move to: ";
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApplyPatchResult {
     ParseError { error: String },
     Operations { results: Vec<PatchOperationResult> },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PatchOperationResult {
     Added {
@@ -43,21 +43,21 @@ pub enum PatchOperationResult {
     },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PatchOperationOutcome {
     Applied { diff: Result<FileDiff, String> },
     Failed { error: String },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FileDiff {
     pub old_path: Option<PathBuf>,
     pub new_path: Option<PathBuf>,
     pub hunks: Vec<DiffHunk>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiffHunk {
     pub old_start: usize,
     pub old_count: usize,
@@ -66,7 +66,7 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub old_line: Option<usize>,

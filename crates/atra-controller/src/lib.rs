@@ -4,10 +4,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,10 +12,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CommandEnvironment, CommandOutput,
-    ControllerRequest, ControllerResponse, ProcessStatus, Runner as RunnerInfo,
-    RunnerOperationUpdate, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
-    RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
+    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CommandEnvironment,
+    CommandExecutionArtifact, CommandMode, CommandOutput, CompactionEvent, ControllerRequest,
+    ControllerResponse, CustomToolType, FrozenBoundaryEvent, InstructionEvent,
+    InstructionTransition, ItemEvent, MessageEvent, ModelRequestEvent, ModelRequestKind,
+    ProcessStatus, RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact,
+    RunnerOperationUpdate, RunnerRequest, RunnerResponse, RunnersEvent, ThreadEvent,
+    ThreadEventData, TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -28,24 +28,26 @@ use codex_login::{
     default_client::set_default_originator, logout_with_revoke, run_login_server,
 };
 use serde::Deserialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, BufReader},
     net::{UnixListener, UnixStream},
-    process::{Child, ChildStdin, Command},
-    sync::{Mutex, mpsc, oneshot, watch},
+    process::{Child, Command},
+    sync::{Mutex, mpsc, watch},
     time::Instant,
 };
 
 mod connection;
+mod lifecycle;
 mod model;
+mod runner_client;
 mod skills;
-#[allow(dead_code)]
 mod storage;
 
+use lifecycle::{ApprovalDecision, TurnLifecycle};
 use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider};
-use storage::{EventKind, Store};
+use runner_client::{PrepareTreeResult, RunnerClient};
+use storage::Store;
 
 const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 const ACTIVE_CONTEXT_HIGH_TOKENS: usize = 96_000;
@@ -146,14 +148,12 @@ pub async fn run(endpoint: &Path, database: &Path, auth_home: &Path) -> Result<(
         runners: Mutex::new(HashMap::new()),
         store,
         provider,
-        approvals: Mutex::new(HashMap::new()),
-        active_turns: Mutex::new(HashMap::new()),
+        turns: TurnLifecycle::new(),
         processes: Mutex::new(HashMap::new()),
         thread_locks: StdMutex::new(HashMap::new()),
-        next_approval_id: AtomicU64::new(0),
-        platform,
         skill_store,
         skill_generation: Mutex::new(None),
+        platform,
         data_home,
         auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
@@ -189,14 +189,12 @@ pub(crate) struct State {
     runners: Mutex<HashMap<String, Arc<Runner>>>,
     store: Store,
     provider: Provider,
-    approvals: Mutex<HashMap<u64, PendingApproval>>,
-    active_turns: Mutex<HashMap<i64, Arc<ActiveTurn>>>,
+    turns: TurnLifecycle,
     processes: Mutex<HashMap<ProcessKey, ProcessRecord>>,
     thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
-    next_approval_id: AtomicU64,
-    platform: Option<Arc<PlatformStore>>,
     skill_store: AtraStore,
     skill_generation: Mutex<Option<Arc<skills::SkillGeneration>>>,
+    platform: Option<Arc<PlatformStore>>,
     data_home: PathBuf,
     auth_home: PathBuf,
     prompt_cache_namespace: String,
@@ -207,14 +205,6 @@ pub(crate) struct State {
 struct WorkspaceInstructions {
     content: Option<String>,
     tracked: bool,
-}
-
-struct ActiveTurn {
-    cancel_requested: watch::Sender<bool>,
-    cancellation: watch::Sender<Option<Result<(), String>>>,
-    cancelling: AtomicBool,
-    uncancellable: Mutex<()>,
-    process: Mutex<Option<(Arc<Runner>, String)>>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -242,26 +232,12 @@ impl State {
             | ControllerRequest::ThreadContinue { thread_id } => *thread_id,
             _ => unreachable!("non-streaming request dispatched as streaming"),
         };
-        let (cancel_requested, _) = watch::channel(false);
-        let (cancellation, _) = watch::channel(None);
-        let active = Arc::new(ActiveTurn {
-            cancel_requested,
-            cancellation,
-            cancelling: AtomicBool::new(false),
-            uncancellable: Mutex::new(()),
-            process: Mutex::new(None),
-        });
-        let mut active_turns = self.active_turns.lock().await;
-        if active_turns.contains_key(&thread_id) {
-            bail!("thread already has an active turn");
-        }
-        active_turns.insert(thread_id, Arc::clone(&active));
-        drop(active_turns);
+        let active = self.turns.start(thread_id).await?;
         updates
             .send(ModelStreamEvent::TurnStarted { thread_id })
             .context("turn stream closed before turn started")?;
-        let mut cancel_requested = active.cancel_requested.subscribe();
-        let mut cancellation = active.cancellation.subscribe();
+        let mut cancel_requested = active.cancel_requested();
+        let mut cancellation = active.cancellation();
         let mut turn = Box::pin(async {
             match request {
                 ControllerRequest::ThreadSend { thread_id, message } => {
@@ -298,9 +274,7 @@ impl State {
                 Err(message) => Err(anyhow!(message)),
             }
         };
-        if active.cancelling.load(Ordering::Acquire)
-            && !matches!(response, Ok(ControllerResponse::ThreadCancelled))
-        {
+        if active.is_cancelling() && !matches!(response, Ok(ControllerResponse::ThreadCancelled)) {
             if !*cancel_requested.borrow() {
                 cancel_requested
                     .changed()
@@ -322,14 +296,8 @@ impl State {
                 Err(message) => Err(anyhow!(message)),
             };
         }
-        if !active.cancelling.load(Ordering::Acquire) {
-            let mut active_turns = self.active_turns.lock().await;
-            if active_turns
-                .get(&thread_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &active))
-            {
-                active_turns.remove(&thread_id);
-            }
+        if !active.is_cancelling() {
+            self.turns.finish(thread_id, &active).await;
         }
         response
     }
@@ -602,25 +570,19 @@ impl State {
             ControllerRequest::ExecCommand {
                 runner,
                 command,
-                background,
-                timeout_ms,
-                timeout_action,
+                mode,
             } => {
                 tracing::debug!(
                     runner,
                     %command,
-                    background,
-                    ?timeout_ms,
-                    ?timeout_action,
+                    ?mode,
                     "executing command"
                 );
                 let runner = self.runner(&runner).await?;
                 runner
                     .request(RunnerRequest::ExecCommand {
                         command,
-                        background,
-                        timeout_ms,
-                        timeout_action,
+                        mode,
                         environment: runner.environment.lock().await.clone(),
                     })
                     .await
@@ -656,31 +618,15 @@ impl State {
         record: ProcessRecord,
     ) -> BackgroundProcessDetail {
         let response = match self.runner(&key.runner).await {
-            Ok(runner) => {
-                runner
-                    .request_raw(RunnerRequest::InspectProcess {
-                        process_handle: record.handle,
-                    })
-                    .await
-            }
+            Ok(runner) => runner.client.inspect(record.handle).await,
             Err(error) => Err(error),
         };
         let (status, output_tail, omitted_bytes) = match response {
-            Ok(RunnerResponse::ProcessInspected {
-                process_status: status,
+            Ok(runner_client::ProcessInspection {
+                status,
                 output_tail,
                 omitted_bytes,
             }) => (status, output_tail, omitted_bytes),
-            Ok(RunnerResponse::Error { message }) => {
-                (ProcessStatus::Unavailable { message }, String::new(), 0)
-            }
-            Ok(_) => (
-                ProcessStatus::Unavailable {
-                    message: "runner returned an invalid inspect_process response".to_owned(),
-                },
-                String::new(),
-                0,
-            ),
             Err(error) => (
                 ProcessStatus::Unavailable {
                     message: format!("{error:#}"),
@@ -704,21 +650,11 @@ impl State {
 
     async fn process_status(&self, key: &ProcessKey, record: &ProcessRecord) -> ProcessStatus {
         let response = match self.runner(&key.runner).await {
-            Ok(runner) => {
-                runner
-                    .request_raw(RunnerRequest::ProcessStatus {
-                        process_handle: record.handle.clone(),
-                    })
-                    .await
-            }
+            Ok(runner) => runner.client.status(record.handle.clone()).await,
             Err(error) => Err(error),
         };
         match response {
-            Ok(RunnerResponse::ProcessStatus { process_status }) => process_status,
-            Ok(RunnerResponse::Error { message }) => ProcessStatus::Unavailable { message },
-            Ok(_) => ProcessStatus::Unavailable {
-                message: "runner returned an invalid process_status response".to_owned(),
-            },
+            Ok(process_status) => process_status,
             Err(error) => ProcessStatus::Unavailable {
                 message: format!("{error:#}"),
             },
@@ -742,8 +678,7 @@ impl State {
         self.sync_workspace_instructions(thread_id).await?;
         self.append_event(
             thread_id,
-            EventKind::UserMessage,
-            json!({ "content": message }),
+            ThreadEventData::UserMessage(MessageEvent { content: message }),
             updates,
         )
         .await
@@ -767,18 +702,22 @@ impl State {
             .context("failed to load thread history")?;
         let resumable = events.iter().rev().find(|event| {
             matches!(
-                event.kind,
-                EventKind::UserMessage
-                    | EventKind::AssistantMessage
-                    | EventKind::ToolCall
-                    | EventKind::ToolResult
-                    | EventKind::Compaction
+                event.data,
+                ThreadEventData::UserMessage(_)
+                    | ThreadEventData::AssistantMessage(_)
+                    | ThreadEventData::ToolCall(_)
+                    | ThreadEventData::ToolResult(_)
+                    | ThreadEventData::Compaction(_)
             )
         });
-        match resumable.map(|event| event.kind) {
-            Some(EventKind::UserMessage | EventKind::ToolResult | EventKind::Compaction) => {}
-            Some(EventKind::AssistantMessage) => bail!("thread turn is already complete"),
-            Some(EventKind::ToolCall) => unreachable!(),
+        match resumable.map(|event| &event.data) {
+            Some(
+                ThreadEventData::UserMessage(_)
+                | ThreadEventData::ToolResult(_)
+                | ThreadEventData::Compaction(_),
+            ) => {}
+            Some(ThreadEventData::AssistantMessage(_)) => bail!("thread turn is already complete"),
+            Some(ThreadEventData::ToolCall(_)) => unreachable!(),
             None => bail!("thread has no resumable history"),
             _ => unreachable!(),
         }
@@ -801,30 +740,36 @@ impl State {
             .rev()
             .find(|event| {
                 matches!(
-                    event.kind,
-                    EventKind::UserMessage
-                        | EventKind::AssistantMessage
-                        | EventKind::ToolCall
-                        | EventKind::ToolResult
-                        | EventKind::Compaction
+                    event.data,
+                    ThreadEventData::UserMessage(_)
+                        | ThreadEventData::AssistantMessage(_)
+                        | ThreadEventData::ToolCall(_)
+                        | ThreadEventData::ToolResult(_)
+                        | ThreadEventData::Compaction(_)
                 )
             })
-            .filter(|event| event.kind == EventKind::ToolCall)
+            .filter(|event| matches!(event.data, ThreadEventData::ToolCall(_)))
         else {
             return Ok(());
         };
-        self.approvals
-            .lock()
-            .await
-            .retain(|_, approval| approval.thread_id != thread_id);
+        self.turns.clear_approvals(thread_id).await;
+        let ThreadEventData::ToolCall(call) = &tool_call.data else {
+            unreachable!()
+        };
+        let (name, call_id, custom) = match call {
+            ToolCallEvent::Custom { name, call_id, .. } => {
+                (name.as_str(), Some(call_id.as_str()), true)
+            }
+            ToolCallEvent::Function { name, call_id, .. } => {
+                (name.as_str(), call_id.as_deref(), false)
+            }
+        };
         self.save_tool_result(
             thread_id,
-            tool_call.payload["name"]
-                .as_str()
-                .context("tool call has no name")?,
-            tool_call.payload["call_id"].as_str(),
+            name,
+            call_id,
             ToolOutcome::text("tool execution was interrupted before completion".to_owned()),
-            tool_call.payload["type"].as_str() == Some("custom"),
+            custom,
             updates,
         )
         .await
@@ -832,37 +777,13 @@ impl State {
     }
 
     async fn cancel_thread(&self, thread_id: i64) -> Result<ControllerResponse> {
-        let active = {
-            let active_turns = self.active_turns.lock().await;
-            let Some(active) = active_turns.get(&thread_id).cloned() else {
-                return Ok(ControllerResponse::ThreadNotActive);
-            };
-            active.cancelling.store(true, Ordering::Release);
-            active
+        let Some(active) = self.turns.begin_cancellation(thread_id).await else {
+            return Ok(ControllerResponse::ThreadNotActive);
         };
-        let stop = async {
-            let _uncancellable = active.uncancellable.lock().await;
-            let mut process = active.process.lock().await;
-            active.cancel_requested.send_replace(true);
-            if let Some((runner, process_handle)) = process.take() {
-                match runner
-                    .request_raw(RunnerRequest::StopProcess { process_handle })
-                    .await?
-                {
-                    RunnerResponse::ProcessStopped { .. } => {}
-                    RunnerResponse::Error { message } => bail!("{message}"),
-                    _ => bail!("runner returned an invalid stop_process response"),
-                }
-            }
-            Ok(())
-        }
-        .await;
+        let stop = active.request_cancellation().await;
         let cleanup = async {
             let _guard = self.thread_lock(thread_id).lock_owned().await;
-            self.approvals
-                .lock()
-                .await
-                .retain(|_, approval| approval.thread_id != thread_id);
+            self.turns.clear_approvals(thread_id).await;
             self.prepare_thread_for_turn(thread_id, None).await
         }
         .await;
@@ -874,16 +795,9 @@ impl State {
                 Err(stop.context(format!("turn cleanup also failed: {cleanup:#}")))
             }
         };
-        let mut active_turns = self.active_turns.lock().await;
-        if active_turns
-            .get(&thread_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &active))
-        {
-            active_turns.remove(&thread_id);
-        }
-        drop(active_turns);
+        self.turns.finish(thread_id, &active).await;
         let outcome = result.map_err(|error| format!("{error:#}"));
-        active.cancellation.send_replace(Some(outcome.clone()));
+        active.complete_cancellation(outcome.clone());
         outcome
             .map(|()| ControllerResponse::ThreadCancelled)
             .map_err(anyhow::Error::msg)
@@ -900,16 +814,7 @@ impl State {
     }
 
     async fn ensure_no_pending_approval(&self, thread_id: i64) -> Result<()> {
-        if self
-            .approvals
-            .lock()
-            .await
-            .values()
-            .any(|approval| approval.thread_id == thread_id)
-        {
-            bail!("thread has a pending approval");
-        }
-        Ok(())
+        self.turns.ensure_no_pending_approval(thread_id).await
     }
 
     async fn continue_turn(
@@ -951,17 +856,16 @@ impl State {
             let masked_tokens = i64::try_from(masked_tokens).unwrap_or(i64::MAX);
             let active_history_start = events
                 .iter()
-                .rposition(|event| event.kind == EventKind::Compaction)
+                .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
                 .map_or(0, |index| index + 1);
             let active_tokens = events[active_history_start..]
                 .iter()
                 .rev()
-                .find(|event| event.kind == EventKind::TokenUsage)
-                .and_then(|event| {
-                    event.payload["usage"]["total_tokens"]
-                        .as_i64()
-                        .or_else(|| event.payload["total_tokens"].as_i64())
+                .find_map(|event| match &event.data {
+                    ThreadEventData::TokenUsage(event) => Some(&event.usage),
+                    _ => None,
                 })
+                .and_then(|usage| usage["total_tokens"].as_i64())
                 .map(|tokens| tokens.saturating_sub(masked_tokens));
             if active_tokens
                 .zip(auto_compact_token_limit)
@@ -975,14 +879,15 @@ impl State {
                 )?;
                 self.append_event(
                     thread_id,
-                    EventKind::ModelRequest,
-                    json!({
-                        "kind": "compaction",
-                        "started_at_ms": unix_time_ms(),
-                        "request": request,
-                        "context_window": context_window,
-                        "auto_compact_token_limit": auto_compact_token_limit,
-                        "compacted": events.iter().any(|event| event.kind == EventKind::Compaction),
+                    ThreadEventData::ModelRequest(ModelRequestEvent {
+                        kind: ModelRequestKind::Compaction,
+                        started_at_ms: unix_time_ms(),
+                        request,
+                        context_window,
+                        auto_compact_token_limit,
+                        compacted: events
+                            .iter()
+                            .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
                     }),
                     updates,
                 )
@@ -1003,17 +908,24 @@ impl State {
                         } else {
                             "removal"
                         };
-                        Some(json!({
-                            "content": workspace_instructions.content,
-                            "transition": transition,
-                        }))
+                        Some(InstructionEvent {
+                            content: workspace_instructions.content,
+                            transition: if transition == "initial" {
+                                InstructionTransition::Initial
+                            } else {
+                                InstructionTransition::Removal
+                            },
+                        })
                     } else {
                         None
                     };
                     self.store
                         .replace_with_compaction(
                             thread_id,
-                            json!({ "items": items }),
+                            CompactionEvent {
+                                items: serde_json::to_value(items)
+                                    .map_err(|error| anyhow!(error))?,
+                            },
                             workspace_event,
                             skill_event(&events),
                             runner_event(&events),
@@ -1036,14 +948,15 @@ impl State {
             let request_sequence = self
                 .append_event(
                     thread_id,
-                    EventKind::ModelRequest,
-                    json!({
-                        "kind": "response",
-                        "started_at_ms": unix_time_ms(),
-                        "request": request,
-                        "context_window": context_window,
-                        "auto_compact_token_limit": auto_compact_token_limit,
-                        "compacted": events.iter().any(|event| event.kind == EventKind::Compaction),
+                    ThreadEventData::ModelRequest(ModelRequestEvent {
+                        kind: ModelRequestKind::Response,
+                        started_at_ms: unix_time_ms(),
+                        request,
+                        context_window,
+                        auto_compact_token_limit,
+                        compacted: events
+                            .iter()
+                            .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
                     }),
                     updates,
                 )
@@ -1060,17 +973,21 @@ impl State {
                 .await?;
             for item in completion.reasoning {
                 self.store
-                    .append(thread_id, EventKind::Reasoning, json!({ "item": item }))
+                    .append(
+                        thread_id,
+                        ThreadEventData::Reasoning(ItemEvent {
+                            item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
+                        }),
+                    )
                     .await
                     .context("failed to save encrypted reasoning")?;
             }
             if let Some(usage) = completion.token_usage {
                 self.append_event(
                     thread_id,
-                    EventKind::TokenUsage,
-                    json!({
-                        "request_sequence": request_sequence,
-                        "usage": usage,
+                    ThreadEventData::TokenUsage(TokenUsageEvent {
+                        request_sequence,
+                        usage: serde_json::to_value(usage).map_err(|error| anyhow!(error))?,
                     }),
                     updates,
                 )
@@ -1080,10 +997,10 @@ impl State {
             if !completion.rate_limits.is_empty() {
                 self.append_event(
                     thread_id,
-                    EventKind::RateLimits,
-                    json!({
-                        "request_sequence": request_sequence,
-                        "snapshots": completion.rate_limits,
+                    ThreadEventData::RateLimits(RateLimitsEvent {
+                        request_sequence,
+                        snapshots: serde_json::to_value(completion.rate_limits)
+                            .map_err(|error| anyhow!(error))?,
                     }),
                     updates,
                 )
@@ -1114,7 +1031,7 @@ impl State {
             .chain(
                 events
                     .iter()
-                    .rfind(|event| event.kind == EventKind::Compaction)
+                    .rfind(|event| matches!(event.data, ThreadEventData::Compaction(_)))
                     .map(|event| event.sequence),
             )
             .max();
@@ -1140,7 +1057,7 @@ impl State {
         let request_sequences = events
             .iter()
             .filter(|event| {
-                event.kind == EventKind::ModelRequest && event.payload["kind"] == "response"
+                matches!(&event.data, ThreadEventData::ModelRequest(request) if request.kind == ModelRequestKind::Response)
             })
             .map(|event| event.sequence)
             .collect::<Vec<_>>();
@@ -1150,15 +1067,26 @@ impl State {
             let event = &events[index];
             let later_requests =
                 request_sequences.partition_point(|sequence| *sequence <= event.sequence);
-            if event.kind != EventKind::ToolResult
-                || request_sequences.len() - later_requests < MINIMUM_FULL_RESULT_REQUESTS
-            {
+            let ThreadEventData::ToolResult(result) = &event.data else {
+                continue;
+            };
+            if request_sequences.len() - later_requests < MINIMUM_FULL_RESULT_REQUESTS {
                 continue;
             }
             through_sequence = Some(event.sequence);
-            if let Some(masked_result) = masked_tool_result(&event.payload) {
+            if let Some(masked_result) = masked_tool_result(result) {
                 let mut event = event.clone();
-                event.payload["masked_result"] = serde_json::Value::String(masked_result);
+                match &mut event.data {
+                    ThreadEventData::ToolResult(ToolResultEvent::Custom {
+                        masked_result: field,
+                        ..
+                    })
+                    | ThreadEventData::ToolResult(ToolResultEvent::Function {
+                        masked_result: field,
+                        ..
+                    }) => *field = Some(serde_json::Value::String(masked_result)),
+                    _ => unreachable!(),
+                }
                 masked_events.push((index, event));
             }
             if index >= freeze_through_index {
@@ -1173,18 +1101,17 @@ impl State {
             .map(|boundary| boundary.masked_sequences)
             .unwrap_or_default();
         masked_sequences.extend(masked_events.iter().map(|(_, event)| event.sequence));
-        let payload = json!({
-            "through_sequence": through_sequence,
-            "masked_sequences": masked_sequences,
-        });
+        let boundary_data = FrozenBoundaryEvent {
+            through_sequence,
+            masked_sequences,
+        };
         let mut projected_events = events.clone();
         for (index, event) in &masked_events {
             projected_events[*index] = event.clone();
         }
         projected_events.push(storage::Event {
             sequence: events.last().map_or(0, |event| event.sequence + 1),
-            kind: EventKind::FrozenBoundary,
-            payload: payload.clone(),
+            data: ThreadEventData::FrozenBoundary(boundary_data.clone()),
         });
         let masked_tokens =
             context_tokens_before.saturating_sub(self.provider.context_tokens(&projected_events)?);
@@ -1197,9 +1124,9 @@ impl State {
                 thread_id,
                 masked_events
                     .iter()
-                    .map(|(_, event)| (event.sequence, event.payload.clone()))
+                    .map(|(_, event)| (event.sequence, event.data.clone()))
                     .collect(),
-                payload.clone(),
+                boundary_data.clone(),
             )
             .await
             .context("failed to mask old command results")?;
@@ -1208,8 +1135,7 @@ impl State {
         }
         let boundary = storage::Event {
             sequence,
-            kind: EventKind::FrozenBoundary,
-            payload,
+            data: ThreadEventData::FrozenBoundary(boundary_data),
         };
         events.push(boundary.clone());
         if let Some(stream_updates) = stream_updates {
@@ -1245,10 +1171,14 @@ impl State {
         self.store
             .append(
                 thread_id,
-                EventKind::WorkspaceInstructions,
-                json!({
-                    "content": content,
-                    "transition": transition,
+                ThreadEventData::WorkspaceInstructions(InstructionEvent {
+                    content,
+                    transition: match transition {
+                        "initial" => InstructionTransition::Initial,
+                        "replacement" => InstructionTransition::Replacement,
+                        "removal" => InstructionTransition::Removal,
+                        _ => unreachable!(),
+                    },
                 }),
             )
             .await
@@ -1292,10 +1222,14 @@ impl State {
         };
         self.append_event(
             thread_id,
-            EventKind::Skills,
-            json!({
-                "content": generation.prompt,
-                "transition": transition,
+            ThreadEventData::Skills(InstructionEvent {
+                content: generation.prompt.clone(),
+                transition: match transition {
+                    "initial" => InstructionTransition::Initial,
+                    "replacement" => InstructionTransition::Replacement,
+                    "removal" => InstructionTransition::Removal,
+                    _ => unreachable!(),
+                },
             }),
             updates,
         )
@@ -1332,10 +1266,13 @@ impl State {
         }
         self.append_event(
             thread_id,
-            EventKind::Runners,
-            json!({
-                "runners": runners,
-                "transition": if previous.is_some() { "replacement" } else { "initial" },
+            ThreadEventData::Runners(RunnersEvent {
+                runners: runners.clone(),
+                transition: if previous.is_some() {
+                    InstructionTransition::Replacement
+                } else {
+                    InstructionTransition::Initial
+                },
             }),
             updates,
         )
@@ -1387,8 +1324,9 @@ impl State {
                 ModelResponse::AssistantMessage { content } => {
                     self.append_event(
                         thread_id,
-                        EventKind::AssistantMessage,
-                        json!({ "content": content }),
+                        ThreadEventData::AssistantMessage(MessageEvent {
+                            content: content.clone(),
+                        }),
                         updates,
                     )
                     .await
@@ -1398,8 +1336,9 @@ impl State {
                 ModelResponse::WebSearch { item } => {
                     self.append_event(
                         thread_id,
-                        EventKind::WebSearch,
-                        json!({ "item": item }),
+                        ThreadEventData::WebSearch(ItemEvent {
+                            item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
+                        }),
                         updates,
                     )
                     .await
@@ -1412,11 +1351,10 @@ impl State {
                 } => {
                     self.append_event(
                         thread_id,
-                        EventKind::ToolCall,
-                        json!({
-                            "name": &name,
-                            "arguments": &arguments,
-                            "call_id": &call_id,
+                        ThreadEventData::ToolCall(ToolCallEvent::Function {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            call_id: call_id.clone(),
                         }),
                         updates,
                     )
@@ -1505,13 +1443,12 @@ impl State {
                     }
                     self.append_event(
                         thread_id,
-                        EventKind::ToolCall,
-                        json!({
-                            "type": "custom",
-                            "item_id": &item_id,
-                            "name": &name,
-                            "input": &input,
-                            "call_id": &call_id,
+                        ThreadEventData::ToolCall(ToolCallEvent::Custom {
+                            call_type: CustomToolType::Custom,
+                            item_id: item_id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            call_id: call_id.clone(),
                         }),
                         updates,
                     )
@@ -1547,15 +1484,12 @@ impl State {
                             "Operation {} [{runner}] {result_label}:\n{}",
                             operation_index, result
                         ));
-                        let artifact = json!({
-                            "kind": "runner_operation",
-                            "data": {
-                                "operation": operation_index,
-                                "runner": runner,
-                                "label": result_label,
-                                "result": result,
-                                "artifacts": outcome.artifacts,
-                            },
+                        let artifact = ToolArtifact::RunnerOperation(RunnerOperationArtifact {
+                            operation: operation_index,
+                            runner,
+                            label: result_label,
+                            result: serde_json::Value::String(result),
+                            artifacts: outcome.artifacts,
                         });
                         send_operation_update(
                             Some(&operation_context),
@@ -1619,17 +1553,9 @@ impl State {
         let runner = self.runner(arguments.runner()).await?;
         let decision =
             if arguments.requires_approval() && runner.approval().await == ApprovalPolicy::Ask {
-                let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
                 let arguments_json = serde_json::to_value(&arguments)
                     .context("failed to encode approval arguments")?;
-                let (decision, approval) = oneshot::channel();
-                self.approvals.lock().await.insert(
-                    approval_id,
-                    PendingApproval {
-                        thread_id,
-                        decision,
-                    },
-                );
+                let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
                 updates
                     .context("approval requires a streaming turn")?
                     .send(ModelStreamEvent::ApprovalRequired {
@@ -1652,18 +1578,16 @@ impl State {
         let allowed = decision.as_ref().is_none_or(|decision| decision.allowed);
         let active = if allowed && matches!(&arguments, ToolArguments::ApplyPatch(_)) {
             Some(
-                self.active_turns
-                    .lock()
+                self.turns
+                    .get(thread_id)
                     .await
-                    .get(&thread_id)
-                    .cloned()
                     .context("thread has no active turn")?,
             )
         } else {
             None
         };
         let _uncancellable = match &active {
-            Some(active) => Some(active.uncancellable.lock().await),
+            Some(active) => Some(active.lock_uncancellable().await),
             None => None,
         };
         let result = if allowed {
@@ -1686,16 +1610,9 @@ impl State {
         allowed: bool,
         reason: Option<String>,
     ) -> Result<ControllerResponse> {
-        let pending = self
-            .approvals
-            .lock()
-            .await
-            .remove(&approval_id)
-            .with_context(|| format!("approval {approval_id} is not pending"))?;
-        pending
-            .decision
-            .send(ApprovalDecision { allowed, reason })
-            .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))?;
+        self.turns
+            .resolve_approval(approval_id, ApprovalDecision { allowed, reason })
+            .await?;
         Ok(ControllerResponse::ApprovalResolved)
     }
 
@@ -1712,7 +1629,7 @@ impl State {
                 let command = arguments.command.clone();
                 let started_at_ms = checkpoint_time_ms();
                 let runner = self.runner(&arguments.runner).await?;
-                if let Some(process_id) = &arguments.process_id
+                if let ModelCommandMode::Background { process_id } = &arguments.mode
                     && self.processes.lock().await.contains_key(&ProcessKey {
                         thread_id,
                         runner: runner_name.clone(),
@@ -1723,130 +1640,133 @@ impl State {
                         "Process ID '{process_id}' is already in use on Runner {runner_name}"
                     )));
                 }
-                let response = if arguments.background {
-                    runner
-                        .request_raw(RunnerRequest::ExecCommand {
-                            command: arguments.command,
-                            background: true,
-                            timeout_ms: arguments.timeout_ms,
-                            timeout_action: arguments.timeout_action,
-                            environment: runner.environment.lock().await.clone(),
-                        })
-                        .await?
-                } else {
-                    let active = self
-                        .active_turns
-                        .lock()
-                        .await
-                        .get(&thread_id)
-                        .cloned()
-                        .context("thread has no active turn")?;
-                    let mut process = active.process.lock().await;
-                    let response = runner
-                        .request_raw(RunnerRequest::StartCommand {
-                            command: arguments.command,
-                            environment: runner.environment.lock().await.clone(),
-                        })
-                        .await?;
-                    let RunnerResponse::ProcessStarted { process_handle } = response else {
-                        bail!("runner returned an invalid start command response");
-                    };
-                    *process = Some((Arc::clone(&runner), process_handle.clone()));
-                    drop(process);
-                    send_operation_update(
-                        operation,
-                        updates,
-                        RunnerOperationUpdate::CommandStarted,
-                    )?;
-                    let deadline = arguments
-                        .timeout_ms
-                        .map(|timeout| Instant::now() + std::time::Duration::from_millis(timeout));
-                    let mut collected = None;
-                    let response = loop {
-                        let timeout_ms = deadline.map_or(1000, |deadline| {
-                            deadline
+                let response = match arguments.mode {
+                    ModelCommandMode::Background { process_id } => {
+                        let response = runner
+                            .request_raw(RunnerRequest::ExecCommand {
+                                command: arguments.command,
+                                mode: CommandMode::Background,
+                                environment: runner.environment.lock().await.clone(),
+                            })
+                            .await?;
+                        match response {
+                            RunnerResponse::ProcessStarted { process_handle } => {
+                                self.processes.lock().await.insert(
+                                    ProcessKey {
+                                        thread_id,
+                                        runner: runner_name.clone(),
+                                        process_id: process_id.clone(),
+                                    },
+                                    ProcessRecord {
+                                        handle: process_handle,
+                                        command: command.clone(),
+                                        started_at_ms,
+                                    },
+                                );
+                                RunnerResponse::ProcessStarted {
+                                    process_handle: process_id,
+                                }
+                            }
+                            response => response,
+                        }
+                    }
+                    mode @ (ModelCommandMode::Foreground { .. }
+                    | ModelCommandMode::Timed { .. }) => {
+                        let terminate_on_timeout = matches!(&mode, ModelCommandMode::Timed { .. });
+                        let timeout_ms = match mode {
+                            ModelCommandMode::Foreground { timeout_ms }
+                            | ModelCommandMode::Timed { timeout_ms } => timeout_ms,
+                            ModelCommandMode::Background { .. } => unreachable!(),
+                        };
+                        let active = self
+                            .turns
+                            .get(thread_id)
+                            .await
+                            .context("thread has no active turn")?;
+                        let response = runner
+                            .request_raw(RunnerRequest::StartCommand {
+                                command: arguments.command,
+                                environment: runner.environment.lock().await.clone(),
+                            })
+                            .await?;
+                        let RunnerResponse::ProcessStarted { process_handle } = response else {
+                            bail!("runner returned an invalid start command response");
+                        };
+                        active
+                            .set_process(Arc::clone(&runner), process_handle.clone())
+                            .await;
+                        send_operation_update(
+                            operation,
+                            updates,
+                            RunnerOperationUpdate::CommandStarted,
+                        )?;
+                        let deadline =
+                            Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                        let mut collected = None;
+                        let response = loop {
+                            let timeout_ms = deadline
                                 .saturating_duration_since(Instant::now())
                                 .as_millis()
                                 .min(1000)
                                 .try_into()
-                                .unwrap_or(1000)
-                        });
-                        match runner
-                            .request_raw(RunnerRequest::WaitProcess {
-                                process_handle: process_handle.clone(),
-                                timeout_ms,
-                            })
-                            .await?
-                        {
-                            RunnerResponse::ProcessRunning { output, .. } => {
-                                send_operation_update(
-                                    operation,
-                                    updates,
-                                    RunnerOperationUpdate::CommandOutput {
-                                        content: output.content.clone(),
-                                        omitted_bytes: output.omitted_bytes,
-                                    },
-                                )?;
-                                append_command_output(&mut collected, output);
-                                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                                    break match arguments.timeout_action {
-                                        TimeoutAction::ReturnRunning => {
+                                .unwrap_or(1000);
+                            match runner
+                                .request_raw(RunnerRequest::WaitProcess {
+                                    process_handle: process_handle.clone(),
+                                    timeout_ms,
+                                })
+                                .await?
+                            {
+                                RunnerResponse::ProcessRunning { output, .. } => {
+                                    send_operation_update(
+                                        operation,
+                                        updates,
+                                        RunnerOperationUpdate::CommandOutput {
+                                            content: output.content.clone(),
+                                            omitted_bytes: output.omitted_bytes,
+                                        },
+                                    )?;
+                                    append_command_output(&mut collected, output);
+                                    if Instant::now() >= deadline {
+                                        break if terminate_on_timeout {
+                                            match runner
+                                                .request_raw(RunnerRequest::StopProcess {
+                                                    process_handle: process_handle.clone(),
+                                                })
+                                                .await?
+                                            {
+                                                RunnerResponse::ProcessStopped { output } => {
+                                                    append_command_output(&mut collected, output);
+                                                    RunnerResponse::ProcessTimedOut {
+                                                        output: collected.take().unwrap(),
+                                                    }
+                                                }
+                                                response => response,
+                                            }
+                                        } else {
                                             RunnerResponse::ProcessRunning {
                                                 process_handle: process_handle.clone(),
                                                 output: collected.take().unwrap(),
                                             }
-                                        }
-                                        TimeoutAction::Terminate => match runner
-                                            .request_raw(RunnerRequest::StopProcess {
-                                                process_handle: process_handle.clone(),
-                                            })
-                                            .await?
-                                        {
-                                            RunnerResponse::ProcessStopped { output } => {
-                                                append_command_output(&mut collected, output);
-                                                RunnerResponse::ProcessTimedOut {
-                                                    output: collected.take().unwrap(),
-                                                }
-                                            }
-                                            response => response,
-                                        },
+                                        };
+                                    }
+                                }
+                                RunnerResponse::ProcessFinished { output, exit_code } => {
+                                    append_command_output(&mut collected, output);
+                                    break RunnerResponse::ProcessFinished {
+                                        output: collected.take().unwrap(),
+                                        exit_code,
                                     };
                                 }
+                                response => break response,
                             }
-                            RunnerResponse::ProcessFinished { output, exit_code } => {
-                                append_command_output(&mut collected, output);
-                                break RunnerResponse::ProcessFinished {
-                                    output: collected.take().unwrap(),
-                                    exit_code,
-                                };
-                            }
-                            response => break response,
-                        }
-                    };
-                    active.process.lock().await.take();
-                    response
+                        };
+                        active.clear_process().await;
+                        response
+                    }
                 };
                 let response = match response {
-                    RunnerResponse::ProcessStarted { process_handle } => {
-                        let process_id = arguments
-                            .process_id
-                            .context("background command requires a process ID")?;
-                        self.processes.lock().await.insert(
-                            ProcessKey {
-                                thread_id,
-                                runner: runner_name.clone(),
-                                process_id: process_id.clone(),
-                            },
-                            ProcessRecord {
-                                handle: process_handle,
-                                command,
-                                started_at_ms,
-                            },
-                        );
-                        RunnerResponse::ProcessStarted {
-                            process_handle: process_id,
-                        }
-                    }
+                    response @ RunnerResponse::ProcessStarted { .. } => response,
                     RunnerResponse::ProcessRunning {
                         process_handle,
                         output,
@@ -1886,31 +1806,21 @@ impl State {
                 let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_exec_response(&runner_name, response)?,
-                    "command_execution",
-                    artifact,
+                    ToolArtifact::CommandExecution(artifact),
                 ))
             }
             ToolArguments::ApplyPatch(arguments) => {
-                let response = self
+                let result = self
                     .runner(&arguments.runner)
                     .await?
-                    .request_raw(RunnerRequest::ApplyPatch {
-                        patch: arguments.patch,
-                    })
+                    .client
+                    .apply_patch(arguments.patch)
                     .await?;
-                Ok(match response {
-                    RunnerResponse::PatchCompleted { result } => {
-                        let output = format_patch_result(&result);
-                        ToolOutcome::with_optional_artifact(
-                            output,
-                            serde_json::to_value(result)
-                                .ok()
-                                .map(|data| ("patch_operations", data)),
-                        )
-                    }
-                    RunnerResponse::Error { message } => bail!("{message}"),
-                    _ => bail!("runner returned an invalid apply_patch response"),
-                })
+                let output = format_patch_result(&result);
+                Ok(ToolOutcome::with_artifact(
+                    output,
+                    ToolArtifact::PatchOperations(result),
+                ))
             }
             ToolArguments::WaitProcess(arguments) => {
                 let runner_name = arguments.runner.clone();
@@ -1996,8 +1906,7 @@ impl State {
                 let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_process_response("wait_process", &runner_name, response)?,
-                    "command_execution",
-                    artifact,
+                    ToolArtifact::CommandExecution(artifact),
                 ))
             }
             ToolArguments::StopProcess(arguments) => {
@@ -2037,8 +1946,7 @@ impl State {
                 let artifact = command_artifact(&response, &runner_name)?;
                 Ok(ToolOutcome::with_artifact(
                     format_process_response("stop_process", &runner_name, response)?,
-                    "command_execution",
-                    artifact,
+                    ToolArtifact::CommandExecution(artifact),
                 ))
             }
         }
@@ -2053,37 +1961,43 @@ impl State {
         custom: bool,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<()> {
-        self.append_event(
-            thread_id,
-            EventKind::ToolResult,
-            json!({
-                "type": custom.then_some("custom"),
-                "name": name,
-                "call_id": call_id,
-                "result": outcome.result,
-                "artifacts": outcome.artifacts,
-            }),
-            updates,
-        )
-        .await
-        .context("failed to save tool result")?;
+        let data = if custom {
+            ThreadEventData::ToolResult(ToolResultEvent::Custom {
+                call_type: CustomToolType::Custom,
+                name: name.to_owned(),
+                call_id: call_id.map(str::to_owned),
+                result: outcome.result,
+                artifacts: outcome.artifacts,
+                masked_result: None,
+            })
+        } else {
+            ThreadEventData::ToolResult(ToolResultEvent::Function {
+                call_type: None,
+                name: name.to_owned(),
+                call_id: call_id.map(str::to_owned),
+                result: outcome.result,
+                artifacts: outcome.artifacts,
+                masked_result: None,
+            })
+        };
+        self.append_event(thread_id, data, updates)
+            .await
+            .context("failed to save tool result")?;
         Ok(())
     }
 
     async fn append_event(
         &self,
         thread_id: i64,
-        kind: EventKind,
-        payload: serde_json::Value,
+        data: ThreadEventData,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> tokio_rusqlite::Result<i64> {
-        let sequence = self.store.append(thread_id, kind, payload.clone()).await?;
+        let sequence = self.store.append(thread_id, data.clone()).await?;
         if let Some(updates) = updates {
             updates
                 .send(ModelStreamEvent::ThreadEvent(ThreadEvent {
                     sequence,
-                    kind: kind.as_str().to_owned(),
-                    payload,
+                    data,
                 }))
                 .ok();
         }
@@ -2117,7 +2031,6 @@ impl State {
                 *runner.config.lock().await = RunnerConfig {
                     description,
                     approval,
-                    _command: command,
                 };
                 return Ok(ControllerResponse::AlreadyRunning);
             }
@@ -2183,14 +2096,17 @@ fn workspace_instructions(events: &[storage::Event]) -> WorkspaceInstructions {
     events
         .iter()
         .rev()
-        .find(|event| event.kind == EventKind::WorkspaceInstructions)
+        .find_map(|event| match &event.data {
+            ThreadEventData::WorkspaceInstructions(event) => Some(event),
+            _ => None,
+        })
         .map_or(
             WorkspaceInstructions {
                 content: None,
                 tracked: false,
             },
             |event| WorkspaceInstructions {
-                content: event.payload["content"].as_str().map(str::to_owned),
+                content: event.content.clone(),
                 tracked: true,
             },
         )
@@ -2200,43 +2116,45 @@ fn current_skills(events: &[storage::Event]) -> WorkspaceInstructions {
     events
         .iter()
         .rev()
-        .find(|event| event.kind == EventKind::Skills)
+        .find_map(|event| match &event.data {
+            ThreadEventData::Skills(event) => Some(event),
+            _ => None,
+        })
         .map_or(
             WorkspaceInstructions {
                 content: None,
                 tracked: false,
             },
             |event| WorkspaceInstructions {
-                content: event.payload["content"].as_str().map(str::to_owned),
+                content: event.content.clone(),
                 tracked: true,
             },
         )
 }
 
 fn current_runners(events: &[storage::Event]) -> Option<Vec<RunnerInfo>> {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.kind == EventKind::Runners)
-        .and_then(|event| serde_json::from_value(event.payload["runners"].clone()).ok())
-}
-
-fn skill_event(events: &[storage::Event]) -> Option<serde_json::Value> {
-    let skills = current_skills(events);
-    skills.tracked.then(|| {
-        json!({
-            "content": skills.content,
-            "transition": if skills.content.is_some() { "initial" } else { "removal" },
-        })
+    events.iter().rev().find_map(|event| match &event.data {
+        ThreadEventData::Runners(event) => Some(event.runners.clone()),
+        _ => None,
     })
 }
 
-fn runner_event(events: &[storage::Event]) -> Option<serde_json::Value> {
-    current_runners(events).map(|runners| {
-        json!({
-            "runners": runners,
-            "transition": "initial",
-        })
+fn skill_event(events: &[storage::Event]) -> Option<InstructionEvent> {
+    let skills = current_skills(events);
+    skills.tracked.then(|| InstructionEvent {
+        transition: if skills.content.is_some() {
+            InstructionTransition::Initial
+        } else {
+            InstructionTransition::Removal
+        },
+        content: skills.content,
+    })
+}
+
+fn runner_event(events: &[storage::Event]) -> Option<RunnersEvent> {
+    current_runners(events).map(|runners| RunnersEvent {
+        runners,
+        transition: InstructionTransition::Initial,
     })
 }
 
@@ -2244,13 +2162,16 @@ fn runner_event(events: &[storage::Event]) -> Option<serde_json::Value> {
 struct ExecCommandArguments {
     runner: String,
     command: String,
-    #[serde(default)]
-    process_id: Option<String>,
-    #[serde(default)]
-    background: bool,
-    timeout_ms: Option<u64>,
-    #[serde(default = "return_running")]
-    timeout_action: TimeoutAction,
+    #[serde(flatten)]
+    mode: ModelCommandMode,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ModelCommandMode {
+    Foreground { timeout_ms: u64 },
+    Background { process_id: String },
+    Timed { timeout_ms: u64 },
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -2302,16 +2223,15 @@ impl RunnerOperation {
 
     fn result_label(&self) -> String {
         match self {
-            Self::Command(arguments) if arguments.background => format!(
-                "Background Command {}",
-                arguments.process_id.as_deref().unwrap()
-            ),
-            Self::Command(arguments)
-                if matches!(arguments.timeout_action, TimeoutAction::Terminate) =>
-            {
-                format!("Timed Command {}", arguments.timeout_ms.unwrap())
-            }
-            Self::Command(_) => "Command".to_owned(),
+            Self::Command(arguments) => match &arguments.mode {
+                ModelCommandMode::Foreground { .. } => "Command".to_owned(),
+                ModelCommandMode::Background { process_id } => {
+                    format!("Background Command {process_id}")
+                }
+                ModelCommandMode::Timed { timeout_ms } => {
+                    format!("Timed Command {timeout_ms}")
+                }
+            },
             Self::Patch(_) => "Patch".to_owned(),
             Self::Wait(arguments) => {
                 format!("Wait {} {}", arguments.process_id, arguments.timeout_ms)
@@ -2365,35 +2285,24 @@ fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
                     || header.starts_with("*** Background Command ")
                     || header.starts_with("*** Timed Command ") =>
             {
-                let (process_id, background, timeout_ms, timeout_action) = match header {
-                    "*** Command" => (
-                        None,
-                        false,
-                        Some(FOREGROUND_TIMEOUT_MS),
-                        TimeoutAction::ReturnRunning,
-                    ),
+                let mode = match header {
+                    "*** Command" => ModelCommandMode::Foreground {
+                        timeout_ms: FOREGROUND_TIMEOUT_MS,
+                    },
                     header if header.starts_with("*** Background Command ") => {
                         let process_id = &header["*** Background Command ".len()..];
                         if !valid_process_id(process_id) {
                             bail!("invalid background command process ID '{process_id}'");
                         }
-                        (
-                            Some(process_id.to_owned()),
-                            true,
-                            None,
-                            TimeoutAction::ReturnRunning,
-                        )
+                        ModelCommandMode::Background {
+                            process_id: process_id.to_owned(),
+                        }
                     }
-                    header => (
-                        None,
-                        false,
-                        Some(
-                            header["*** Timed Command ".len()..]
-                                .parse()
-                                .context("timed command milliseconds must be an integer")?,
-                        ),
-                        TimeoutAction::Terminate,
-                    ),
+                    header => ModelCommandMode::Timed {
+                        timeout_ms: header["*** Timed Command ".len()..]
+                            .parse()
+                            .context("timed command milliseconds must be an integer")?,
+                    },
                 };
                 index += 1;
                 let end = lines[index..]
@@ -2407,10 +2316,7 @@ fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
                 operations.push(RunnerOperation::Command(ExecCommandArguments {
                     runner,
                     command: lines[index..end].join("\n"),
-                    process_id,
-                    background,
-                    timeout_ms,
-                    timeout_action,
+                    mode,
                 }));
                 group_operations += 1;
                 index = end + 1;
@@ -2498,7 +2404,7 @@ enum ToolArguments {
 
 struct ToolOutcome {
     result: serde_json::Value,
-    artifacts: Vec<serde_json::Value>,
+    artifacts: Vec<ToolArtifact>,
 }
 
 impl ToolOutcome {
@@ -2509,20 +2415,10 @@ impl ToolOutcome {
         }
     }
 
-    fn with_artifact(result: String, kind: &str, data: serde_json::Value) -> Self {
+    fn with_artifact(result: String, artifact: ToolArtifact) -> Self {
         Self {
             result: serde_json::Value::String(result),
-            artifacts: vec![json!({
-                "kind": kind,
-                "data": data,
-            })],
-        }
-    }
-
-    fn with_optional_artifact(result: String, artifact: Option<(&str, serde_json::Value)>) -> Self {
-        match artifact {
-            Some((kind, data)) => Self::with_artifact(result, kind, data),
-            None => Self::text(result),
+            artifacts: vec![artifact],
         }
     }
 }
@@ -2540,16 +2436,6 @@ impl ToolArguments {
     fn requires_approval(&self) -> bool {
         matches!(self, Self::ExecCommand(_) | Self::ApplyPatch(_))
     }
-}
-
-struct PendingApproval {
-    thread_id: i64,
-    decision: oneshot::Sender<ApprovalDecision>,
-}
-
-struct ApprovalDecision {
-    allowed: bool,
-    reason: Option<String>,
 }
 
 struct OperationContext {
@@ -2576,15 +2462,13 @@ fn send_operation_update(
     Ok(())
 }
 
-fn return_running() -> TimeoutAction {
-    TimeoutAction::ReturnRunning
-}
-
-fn unix_time_ms() -> u128 {
+fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time is before the Unix epoch")
         .as_millis()
+        .try_into()
+        .expect("current time fits in u64 milliseconds")
 }
 
 fn checkpoint_time_ms() -> i64 {
@@ -2594,8 +2478,7 @@ fn checkpoint_time_ms() -> i64 {
 fn protocol_event(event: storage::Event) -> ThreadEvent {
     ThreadEvent {
         sequence: event.sequence,
-        kind: event.kind.as_str().to_owned(),
-        payload: event.payload,
+        data: event.data,
     }
 }
 
@@ -2609,12 +2492,13 @@ fn protocol_events(mut events: Vec<storage::Event>) -> Vec<ThreadEvent> {
         })
         .unwrap_or_default();
     for event in &mut events {
-        if event.kind == EventKind::ToolResult && !masked_sequences.contains(&event.sequence) {
-            event
-                .payload
-                .as_object_mut()
-                .expect("tool result payload is an object")
-                .remove("masked_result");
+        if !masked_sequences.contains(&event.sequence)
+            && let ThreadEventData::ToolResult(result) = &mut event.data
+        {
+            match result {
+                ToolResultEvent::Custom { masked_result, .. }
+                | ToolResultEvent::Function { masked_result, .. } => *masked_result = None,
+            }
         }
     }
     events.into_iter().map(protocol_event).collect()
@@ -2631,7 +2515,6 @@ struct Runner {
 struct RunnerConfig {
     description: String,
     approval: ApprovalPolicy,
-    _command: Vec<String>,
 }
 
 impl Runner {
@@ -2692,10 +2575,10 @@ impl Runner {
         });
 
         let client = RunnerClient::new(stdin, stdout, name);
-        match client.request_raw(RunnerRequest::Initialize).await? {
-            RunnerResponse::Ready => {}
-            response => bail!("runner {name} returned an invalid readiness response: {response:?}"),
-        }
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("runner {name} failed to initialize"))?;
         let mut environment = CommandEnvironment::default();
         if let Some(platform) = platform {
             let tools = platform.tools()?;
@@ -2715,7 +2598,6 @@ impl Runner {
             config: Mutex::new(RunnerConfig {
                 description,
                 approval,
-                _command: command,
             }),
             child: Mutex::new(child),
             client,
@@ -2730,6 +2612,10 @@ impl Runner {
 
     async fn request_raw(&self, request: RunnerRequest) -> Result<RunnerResponse> {
         self.client.request_raw(request).await
+    }
+
+    async fn stop(&self, process_handle: String) -> Result<CommandOutput> {
+        self.client.stop(process_handle).await
     }
 
     async fn approval(&self) -> ApprovalPolicy {
@@ -2777,13 +2663,8 @@ async fn deploy_tree(
 ) -> Result<String> {
     let expected_digest = manifest.digest();
     loop {
-        match client
-            .request_raw(RunnerRequest::PrepareTree {
-                manifest: manifest.clone(),
-            })
-            .await?
-        {
-            RunnerResponse::MissingObjects { digests } => {
+        match client.prepare_tree(manifest.clone()).await? {
+            PrepareTreeResult::MissingObjects(digests) => {
                 for digest in digests {
                     let objects = objects.clone();
                     let object_digest = digest.clone();
@@ -2803,146 +2684,18 @@ async fn deploy_tree(
                     })
                     .await
                     .context("object compression task failed")??;
-                    match client
-                        .request_raw(RunnerRequest::UploadObject {
-                            digest,
-                            executable,
-                            blob: STANDARD.encode(compressed),
-                        })
-                        .await?
-                    {
-                        RunnerResponse::ObjectStored => {}
-                        response => {
-                            bail!("runner returned an invalid object response: {response:?}")
-                        }
-                    }
+                    client
+                        .upload_object(digest, executable, STANDARD.encode(compressed))
+                        .await?;
                 }
             }
-            RunnerResponse::TreeReady { digest, path } => {
+            PrepareTreeResult::Ready { digest, path } => {
                 if digest != expected_digest {
                     bail!("runner returned tree digest {digest}, expected {expected_digest}");
                 }
                 return Ok(path);
             }
-            response => bail!("runner returned an invalid tree response: {response:?}"),
         }
-    }
-}
-
-struct RunnerClient {
-    stdin: Arc<Mutex<ChildStdin>>,
-    pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RunnerResponse>>>>,
-    next_request_id: Arc<AtomicU64>,
-    name: String,
-}
-
-impl RunnerClient {
-    fn new(stdin: ChildStdin, stdout: tokio::process::ChildStdout, name: &str) -> Self {
-        let stdin = Arc::new(Mutex::new(stdin));
-        let reader_stdin = Arc::clone(&stdin);
-        let pending = Arc::new(StdMutex::new(
-            HashMap::<u64, oneshot::Sender<RunnerResponse>>::new(),
-        ));
-        let reader_pending = Arc::clone(&pending);
-        let next_request_id = Arc::new(AtomicU64::new(0));
-        let reader_next_request_id = Arc::clone(&next_request_id);
-        let runner_name = name.to_owned();
-        tokio::spawn(async move {
-            let mut stdout = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stdout.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => match serde_json::from_str::<RunnerResponseEnvelope>(&line) {
-                        Ok(envelope) => {
-                            let sender =
-                                reader_pending.lock().unwrap().remove(&envelope.request_id);
-                            if let Some(sender) = sender {
-                                if let Err(RunnerResponse::ProcessStarted { process_handle }) =
-                                    sender.send(envelope.response)
-                                {
-                                    let request_id =
-                                        reader_next_request_id.fetch_add(1, Ordering::Relaxed);
-                                    let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
-                                        request_id,
-                                        request: RunnerRequest::StopProcess { process_handle },
-                                    })
-                                    .expect("runner stop request should encode");
-                                    request.push(b'\n');
-                                    if let Err(error) =
-                                        reader_stdin.lock().await.write_all(&request).await
-                                    {
-                                        tracing::warn!(
-                                            runner = runner_name,
-                                            %error,
-                                            "failed to stop an abandoned process"
-                                        );
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(
-                                    runner = runner_name,
-                                    request_id = envelope.request_id,
-                                    "runner returned an unknown request ID"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                runner = runner_name,
-                                %error,
-                                "runner returned an invalid response"
-                            );
-                            break;
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(
-                            runner = runner_name,
-                            %error,
-                            "failed to read runner response"
-                        );
-                        break;
-                    }
-                }
-            }
-            for (_, sender) in reader_pending.lock().unwrap().drain() {
-                let _ = sender.send(RunnerResponse::Error {
-                    message: format!("runner {runner_name} disconnected"),
-                });
-            }
-        });
-
-        Self {
-            stdin,
-            pending,
-            next_request_id,
-            name: name.to_owned(),
-        }
-    }
-
-    async fn request_raw(&self, request: RunnerRequest) -> Result<RunnerResponse> {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
-        self.pending.lock().unwrap().insert(request_id, sender);
-
-        let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
-            request_id,
-            request,
-        })
-        .context("failed to encode runner request")?;
-        request.push(b'\n');
-        if let Err(error) = self.stdin.lock().await.write_all(&request).await {
-            self.pending.lock().unwrap().remove(&request_id);
-            return Err(error)
-                .with_context(|| format!("failed to send request to runner {}", self.name));
-        }
-
-        let response = receiver
-            .await
-            .with_context(|| format!("runner {} disconnected", self.name))?;
-        Ok(response)
     }
 }
 
@@ -3099,26 +2852,28 @@ fn format_patch_result(result: &ApplyPatchResult) -> String {
     output
 }
 
-fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
-    let original = payload["result"].as_str()?;
-    if payload["type"] == "custom" {
+fn masked_tool_result(payload: &ToolResultEvent) -> Option<String> {
+    let (original, artifacts, custom) = match payload {
+        ToolResultEvent::Custom {
+            result, artifacts, ..
+        } => (result.as_str()?, artifacts, true),
+        ToolResultEvent::Function {
+            result, artifacts, ..
+        } => (result.as_str()?, artifacts, false),
+    };
+    if custom {
         let mut operations = Vec::new();
         let mut command_found = false;
         let mut command_masked = false;
-        for artifact in payload["artifacts"].as_array()? {
-            if artifact["kind"] != "runner_operation" {
+        for artifact in artifacts {
+            let ToolArtifact::RunnerOperation(data) = artifact else {
                 continue;
-            }
-            let data = &artifact["data"];
-            let operation = data["operation"].as_u64()?;
-            let runner = data["runner"].as_str()?;
-            let label = data["label"].as_str()?;
-            let operation_result = data["result"].as_str()?;
-            let masked = data["artifacts"]
-                .as_array()?
-                .iter()
-                .find(|artifact| artifact["kind"] == "command_execution")
-                .and_then(|artifact| masked_command_result(&artifact["data"]));
+            };
+            let operation_result = data.result.as_str()?;
+            let masked = data.artifacts.iter().find_map(|artifact| match artifact {
+                ToolArtifact::CommandExecution(command) => masked_command_result(command),
+                ToolArtifact::PatchOperations(_) | ToolArtifact::RunnerOperation(_) => None,
+            });
             let result = if let Some(masked) = masked {
                 command_found = true;
                 if model::text_tokens(&masked) < model::text_tokens(operation_result) {
@@ -3131,7 +2886,8 @@ fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
                 operation_result.to_owned()
             };
             operations.push(format!(
-                "Operation {operation} [{runner}] {label}:\n{result}"
+                "Operation {} [{}] {}:\n{result}",
+                data.operation, data.runner, data.label
             ));
         }
         if !command_found {
@@ -3142,20 +2898,67 @@ fn masked_tool_result(payload: &serde_json::Value) -> Option<String> {
             .then_some(masked);
     }
 
-    let command = payload["artifacts"]
-        .as_array()?
-        .iter()
-        .find(|artifact| artifact["kind"] == "command_execution")?;
-    let masked = masked_command_result(&command["data"])?;
+    let command = artifacts.iter().find_map(|artifact| match artifact {
+        ToolArtifact::CommandExecution(command) => Some(command),
+        ToolArtifact::PatchOperations(_) | ToolArtifact::RunnerOperation(_) => None,
+    })?;
+    let masked = masked_command_result(command)?;
     (model::text_tokens(&masked) < model::text_tokens(original)).then_some(masked)
 }
 
-fn masked_command_result(data: &serde_json::Value) -> Option<String> {
-    let output = data["output"]
-        .as_str()
-        .filter(|output| !output.is_empty())?;
-    let runner = data["runner"].as_str()?;
-    let full_output_path = data["full_output_path"].as_str()?;
+fn masked_command_result(command: &CommandExecutionArtifact) -> Option<String> {
+    let (output, runner, full_output_path, status) = match command {
+        CommandExecutionArtifact::Started { .. } => return None,
+        CommandExecutionArtifact::Running {
+            output,
+            runner,
+            full_output_path,
+        } => (
+            output,
+            runner,
+            full_output_path,
+            "Process is still running".to_owned(),
+        ),
+        CommandExecutionArtifact::Finished {
+            output,
+            exit_code,
+            runner,
+            full_output_path,
+        } => (
+            output,
+            runner,
+            full_output_path,
+            format!(
+                "Process exited with code {}",
+                exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ),
+        ),
+        CommandExecutionArtifact::TimedOut {
+            output,
+            runner,
+            full_output_path,
+        } => (
+            output,
+            runner,
+            full_output_path,
+            "Process timed out".to_owned(),
+        ),
+        CommandExecutionArtifact::Stopped {
+            output,
+            runner,
+            full_output_path,
+        } => (
+            output,
+            runner,
+            full_output_path,
+            "Process stopped".to_owned(),
+        ),
+    };
+    if output.is_empty() {
+        return None;
+    }
     let lines = output.lines().collect::<Vec<_>>();
     let head = lines
         .iter()
@@ -3175,22 +2978,10 @@ fn masked_command_result(data: &serde_json::Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     let tail = truncate_mask_tail(&tail);
-    let status = match data["state"].as_str()? {
-        "running" => "Process is still running".to_owned(),
-        "finished" => format!(
-            "Process exited with code {}",
-            data["exit_code"]
-                .as_i64()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
-        ),
-        "timed_out" => "Process timed out".to_owned(),
-        "stopped" => "Process stopped".to_owned(),
-        _ => return None,
-    };
     Some(clean_model_output(&format!(
         "{head}\n\n... output masked ...\n\n{tail}\n\n{status}\n\
-         Full output: runner \"{runner}\": {full_output_path}"
+         Full output: runner \"{runner}\": {}",
+        full_output_path.display()
     )))
 }
 
@@ -3202,37 +2993,34 @@ fn truncate_mask_tail(output: &str) -> &str {
     &output[ceil_char_boundary(output, output.len().saturating_sub(MASK_OUTPUT_SIDE_BYTES))..]
 }
 
-fn command_artifact(response: &RunnerResponse, runner: &str) -> Result<serde_json::Value> {
+fn command_artifact(response: &RunnerResponse, runner: &str) -> Result<CommandExecutionArtifact> {
     Ok(match response {
-        RunnerResponse::ProcessStarted { .. } => json!({
-            "state": "started",
-            "runner": runner,
-        }),
-        RunnerResponse::ProcessRunning { output, .. } => json!({
-            "state": "running",
-            "output": format_command_output(output),
-            "runner": runner,
-            "full_output_path": output.full_output_path.display().to_string(),
-        }),
-        RunnerResponse::ProcessFinished { output, exit_code } => json!({
-            "state": "finished",
-            "output": format_command_output(output),
-            "exit_code": exit_code,
-            "runner": runner,
-            "full_output_path": output.full_output_path.display().to_string(),
-        }),
-        RunnerResponse::ProcessTimedOut { output } => json!({
-            "state": "timed_out",
-            "output": format_command_output(output),
-            "runner": runner,
-            "full_output_path": output.full_output_path.display().to_string(),
-        }),
-        RunnerResponse::ProcessStopped { output } => json!({
-            "state": "stopped",
-            "output": format_command_output(output),
-            "runner": runner,
-            "full_output_path": output.full_output_path.display().to_string(),
-        }),
+        RunnerResponse::ProcessStarted { .. } => CommandExecutionArtifact::Started {
+            runner: runner.to_owned(),
+        },
+        RunnerResponse::ProcessRunning { output, .. } => CommandExecutionArtifact::Running {
+            output: format_command_output(output),
+            runner: runner.to_owned(),
+            full_output_path: output.full_output_path.clone(),
+        },
+        RunnerResponse::ProcessFinished { output, exit_code } => {
+            CommandExecutionArtifact::Finished {
+                output: format_command_output(output),
+                exit_code: *exit_code,
+                runner: runner.to_owned(),
+                full_output_path: output.full_output_path.clone(),
+            }
+        }
+        RunnerResponse::ProcessTimedOut { output } => CommandExecutionArtifact::TimedOut {
+            output: format_command_output(output),
+            runner: runner.to_owned(),
+            full_output_path: output.full_output_path.clone(),
+        },
+        RunnerResponse::ProcessStopped { output } => CommandExecutionArtifact::Stopped {
+            output: format_command_output(output),
+            runner: runner.to_owned(),
+            full_output_path: output.full_output_path.clone(),
+        },
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("runner returned an invalid command response"),
     })

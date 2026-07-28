@@ -4,6 +4,7 @@ use super::*;
 use crate::transcript::{
     ToolArtifact, layout_transcript, prepare_transcript, transcript_lines, transcript_text,
 };
+use atra_protocol::CommandExecutionArtifact;
 use ratatui::{Terminal, layout::Rect, text::Line};
 
 #[test]
@@ -44,11 +45,12 @@ fn transcript_render_is_stable() {
             },
         ],
         models: Vec::new(),
-        thread_id: Some(2),
+        target: Target::Thread {
+            id: 2,
+            view: ThreadView::Live,
+        },
         transcript: items,
         events: Vec::new(),
-        checkpoint: None,
-        checkpoint_picker: None,
         tool_call_previews: HashMap::new(),
         message_input: {
             let mut input = InputBuffer::new(Vec::new(), true);
@@ -59,7 +61,6 @@ fn transcript_render_is_stable() {
         overlay: Overlay::None,
         word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
         activity: None,
-        new_thread_model: None,
         login_required: false,
         view: ViewState::default(),
         layout: ViewLayout::default(),
@@ -77,14 +78,14 @@ fn transcript_render_is_stable() {
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
-        artifacts: vec![ToolArtifact {
-            kind: "command_execution".to_owned(),
-            data: serde_json::json!({
-                "state": "finished",
-                "output": "abcdefgh\nsecond",
-                "exit_code": 0,
-            }),
-        }],
+        artifacts: vec![ToolArtifact::CommandExecution(
+            CommandExecutionArtifact::Finished {
+                output: "abcdefgh\nsecond".to_owned(),
+                exit_code: Some(0),
+                runner: "local".to_owned(),
+                full_output_path: "/tmp/output".into(),
+            },
+        )],
         masked: false,
     })];
 

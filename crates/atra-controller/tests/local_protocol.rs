@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ControllerRequest, ControllerResponse, Thread};
+use atra_protocol::{ControllerRequest, ControllerResponse, Thread, ThreadEventData};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -91,14 +91,14 @@ async fn lists_threads_newest_first() {
             .unwrap();
     assert!(matches!(
         skills,
-        ControllerResponse::TurnEvent { event } if event.kind == "skills"
+        ControllerResponse::TurnEvent { event } if matches!(event.data, ThreadEventData::Skills(_))
     ));
     let runners =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap();
     assert!(matches!(
         runners,
-        ControllerResponse::TurnEvent { event } if event.kind == "runners"
+        ControllerResponse::TurnEvent { event } if matches!(event.data, ThreadEventData::Runners(_))
     ));
     let event =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
@@ -106,8 +106,7 @@ async fn lists_threads_newest_first() {
     assert!(matches!(
         event,
         ControllerResponse::TurnEvent { event }
-            if event.kind == "user_message"
-                && event.payload["content"] == "First prompt"
+            if matches!(&event.data, ThreadEventData::UserMessage(message) if message.content == "First prompt")
     ));
     let response =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())

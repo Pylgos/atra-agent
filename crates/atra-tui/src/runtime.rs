@@ -8,9 +8,29 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use crate::{
-    app::{App, TurnCompletion, TurnUpdate, load_transcript},
+    app::{App, HistoryChange, TurnCompletion, TurnUpdate, load_transcript},
     controller::{request, request_stream},
 };
+
+pub(crate) enum ApprovalDecision {
+    Allow,
+    Deny { reason: Option<String> },
+}
+
+pub(crate) enum HistoryOperation {
+    CreateCheckpoint,
+    Fork {
+        checkpoint_id: Option<i64>,
+        sequence: i64,
+    },
+    Rewind {
+        checkpoint_id: Option<i64>,
+        sequence: i64,
+    },
+    Restore {
+        checkpoint_id: i64,
+    },
+}
 
 pub(crate) enum Effect {
     Login {
@@ -40,12 +60,11 @@ pub(crate) enum Effect {
     ContinueTurn {
         endpoint: std::path::PathBuf,
         thread_id: i64,
-        request: ControllerRequest,
     },
     ResolveApproval {
         endpoint: std::path::PathBuf,
         approval_id: u64,
-        request: ControllerRequest,
+        decision: ApprovalDecision,
     },
     CancelTurn {
         endpoint: std::path::PathBuf,
@@ -63,7 +82,7 @@ pub(crate) enum Effect {
         endpoint: std::path::PathBuf,
         thread_id: i64,
         draft: Option<String>,
-        request: ControllerRequest,
+        operation: HistoryOperation,
     },
     PollProcesses {
         endpoint: std::path::PathBuf,
@@ -195,21 +214,32 @@ impl Effect {
                 Self::ContinueTurn {
                     endpoint,
                     thread_id,
-                    request: turn_request,
                 } => {
-                    let result = request_stream(&endpoint, turn_request, thread_id, &updates)
-                        .await
-                        .map(|response| TurnCompletion {
-                            thread_id,
-                            response,
-                        });
+                    let result = request_stream(
+                        &endpoint,
+                        ControllerRequest::ThreadContinue { thread_id },
+                        thread_id,
+                        &updates,
+                    )
+                    .await
+                    .map(|response| TurnCompletion {
+                        thread_id,
+                        response,
+                    });
                     let _ = updates.send(TurnUpdate::Completed(result));
                 }
                 Self::ResolveApproval {
                     endpoint,
                     approval_id,
-                    request: approval_request,
+                    decision,
                 } => {
+                    let approval_request = match decision {
+                        ApprovalDecision::Allow => ControllerRequest::ApprovalAllow { approval_id },
+                        ApprovalDecision::Deny { reason } => ControllerRequest::ApprovalDeny {
+                            approval_id,
+                            reason,
+                        },
+                    };
                     let result = request(&endpoint, approval_request).await;
                     let _ = updates.send(TurnUpdate::ApprovalResolved {
                         approval_id,
@@ -263,9 +293,37 @@ impl Effect {
                     endpoint,
                     thread_id,
                     draft,
-                    request: history_request,
+                    operation,
                 } => {
                     let result = async {
+                        let history_request = match operation {
+                            HistoryOperation::CreateCheckpoint => {
+                                ControllerRequest::ThreadCheckpointCreate { thread_id }
+                            }
+                            HistoryOperation::Fork {
+                                checkpoint_id,
+                                sequence,
+                            } => ControllerRequest::ThreadFork {
+                                thread_id,
+                                checkpoint_id,
+                                sequence,
+                                display_name: None,
+                            },
+                            HistoryOperation::Rewind {
+                                checkpoint_id,
+                                sequence,
+                            } => ControllerRequest::ThreadRewind {
+                                thread_id,
+                                checkpoint_id,
+                                sequence,
+                            },
+                            HistoryOperation::Restore { checkpoint_id } => {
+                                ControllerRequest::ThreadCheckpointRestore {
+                                    thread_id,
+                                    checkpoint_id,
+                                }
+                            }
+                        };
                         let response = request(&endpoint, history_request).await?;
                         if let ControllerResponse::Error { message } = response {
                             anyhow::bail!("{message}");
@@ -283,7 +341,14 @@ impl Effect {
                                 ),
                             };
                         let transcript = load_transcript(&endpoint, selected_thread_id).await?;
-                        Ok((response, selected_thread_id, threads, transcript))
+                        let (transcript, events) = transcript;
+                        Ok(HistoryChange {
+                            response,
+                            thread_id: selected_thread_id,
+                            threads,
+                            transcript,
+                            events,
+                        })
                     }
                     .await;
                     let _ = updates.send(TurnUpdate::HistoryChanged {
