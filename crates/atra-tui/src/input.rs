@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use icu_segmenter::WordSegmenterBorrowed;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) struct InputBuffer {
     pub(crate) value: String,
@@ -69,6 +70,8 @@ impl InputBuffer {
             KeyCode::Right => self.move_forward(),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.value.len(),
+            KeyCode::Up if self.multiline => self.move_up_or_previous_history(),
+            KeyCode::Down if self.multiline => self.move_down_or_next_history(),
             KeyCode::Up => self.previous_history(),
             KeyCode::Down => self.next_history(),
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -141,6 +144,43 @@ impl InputBuffer {
         }
     }
 
+    fn move_up_or_previous_history(&mut self) {
+        let current_line_start = self.value[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if current_line_start == 0 {
+            self.previous_history();
+            return;
+        }
+
+        let column = self.value[current_line_start..self.cursor].width();
+        let previous_line_end = current_line_start - 1;
+        let previous_line_start = self.value[..previous_line_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.cursor = column_offset(&self.value, previous_line_start, previous_line_end, column);
+    }
+
+    fn move_down_or_next_history(&mut self) {
+        let current_line_end = self.value[self.cursor..]
+            .find('\n')
+            .map(|offset| self.cursor + offset);
+        let Some(current_line_end) = current_line_end else {
+            self.next_history();
+            return;
+        };
+
+        let current_line_start = self.value[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let column = self.value[current_line_start..self.cursor].width();
+        let next_line_start = current_line_end + 1;
+        let next_line_end = self.value[next_line_start..]
+            .find('\n')
+            .map_or(self.value.len(), |offset| next_line_start + offset);
+        self.cursor = column_offset(&self.value, next_line_start, next_line_end, column);
+    }
+
     fn delete_word_backward(&mut self, word_segmenter: &WordSegmenterBorrowed<'static>) {
         let end = self.cursor;
         self.move_word_backward(word_segmenter);
@@ -208,5 +248,67 @@ impl InputBuffer {
             self.value = std::mem::take(&mut self.history_draft);
         }
         self.cursor = self.value.len();
+    }
+}
+
+fn column_offset(value: &str, start: usize, end: usize, column: usize) -> usize {
+    let mut width = 0;
+    for (offset, character) in value[start..end].char_indices() {
+        let next_width = width + character.width().unwrap_or(0);
+        if next_width > column {
+            return start + offset;
+        }
+        width = next_width;
+        if width == column {
+            return start + offset + character.len_utf8();
+        }
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputBuffer;
+
+    #[test]
+    fn multiline_arrows_move_between_lines_before_navigating_history() {
+        let mut input = InputBuffer::new(vec!["history".to_owned()], true);
+        input.set("first\nsecond\nthird".to_owned());
+        input.cursor = "first\nsec".len();
+
+        input.move_up_or_previous_history();
+        assert_eq!(input.value, "first\nsecond\nthird");
+        assert_eq!(input.cursor, "fir".len());
+
+        input.move_down_or_next_history();
+        assert_eq!(input.cursor, "first\nsec".len());
+    }
+
+    #[test]
+    fn multiline_arrows_navigate_history_only_at_vertical_boundaries() {
+        let mut input = InputBuffer::new(vec!["history".to_owned()], true);
+        input.set("first\nsecond".to_owned());
+        input.cursor = 2;
+
+        input.move_up_or_previous_history();
+        assert_eq!(input.value, "history");
+        assert_eq!(input.cursor, input.value.len());
+
+        input.move_down_or_next_history();
+        assert_eq!(input.value, "first\nsecond");
+        assert_eq!(input.cursor, input.value.len());
+    }
+
+    #[test]
+    fn vertical_movement_clamps_to_shorter_lines() {
+        let mut input = InputBuffer::new(Vec::new(), true);
+        input.set("long line\n短\nlast".to_owned());
+        input.cursor = "long li".len();
+
+        input.move_down_or_next_history();
+        assert_eq!(input.cursor, "long line\n短".len());
+
+        input.move_down_or_next_history();
+        assert_eq!(input.cursor, "long line\n短\nla".len());
     }
 }
