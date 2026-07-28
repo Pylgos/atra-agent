@@ -781,10 +781,10 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                 Start each group with `*** Runner <runner>`; repeat it to switch Runners.
 
                 Processes:
-                Use `*** Command` to wait up to 10000 milliseconds for a Bash command and leave it running if unfinished.
+                Use `*** Command` to wait up to 120000 milliseconds for a Bash command and leave it running if unfinished.
                 Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
                 End every command with `*** End`.
-                Use `*** Wait <process-id>` to wait up to 10 seconds for more output or completion.
+                Use `*** Wait <process-id>` to wait up to 120 seconds for more output or completion.
                 Use `*** Stop <process-id>` to stop a managed process.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
 

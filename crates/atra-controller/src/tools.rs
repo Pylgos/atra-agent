@@ -34,8 +34,8 @@ pub(super) struct StopProcessArguments {
     pub(super) process_id: ProcessId,
 }
 
-const FOREGROUND_TIMEOUT_MS: u64 = 10_000;
-const WAIT_TIMEOUT_MS: u64 = 10_000;
+const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
+const WAIT_TIMEOUT_MS: u64 = 120_000;
 
 pub(super) enum RunnerOperation {
     Command(ExecCommandArguments),
