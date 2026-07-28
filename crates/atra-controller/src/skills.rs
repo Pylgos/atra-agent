@@ -250,7 +250,7 @@ fn parse_skill(
     files: SkillFiles,
     location: String,
 ) -> Result<Skill> {
-    let frontmatter = parse_frontmatter(&content)?;
+    let frontmatter = parse_frontmatter(content)?;
     let name = frontmatter["name"]
         .as_str()
         .context("frontmatter name is required")?

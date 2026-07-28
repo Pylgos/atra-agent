@@ -31,7 +31,9 @@ use atra_protocol::{Model, Runner};
 
 use super::{ModelCompletion, ModelResponse, ModelStreamEvent};
 use crate::storage::Event;
-use atra_protocol::{InstructionTransition, ThreadEventData, ToolCallEvent, ToolResultEvent};
+use atra_protocol::{
+    InstructionEvent, RunnersEvent, ThreadEventData, ToolCallEvent, ToolResultEvent,
+};
 
 const INSTRUCTIONS: &str = r#"You are Atra Agent. Fulfill the user's request using the provided tools when needed.
 
@@ -530,14 +532,14 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
         let Some(item) = (|| {
             Some(match &event.data {
                 ThreadEventData::WorkspaceInstructions(instructions) => {
-                    let text = match instructions.transition {
-                        InstructionTransition::Initial => instructions.content.clone()?,
-                        InstructionTransition::Replacement => format!(
+                    let text = match instructions {
+                        InstructionEvent::Initial(content) => content.clone(),
+                        InstructionEvent::Replacement(content) => format!(
                             "These AGENTS.md instructions replace all previously provided \
                                  AGENTS.md instructions.\n\n{}",
-                            instructions.content.as_deref()?
+                            content
                         ),
-                        InstructionTransition::Removal => {
+                        InstructionEvent::Removal => {
                             "The previously provided AGENTS.md instructions no longer apply."
                                 .to_owned()
                         }
@@ -553,13 +555,13 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                     })
                 }
                 ThreadEventData::Skills(instructions) => {
-                    let text = match instructions.transition {
-                        InstructionTransition::Initial => instructions.content.clone()?,
-                        InstructionTransition::Replacement => format!(
+                    let text = match instructions {
+                        InstructionEvent::Initial(content) => content.clone(),
+                        InstructionEvent::Replacement(content) => format!(
                             "This skills list replaces all previously provided skills.\n\n{}",
-                            instructions.content.as_deref()?
+                            content
                         ),
-                        InstructionTransition::Removal => {
+                        InstructionEvent::Removal => {
                             "The previously provided skills are no longer available.".to_owned()
                         }
                     };
@@ -570,14 +572,13 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
                     })
                 }
                 ThreadEventData::Runners(event) => {
-                    let list = format_runners(&event.runners);
-                    let text = match event.transition {
-                        InstructionTransition::Initial => list,
-                        InstructionTransition::Replacement => format!(
+                    let text = match event {
+                        RunnersEvent::Initial(runners) => format_runners(runners),
+                        RunnersEvent::Replacement(runners) => format!(
                             "The available Atra Runner list has changed. This list replaces \
-                                 the previously provided list.\n\n{list}"
+                                 the previously provided list.\n\n{}",
+                            format_runners(runners)
                         ),
-                        InstructionTransition::Removal => return None,
                     };
                     ResponseItem::from(ResponseInputItem::Message {
                         role: "developer".to_owned(),
@@ -668,7 +669,7 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
 
 fn projected_tool_result<'a>(
     event: &'a Event,
-    masked_sequences: &HashSet<i64>,
+    masked_sequences: &HashSet<atra_protocol::EventSequence>,
 ) -> &'a serde_json::Value {
     let (result, masked_result) = match &event.data {
         ThreadEventData::ToolResult(ToolResultEvent::Custom {
@@ -867,13 +868,13 @@ mod tests {
     fn request_snapshot_contains_exact_context_and_omits_observer_events() {
         let events = vec![
             Event {
-                sequence: 0,
+                sequence: atra_protocol::EventSequence(0),
                 data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
                     content: "hello".to_owned(),
                 }),
             },
             Event {
-                sequence: 1,
+                sequence: atra_protocol::EventSequence(1),
                 data: ThreadEventData::ModelRequest(atra_protocol::ModelRequestEvent {
                     kind: atra_protocol::ModelRequestKind::Response,
                     started_at_ms: 0,

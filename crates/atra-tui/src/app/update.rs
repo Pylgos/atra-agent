@@ -1,0 +1,489 @@
+use anyhow::{Result, bail};
+use atra_client::{CancelResult, CodexLoginStatus, TurnResult};
+use atra_protocol::ThreadEventData;
+use tokio::sync::mpsc;
+
+use super::{Activity, App, HistoryChange, Target, ThreadView, TurnUpdate};
+use crate::{
+    runtime::Effect,
+    state::{
+        Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, TranscriptMode, TurnState,
+    },
+    transcript::{Author, TranscriptEntry, sanitize},
+};
+
+impl App {
+    pub(crate) fn update(
+        &mut self,
+        update: TurnUpdate,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<()> {
+        let completion = match update {
+            TurnUpdate::Started {
+                message,
+                thread_id,
+                threads,
+            } => {
+                self.threads = threads;
+                if self.target.thread_id().is_none() {
+                    self.target = Target::Thread {
+                        id: thread_id,
+                        view: ThreadView::Live,
+                    };
+                }
+                if let Some(thread) = self
+                    .threads
+                    .iter_mut()
+                    .find(|thread| thread.id == thread_id)
+                {
+                    thread.display_name = Some(message);
+                }
+                return Ok(());
+            }
+            TurnUpdate::StreamStarted { thread_id } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    if matches!(self.turn, TurnState::Cancelling) {
+                        effects
+                            .send(Effect::CancelTurn {
+                                endpoint: self.endpoint.clone(),
+                                thread_id,
+                            })
+                            .ok();
+                    } else {
+                        self.turn = TurnState::Running;
+                        self.activity = Some(Activity::Info(
+                            "Waiting for Atra Controller… · Esc cancels".to_owned(),
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::Delta { thread_id, content } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_assistant_delta(&content);
+                }
+                return Ok(());
+            }
+            TurnUpdate::ReasoningSummaryDelta { thread_id, content } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_reasoning_delta(&content);
+                }
+                return Ok(());
+            }
+            TurnUpdate::ReasoningSummaryPartAdded { thread_id } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.finish_reasoning_part();
+                }
+                return Ok(());
+            }
+            TurnUpdate::ToolCallStarted {
+                thread_id,
+                item_id,
+                name,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.start_tool_preview(item_id, &name);
+                }
+                return Ok(());
+            }
+            TurnUpdate::ToolCallDelta {
+                thread_id,
+                item_id,
+                content,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.append_tool_preview(&item_id, &content);
+                }
+                return Ok(());
+            }
+            TurnUpdate::Event { thread_id, event } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    let usage_matches_selected_model = match &event.data {
+                        ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
+                            .and_then(|sequence| {
+                                self.transcript
+                                    .events
+                                    .iter()
+                                    .find(|event| event.sequence == sequence)
+                            })
+                            .and_then(|event| match &event.data {
+                                ThreadEventData::ModelRequest(request) => {
+                                    request.request.pointer("/model")
+                                }
+                                _ => None,
+                            })
+                            .and_then(serde_json::Value::as_str)
+                            .zip(
+                                self.threads
+                                    .iter()
+                                    .find(|thread| thread.id == thread_id)
+                                    .map(|thread| thread.model.as_str()),
+                            )
+                            .is_some_and(|(request_model, selected_model)| {
+                                request_model == selected_model
+                            }),
+                        _ => false,
+                    };
+                    if usage_matches_selected_model {
+                        self.metrics_stale = false;
+                    }
+                    self.transcript.apply_event(event);
+                }
+                return Ok(());
+            }
+            TurnUpdate::RunnerOperationUpdate {
+                thread_id,
+                call_id,
+                operation_index,
+                update,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript
+                        .update_runner_operation(&call_id, operation_index, update);
+                }
+                return Ok(());
+            }
+            TurnUpdate::ApprovalRequired {
+                approval_id,
+                thread_id,
+                runner,
+                label,
+                operation_index,
+            } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    if operation_index.is_some() {
+                        self.transcript.set_pending_approval(operation_index);
+                    }
+                    self.turn = TurnState::AwaitingApproval(Approval {
+                        id: approval_id,
+                        runner,
+                        label,
+                        operation_index,
+                        state: ApprovalState::Pending,
+                    });
+                    self.activity = None;
+                }
+                return Ok(());
+            }
+            TurnUpdate::Completed(Ok(completion)) => completion,
+            TurnUpdate::Completed(Err(error)) => {
+                self.transcript.discard_tool_previews();
+                self.turn = TurnState::Idle;
+                self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                return Ok(());
+            }
+            TurnUpdate::ApprovalResolved {
+                approval_id,
+                result,
+            } => {
+                match result {
+                    Ok(TurnResult::ApprovalResolved) => {}
+                    Ok(result) => {
+                        bail!("controller returned an unexpected approval result: {result:?}")
+                    }
+                    Err(error) => {
+                        self.restore_failed_approval(approval_id);
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::CancelCompleted { thread_id, result } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    match result {
+                        Ok(CancelResult::Cancelled) => {}
+                        Ok(CancelResult::NotActive) => {
+                            self.turn = TurnState::Idle;
+                            self.activity =
+                                Some(Activity::Info("Turn already finished".to_owned()));
+                        }
+                        Err(error) => {
+                            self.turn = TurnState::Idle;
+                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::LoginCompleted(result) => {
+                match result {
+                    Ok(CodexLoginStatus::LoggedIn { .. }) => {
+                        self.login_required = false;
+                        self.activity = Some(Activity::Info("Codex login complete".to_owned()));
+                    }
+                    Ok(CodexLoginStatus::LoginRequired) => {
+                        self.login_required = true;
+                        self.activity = Some(Activity::Info("Codex login required".to_owned()));
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ThreadSelected { thread_id, result } => {
+                let (transcript, events) = result?;
+                self.target = Target::Thread {
+                    id: thread_id,
+                    view: ThreadView::Live,
+                };
+                self.processes.clear();
+                self.transcript.replace(transcript, events);
+                self.overlay = Overlay::None;
+                self.clear_selection();
+                self.reset_view();
+                self.metrics_stale = false;
+                self.activity = Some(Activity::Info("Thread selected".to_owned()));
+                return Ok(());
+            }
+            TurnUpdate::ProcessesLoaded { thread_id, result } => {
+                self.process_refresh_pending = false;
+                if self.target.thread_id() != Some(thread_id) {
+                    return Ok(());
+                }
+                let (processes, detail) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if matches!(self.overlay, Overlay::Processes(_)) {
+                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        }
+                        return Ok(());
+                    }
+                };
+                let selected_key = match &self.overlay {
+                    Overlay::Processes(picker) => self
+                        .processes
+                        .get(picker.selected)
+                        .map(|process| (process.runner.clone(), process.process_id.clone())),
+                    _ => None,
+                };
+                self.processes = processes;
+                if let Overlay::Processes(picker) = &mut self.overlay {
+                    picker.selected = selected_key
+                        .and_then(|(runner, process_id)| {
+                            self.processes.iter().position(|process| {
+                                process.runner == runner && process.process_id == process_id
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            picker.selected.min(self.processes.len().saturating_sub(1))
+                        });
+                    let selected = self.processes.get(picker.selected);
+                    picker.detail = detail.filter(|detail| {
+                        selected.is_some_and(|selected| {
+                            detail.process.runner == selected.runner
+                                && detail.process.process_id == selected.process_id
+                        })
+                    });
+                }
+                return Ok(());
+            }
+            TurnUpdate::ProcessStopped {
+                thread_id,
+                runner,
+                process_id,
+                result,
+            } => {
+                if self.target.thread_id() != Some(thread_id) {
+                    return Ok(());
+                }
+                match result {
+                    Ok(()) => {
+                        self.processes.retain(|process| {
+                            process.runner != runner || process.process_id != process_id
+                        });
+                        if let Overlay::Processes(picker) = &mut self.overlay {
+                            picker.selected =
+                                picker.selected.min(self.processes.len().saturating_sub(1));
+                            picker.detail = None;
+                            picker.output_scroll = 0;
+                        }
+                        self.activity = Some(Activity::Info(format!("Stopped {process_id}")));
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ThreadRenamed {
+                thread_id,
+                display_name,
+                result,
+            } => {
+                match result {
+                    Ok(()) => {
+                        if let Some(thread) = self
+                            .threads
+                            .iter_mut()
+                            .find(|thread| thread.id == thread_id)
+                        {
+                            thread.display_name = Some(display_name);
+                        }
+                        self.activity = Some(Activity::Info("Thread renamed".to_owned()));
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ModelChanged {
+                thread_id,
+                model,
+                reasoning_effort,
+                result,
+            } => {
+                match result {
+                    Ok(()) => {
+                        if let Some(thread) = self
+                            .threads
+                            .iter_mut()
+                            .find(|thread| thread.id == thread_id)
+                        {
+                            thread.model = model;
+                            thread.reasoning_effort = reasoning_effort;
+                        }
+                        self.metrics_stale = true;
+                        self.activity = Some(Activity::Info("Thread model changed".to_owned()));
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::CheckpointsLoaded { thread_id, result } => {
+                if self.target.thread_id() != Some(thread_id) {
+                    return Ok(());
+                }
+                let (checkpoints, events) = result?;
+                if checkpoints.is_empty() {
+                    self.activity = Some(Activity::Info("No checkpoints are available".to_owned()));
+                } else {
+                    let checkpoint = checkpoints[0].clone();
+                    self.transcript.replace_events(events);
+                    self.target = Target::Thread {
+                        id: thread_id,
+                        view: ThreadView::Checkpoint {
+                            checkpoint,
+                            picker: CheckpointPicker {
+                                checkpoints,
+                                selected: 0,
+                            },
+                        },
+                    };
+                    self.clear_selection();
+                    self.reset_view();
+                    self.view.transcript_mode = TranscriptMode::Coding;
+                    self.view.focus = FocusPane::Checkpoints;
+                    self.activity = Some(Activity::Info(
+                        "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
+                    ));
+                }
+                return Ok(());
+            }
+            TurnUpdate::CheckpointLoaded(result) => {
+                let (checkpoint, events) = result?;
+                if self.target.thread_id() != Some(checkpoint.thread_id) {
+                    return Ok(());
+                }
+                if let Some(picker) = self.target.checkpoint_picker()
+                    && picker.checkpoints[picker.selected].id != checkpoint.id
+                {
+                    return Ok(());
+                }
+                self.transcript.replace_events(events);
+                let Target::Thread {
+                    view:
+                        ThreadView::Checkpoint {
+                            checkpoint: displayed,
+                            ..
+                        },
+                    ..
+                } = &mut self.target
+                else {
+                    return Ok(());
+                };
+                *displayed = checkpoint;
+                self.clear_selection();
+                self.reset_view();
+                if self.target.checkpoint_picker().is_some() {
+                    self.view.focus = FocusPane::Checkpoints;
+                }
+                self.activity = Some(Activity::Info(
+                    "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
+                ));
+                return Ok(());
+            }
+            TurnUpdate::HistoryChanged {
+                source_thread_id,
+                draft,
+                result,
+            } => {
+                if self.target.thread_id() != Some(source_thread_id) {
+                    return Ok(());
+                }
+                let HistoryChange {
+                    message,
+                    thread_id,
+                    threads,
+                    transcript,
+                    events,
+                } = result?;
+                self.target = Target::Thread {
+                    id: thread_id,
+                    view: ThreadView::Live,
+                };
+                self.processes.clear();
+                self.threads = threads;
+                self.transcript.replace(transcript, events);
+                self.overlay = Overlay::None;
+                self.clear_selection();
+                self.reset_view();
+                if let Some(draft) = draft {
+                    self.message_input.set(draft);
+                    self.view.focus = FocusPane::Input;
+                }
+                self.metrics_stale = false;
+                self.activity = Some(Activity::Info(message));
+                return Ok(());
+            }
+        };
+        self.turn = TurnState::Idle;
+        if self.target.thread_id() == Some(completion.thread_id) {
+            match completion.result {
+                TurnResult::Completed { .. }
+                    if self
+                        .transcript
+                        .entries
+                        .last()
+                        .is_some_and(TranscriptEntry::is_assistant_message) =>
+                {
+                    self.activity = None;
+                }
+                result => self.accept_turn_result(result)?,
+            }
+        } else {
+            self.activity = None;
+        }
+        Ok(())
+    }
+
+    fn accept_turn_result(&mut self, result: TurnResult) -> Result<()> {
+        match result {
+            TurnResult::Completed { content } => {
+                self.transcript.entries.push(TranscriptEntry::message(
+                    Author::Assistant,
+                    sanitize(&content),
+                ));
+                self.activity = None;
+            }
+            TurnResult::Cancelled => {
+                self.activity = Some(Activity::Info("Cancelled".to_owned()));
+            }
+            result => bail!("controller returned an unexpected turn result: {result:?}"),
+        }
+        Ok(())
+    }
+}

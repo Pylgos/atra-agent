@@ -358,171 +358,215 @@ enum Chunk {
 }
 
 fn parse(patch: &str) -> Result<Vec<Operation>> {
-    let lines: Vec<&str> = patch.lines().collect();
-    let mut operations = Vec::new();
-    let mut index = 0;
+    Parser {
+        lines: patch.lines().collect(),
+        index: 0,
+    }
+    .parse()
+}
 
-    while index < lines.len() {
-        let header = lines[index].trim();
+struct Parser<'a> {
+    lines: Vec<&'a str>,
+    index: usize,
+}
+
+impl Parser<'_> {
+    fn parse(mut self) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        while self.index < self.lines.len() {
+            operations.push(self.parse_operation()?);
+        }
+        Ok(operations)
+    }
+
+    fn parse_operation(&mut self) -> Result<Operation> {
+        let header = self.lines[self.index].trim();
         if let Some(path) = header.strip_prefix(ADD) {
-            index += 1;
-            let mut content = String::new();
-            while index < lines.len() && !is_operation_header(lines[index]) {
-                let line = lines[index]
-                    .strip_prefix('+')
-                    .with_context(|| format!("invalid add-file line {}", index + 1))?;
-                content.push_str(line);
-                content.push('\n');
-                index += 1;
-            }
-            if content.is_empty() {
-                bail!("Add file hunk for path '{path}' is empty");
-            }
-            operations.push(Operation::Add {
-                path: path.into(),
-                content,
-            });
+            self.index += 1;
+            self.parse_add(path)
         } else if let Some(path) = header.strip_prefix(DELETE) {
-            operations.push(Operation::Delete { path: path.into() });
-            index += 1;
+            self.index += 1;
+            Ok(Operation::Delete { path: path.into() })
         } else if let Some(path) = header.strip_prefix(UPDATE) {
-            index += 1;
-            let mut move_path = None;
-            if let Some(destination) = lines
-                .get(index)
-                .and_then(|line| line.trim_end().strip_prefix(MOVE))
-            {
-                move_path = Some(destination.into());
-                index += 1;
-            }
-            let mut chunks = Vec::new();
-            while index < lines.len() && !is_operation_header(lines[index]) {
-                if lines[index].trim().is_empty()
-                    && chunks
-                        .last()
-                        .is_some_and(|chunk| matches!(chunk, Chunk::Content { eof: true, .. }))
-                {
-                    index += 1;
-                    continue;
-                }
-                if let Some(start) = lines[index].trim_end().strip_prefix("@ start ") {
-                    let start = start
-                        .parse::<usize>()
-                        .with_context(|| format!("invalid range start on line {}", index + 1))?;
-                    index += 1;
-                    let first = lines
-                        .get(index)
-                        .and_then(|line| line.strip_prefix('-'))
-                        .with_context(|| {
-                            format!(
-                                "range start must be followed by a '-' line at {}",
-                                index + 1
-                            )
-                        })?
-                        .to_owned();
-                    index += 1;
-                    let end = if let Some(number) = lines
-                        .get(index)
-                        .and_then(|line| line.trim_end().strip_prefix("@ end "))
-                    {
-                        let number = number
-                            .parse::<usize>()
-                            .with_context(|| format!("invalid range end on line {}", index + 1))?;
-                        index += 1;
-                        let boundary = lines
-                            .get(index)
-                            .and_then(|line| line.strip_prefix('-'))
-                            .with_context(|| {
-                                format!("range end must be followed by a '-' line at {}", index + 1)
-                            })?
-                            .to_owned();
-                        index += 1;
-                        Some((number, boundary))
-                    } else {
-                        None
-                    };
-                    let mut new = Vec::new();
-                    while let Some(line) = lines.get(index).and_then(|line| line.strip_prefix('+'))
-                    {
-                        new.push(line.to_owned());
-                        index += 1;
-                    }
-                    chunks.push(Chunk::Range {
-                        start,
-                        first,
-                        end,
-                        new,
-                    });
-                    continue;
-                }
-
-                let context = match lines[index].trim_end() {
-                    "@@" => {
-                        index += 1;
-                        None
-                    }
-                    line if line.starts_with("@@ ") => {
-                        index += 1;
-                        Some(line[3..].to_owned())
-                    }
-                    _ if chunks.is_empty() => None,
-                    line => bail!("expected update hunk header, got '{line}'"),
-                };
-                let mut old = Vec::new();
-                let mut new = Vec::new();
-                let mut eof = false;
-                while index < lines.len() {
-                    let line = lines[index];
-                    if is_operation_header(line)
-                        || line.trim_end() == "@@"
-                        || line.trim_end().starts_with("@@ ")
-                        || line.trim_end().starts_with("@ start ")
-                    {
-                        break;
-                    }
-                    if line.trim_end() == "*** End of File" {
-                        eof = true;
-                        index += 1;
-                        break;
-                    }
-                    match line.as_bytes().first() {
-                        Some(b' ') => {
-                            old.push(line[1..].to_owned());
-                            new.push(line[1..].to_owned());
-                        }
-                        Some(b'-') => old.push(line[1..].to_owned()),
-                        Some(b'+') => new.push(line[1..].to_owned()),
-                        None => {
-                            old.push(String::new());
-                            new.push(String::new());
-                        }
-                        _ => bail!("invalid update line {}", index + 1),
-                    }
-                    index += 1;
-                }
-                if old.is_empty() && new.is_empty() {
-                    bail!("Update hunk does not contain any lines");
-                }
-                chunks.push(Chunk::Content {
-                    context,
-                    old,
-                    new,
-                    eof,
-                });
-            }
-            if chunks.is_empty() {
-                bail!("Update file hunk for path '{path}' is empty");
-            }
-            operations.push(Operation::Update {
-                path: path.into(),
-                move_path,
-                chunks,
-            });
+            self.index += 1;
+            self.parse_update(path)
         } else {
             bail!("'{header}' is not a valid hunk header");
         }
     }
-    Ok(operations)
+
+    fn parse_add(&mut self, path: &str) -> Result<Operation> {
+        let mut content = String::new();
+        while self.index < self.lines.len() && !is_operation_header(self.lines[self.index]) {
+            let line = self.lines[self.index]
+                .strip_prefix('+')
+                .with_context(|| format!("invalid add-file line {}", self.index + 1))?;
+            content.push_str(line);
+            content.push('\n');
+            self.index += 1;
+        }
+        if content.is_empty() {
+            bail!("Add file hunk for path '{path}' is empty");
+        }
+        Ok(Operation::Add {
+            path: path.into(),
+            content,
+        })
+    }
+
+    fn parse_update(&mut self, path: &str) -> Result<Operation> {
+        let mut move_path = None;
+        if let Some(destination) = self
+            .lines
+            .get(self.index)
+            .and_then(|line| line.trim_end().strip_prefix(MOVE))
+        {
+            move_path = Some(destination.into());
+            self.index += 1;
+        }
+        let mut chunks = Vec::new();
+        while self.index < self.lines.len() && !is_operation_header(self.lines[self.index]) {
+            if self.lines[self.index].trim().is_empty()
+                && chunks
+                    .last()
+                    .is_some_and(|chunk| matches!(chunk, Chunk::Content { eof: true, .. }))
+            {
+                self.index += 1;
+                continue;
+            }
+            if self.lines[self.index].trim_end().starts_with("@ start ") {
+                chunks.push(self.parse_range()?);
+            } else {
+                chunks.push(self.parse_content(chunks.is_empty())?);
+            }
+        }
+        if chunks.is_empty() {
+            bail!("Update file hunk for path '{path}' is empty");
+        }
+        Ok(Operation::Update {
+            path: path.into(),
+            move_path,
+            chunks,
+        })
+    }
+
+    fn parse_range(&mut self) -> Result<Chunk> {
+        let start = self.lines[self.index]
+            .trim_end()
+            .strip_prefix("@ start ")
+            .unwrap()
+            .parse::<usize>()
+            .with_context(|| format!("invalid range start on line {}", self.index + 1))?;
+        self.index += 1;
+        let first = self
+            .lines
+            .get(self.index)
+            .and_then(|line| line.strip_prefix('-'))
+            .with_context(|| {
+                format!(
+                    "range start must be followed by a '-' line at {}",
+                    self.index + 1
+                )
+            })?
+            .to_owned();
+        self.index += 1;
+        let end = if let Some(number) = self
+            .lines
+            .get(self.index)
+            .and_then(|line| line.trim_end().strip_prefix("@ end "))
+        {
+            let number = number
+                .parse::<usize>()
+                .with_context(|| format!("invalid range end on line {}", self.index + 1))?;
+            self.index += 1;
+            let boundary = self
+                .lines
+                .get(self.index)
+                .and_then(|line| line.strip_prefix('-'))
+                .with_context(|| {
+                    format!(
+                        "range end must be followed by a '-' line at {}",
+                        self.index + 1
+                    )
+                })?
+                .to_owned();
+            self.index += 1;
+            Some((number, boundary))
+        } else {
+            None
+        };
+        let mut new = Vec::new();
+        while let Some(line) = self
+            .lines
+            .get(self.index)
+            .and_then(|line| line.strip_prefix('+'))
+        {
+            new.push(line.to_owned());
+            self.index += 1;
+        }
+        Ok(Chunk::Range {
+            start,
+            first,
+            end,
+            new,
+        })
+    }
+
+    fn parse_content(&mut self, first_chunk: bool) -> Result<Chunk> {
+        let context = match self.lines[self.index].trim_end() {
+            "@@" => {
+                self.index += 1;
+                None
+            }
+            line if line.starts_with("@@ ") => {
+                self.index += 1;
+                Some(line[3..].to_owned())
+            }
+            _ if first_chunk => None,
+            line => bail!("expected update hunk header, got '{line}'"),
+        };
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        let mut eof = false;
+        while self.index < self.lines.len() {
+            let line = self.lines[self.index];
+            if is_operation_header(line)
+                || line.trim_end() == "@@"
+                || line.trim_end().starts_with("@@ ")
+                || line.trim_end().starts_with("@ start ")
+            {
+                break;
+            }
+            if line.trim_end() == "*** End of File" {
+                eof = true;
+                self.index += 1;
+                break;
+            }
+            match line.as_bytes().first() {
+                Some(b' ') => {
+                    old.push(line[1..].to_owned());
+                    new.push(line[1..].to_owned());
+                }
+                Some(b'-') => old.push(line[1..].to_owned()),
+                Some(b'+') => new.push(line[1..].to_owned()),
+                None => {
+                    old.push(String::new());
+                    new.push(String::new());
+                }
+                _ => bail!("invalid update line {}", self.index + 1),
+            }
+            self.index += 1;
+        }
+        if old.is_empty() && new.is_empty() {
+            bail!("Update hunk does not contain any lines");
+        }
+        Ok(Chunk::Content {
+            context,
+            old,
+            new,
+            eof,
+        })
+    }
 }
 
 fn is_operation_header(line: &str) -> bool {

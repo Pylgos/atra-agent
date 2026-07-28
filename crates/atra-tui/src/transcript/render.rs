@@ -315,32 +315,29 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
             ..
         } => runner_tool_lines(input, results, *pending_approval, *masked, expanded),
         TranscriptItem::ToolResult { artifacts, masked } => {
-            let mut lines = (*masked)
-                .then(|| {
-                    vec![(
-                        Some('◇'),
-                        Line::from(Span::styled(
-                            "model context uses masked output",
-                            Style::default().fg(Color::DarkGray),
-                        )),
-                    )]
-                })
-                .unwrap_or_default();
+            let mut lines = if *masked {
+                vec![(
+                    Some('◇'),
+                    Line::from(Span::styled(
+                        "model context uses masked output",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                )]
+            } else {
+                Vec::new()
+            };
             lines.extend(fold_result_lines(
                 artifacts
                     .iter()
-                    .filter_map(|artifact| match artifact {
+                    .flat_map(|artifact| match artifact {
                         ToolArtifact::RunnerOperation(operation) => {
-                            Some(runner_operation_lines(operation))
+                            runner_operation_lines(operation)
                         }
                         ToolArtifact::CommandExecution(command) => {
-                            Some(command_execution_lines(command, false))
+                            command_execution_lines(command, false)
                         }
-                        ToolArtifact::PatchOperations(result) => {
-                            Some(patch_operation_lines(result))
-                        }
+                        ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
                     })
-                    .flatten()
                     .collect(),
                 expanded,
             ));

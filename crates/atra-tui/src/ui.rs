@@ -69,7 +69,7 @@ fn format_window_duration(minutes: i64) -> String {
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = if matches!(self.overlay, Overlay::Approval(_)) {
+        let input_height = if self.turn.approval().is_some() {
             3
         } else {
             (self
@@ -105,49 +105,59 @@ impl App {
             TranscriptMode::Coding => self.render_coding_transcript(frame, transcript_area),
             TranscriptMode::Debug => self.render_debug_transcript(frame, transcript_area),
         }
+        self.render_composer(frame, input);
+        self.render_activity_and_status(frame, activity_area, status);
+        self.render_overlays(frame, main);
+    }
 
-        let (input_title, input_hint, input_value, input_cursor, show_cursor) = match &self.overlay
-        {
-            Overlay::Approval(approval) => match &approval.state {
-                ApprovalState::EnteringDenyReason(reason) => (
-                    "Deny reason (optional)".to_owned(),
-                    Some(Line::from("Enter: deny · Esc: back").right_aligned()),
-                    reason.value.as_str(),
-                    reason.cursor,
-                    true,
-                ),
-                ApprovalState::Pending => {
-                    let operation = approval
-                        .operation_index
-                        .map(|index| format!("Operation {index} · "))
-                        .unwrap_or_default();
-                    let runner = (!approval.runner.is_empty())
-                        .then(|| format!("{} · ", approval.runner))
-                        .unwrap_or_default();
-                    (
-                        format!("Approval required · {operation}{runner}{}", approval.label),
-                        None,
-                        "[y] Allow  [n] Deny",
-                        0,
-                        false,
-                    )
+    fn render_composer(&self, frame: &mut Frame<'_>, input: Rect) {
+        let (input_title, input_hint, input_value, input_cursor, show_cursor) =
+            if let Some(approval) = self.turn.approval() {
+                match &approval.state {
+                    ApprovalState::EnteringDenyReason(reason) => (
+                        "Deny reason (optional)".to_owned(),
+                        Some(Line::from("Enter: deny · Esc: back").right_aligned()),
+                        reason.value.as_str(),
+                        reason.cursor,
+                        true,
+                    ),
+                    ApprovalState::Pending => {
+                        let operation = approval
+                            .operation_index
+                            .map(|index| format!("Operation {index} · "))
+                            .unwrap_or_default();
+                        let runner = if approval.runner.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} · ", approval.runner)
+                        };
+                        (
+                            format!("Approval required · {operation}{runner}{}", approval.label),
+                            None,
+                            "[y] Allow  [n] Deny",
+                            0,
+                            false,
+                        )
+                    }
                 }
-            },
-            Overlay::Rename => (
-                "Thread name".to_owned(),
-                None,
-                self.message_input.value.as_str(),
-                self.message_input.cursor,
-                true,
-            ),
-            _ => (
-                "Message".to_owned(),
-                Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
-                self.message_input.value.as_str(),
-                self.message_input.cursor,
-                true,
-            ),
-        };
+            } else {
+                match &self.overlay {
+                    Overlay::Rename => (
+                        "Thread name".to_owned(),
+                        None,
+                        self.message_input.value.as_str(),
+                        self.message_input.cursor,
+                        true,
+                    ),
+                    _ => (
+                        "Message".to_owned(),
+                        Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
+                        self.message_input.value.as_str(),
+                        self.message_input.cursor,
+                        true,
+                    ),
+                }
+            };
         let mut input_block = Block::default().title(input_title);
         if let Some(input_hint) = input_hint {
             input_block = input_block.title_bottom(input_hint);
@@ -177,6 +187,23 @@ impl App {
                 ),
             input,
         );
+        if !matches!(
+            self.overlay,
+            Overlay::Command
+                | Overlay::ModelPicker(_)
+                | Overlay::ThreadPicker(_)
+                | Overlay::Processes(_)
+        ) && self.view.focus == FocusPane::Input
+            && show_cursor
+        {
+            frame.set_cursor_position((
+                input.x + 1 + cursor_column as u16 - horizontal_scroll,
+                input.y + 1 + cursor_row as u16 - vertical_scroll,
+            ));
+        }
+    }
+
+    fn render_activity_and_status(&self, frame: &mut Frame<'_>, activity_area: Rect, status: Rect) {
         if matches!(self.overlay, Overlay::Command) {
             frame.render_widget(
                 Paragraph::new(format!("/{}", self.command_input.value)),
@@ -196,20 +223,9 @@ impl App {
             frame.render_widget(Paragraph::new(message.as_str()).style(style), activity_area);
         }
         frame.render_widget(Paragraph::new(self.status_line()), status);
-        if !matches!(
-            self.overlay,
-            Overlay::Command
-                | Overlay::ModelPicker(_)
-                | Overlay::ThreadPicker(_)
-                | Overlay::Processes(_)
-        ) && self.view.focus == FocusPane::Input
-            && show_cursor
-        {
-            frame.set_cursor_position((
-                input.x + 1 + cursor_column as u16 - horizontal_scroll,
-                input.y + 1 + cursor_row as u16 - vertical_scroll,
-            ));
-        }
+    }
+
+    fn render_overlays(&self, frame: &mut Frame<'_>, main: Rect) {
         if let Overlay::ModelPicker(picker) = &self.overlay {
             render_model_picker(frame, picker);
         }
@@ -242,12 +258,12 @@ impl App {
     fn focus_border_style(&self, pane: FocusPane) -> Style {
         if !matches!(
             self.overlay,
-            Overlay::Approval(_)
-                | Overlay::ModelPicker(_)
+            Overlay::ModelPicker(_)
                 | Overlay::ThreadPicker(_)
                 | Overlay::Processes(_)
                 | Overlay::HistoryConfirmation(_)
-        ) && self.view.focus == pane
+        ) && self.turn.approval().is_none()
+            && self.view.focus == pane
         {
             Style::default().fg(Color::Cyan)
         } else {
@@ -271,7 +287,7 @@ impl App {
         };
         let usage = (!self.metrics_stale)
             .then(|| {
-                self.events.iter().rev().find_map(|event| {
+                self.transcript.events.iter().rev().find_map(|event| {
                     if let ThreadEventData::ModelRequest(request) = &event.data
                         && request.kind == ModelRequestKind::Response
                         && request
@@ -356,6 +372,7 @@ impl App {
 
     fn quota_status(&self) -> Vec<Span<'static>> {
         let snapshots = self
+            .transcript
             .events
             .iter()
             .rev()
@@ -373,6 +390,7 @@ impl App {
             return Vec::new();
         };
         let first_snapshot = self
+            .transcript
             .events
             .iter()
             .find_map(|event| match &event.data {
@@ -452,14 +470,18 @@ impl App {
             .borders(Borders::ALL)
             .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
-        prepare_transcript(&mut self.transcript, &self.view.expanded_tools, inner.width);
-        let (content_length, item_ranges) = transcript_ranges(&self.transcript);
+        prepare_transcript(
+            &mut self.transcript.entries,
+            &self.view.expanded_tools,
+            inner.width,
+        );
+        let (content_length, item_ranges) = transcript_ranges(&self.transcript.entries);
         let max_scroll = content_length.saturating_sub(usize::from(inner.height));
         self.layout.transcript_max_scroll = max_scroll;
         self.view.transcript_scroll = self.view.transcript_scroll.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.view.transcript_scroll);
         let lines = transcript_lines(
-            &self.transcript,
+            &self.transcript.entries,
             self.selection_range(),
             self.view.selected_item,
             inner.width,
@@ -483,7 +505,7 @@ impl App {
                 ))
             })
             .collect();
-        self.layout.transcript = layout_transcript(&self.transcript, inner, scroll);
+        self.layout.transcript = layout_transcript(&self.transcript.entries, inner, scroll);
         frame.render_widget(Paragraph::new(lines).block(block), area);
         if max_scroll > 0 && inner.height > 2 {
             self.layout.transcript_scrollbar_area =
@@ -535,6 +557,7 @@ impl App {
         self.layout.request_list_area = requests;
         self.layout.detail_area = detail;
         let request_events = self
+            .transcript
             .events
             .iter()
             .filter(|event| matches!(event.data, ThreadEventData::ModelRequest(_)))
@@ -631,13 +654,21 @@ impl App {
         );
     }
 
-    fn usage_for(&self, request_sequence: i64) -> Option<&serde_json::Value> {
-        self.events.iter().find_map(|event| match &event.data {
-            ThreadEventData::TokenUsage(event) if event.request_sequence == request_sequence => {
-                Some(&event.usage)
-            }
-            _ => None,
-        })
+    fn usage_for(
+        &self,
+        request_sequence: atra_protocol::EventSequence,
+    ) -> Option<&serde_json::Value> {
+        self.transcript
+            .events
+            .iter()
+            .find_map(|event| match &event.data {
+                ThreadEventData::TokenUsage(event)
+                    if event.request_sequence == request_sequence =>
+                {
+                    Some(&event.usage)
+                }
+                _ => None,
+            })
     }
 
     fn request_detail_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
@@ -652,6 +683,16 @@ impl App {
                 .map(|line| Line::from(line.to_owned()))
                 .collect();
         }
+        let mut lines = self.request_summary_lines(event);
+        append_request_payload(&mut lines, request);
+        lines
+    }
+
+    fn request_summary_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
+        let ThreadEventData::ModelRequest(model_request) = &event.data else {
+            return Vec::new();
+        };
+        let request = &model_request.request;
         let mut lines = Vec::new();
         let kind = match model_request.kind {
             ModelRequestKind::Compaction => "compaction",
@@ -739,38 +780,6 @@ impl App {
             request["instructions"].as_str().map_or(0, str::len),
             serde_json::to_vec(&request["tools"]).map_or(0, |value| value.len()),
         )));
-        lines.push(Line::default());
-        lines.push(section("Instructions"));
-        lines.extend(
-            request["instructions"]
-                .as_str()
-                .unwrap_or("")
-                .lines()
-                .map(|line| Line::from(line.to_owned())),
-        );
-        lines.push(Line::default());
-        lines.push(section("Input"));
-        for (index, item) in input.iter().enumerate() {
-            let encoded = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "[{index}] {} · {} chars/{} B",
-                    item["type"].as_str().unwrap_or("item"),
-                    encoded.chars().count(),
-                    encoded.len()
-                ),
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.extend(encoded.lines().map(|line| Line::from(line.to_owned())));
-        }
-        lines.push(Line::default());
-        lines.push(section("Tools"));
-        lines.extend(
-            serde_json::to_string_pretty(&request["tools"])
-                .unwrap_or_else(|_| request["tools"].to_string())
-                .lines()
-                .map(|line| Line::from(line.to_owned())),
-        );
         lines
     }
 }
@@ -786,6 +795,47 @@ fn section(name: &str) -> Line<'static> {
             .fg(Color::Cyan)
             .add_modifier(ratatui::style::Modifier::BOLD),
     ))
+}
+
+fn append_request_payload(lines: &mut Vec<Line<'static>>, request: &Value) {
+    lines.push(Line::default());
+    lines.push(section("Instructions"));
+    lines.extend(
+        request["instructions"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .map(|line| Line::from(line.to_owned())),
+    );
+    lines.push(Line::default());
+    lines.push(section("Input"));
+    for (index, item) in request["input"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let encoded = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
+        lines.push(Line::from(Span::styled(
+            format!(
+                "[{index}] {} · {} chars/{} B",
+                item["type"].as_str().unwrap_or("item"),
+                encoded.chars().count(),
+                encoded.len()
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.extend(encoded.lines().map(|line| Line::from(line.to_owned())));
+    }
+    lines.push(Line::default());
+    lines.push(section("Tools"));
+    lines.extend(
+        serde_json::to_string_pretty(&request["tools"])
+            .unwrap_or_else(|_| request["tools"].to_string())
+            .lines()
+            .map(|line| Line::from(line.to_owned())),
+    );
 }
 
 fn value_or_dash(value: &serde_json::Value) -> String {
@@ -845,8 +895,7 @@ fn render_process_picker(
         .area()
         .height
         .saturating_sub(4)
-        .min(32)
-        .max(8)
+        .clamp(8, 32)
         .min(frame.area().height);
     let area = Rect::new(
         frame.area().x + (frame.area().width - width) / 2,
@@ -858,10 +907,35 @@ fn render_process_picker(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .areas(area);
+    let items = process_list_items(processes);
+    let mut state =
+        ListState::default().with_selected((!processes.is_empty()).then_some(picker.selected));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("● ").block(
+            Block::default()
+                .title(format!("Background processes · {}", processes.len()))
+                .title_bottom(
+                    Line::from("↑/↓ select · PageUp/PageDown output · x stop · Esc close")
+                        .right_aligned(),
+                )
+                .borders(Borders::ALL),
+        ),
+        list_area,
+        &mut state,
+    );
+    render_process_detail(frame, picker, processes, detail_area);
+
+    if matches!(picker.state, ProcessPickerState::ConfirmingStop { .. }) {
+        render_stop_confirmation(frame, area);
+    }
+}
+
+fn process_list_items(processes: &[atra_protocol::BackgroundProcess]) -> Vec<ListItem<'static>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64);
-    let items = processes
+    processes
         .iter()
         .map(|process| {
             let (status, color) = match &process.status {
@@ -888,28 +962,19 @@ fn render_process_picker(
                 ),
             ])
         })
-        .collect::<Vec<_>>();
-    let mut state =
-        ListState::default().with_selected((!processes.is_empty()).then_some(picker.selected));
-    frame.render_widget(Clear, area);
-    frame.render_stateful_widget(
-        List::new(items).highlight_symbol("● ").block(
-            Block::default()
-                .title(format!("Background processes · {}", processes.len()))
-                .title_bottom(
-                    Line::from("↑/↓ select · PageUp/PageDown output · x stop · Esc close")
-                        .right_aligned(),
-                )
-                .borders(Borders::ALL),
-        ),
-        list_area,
-        &mut state,
-    );
+        .collect()
+}
 
+fn render_process_detail(
+    frame: &mut Frame<'_>,
+    picker: &ProcessPicker,
+    processes: &[atra_protocol::BackgroundProcess],
+    area: Rect,
+) {
     let [command_area, output_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(3)])
-        .areas(detail_area);
+        .areas(area);
     let selected = processes.get(picker.selected);
     let command = selected
         .map(|process| sanitize(&process.command))
@@ -957,25 +1022,25 @@ fn render_process_picker(
         ),
         output_area,
     );
+}
 
-    if matches!(picker.state, ProcessPickerState::ConfirmingStop { .. }) {
-        let width = area.width.saturating_sub(8).min(54);
-        let confirmation = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + area.height.saturating_sub(3) / 2,
-            width,
-            3,
-        );
-        frame.render_widget(Clear, confirmation);
-        frame.render_widget(
-            Paragraph::new("[y] Stop process  [n] Cancel").block(
-                Block::default()
-                    .title("Stop background process?")
-                    .borders(Borders::ALL),
-            ),
-            confirmation,
-        );
-    }
+fn render_stop_confirmation(frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width.saturating_sub(8).min(54);
+    let confirmation = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + area.height.saturating_sub(3) / 2,
+        width,
+        3,
+    );
+    frame.render_widget(Clear, confirmation);
+    frame.render_widget(
+        Paragraph::new("[y] Stop process  [n] Cancel").block(
+            Block::default()
+                .title("Stop background process?")
+                .borders(Borders::ALL),
+        ),
+        confirmation,
+    );
 }
 
 fn format_elapsed_ms(milliseconds: i64) -> String {

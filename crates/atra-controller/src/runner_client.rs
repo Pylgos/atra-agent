@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::ApplyPatchResult;
 use atra_protocol::{
-    CommandOutput, ProcessStatus, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
-    RunnerResponseEnvelope,
+    CommandOutput, ProcessHandle, ProcessStatus, RunnerRequest, RunnerRequestEnvelope,
+    RunnerResponse, RunnerResponseEnvelope,
 };
 use atra_store::TreeManifest;
 use tokio::{
@@ -130,7 +130,44 @@ impl RunnerClient {
         }
     }
 
-    pub(super) async fn stop(&self, process_handle: String) -> Result<CommandOutput> {
+    pub(super) async fn start(
+        &self,
+        command: String,
+        environment: atra_protocol::CommandEnvironment,
+    ) -> Result<ProcessHandle> {
+        match self
+            .request_raw(RunnerRequest::StartCommand {
+                command,
+                environment,
+            })
+            .await?
+        {
+            RunnerResponse::ProcessStarted { process_handle } => Ok(process_handle),
+            RunnerResponse::Error { message } => bail!("{message}"),
+            _ => bail!("runner returned an invalid start_command response"),
+        }
+    }
+
+    pub(super) async fn wait(
+        &self,
+        process_handle: ProcessHandle,
+        timeout_ms: u64,
+    ) -> Result<RunnerResponse> {
+        match self
+            .request_raw(RunnerRequest::WaitProcess {
+                process_handle,
+                timeout_ms,
+            })
+            .await?
+        {
+            response @ (RunnerResponse::ProcessRunning { .. }
+            | RunnerResponse::ProcessFinished { .. }) => Ok(response),
+            RunnerResponse::Error { message } => bail!("{message}"),
+            _ => bail!("runner returned an invalid wait_process response"),
+        }
+    }
+
+    pub(super) async fn stop(&self, process_handle: ProcessHandle) -> Result<CommandOutput> {
         match self
             .request_raw(RunnerRequest::StopProcess { process_handle })
             .await?
@@ -141,7 +178,7 @@ impl RunnerClient {
         }
     }
 
-    pub(super) async fn inspect(&self, process_handle: String) -> Result<ProcessInspection> {
+    pub(super) async fn inspect(&self, process_handle: ProcessHandle) -> Result<ProcessInspection> {
         match self
             .request_raw(RunnerRequest::InspectProcess { process_handle })
             .await?
@@ -160,7 +197,7 @@ impl RunnerClient {
         }
     }
 
-    pub(super) async fn status(&self, process_handle: String) -> Result<ProcessStatus> {
+    pub(super) async fn status(&self, process_handle: ProcessHandle) -> Result<ProcessStatus> {
         match self
             .request_raw(RunnerRequest::ProcessStatus { process_handle })
             .await?

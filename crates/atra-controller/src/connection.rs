@@ -6,7 +6,11 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
-use crate::{State, model::ModelStreamEvent};
+use crate::{
+    State,
+    model::ModelStreamEvent,
+    request::{Request, TurnRequest},
+};
 
 pub(crate) async fn handle_client(
     mut stream: UnixStream,
@@ -20,51 +24,53 @@ pub(crate) async fn handle_client(
         .context("failed to read controller request")?;
     let request: ControllerRequest =
         serde_json::from_str(&request).context("failed to decode controller request")?;
-    if request == ControllerRequest::Shutdown {
-        let response = write_response(&mut stream, &ControllerResponse::Stopping).await;
-        let closed = stream
-            .shutdown()
-            .await
-            .context("failed to close shutdown response stream");
-        drop(stream);
-        shutdown.send_replace(true);
-        response?;
-        closed?;
-        return Ok(());
+    match Request::from(request) {
+        Request::Shutdown => {
+            let response = write_response(&mut stream, &ControllerResponse::Stopping).await;
+            let closed = stream
+                .shutdown()
+                .await
+                .context("failed to close shutdown response stream");
+            drop(stream);
+            shutdown.send_replace(true);
+            response?;
+            closed
+        }
+        Request::Turn(request) => handle_turn(&mut stream, state, request).await,
+        Request::Unary(request) => {
+            let response = match state.handle(request).await {
+                Ok(response) => response,
+                Err(error) => ControllerResponse::Error {
+                    message: format!("{error:#}"),
+                },
+            };
+            write_response(&mut stream, &response).await
+        }
     }
-    if matches!(
-        request,
-        ControllerRequest::ThreadSend { .. } | ControllerRequest::ThreadContinue { .. }
-    ) {
-        let (updates, mut pending_updates) = mpsc::unbounded_channel();
-        let response = {
-            let response = state.handle_streaming(request, &updates);
-            tokio::pin!(response);
-            loop {
-                tokio::select! {
-                    response = &mut response => break response,
-                    Some(update) = pending_updates.recv() => {
-                        write_stream_update(&mut stream, update).await?;
-                    }
+}
+
+async fn handle_turn(stream: &mut UnixStream, state: &State, request: TurnRequest) -> Result<()> {
+    let (updates, mut pending_updates) = mpsc::unbounded_channel();
+    let response = {
+        let response = state.handle_streaming(request, &updates);
+        tokio::pin!(response);
+        loop {
+            tokio::select! {
+                response = &mut response => break response,
+                Some(update) = pending_updates.recv() => {
+                    write_stream_update(stream, update).await?;
                 }
             }
-        };
-        drop(updates);
-        while let Ok(update) = pending_updates.try_recv() {
-            write_stream_update(&mut stream, update).await?;
         }
-        let response = response.unwrap_or_else(|error| ControllerResponse::Error {
-            message: format!("{error:#}"),
-        });
-        return write_response(&mut stream, &response).await;
-    }
-    let response = match state.handle(request).await {
-        Ok(response) => response,
-        Err(error) => ControllerResponse::Error {
-            message: format!("{error:#}"),
-        },
     };
-    write_response(&mut stream, &response).await
+    drop(updates);
+    while let Ok(update) = pending_updates.try_recv() {
+        write_stream_update(stream, update).await?;
+    }
+    let response = response.unwrap_or_else(|error| ControllerResponse::Error {
+        message: format!("{error:#}"),
+    });
+    write_response(stream, &response).await
 }
 
 async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) -> Result<()> {

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use atra_protocol::{ControllerRequest, ControllerResponse, Thread, ThreadEventData};
+use atra_protocol::{ControllerRequest, ControllerResponse, Thread, ThreadEventData, ThreadId};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -37,8 +37,12 @@ async fn lists_threads_newest_first() {
     assert_eq!(
         (first, second),
         (
-            ControllerResponse::ThreadCreated { thread_id: 1 },
-            ControllerResponse::ThreadCreated { thread_id: 2 },
+            ControllerResponse::ThreadCreated {
+                thread_id: ThreadId(1),
+            },
+            ControllerResponse::ThreadCreated {
+                thread_id: ThreadId(2),
+            },
         )
     );
     assert_eq!(
@@ -46,13 +50,13 @@ async fn lists_threads_newest_first() {
         ControllerResponse::ThreadList {
             threads: vec![
                 Thread {
-                    id: 2,
+                    id: ThreadId(2),
                     display_name: None,
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
-                    id: 1,
+                    id: ThreadId(1),
                     display_name: Some("Named".to_owned()),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
@@ -65,7 +69,7 @@ async fn lists_threads_newest_first() {
         request(
             &controller.endpoint,
             ControllerRequest::ThreadRename {
-                thread_id: 1,
+                thread_id: ThreadId(1),
                 display_name: "Renamed".to_owned(),
             },
         )
@@ -74,7 +78,7 @@ async fn lists_threads_newest_first() {
     );
     let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
     let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
-        thread_id: 2,
+        thread_id: ThreadId(2),
         message: "First prompt".to_owned(),
     })
     .unwrap();
@@ -84,7 +88,9 @@ async fn lists_threads_newest_first() {
     assert_eq!(
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap(),
-        ControllerResponse::TurnStarted { thread_id: 2 }
+        ControllerResponse::TurnStarted {
+            thread_id: ThreadId(2),
+        }
     );
     let skills =
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
@@ -117,13 +123,13 @@ async fn lists_threads_newest_first() {
         ControllerResponse::ThreadList {
             threads: vec![
                 Thread {
-                    id: 2,
+                    id: ThreadId(2),
                     display_name: Some("First prompt".to_owned()),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
-                    id: 1,
+                    id: ThreadId(1),
                     display_name: Some("Renamed".to_owned()),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
@@ -142,11 +148,13 @@ async fn active_turn_can_be_cancelled_after_starting() {
             ControllerRequest::ThreadCreate { display_name: None },
         )
         .await,
-        ControllerResponse::ThreadCreated { thread_id: 1 }
+        ControllerResponse::ThreadCreated {
+            thread_id: ThreadId(1),
+        }
     );
     let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
     let mut encoded_request = serde_json::to_vec(&ControllerRequest::ThreadSend {
-        thread_id: 1,
+        thread_id: ThreadId(1),
         message: "Cancel this".to_owned(),
     })
     .unwrap();
@@ -156,7 +164,9 @@ async fn active_turn_can_be_cancelled_after_starting() {
     assert_eq!(
         serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
             .unwrap(),
-        ControllerResponse::TurnStarted { thread_id: 1 }
+        ControllerResponse::TurnStarted {
+            thread_id: ThreadId(1),
+        }
     );
 
     assert_eq!(
@@ -164,7 +174,9 @@ async fn active_turn_can_be_cancelled_after_starting() {
             Duration::from_secs(1),
             request(
                 &controller.endpoint,
-                ControllerRequest::ThreadCancel { thread_id: 1 },
+                ControllerRequest::ThreadCancel {
+                    thread_id: ThreadId(1),
+                },
             ),
         )
         .await

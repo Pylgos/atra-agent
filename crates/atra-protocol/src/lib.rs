@@ -1,9 +1,93 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use atra_patch::ApplyPatchResult;
 use atra_store::TreeManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ThreadId(pub i64);
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct CheckpointId(pub i64);
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct EventSequence(pub i64);
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ApprovalId(pub u64);
+
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ProcessId(pub String);
+
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ProcessHandle(pub String);
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for CheckpointId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for EventSequence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ApprovalId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ProcessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl fmt::Display for ProcessHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl AsRef<str> for ProcessId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ProcessHandle {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ProcessId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<String> for ProcessHandle {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,72 +115,72 @@ pub enum ControllerRequest {
     ThreadList,
     ModelList,
     ThreadRename {
-        thread_id: i64,
+        thread_id: ThreadId,
         display_name: String,
     },
     ThreadSetModel {
-        thread_id: i64,
+        thread_id: ThreadId,
         model: String,
         reasoning_effort: String,
     },
     ThreadSend {
-        thread_id: i64,
+        thread_id: ThreadId,
         message: String,
     },
     ThreadEvents {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadCheckpointCreate {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadCheckpointList {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadCheckpointEvents {
-        checkpoint_id: i64,
+        checkpoint_id: CheckpointId,
     },
     ThreadCheckpointRestore {
-        thread_id: i64,
-        checkpoint_id: i64,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
     },
     ThreadFork {
-        thread_id: i64,
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
         display_name: Option<String>,
     },
     ThreadRewind {
-        thread_id: i64,
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
     },
     ThreadContinue {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadCancel {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadProcessList {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadProcessInspect {
-        thread_id: i64,
+        thread_id: ThreadId,
         runner: String,
-        process_id: String,
+        process_id: ProcessId,
     },
     ThreadProcessStop {
-        thread_id: i64,
+        thread_id: ThreadId,
         runner: String,
-        process_id: String,
+        process_id: ProcessId,
     },
     CodexLogin,
     CodexLogout,
     CodexLoginStatus,
     ApprovalAllow {
-        approval_id: u64,
+        approval_id: ApprovalId,
     },
     ApprovalDeny {
-        approval_id: u64,
+        approval_id: ApprovalId,
         reason: Option<String>,
     },
     RunnerList,
@@ -113,12 +197,12 @@ pub enum ControllerRequest {
     },
     WaitProcess {
         runner: String,
-        process_handle: String,
+        process_handle: ProcessHandle,
         timeout_ms: u64,
     },
     StopProcess {
         runner: String,
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
 }
 
@@ -128,7 +212,7 @@ pub enum ControllerResponse {
     Running,
     Stopping,
     ThreadCreated {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadList {
         threads: Vec<Thread>,
@@ -139,7 +223,7 @@ pub enum ControllerResponse {
     ThreadRenamed,
     ThreadModelChanged,
     TurnStarted {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     TurnDelta {
         content: String,
@@ -173,8 +257,8 @@ pub enum ControllerResponse {
     ThreadProcessStopped,
     ApprovalResolved,
     ApprovalRequired {
-        approval_id: u64,
-        thread_id: i64,
+        approval_id: ApprovalId,
+        thread_id: ThreadId,
         tool: String,
         arguments: Value,
         operation_index: Option<usize>,
@@ -189,7 +273,7 @@ pub enum ControllerResponse {
         events: Vec<ThreadEvent>,
     },
     ThreadCheckpointCreated {
-        checkpoint_id: i64,
+        checkpoint_id: CheckpointId,
     },
     ThreadCheckpointList {
         checkpoints: Vec<ThreadCheckpoint>,
@@ -199,7 +283,7 @@ pub enum ControllerResponse {
     },
     ThreadCheckpointRestored,
     ThreadForked {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ThreadRewound,
     RunnerList {
@@ -208,10 +292,10 @@ pub enum ControllerResponse {
     Launched,
     AlreadyRunning,
     ProcessStarted {
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
     ProcessRunning {
-        process_handle: String,
+        process_handle: ProcessHandle,
         output: String,
     },
     ProcessFinished {
@@ -296,7 +380,7 @@ pub struct RunnerOperationArtifact {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThreadEvent {
-    pub sequence: i64,
+    pub sequence: EventSequence,
     #[serde(flatten)]
     pub data: ThreadEventData,
 }
@@ -342,23 +426,28 @@ impl ThreadEventData {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct InstructionEvent {
-    pub content: Option<String>,
-    pub transition: InstructionTransition,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstructionTransition {
-    Initial,
-    Replacement,
+#[serde(
+    tag = "transition",
+    content = "content",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InstructionEvent {
+    Initial(String),
+    Replacement(String),
     Removal,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct RunnersEvent {
-    pub runners: Vec<Runner>,
-    pub transition: InstructionTransition,
+#[serde(
+    tag = "transition",
+    content = "runners",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum RunnersEvent {
+    Initial(Vec<Runner>),
+    Replacement(Vec<Runner>),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -422,8 +511,8 @@ pub enum ToolResultEvent {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FrozenBoundaryEvent {
-    pub through_sequence: i64,
-    pub masked_sequences: Vec<i64>,
+    pub through_sequence: EventSequence,
+    pub masked_sequences: Vec<EventSequence>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -450,19 +539,19 @@ pub enum ModelRequestKind {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TokenUsageEvent {
-    pub request_sequence: i64,
+    pub request_sequence: EventSequence,
     pub usage: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RateLimitsEvent {
-    pub request_sequence: i64,
+    pub request_sequence: EventSequence,
     pub snapshots: Value,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Thread {
-    pub id: i64,
+    pub id: ThreadId,
     pub display_name: Option<String>,
     pub model: String,
     pub reasoning_effort: String,
@@ -470,8 +559,8 @@ pub struct Thread {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ThreadCheckpoint {
-    pub id: i64,
-    pub thread_id: i64,
+    pub id: CheckpointId,
+    pub thread_id: ThreadId,
     pub created_at_ms: i64,
     pub reason: String,
 }
@@ -498,7 +587,7 @@ pub struct Model {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BackgroundProcess {
     pub runner: String,
-    pub process_id: String,
+    pub process_id: ProcessId,
     pub command: String,
     pub started_at_ms: i64,
     pub status: ProcessStatus,
@@ -552,11 +641,6 @@ pub enum RunnerRequest {
         executable: bool,
         blob: String,
     },
-    ExecCommand {
-        command: String,
-        mode: CommandMode,
-        environment: CommandEnvironment,
-    },
     StartCommand {
         command: String,
         environment: CommandEnvironment,
@@ -565,17 +649,17 @@ pub enum RunnerRequest {
         patch: String,
     },
     WaitProcess {
-        process_handle: String,
+        process_handle: ProcessHandle,
         timeout_ms: u64,
     },
     StopProcess {
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
     InspectProcess {
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
     ProcessStatus {
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
 }
 
@@ -592,10 +676,10 @@ pub enum RunnerResponse {
     },
     ObjectStored,
     ProcessStarted {
-        process_handle: String,
+        process_handle: ProcessHandle,
     },
     ProcessRunning {
-        process_handle: String,
+        process_handle: ProcessHandle,
         output: CommandOutput,
     },
     ProcessFinished {

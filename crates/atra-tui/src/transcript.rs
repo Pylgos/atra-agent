@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use atra_protocol::{
-    RunnerOperationUpdate, ThreadEvent, ThreadEventData, ToolCallEvent, ToolResultEvent,
+    EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, ToolCallEvent,
+    ToolResultEvent,
 };
 use ratatui::text::Line;
 
@@ -11,6 +12,191 @@ pub(crate) use atra_protocol::ToolArtifact;
 pub(crate) use render::{
     layout_transcript, prepare_transcript, transcript_lines, transcript_ranges, transcript_text,
 };
+
+pub(crate) struct TranscriptState {
+    pub(crate) entries: Vec<TranscriptEntry>,
+    pub(crate) events: Vec<ThreadEvent>,
+    tool_call_previews: HashMap<String, usize>,
+}
+
+impl TranscriptState {
+    pub(crate) fn new(entries: Vec<TranscriptEntry>, events: Vec<ThreadEvent>) -> Self {
+        Self {
+            entries,
+            events,
+            tool_call_previews: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn replace(&mut self, entries: Vec<TranscriptEntry>, events: Vec<ThreadEvent>) {
+        self.entries = entries;
+        self.events = events;
+        self.tool_call_previews.clear();
+    }
+
+    pub(crate) fn replace_events(&mut self, events: Vec<ThreadEvent>) {
+        self.replace(transcript_from_events(&events), events);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.replace(Vec::new(), Vec::new());
+    }
+
+    pub(crate) fn append_assistant_delta(&mut self, content: &str) {
+        let content = sanitize(content);
+        if self
+            .entries
+            .last()
+            .is_some_and(TranscriptEntry::is_assistant_message)
+        {
+            self.entries.last_mut().unwrap().append_message(&content);
+        } else {
+            self.entries
+                .push(TranscriptEntry::message(Author::Assistant, content));
+        }
+    }
+
+    pub(crate) fn append_reasoning_delta(&mut self, content: &str) {
+        let content = sanitize(content);
+        if self
+            .entries
+            .last()
+            .is_some_and(TranscriptEntry::is_reasoning_summary)
+        {
+            self.entries.last_mut().unwrap().append_message(&content);
+        } else {
+            self.entries
+                .push(TranscriptEntry::new(TranscriptItem::ReasoningSummary {
+                    text: content,
+                }));
+        }
+    }
+
+    pub(crate) fn finish_reasoning_part(&mut self) {
+        if let Some(entry) = self.entries.last_mut()
+            && entry.is_reasoning_summary()
+            && !entry.is_empty_reasoning_summary()
+        {
+            entry.append_message("\n\n");
+        }
+    }
+
+    pub(crate) fn start_tool_preview(&mut self, item_id: String, name: &str) {
+        let index = self.entries.len();
+        self.entries
+            .push(TranscriptEntry::new(TranscriptItem::ToolCall {
+                name: sanitize(name),
+                arguments: None,
+            }));
+        self.tool_call_previews.insert(item_id, index);
+    }
+
+    pub(crate) fn append_tool_preview(&mut self, item_id: &str, content: &str) {
+        if let Some(index) = self.tool_call_previews.get(item_id) {
+            self.entries[*index].append_tool_input(&sanitize(content));
+        }
+    }
+
+    pub(crate) fn discard_tool_previews(&mut self) {
+        let mut indices = self
+            .tool_call_previews
+            .drain()
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>();
+        indices.sort_unstable_by(|left, right| right.cmp(left));
+        for index in indices {
+            self.entries.remove(index);
+        }
+    }
+
+    pub(crate) fn update_runner_operation(
+        &mut self,
+        call_id: &str,
+        operation_index: usize,
+        update: RunnerOperationUpdate,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.runner_call_id() == Some(call_id))
+        {
+            entry.update_runner_operation(call_id, operation_index, update);
+        }
+    }
+
+    pub(crate) fn set_pending_approval(&mut self, operation_index: Option<usize>) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.runner_call_id().is_some())
+        {
+            entry.set_pending_approval(operation_index);
+        }
+    }
+
+    pub(crate) fn apply_event(&mut self, event: ThreadEvent) {
+        if let Some(existing) = self
+            .events
+            .iter_mut()
+            .find(|existing| existing.sequence == event.sequence)
+        {
+            *existing = event.clone();
+            if merge_runner_tool_result(&mut self.entries, &event) {
+                return;
+            }
+            if let Some(item) = item_from_event(event)
+                && let Some(entry) = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.sequence == Some(existing.sequence))
+            {
+                entry.replace(item);
+            }
+            return;
+        }
+        self.events.push(event.clone());
+        let item_id = match &event.data {
+            ThreadEventData::ToolCall(ToolCallEvent::Custom { item_id, .. }) => item_id.clone(),
+            _ => None,
+        };
+        let sequence = event.sequence;
+        if merge_runner_tool_result(&mut self.entries, &event) {
+            return;
+        }
+        let Some(item) = item_from_event(event) else {
+            return;
+        };
+        if matches!(
+            item,
+            TranscriptItem::ToolCall { .. } | TranscriptItem::RunnerTool { .. }
+        ) && let Some(item_id) = item_id
+            && let Some(index) = self.tool_call_previews.remove(&item_id)
+        {
+            self.entries[index].replace_event(sequence, item);
+            return;
+        }
+        if matches!(
+            item,
+            TranscriptItem::Message {
+                author: Author::Assistant,
+                ..
+            }
+        ) && let Some(entry) = self.entries.last_mut()
+            && entry.is_assistant_message()
+            && entry.sequence.is_none()
+        {
+            entry.replace_event(sequence, item);
+            return;
+        }
+        self.entries.push(TranscriptEntry {
+            item,
+            sequence: Some(sequence),
+            rendered: None,
+        });
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Author {
@@ -114,7 +300,7 @@ impl TranscriptItem {
 
 pub(crate) struct TranscriptEntry {
     pub(crate) item: TranscriptItem,
-    pub(crate) sequence: Option<i64>,
+    pub(crate) sequence: Option<EventSequence>,
     pub(crate) rendered: Option<RenderedItem>,
 }
 
@@ -255,7 +441,7 @@ impl TranscriptEntry {
         self.rendered = None;
     }
 
-    pub(crate) fn replace_event(&mut self, sequence: i64, item: TranscriptItem) {
+    pub(crate) fn replace_event(&mut self, sequence: EventSequence, item: TranscriptItem) {
         self.sequence = Some(sequence);
         self.replace(item);
     }
@@ -386,7 +572,13 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             })
         }
         ThreadEventData::Compaction(_) => Some(TranscriptItem::Compaction),
-        _ => None,
+        ThreadEventData::WorkspaceInstructions(_)
+        | ThreadEventData::Skills(_)
+        | ThreadEventData::Runners(_)
+        | ThreadEventData::FrozenBoundary(_)
+        | ThreadEventData::ModelRequest(_)
+        | ThreadEventData::TokenUsage(_)
+        | ThreadEventData::RateLimits(_) => None,
     }
 }
 
@@ -553,7 +745,7 @@ mod tests {
     #[test]
     fn event_conversion_sanitizes_nested_tool_input() {
         let event = ThreadEvent {
-            sequence: 1,
+            sequence: EventSequence(1),
             data: ThreadEventData::ToolCall(ToolCallEvent::Function {
                 name: "exec\u{1b}[31m_command".to_owned(),
                 arguments: serde_json::json!({

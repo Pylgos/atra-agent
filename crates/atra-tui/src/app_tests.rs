@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::transcript::{
-    ToolArtifact, layout_transcript, prepare_transcript, transcript_lines, transcript_text,
+    Author, ToolArtifact, TranscriptItem, TranscriptState, layout_transcript, prepare_transcript,
+    sanitize, transcript_lines, transcript_text,
 };
 use atra_protocol::CommandExecutionArtifact;
 use ratatui::{Terminal, layout::Rect, text::Line};
@@ -32,13 +33,13 @@ fn transcript_render_is_stable() {
         command_history_path: PathBuf::new(),
         threads: vec![
             Thread {
-                id: 2,
+                id: atra_protocol::ThreadId(2),
                 display_name: Some("Current work".to_owned()),
                 model: "gpt-5.6-sol".to_owned(),
                 reasoning_effort: "medium".to_owned(),
             },
             Thread {
-                id: 1,
+                id: atra_protocol::ThreadId(1),
                 display_name: None,
                 model: "gpt-5.6-sol".to_owned(),
                 reasoning_effort: "medium".to_owned(),
@@ -46,12 +47,10 @@ fn transcript_render_is_stable() {
         ],
         models: Vec::new(),
         target: Target::Thread {
-            id: 2,
+            id: atra_protocol::ThreadId(2),
             view: ThreadView::Live,
         },
-        transcript: items,
-        events: Vec::new(),
-        tool_call_previews: HashMap::new(),
+        transcript: TranscriptState::new(items, Vec::new()),
         message_input: {
             let mut input = InputBuffer::new(Vec::new(), true);
             input.set("next".to_owned());

@@ -1,56 +1,34 @@
-use std::{path::Path, time::Duration};
-
-use anyhow::{Context, Result};
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use anyhow::Result;
+use atra_client::{TurnResult, TurnStream};
+use atra_protocol::ThreadId;
 use tokio::sync::mpsc;
 
 use crate::app::TurnUpdate;
 
-pub(super) async fn request(
-    endpoint: &Path,
-    request: ControllerRequest,
-) -> Result<ControllerResponse> {
-    tokio::time::timeout(
-        Duration::from_secs(300),
-        atra_client::request(endpoint, &request),
-    )
-    .await
-    .context("controller request timed out")?
-}
-
-pub(super) async fn request_stream(
-    endpoint: &Path,
-    request: ControllerRequest,
-    thread_id: i64,
+pub(super) async fn forward_turn(
+    mut stream: TurnStream,
+    thread_id: ThreadId,
     updates: &mpsc::UnboundedSender<TurnUpdate>,
-) -> Result<ControllerResponse> {
-    let mut connection = atra_client::Connection::open(endpoint, &request).await?;
+) -> Result<TurnResult> {
     loop {
-        let response = connection.receive().await?;
-        match response {
-            ControllerResponse::TurnStarted {
-                thread_id: started_thread_id,
-            } => {
-                updates
-                    .send(TurnUpdate::StreamStarted {
-                        thread_id: started_thread_id,
-                    })
-                    .ok();
+        match stream.receive().await? {
+            atra_client::TurnUpdate::Started { thread_id } => {
+                updates.send(TurnUpdate::StreamStarted { thread_id }).ok();
             }
-            ControllerResponse::TurnDelta { content } => {
+            atra_client::TurnUpdate::Delta { content } => {
                 updates.send(TurnUpdate::Delta { thread_id, content }).ok();
             }
-            ControllerResponse::ReasoningSummaryDelta { content } => {
+            atra_client::TurnUpdate::ReasoningSummaryDelta { content } => {
                 updates
                     .send(TurnUpdate::ReasoningSummaryDelta { thread_id, content })
                     .ok();
             }
-            ControllerResponse::ReasoningSummaryPartAdded => {
+            atra_client::TurnUpdate::ReasoningSummaryPartAdded => {
                 updates
                     .send(TurnUpdate::ReasoningSummaryPartAdded { thread_id })
                     .ok();
             }
-            ControllerResponse::ToolCallStarted { item_id, name } => {
+            atra_client::TurnUpdate::ToolCallStarted { item_id, name } => {
                 updates
                     .send(TurnUpdate::ToolCallStarted {
                         thread_id,
@@ -59,7 +37,7 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
-            ControllerResponse::ToolCallDelta { item_id, delta } => {
+            atra_client::TurnUpdate::ToolCallDelta { item_id, delta } => {
                 updates
                     .send(TurnUpdate::ToolCallDelta {
                         thread_id,
@@ -68,33 +46,7 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
-            ControllerResponse::TurnEvent { event } => {
-                updates.send(TurnUpdate::Event { thread_id, event }).ok();
-            }
-            ControllerResponse::ApprovalRequired {
-                approval_id,
-                thread_id,
-                tool,
-                arguments,
-                operation_index,
-                operation_label,
-            } => {
-                let runner = arguments
-                    .get("runner")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                updates
-                    .send(TurnUpdate::ApprovalRequired {
-                        approval_id,
-                        thread_id,
-                        runner,
-                        label: operation_label.unwrap_or(tool),
-                        operation_index,
-                    })
-                    .ok();
-            }
-            ControllerResponse::RunnerOperationUpdate {
+            atra_client::TurnUpdate::RunnerOperation {
                 call_id,
                 operation_index,
                 update,
@@ -108,7 +60,33 @@ pub(super) async fn request_stream(
                     })
                     .ok();
             }
-            response => return Ok(response),
+            atra_client::TurnUpdate::Event { event } => {
+                updates.send(TurnUpdate::Event { thread_id, event }).ok();
+            }
+            atra_client::TurnUpdate::ApprovalRequired {
+                approval_id,
+                tool,
+                arguments,
+            } => {
+                let context = stream
+                    .take_approval_context()
+                    .expect("approval update includes context");
+                let runner = arguments
+                    .get("runner")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                updates
+                    .send(TurnUpdate::ApprovalRequired {
+                        approval_id,
+                        thread_id: context.thread_id,
+                        runner,
+                        label: context.operation_label.unwrap_or(tool),
+                        operation_index: context.operation_index,
+                    })
+                    .ok();
+            }
+            atra_client::TurnUpdate::Finished(result) => return Ok(result),
         }
     }
 }

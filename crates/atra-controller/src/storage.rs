@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use atra_protocol::{
-    CompactionEvent, FrozenBoundaryEvent, InstructionEvent, RunnersEvent, Thread, ThreadCheckpoint,
-    ThreadEventData,
+    CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, InstructionEvent,
+    RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
 };
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -12,14 +12,14 @@ use tokio_rusqlite::{
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub(crate) struct Event {
-    pub sequence: i64,
+    pub sequence: EventSequence,
     #[serde(flatten)]
     pub data: ThreadEventData,
 }
 
 pub(crate) struct FrozenBoundary {
-    pub through_sequence: i64,
-    pub masked_sequences: Vec<i64>,
+    pub through_sequence: EventSequence,
+    pub masked_sequences: Vec<EventSequence>,
 }
 
 pub(crate) fn latest_frozen_boundary(events: &[Event]) -> Option<FrozenBoundary> {
@@ -96,14 +96,14 @@ impl Store {
         display_name: Option<String>,
         model: String,
         reasoning_effort: String,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<ThreadId> {
         self.connection
             .call(move |connection| {
                 connection.execute(
                     "INSERT INTO threads (display_name, model, reasoning_effort) VALUES (?1, ?2, ?3)",
                     params![display_name, model, reasoning_effort],
                 )?;
-                Ok(connection.last_insert_rowid())
+                Ok(ThreadId(connection.last_insert_rowid()))
             })
             .await
     }
@@ -116,7 +116,7 @@ impl Store {
                 statement
                     .query_map([], |row| {
                         Ok(Thread {
-                            id: row.get(0)?,
+                            id: ThreadId(row.get(0)?),
                             display_name: row.get(1)?,
                             model: row.get(2)?,
                             reasoning_effort: row.get(3)?,
@@ -129,11 +129,12 @@ impl Store {
 
     pub async fn rename_thread(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         display_name: String,
     ) -> tokio_rusqlite::Result<()> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let updated = connection.execute(
                     "UPDATE threads SET display_name = ?1 WHERE id = ?2",
                     params![display_name, thread_id],
@@ -148,12 +149,13 @@ impl Store {
 
     pub async fn set_thread_model(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         model: String,
         reasoning_effort: String,
     ) -> tokio_rusqlite::Result<()> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let updated = connection.execute(
                     "UPDATE threads SET model = ?1, reasoning_effort = ?2 WHERE id = ?3",
                     params![model, reasoning_effort, thread_id],
@@ -166,9 +168,13 @@ impl Store {
             .await
     }
 
-    pub async fn thread_model(&self, thread_id: i64) -> tokio_rusqlite::Result<(String, String)> {
+    pub async fn thread_model(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio_rusqlite::Result<(String, String)> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 connection.query_row(
                     "SELECT model, reasoning_effort FROM threads WHERE id = ?1",
                     [thread_id],
@@ -180,11 +186,12 @@ impl Store {
 
     pub async fn name_thread_if_unnamed(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         display_name: String,
     ) -> tokio_rusqlite::Result<()> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 connection.execute(
                     "
                     UPDATE threads
@@ -200,15 +207,16 @@ impl Store {
 
     pub async fn append(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         data: ThreadEventData,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<EventSequence> {
         let (kind, payload) = event_columns(&data)?;
         let payload = serde_json::to_string(&payload).map_err(|error| {
             tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
         })?;
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
                 let sequence = transaction.query_row(
                     "
@@ -227,14 +235,15 @@ impl Store {
                     params![thread_id, sequence, kind.as_str(), payload],
                 )?;
                 transaction.commit()?;
-                Ok(sequence)
+                Ok(EventSequence(sequence))
             })
             .await
     }
 
-    pub async fn events(&self, thread_id: i64) -> tokio_rusqlite::Result<Vec<Event>> {
+    pub async fn events(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<Vec<Event>> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let mut statement = connection.prepare(
                     "
                     SELECT sequence, kind, payload
@@ -252,7 +261,7 @@ impl Store {
                 rows.map(|row| {
                     let (sequence, kind, payload) = row?;
                     Ok(Event {
-                        sequence,
+                        sequence: EventSequence(sequence),
                         data: event_data(&kind, &payload)?,
                     })
                 })
@@ -263,22 +272,23 @@ impl Store {
 
     pub async fn freeze_event_payloads(
         &self,
-        thread_id: i64,
-        events: Vec<(i64, ThreadEventData)>,
+        thread_id: ThreadId,
+        events: Vec<(EventSequence, ThreadEventData)>,
         boundary: FrozenBoundaryEvent,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<EventSequence> {
         let events = events
             .into_iter()
             .map(|(sequence, data)| {
                 let (_, payload) = event_columns(&data)?;
                 serde_json::to_string(&payload)
-                    .map(|payload| (sequence, payload))
+                    .map(|payload| (sequence.0, payload))
                     .map_err(to_sql_error)
             })
             .collect::<tokio_rusqlite::Result<Vec<_>>>()?;
         let boundary = serde_json::to_string(&boundary).map_err(to_sql_error)?;
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
                 for (sequence, payload) in events {
                     transaction.execute(
@@ -307,34 +317,36 @@ impl Store {
                     params![thread_id, sequence, "frozen_boundary", boundary],
                 )?;
                 transaction.commit()?;
-                Ok(sequence)
+                Ok(EventSequence(sequence))
             })
             .await
     }
 
     pub async fn create_checkpoint(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         created_at_ms: i64,
         reason: String,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<CheckpointId> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
                 let checkpoint_id =
                     create_checkpoint(&transaction, thread_id, created_at_ms, &reason)?;
                 transaction.commit()?;
-                Ok(checkpoint_id)
+                Ok(CheckpointId(checkpoint_id))
             })
             .await
     }
 
     pub async fn checkpoints(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
     ) -> tokio_rusqlite::Result<Vec<ThreadCheckpoint>> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let mut statement = connection.prepare(
                     "
                     SELECT id, thread_id, created_at_ms, reason
@@ -346,8 +358,8 @@ impl Store {
                 statement
                     .query_map([thread_id], |row| {
                         Ok(ThreadCheckpoint {
-                            id: row.get(0)?,
-                            thread_id: row.get(1)?,
+                            id: CheckpointId(row.get(0)?),
+                            thread_id: ThreadId(row.get(1)?),
                             created_at_ms: row.get(2)?,
                             reason: row.get(3)?,
                         })
@@ -359,10 +371,11 @@ impl Store {
 
     pub async fn checkpoint_events(
         &self,
-        checkpoint_id: i64,
+        checkpoint_id: CheckpointId,
     ) -> tokio_rusqlite::Result<Vec<Event>> {
         self.connection
             .call(move |connection| {
+                let checkpoint_id = checkpoint_id.0;
                 read_events(
                     connection,
                     "
@@ -379,13 +392,16 @@ impl Store {
 
     pub async fn fork_thread(
         &self,
-        thread_id: i64,
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
         display_name: Option<String>,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<ThreadId> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
+                let checkpoint_id = checkpoint_id.map(|id| id.0);
+                let sequence = sequence.0;
                 let transaction = connection.transaction()?;
                 let kind =
                     validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
@@ -426,20 +442,23 @@ impl Store {
                     Some(history_end_sequence(kind, sequence)),
                 )?;
                 transaction.commit()?;
-                Ok(new_thread_id)
+                Ok(ThreadId(new_thread_id))
             })
             .await
     }
 
     pub async fn rewind(
         &self,
-        thread_id: i64,
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
         created_at_ms: i64,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<CheckpointId> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
+                let checkpoint_id = checkpoint_id.map(|id| id.0);
+                let sequence = sequence.0;
                 let transaction = connection.transaction()?;
                 let kind =
                     validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
@@ -467,19 +486,21 @@ impl Store {
                     Some(history_end_sequence(kind, sequence)),
                 )?;
                 transaction.commit()?;
-                Ok(saved)
+                Ok(CheckpointId(saved))
             })
             .await
     }
 
     pub async fn restore_checkpoint(
         &self,
-        thread_id: i64,
-        checkpoint_id: i64,
+        thread_id: ThreadId,
+        checkpoint_id: CheckpointId,
         created_at_ms: i64,
-    ) -> tokio_rusqlite::Result<i64> {
+    ) -> tokio_rusqlite::Result<CheckpointId> {
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
+                let checkpoint_id = checkpoint_id.0;
                 let transaction = connection.transaction()?;
                 let (display_name, model, reasoning_effort): (Option<String>, String, String) =
                     transaction.query_row(
@@ -509,14 +530,14 @@ impl Store {
                     None,
                 )?;
                 transaction.commit()?;
-                Ok(saved)
+                Ok(CheckpointId(saved))
             })
             .await
     }
 
     pub async fn replace_with_compaction(
         &self,
-        thread_id: i64,
+        thread_id: ThreadId,
         compaction: CompactionEvent,
         workspace_instructions: Option<InstructionEvent>,
         skills: Option<InstructionEvent>,
@@ -534,6 +555,7 @@ impl Store {
             .transpose()?;
         self.connection
             .call(move |connection| {
+                let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
                 transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
                 transaction.execute(
@@ -760,7 +782,7 @@ fn read_events(
     rows.map(|row| {
         let (sequence, kind, payload) = row?;
         Ok(Event {
-            sequence,
+            sequence: EventSequence(sequence),
             data: event_data(&kind, &payload)?,
         })
     })
@@ -789,7 +811,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            0
+            EventSequence(0)
         );
         assert_eq!(
             store
@@ -801,19 +823,19 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            1
+            EventSequence(1)
         );
         assert_eq!(
             store.events(thread).await.unwrap(),
             vec![
                 Event {
-                    sequence: 0,
+                    sequence: EventSequence(0),
                     data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
                         content: "one".to_owned()
                     }),
                 },
                 Event {
-                    sequence: 1,
+                    sequence: EventSequence(1),
                     data: ThreadEventData::AssistantMessage(atra_protocol::MessageEvent {
                         content: "two".to_owned()
                     }),
@@ -847,7 +869,7 @@ mod tests {
         assert_eq!(
             reopened.events(thread).await.unwrap(),
             vec![Event {
-                sequence: 0,
+                sequence: EventSequence(0),
                 data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
                     content: "saved".to_owned()
                 }),

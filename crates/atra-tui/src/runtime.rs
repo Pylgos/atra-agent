@@ -1,7 +1,8 @@
 use std::{io, time::Duration};
 
 use anyhow::Result;
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use atra_client::Client;
+use atra_protocol::{ApprovalId, CheckpointId, EventSequence, ProcessId, ThreadId};
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -9,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     app::{App, HistoryChange, TurnCompletion, TurnUpdate, load_transcript},
-    controller::{request, request_stream},
+    controller::forward_turn,
 };
 
 pub(crate) enum ApprovalDecision {
@@ -20,15 +21,15 @@ pub(crate) enum ApprovalDecision {
 pub(crate) enum HistoryOperation {
     CreateCheckpoint,
     Fork {
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
     },
     Rewind {
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
     },
     Restore {
-        checkpoint_id: i64,
+        checkpoint_id: CheckpointId,
     },
 }
 
@@ -38,41 +39,41 @@ pub(crate) enum Effect {
     },
     SelectThread {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     RenameThread {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
         display_name: String,
     },
     ChangeModel {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
         model: String,
         reasoning_effort: String,
     },
     SendTurn {
         endpoint: std::path::PathBuf,
-        thread_id: Option<i64>,
+        thread_id: Option<ThreadId>,
         new_thread_model: Option<(String, String)>,
         message: String,
     },
     ContinueTurn {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     ResolveApproval {
         endpoint: std::path::PathBuf,
-        approval_id: u64,
+        approval_id: ApprovalId,
         decision: ApprovalDecision,
     },
     CancelTurn {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     LoadCheckpoints {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     LoadCheckpoint {
         endpoint: std::path::PathBuf,
@@ -80,20 +81,20 @@ pub(crate) enum Effect {
     },
     HistoryRequest {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
         draft: Option<String>,
         operation: HistoryOperation,
     },
     PollProcesses {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
-        selected: Option<(String, String)>,
+        thread_id: ThreadId,
+        selected: Option<(String, ProcessId)>,
     },
     StopProcess {
         endpoint: std::path::PathBuf,
-        thread_id: i64,
+        thread_id: ThreadId,
         runner: String,
-        process_id: String,
+        process_id: ProcessId,
     },
 }
 
@@ -150,7 +151,7 @@ impl Effect {
         tokio::spawn(async move {
             match self {
                 Self::Login { endpoint } => {
-                    let result = request(&endpoint, ControllerRequest::CodexLogin).await;
+                    let result = Client::new(&endpoint).codex_login().await;
                     let _ = updates.send(TurnUpdate::LoginCompleted(result));
                 }
                 Self::SelectThread {
@@ -165,14 +166,9 @@ impl Effect {
                     thread_id,
                     display_name,
                 } => {
-                    let result = request(
-                        &endpoint,
-                        ControllerRequest::ThreadRename {
-                            thread_id,
-                            display_name: display_name.clone(),
-                        },
-                    )
-                    .await;
+                    let result = Client::new(&endpoint)
+                        .thread_rename(thread_id, display_name.clone())
+                        .await;
                     let _ = updates.send(TurnUpdate::ThreadRenamed {
                         thread_id,
                         display_name,
@@ -185,15 +181,9 @@ impl Effect {
                     model,
                     reasoning_effort,
                 } => {
-                    let result = request(
-                        &endpoint,
-                        ControllerRequest::ThreadSetModel {
-                            thread_id,
-                            model: model.clone(),
-                            reasoning_effort: reasoning_effort.clone(),
-                        },
-                    )
-                    .await;
+                    let result = Client::new(&endpoint)
+                        .thread_set_model(thread_id, model.clone(), reasoning_effort.clone())
+                        .await;
                     let _ = updates.send(TurnUpdate::ModelChanged {
                         thread_id,
                         model,
@@ -215,17 +205,12 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = request_stream(
-                        &endpoint,
-                        ControllerRequest::ThreadContinue { thread_id },
-                        thread_id,
-                        &updates,
-                    )
-                    .await
-                    .map(|response| TurnCompletion {
-                        thread_id,
-                        response,
-                    });
+                    let result = async {
+                        let stream = Client::new(&endpoint).thread_continue(thread_id).await?;
+                        let result = forward_turn(stream, thread_id, &updates).await?;
+                        Ok(TurnCompletion { thread_id, result })
+                    }
+                    .await;
                     let _ = updates.send(TurnUpdate::Completed(result));
                 }
                 Self::ResolveApproval {
@@ -233,14 +218,13 @@ impl Effect {
                     approval_id,
                     decision,
                 } => {
-                    let approval_request = match decision {
-                        ApprovalDecision::Allow => ControllerRequest::ApprovalAllow { approval_id },
-                        ApprovalDecision::Deny { reason } => ControllerRequest::ApprovalDeny {
-                            approval_id,
-                            reason,
-                        },
+                    let client = Client::new(&endpoint);
+                    let result = match decision {
+                        ApprovalDecision::Allow => client.approval_allow(approval_id).await,
+                        ApprovalDecision::Deny { reason } => {
+                            client.approval_deny(approval_id, reason).await
+                        }
                     };
-                    let result = request(&endpoint, approval_request).await;
                     let _ = updates.send(TurnUpdate::ApprovalResolved {
                         approval_id,
                         result,
@@ -250,8 +234,7 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result =
-                        request(&endpoint, ControllerRequest::ThreadCancel { thread_id }).await;
+                    let result = Client::new(&endpoint).thread_cancel(thread_id).await;
                     let _ = updates.send(TurnUpdate::CancelCompleted { thread_id, result });
                 }
                 Self::LoadCheckpoints {
@@ -259,20 +242,10 @@ impl Effect {
                     thread_id,
                 } => {
                     let result = async {
-                        let checkpoints = match request(
-                            &endpoint,
-                            ControllerRequest::ThreadCheckpointList { thread_id },
-                        )
-                        .await?
-                        {
-                            ControllerResponse::ThreadCheckpointList { checkpoints } => checkpoints,
-                            ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                            response => anyhow::bail!(
-                                "controller returned an unexpected response: {response:?}"
-                            ),
-                        };
+                        let client = Client::new(&endpoint);
+                        let checkpoints = client.checkpoint_list(thread_id).await?;
                         let events = match checkpoints.first() {
-                            Some(checkpoint) => checkpoint_events(&endpoint, checkpoint.id).await?,
+                            Some(checkpoint) => client.checkpoint_events(checkpoint.id).await?,
                             None => Vec::new(),
                         };
                         Ok((checkpoints, events))
@@ -284,7 +257,8 @@ impl Effect {
                     endpoint,
                     checkpoint,
                 } => {
-                    let result = checkpoint_events(&endpoint, checkpoint.id)
+                    let result = Client::new(&endpoint)
+                        .checkpoint_events(checkpoint.id)
                         .await
                         .map(|events| (checkpoint, events));
                     let _ = updates.send(TurnUpdate::CheckpointLoaded(result));
@@ -296,54 +270,40 @@ impl Effect {
                     operation,
                 } => {
                     let result = async {
-                        let history_request = match operation {
+                        let client = Client::new(&endpoint);
+                        let (selected_thread_id, message) = match operation {
                             HistoryOperation::CreateCheckpoint => {
-                                ControllerRequest::ThreadCheckpointCreate { thread_id }
+                                let checkpoint_id = client.checkpoint_create(thread_id).await?;
+                                (thread_id, format!("Checkpoint {checkpoint_id} created"))
                             }
                             HistoryOperation::Fork {
                                 checkpoint_id,
                                 sequence,
-                            } => ControllerRequest::ThreadFork {
-                                thread_id,
-                                checkpoint_id,
-                                sequence,
-                                display_name: None,
-                            },
+                            } => (
+                                client
+                                    .thread_fork(thread_id, checkpoint_id, sequence, None)
+                                    .await?,
+                                "Thread forked".to_owned(),
+                            ),
                             HistoryOperation::Rewind {
                                 checkpoint_id,
                                 sequence,
-                            } => ControllerRequest::ThreadRewind {
-                                thread_id,
-                                checkpoint_id,
-                                sequence,
-                            },
+                            } => {
+                                client
+                                    .thread_rewind(thread_id, checkpoint_id, sequence)
+                                    .await?;
+                                (thread_id, "Thread rewound".to_owned())
+                            }
                             HistoryOperation::Restore { checkpoint_id } => {
-                                ControllerRequest::ThreadCheckpointRestore {
-                                    thread_id,
-                                    checkpoint_id,
-                                }
+                                client.checkpoint_restore(thread_id, checkpoint_id).await?;
+                                (thread_id, "Checkpoint restored".to_owned())
                             }
                         };
-                        let response = request(&endpoint, history_request).await?;
-                        if let ControllerResponse::Error { message } = response {
-                            anyhow::bail!("{message}");
-                        }
-                        let selected_thread_id = match &response {
-                            ControllerResponse::ThreadForked { thread_id } => *thread_id,
-                            _ => thread_id,
-                        };
-                        let threads =
-                            match request(&endpoint, ControllerRequest::ThreadList).await? {
-                                ControllerResponse::ThreadList { threads } => threads,
-                                ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                                response => anyhow::bail!(
-                                    "controller returned an unexpected response: {response:?}"
-                                ),
-                            };
+                        let threads = client.thread_list().await?;
                         let transcript = load_transcript(&endpoint, selected_thread_id).await?;
                         let (transcript, events) = transcript;
                         Ok(HistoryChange {
-                            response,
+                            message,
                             thread_id: selected_thread_id,
                             threads,
                             transcript,
@@ -363,41 +323,17 @@ impl Effect {
                     selected,
                 } => {
                     let result = async {
-                        let processes = match request(
-                            &endpoint,
-                            ControllerRequest::ThreadProcessList { thread_id },
-                        )
-                        .await?
-                        {
-                            ControllerResponse::ThreadProcessList { processes } => processes,
-                            ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                            response => anyhow::bail!(
-                                "controller returned an unexpected process response: {response:?}"
-                            ),
-                        };
+                        let client = Client::new(&endpoint);
+                        let processes = client.thread_process_list(thread_id).await?;
                         let detail = match selected.filter(|(runner, process_id)| {
                             processes.iter().any(|process| {
                                 process.runner == *runner && process.process_id == *process_id
                             })
                         }) {
-                            Some((runner, process_id)) => match request(
-                                &endpoint,
-                                ControllerRequest::ThreadProcessInspect {
-                                    thread_id,
-                                    runner,
-                                    process_id,
-                                },
-                            )
-                            .await?
-                            {
-                                ControllerResponse::ThreadProcessInspect { process } => {
-                                    Some(process)
-                                }
-                                ControllerResponse::Error { .. } => None,
-                                response => anyhow::bail!(
-                                    "controller returned an unexpected process response: {response:?}"
-                                ),
-                            },
+                            Some((runner, process_id)) => client
+                                .thread_process_inspect(thread_id, runner, process_id)
+                                .await
+                                .ok(),
                             None => None,
                         };
                         Ok((processes, detail))
@@ -411,15 +347,9 @@ impl Effect {
                     runner,
                     process_id,
                 } => {
-                    let result = request(
-                        &endpoint,
-                        ControllerRequest::ThreadProcessStop {
-                            thread_id,
-                            runner: runner.clone(),
-                            process_id: process_id.clone(),
-                        },
-                    )
-                    .await;
+                    let result = Client::new(&endpoint)
+                        .thread_process_stop(thread_id, runner.clone(), process_id.clone())
+                        .await;
                     let _ = updates.send(TurnUpdate::ProcessStopped {
                         thread_id,
                         runner,
@@ -432,69 +362,24 @@ impl Effect {
     }
 }
 
-async fn checkpoint_events(
-    endpoint: &std::path::Path,
-    checkpoint_id: i64,
-) -> Result<Vec<atra_protocol::ThreadEvent>> {
-    match request(
-        endpoint,
-        ControllerRequest::ThreadCheckpointEvents { checkpoint_id },
-    )
-    .await?
-    {
-        ControllerResponse::ThreadCheckpointEvents { events } => Ok(events),
-        ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-        response => anyhow::bail!("controller returned an unexpected response: {response:?}"),
-    }
-}
-
 async fn send_turn(
     endpoint: &std::path::Path,
-    existing_thread_id: Option<i64>,
+    existing_thread_id: Option<ThreadId>,
     new_thread_model: Option<(String, String)>,
     message: String,
     updates: &mpsc::UnboundedSender<TurnUpdate>,
 ) -> Result<TurnCompletion> {
+    let client = Client::new(endpoint);
     let thread_id = match existing_thread_id {
         Some(thread_id) => thread_id,
         None => {
-            let thread_id = match request(
-                endpoint,
-                ControllerRequest::ThreadCreate { display_name: None },
-            )
-            .await?
-            {
-                ControllerResponse::ThreadCreated { thread_id } => thread_id,
-                ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                response => {
-                    anyhow::bail!("controller returned an unexpected response: {response:?}")
-                }
-            };
+            let thread_id = client.thread_create(None).await?;
             if let Some((model, reasoning_effort)) = new_thread_model {
-                match request(
-                    endpoint,
-                    ControllerRequest::ThreadSetModel {
-                        thread_id,
-                        model,
-                        reasoning_effort,
-                    },
-                )
-                .await?
-                {
-                    ControllerResponse::ThreadModelChanged => {}
-                    ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                    response => {
-                        anyhow::bail!("controller returned an unexpected response: {response:?}")
-                    }
-                }
+                client
+                    .thread_set_model(thread_id, model, reasoning_effort)
+                    .await?;
             }
-            let threads = match request(endpoint, ControllerRequest::ThreadList).await? {
-                ControllerResponse::ThreadList { threads } => threads,
-                ControllerResponse::Error { message } => anyhow::bail!("{message}"),
-                response => {
-                    anyhow::bail!("controller returned an unexpected response: {response:?}")
-                }
-            };
+            let threads = client.thread_list().await?;
             updates
                 .send(TurnUpdate::Started {
                     message: message.clone(),
@@ -505,15 +390,7 @@ async fn send_turn(
             thread_id
         }
     };
-    let response = request_stream(
-        endpoint,
-        ControllerRequest::ThreadSend { thread_id, message },
-        thread_id,
-        updates,
-    )
-    .await?;
-    Ok(TurnCompletion {
-        thread_id,
-        response,
-    })
+    let stream = client.thread_send(thread_id, message).await?;
+    let result = forward_turn(stream, thread_id, updates).await?;
+    Ok(TurnCompletion { thread_id, result })
 }

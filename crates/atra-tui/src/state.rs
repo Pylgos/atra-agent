@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use atra_protocol::{BackgroundProcessDetail, Model, ThreadCheckpoint};
+use atra_protocol::{
+    ApprovalId, BackgroundProcessDetail, CheckpointId, EventSequence, Model, ProcessId,
+    ThreadCheckpoint,
+};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
@@ -26,11 +29,27 @@ pub(crate) enum TurnState {
     Starting,
     Running,
     Cancelling,
+    AwaitingApproval(Approval),
+    ResolvingApproval(Approval),
 }
 
 impl TurnState {
     pub(crate) fn is_running(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    pub(crate) fn approval(&self) -> Option<&Approval> {
+        match self {
+            Self::AwaitingApproval(approval) => Some(approval),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn approval_mut(&mut self) -> Option<&mut Approval> {
+        match self {
+            Self::AwaitingApproval(approval) => Some(approval),
+            _ => None,
+        }
     }
 }
 
@@ -68,7 +87,6 @@ pub(crate) enum Overlay {
     None,
     Command,
     Help,
-    Approval(Approval),
     Rename,
     ModelPicker(ModelPicker),
     ThreadPicker(ThreadPicker),
@@ -90,7 +108,7 @@ impl Overlay {
 }
 
 pub(crate) struct Approval {
-    pub(crate) id: u64,
+    pub(crate) id: ApprovalId,
     pub(crate) runner: String,
     pub(crate) label: String,
     pub(crate) operation_index: Option<usize>,
@@ -127,7 +145,10 @@ pub(crate) struct ProcessPicker {
 
 pub(crate) enum ProcessPickerState {
     Browsing,
-    ConfirmingStop { runner: String, process_id: String },
+    ConfirmingStop {
+        runner: String,
+        process_id: ProcessId,
+    },
 }
 
 pub(crate) struct CheckpointPicker {
@@ -137,11 +158,11 @@ pub(crate) struct CheckpointPicker {
 
 pub(crate) enum HistoryAction {
     Rewind {
-        checkpoint_id: Option<i64>,
-        sequence: i64,
+        checkpoint_id: Option<CheckpointId>,
+        sequence: EventSequence,
         draft: Option<String>,
     },
     Restore {
-        checkpoint_id: i64,
+        checkpoint_id: CheckpointId,
     },
 }

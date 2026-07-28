@@ -7,13 +7,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use atra_protocol::{ApprovalId, ProcessHandle, ThreadId};
 use tokio::sync::{Mutex, MutexGuard, oneshot, watch};
 
 use crate::Runner;
 
 pub(super) struct TurnLifecycle {
-    active: Mutex<HashMap<i64, Arc<ActiveTurn>>>,
-    approvals: Mutex<HashMap<u64, PendingApproval>>,
+    active: Mutex<HashMap<ThreadId, Arc<ActiveTurn>>>,
+    approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
     next_approval_id: AtomicU64,
 }
 
@@ -22,7 +23,7 @@ pub(super) struct ActiveTurn {
     cancellation: watch::Sender<Option<Result<(), String>>>,
     cancelling: AtomicBool,
     uncancellable: Mutex<()>,
-    process: Mutex<Option<(Arc<Runner>, String)>>,
+    process: Mutex<Option<(Arc<Runner>, ProcessHandle)>>,
 }
 
 pub(super) struct ApprovalDecision {
@@ -31,7 +32,7 @@ pub(super) struct ApprovalDecision {
 }
 
 struct PendingApproval {
-    thread_id: i64,
+    thread_id: ThreadId,
     decision: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -44,7 +45,7 @@ impl TurnLifecycle {
         }
     }
 
-    pub(super) async fn start(&self, thread_id: i64) -> Result<Arc<ActiveTurn>> {
+    pub(super) async fn start(&self, thread_id: ThreadId) -> Result<Arc<ActiveTurn>> {
         let mut active = self.active.lock().await;
         if active.contains_key(&thread_id) {
             bail!("thread already has an active turn");
@@ -54,17 +55,17 @@ impl TurnLifecycle {
         Ok(turn)
     }
 
-    pub(super) async fn get(&self, thread_id: i64) -> Option<Arc<ActiveTurn>> {
+    pub(super) async fn get(&self, thread_id: ThreadId) -> Option<Arc<ActiveTurn>> {
         self.active.lock().await.get(&thread_id).cloned()
     }
 
-    pub(super) async fn begin_cancellation(&self, thread_id: i64) -> Option<Arc<ActiveTurn>> {
+    pub(super) async fn begin_cancellation(&self, thread_id: ThreadId) -> Option<Arc<ActiveTurn>> {
         let turn = self.active.lock().await.get(&thread_id).cloned()?;
         turn.cancelling.store(true, Ordering::Release);
         Some(turn)
     }
 
-    pub(super) async fn finish(&self, thread_id: i64, turn: &Arc<ActiveTurn>) {
+    pub(super) async fn finish(&self, thread_id: ThreadId, turn: &Arc<ActiveTurn>) {
         let mut active = self.active.lock().await;
         if active
             .get(&thread_id)
@@ -77,8 +78,8 @@ impl TurnLifecycle {
 
     pub(super) async fn register_approval(
         &self,
-        thread_id: i64,
-    ) -> Result<(u64, oneshot::Receiver<ApprovalDecision>)> {
+        thread_id: ThreadId,
+    ) -> Result<(ApprovalId, oneshot::Receiver<ApprovalDecision>)> {
         let active = self.active.lock().await;
         let turn = active
             .get(&thread_id)
@@ -86,7 +87,7 @@ impl TurnLifecycle {
         if turn.is_cancelling() {
             bail!("thread cancellation is in progress");
         }
-        let approval_id = self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let approval_id = ApprovalId(self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1);
         let (decision, receiver) = oneshot::channel();
         self.approvals.lock().await.insert(
             approval_id,
@@ -100,7 +101,7 @@ impl TurnLifecycle {
 
     pub(super) async fn resolve_approval(
         &self,
-        approval_id: u64,
+        approval_id: ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<()> {
         let pending = self
@@ -115,14 +116,14 @@ impl TurnLifecycle {
             .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))
     }
 
-    pub(super) async fn clear_approvals(&self, thread_id: i64) {
+    pub(super) async fn clear_approvals(&self, thread_id: ThreadId) {
         self.approvals
             .lock()
             .await
             .retain(|_, approval| approval.thread_id != thread_id);
     }
 
-    pub(super) async fn ensure_no_pending_approval(&self, thread_id: i64) -> Result<()> {
+    pub(super) async fn ensure_no_pending_approval(&self, thread_id: ThreadId) -> Result<()> {
         if self
             .approvals
             .lock()
@@ -165,7 +166,7 @@ impl ActiveTurn {
         self.uncancellable.lock().await
     }
 
-    pub(super) async fn set_process(&self, runner: Arc<Runner>, process_handle: String) {
+    pub(super) async fn set_process(&self, runner: Arc<Runner>, process_handle: ProcessHandle) {
         *self.process.lock().await = Some((runner, process_handle));
     }
 

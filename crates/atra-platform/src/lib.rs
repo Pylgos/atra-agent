@@ -26,7 +26,7 @@ struct ManifestObject {
     blob: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct PlatformProfile {
     runner: String,
     tools: String,
@@ -44,7 +44,6 @@ struct Object {
     compressed: Vec<u8>,
 }
 
-#[derive(Clone)]
 pub struct PlatformStore {
     store: Store,
     profile: PlatformProfile,

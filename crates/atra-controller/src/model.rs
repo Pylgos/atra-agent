@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::storage::Event;
 use anyhow::Result;
-use atra_protocol::{Model, RunnerOperationUpdate, ThreadEvent};
+use atra_protocol::{ApprovalId, Model, RunnerOperationUpdate, ThreadEvent, ThreadId};
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
 use serde::Deserialize;
@@ -39,7 +39,7 @@ pub(crate) enum ModelResponse {
 
 pub(crate) enum ModelStreamEvent {
     TurnStarted {
-        thread_id: i64,
+        thread_id: ThreadId,
     },
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
@@ -53,8 +53,8 @@ pub(crate) enum ModelStreamEvent {
         delta: String,
     },
     ApprovalRequired {
-        approval_id: u64,
-        thread_id: i64,
+        approval_id: ApprovalId,
+        thread_id: ThreadId,
         tool: String,
         arguments: serde_json::Value,
         operation_index: Option<usize>,

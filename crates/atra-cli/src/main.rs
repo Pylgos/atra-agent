@@ -5,7 +5,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ApprovalPolicy, CommandMode, ControllerRequest, ControllerResponse};
+use atra_client::{
+    CodexLoginStatus, LaunchResult, ProcessResult, TurnResult, TurnStream, TurnUpdate,
+};
+use atra_protocol::{
+    ApprovalId, ApprovalPolicy, CheckpointId, CommandMode, EventSequence, ProcessHandle, ThreadId,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 
@@ -13,9 +18,7 @@ mod controller_client;
 mod platform;
 mod workspace;
 
-use controller_client::{
-    not_running as controller_not_running, request as send_controller_request,
-};
+use controller_client::{client, not_running as controller_not_running};
 use workspace::ControllerStart;
 
 #[derive(Parser)]
@@ -307,12 +310,8 @@ async fn run(command: Command) -> Result<()> {
         Command::Codex {
             command: CodexCommand::Logout,
         } => {
-            match send_controller_request(&endpoint, ControllerRequest::CodexLogout).await {
-                Ok(ControllerResponse::CodexLoggedOut) => {}
-                Ok(ControllerResponse::Error { message }) => bail!("{message}"),
-                Ok(response) => {
-                    bail!("controller returned an unexpected response: {response:?}")
-                }
+            match client(&endpoint).codex_logout().await {
+                Ok(()) => {}
                 Err(error) if controller_not_running(&error) => {
                     atra_controller::codex_logout(&codex_auth_home()?).await?;
                 }
@@ -323,8 +322,8 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Codex {
             command: CodexCommand::Status,
-        } => match send_controller_request(&endpoint, ControllerRequest::CodexLoginStatus).await? {
-            ControllerResponse::CodexLoggedIn { email } => {
+        } => match client(&endpoint).codex_login_status().await? {
+            CodexLoginStatus::LoggedIn { email } => {
                 println!(
                     "logged in{}",
                     email
@@ -333,12 +332,10 @@ async fn run(command: Command) -> Result<()> {
                 );
                 Ok(())
             }
-            ControllerResponse::CodexLoginRequired => {
+            CodexLoginStatus::LoginRequired => {
                 println!("logged out");
                 Ok(())
             }
-            ControllerResponse::Error { message } => bail!("{message}"),
-            response => bail!("controller returned an unexpected response: {response:?}"),
         },
         Command::Platform {
             command: PlatformCommand::Install { bundle },
@@ -375,274 +372,29 @@ async fn run(command: Command) -> Result<()> {
         Command::Workspace {
             command: WorkspaceCommand::Start,
         } => workspace::start(&workspace, &endpoint, &workspace_id).await,
-        Command::Thread {
-            command: ThreadCommand::Create { name },
-        } => {
-            match send_controller_request(
-                &endpoint,
-                ControllerRequest::ThreadCreate { display_name: name },
-            )
-            .await?
-            {
-                ControllerResponse::ThreadCreated { thread_id } => println!("{thread_id}"),
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-            Ok(())
-        }
-        Command::Thread {
-            command: ThreadCommand::List,
-        } => {
-            match send_controller_request(&endpoint, ControllerRequest::ThreadList).await? {
-                ControllerResponse::ThreadList { threads } => {
-                    for thread in threads {
-                        println!(
-                            "{}\t{}",
-                            thread.id,
-                            thread.display_name.as_deref().unwrap_or("")
-                        );
-                    }
-                }
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-            Ok(())
-        }
-        Command::Thread {
-            command: ThreadCommand::Rename { thread, name },
-        } => {
-            controller_request(
-                &endpoint,
-                ControllerRequest::ThreadRename {
-                    thread_id: thread,
-                    display_name: name,
-                },
-            )
-            .await
-        }
-        Command::Thread {
-            command:
-                ThreadCommand::Model {
-                    thread,
-                    model,
-                    reasoning_effort,
-                },
-        } => {
-            controller_request(
-                &endpoint,
-                ControllerRequest::ThreadSetModel {
-                    thread_id: thread,
-                    model,
-                    reasoning_effort,
-                },
-            )
-            .await
-        }
-        Command::Thread {
-            command: ThreadCommand::Send { thread, message },
-        } => {
-            display_turn_stream(
-                &endpoint,
-                ControllerRequest::ThreadSend {
-                    thread_id: thread,
-                    message,
-                },
-            )
-            .await
-        }
-        Command::Thread {
-            command: ThreadCommand::Events { thread },
-        } => {
-            match send_controller_request(
-                &endpoint,
-                ControllerRequest::ThreadEvents { thread_id: thread },
-            )
-            .await?
-            {
-                ControllerResponse::ThreadEvents { events } => {
-                    for event in events {
-                        println!(
-                            "{}",
-                            serde_json::to_string(&event)
-                                .context("failed to encode thread event")?
-                        );
-                    }
-                }
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-            Ok(())
-        }
-        Command::Thread {
-            command: ThreadCommand::Checkpoint { command },
-        } => match command {
-            CheckpointCommand::Create { thread } => {
-                match send_controller_request(
-                    &endpoint,
-                    ControllerRequest::ThreadCheckpointCreate { thread_id: thread },
-                )
-                .await?
-                {
-                    ControllerResponse::ThreadCheckpointCreated { checkpoint_id } => {
-                        println!("{checkpoint_id}");
-                        Ok(())
-                    }
-                    ControllerResponse::Error { message } => bail!("{message}"),
-                    response => {
-                        bail!("controller returned an unexpected response: {response:?}")
-                    }
-                }
-            }
-            CheckpointCommand::List { thread } => {
-                match send_controller_request(
-                    &endpoint,
-                    ControllerRequest::ThreadCheckpointList { thread_id: thread },
-                )
-                .await?
-                {
-                    ControllerResponse::ThreadCheckpointList { checkpoints } => {
-                        for checkpoint in checkpoints {
-                            println!(
-                                "{}\t{}\t{}",
-                                checkpoint.id, checkpoint.created_at_ms, checkpoint.reason
-                            );
-                        }
-                        Ok(())
-                    }
-                    ControllerResponse::Error { message } => bail!("{message}"),
-                    response => {
-                        bail!("controller returned an unexpected response: {response:?}")
-                    }
-                }
-            }
-            CheckpointCommand::Events { checkpoint } => {
-                match send_controller_request(
-                    &endpoint,
-                    ControllerRequest::ThreadCheckpointEvents {
-                        checkpoint_id: checkpoint,
-                    },
-                )
-                .await?
-                {
-                    ControllerResponse::ThreadCheckpointEvents { events } => {
-                        for event in events {
-                            println!(
-                                "{}",
-                                serde_json::to_string(&event)
-                                    .context("failed to encode checkpoint event")?
-                            );
-                        }
-                        Ok(())
-                    }
-                    ControllerResponse::Error { message } => bail!("{message}"),
-                    response => {
-                        bail!("controller returned an unexpected response: {response:?}")
-                    }
-                }
-            }
-            CheckpointCommand::Restore { thread, checkpoint } => {
-                controller_request(
-                    &endpoint,
-                    ControllerRequest::ThreadCheckpointRestore {
-                        thread_id: thread,
-                        checkpoint_id: checkpoint,
-                    },
-                )
-                .await
-            }
-        },
-        Command::Thread {
-            command:
-                ThreadCommand::Fork {
-                    thread,
-                    checkpoint,
-                    sequence,
-                    name,
-                },
-        } => {
-            match send_controller_request(
-                &endpoint,
-                ControllerRequest::ThreadFork {
-                    thread_id: thread,
-                    checkpoint_id: checkpoint,
-                    sequence,
-                    display_name: name,
-                },
-            )
-            .await?
-            {
-                ControllerResponse::ThreadForked { thread_id } => println!("{thread_id}"),
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
-            }
-            Ok(())
-        }
-        Command::Thread {
-            command:
-                ThreadCommand::Rewind {
-                    thread,
-                    checkpoint,
-                    sequence,
-                },
-        } => {
-            controller_request(
-                &endpoint,
-                ControllerRequest::ThreadRewind {
-                    thread_id: thread,
-                    checkpoint_id: checkpoint,
-                    sequence,
-                },
-            )
-            .await
-        }
-        Command::Thread {
-            command: ThreadCommand::Continue { thread },
-        } => {
-            display_turn_stream(
-                &endpoint,
-                ControllerRequest::ThreadContinue { thread_id: thread },
-            )
-            .await
-        }
+        Command::Thread { command } => run_thread(&endpoint, command).await,
         Command::Approval {
             command: ApprovalCommand::Allow { approval },
-        } => {
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::ApprovalAllow {
-                    approval_id: approval,
-                },
-            )
-            .await?;
-            display_turn_response(response)
-        }
+        } => display_turn_result(
+            client(&endpoint)
+                .approval_allow(ApprovalId(approval))
+                .await?,
+        ),
         Command::Approval {
             command: ApprovalCommand::Deny { approval, reason },
-        } => {
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::ApprovalDeny {
-                    approval_id: approval,
-                    reason,
-                },
-            )
-            .await?;
-            display_turn_response(response)
-        }
+        } => display_turn_result(
+            client(&endpoint)
+                .approval_deny(ApprovalId(approval), reason)
+                .await?,
+        ),
         Command::Runner {
             command: RunnerCommand::Run { .. },
         } => unreachable!("runner run is handled before workspace setup"),
         Command::Runner {
             command: RunnerCommand::List,
         } => {
-            match send_controller_request(&endpoint, ControllerRequest::RunnerList).await? {
-                ControllerResponse::RunnerList { runners } => {
-                    for runner in runners {
-                        println!("{}\t{}", runner.name, runner.description);
-                    }
-                }
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => bail!("controller returned an unexpected response: {response:?}"),
+            for runner in client(&endpoint).runner_list().await? {
+                println!("{}\t{}", runner.name, runner.description);
             }
             Ok(())
         }
@@ -663,16 +415,14 @@ async fn run(command: Command) -> Result<()> {
                 },
         } => {
             let command = runner_command(command)?;
-            controller_request(
-                &endpoint,
-                ControllerRequest::RunnerLaunch {
-                    name,
-                    description,
-                    approval: approval.into(),
-                    command,
-                },
-            )
-            .await
+            match client(&endpoint)
+                .runner_launch(name, description, approval.into(), command)
+                .await?
+            {
+                LaunchResult::Launched => println!("launched"),
+                LaunchResult::AlreadyRunning => println!("already running"),
+            }
+            Ok(())
         }
         Command::Runner {
             command:
@@ -697,16 +447,7 @@ async fn run(command: Command) -> Result<()> {
                     bail!("--on-timeout terminate requires --timeout-ms")
                 }
             };
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::ExecCommand {
-                    runner: name,
-                    command,
-                    mode,
-                },
-            )
-            .await?;
-            display_process_response(response)
+            display_process_result(client(&endpoint).exec_command(name, command, mode).await?)
         }
         Command::Tui => {
             if workspace::prepare_tui(&workspace, &endpoint, &workspace_id).await? {
@@ -725,54 +466,172 @@ async fn run(command: Command) -> Result<()> {
                     process_handle,
                     timeout_ms,
                 },
-        } => {
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::WaitProcess {
-                    runner: name,
-                    process_handle,
-                    timeout_ms,
-                },
-            )
-            .await?;
-            display_process_response(response)
-        }
+        } => display_process_result(
+            client(&endpoint)
+                .wait_process(name, ProcessHandle(process_handle), timeout_ms)
+                .await?,
+        ),
         Command::Runner {
             command:
                 RunnerCommand::Stop {
                     name,
                     process_handle,
                 },
+        } => display_process_result(
+            client(&endpoint)
+                .stop_process(name, ProcessHandle(process_handle))
+                .await?,
+        ),
+    }
+}
+
+async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
+    match command {
+        ThreadCommand::Create { name } => {
+            println!("{}", client(endpoint).thread_create(name).await?);
+            Ok(())
+        }
+        ThreadCommand::List => {
+            for thread in client(endpoint).thread_list().await? {
+                println!(
+                    "{}\t{}",
+                    thread.id,
+                    thread.display_name.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        ThreadCommand::Rename { thread, name } => {
+            client(endpoint)
+                .thread_rename(ThreadId(thread), name)
+                .await?;
+            println!("renamed");
+            Ok(())
+        }
+        ThreadCommand::Model {
+            thread,
+            model,
+            reasoning_effort,
         } => {
-            let response = send_controller_request(
-                &endpoint,
-                ControllerRequest::StopProcess {
-                    runner: name,
-                    process_handle,
-                },
+            client(endpoint)
+                .thread_set_model(ThreadId(thread), model, reasoning_effort)
+                .await?;
+            println!("model changed");
+            Ok(())
+        }
+        ThreadCommand::Send { thread, message } => {
+            display_turn_stream(
+                client(endpoint)
+                    .thread_send(ThreadId(thread), message)
+                    .await?,
             )
-            .await?;
-            display_process_response(response)
+            .await
+        }
+        ThreadCommand::Events { thread } => {
+            for event in client(endpoint).thread_events(ThreadId(thread)).await? {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).context("failed to encode thread event")?
+                );
+            }
+            Ok(())
+        }
+        ThreadCommand::Checkpoint { command } => run_checkpoint(endpoint, command).await,
+        ThreadCommand::Fork {
+            thread,
+            checkpoint,
+            sequence,
+            name,
+        } => {
+            println!(
+                "{}",
+                client(endpoint)
+                    .thread_fork(
+                        ThreadId(thread),
+                        checkpoint.map(CheckpointId),
+                        EventSequence(sequence),
+                        name,
+                    )
+                    .await?
+            );
+            Ok(())
+        }
+        ThreadCommand::Rewind {
+            thread,
+            checkpoint,
+            sequence,
+        } => {
+            client(endpoint)
+                .thread_rewind(
+                    ThreadId(thread),
+                    checkpoint.map(CheckpointId),
+                    EventSequence(sequence),
+                )
+                .await?;
+            println!("rewound");
+            Ok(())
+        }
+        ThreadCommand::Continue { thread } => {
+            display_turn_stream(client(endpoint).thread_continue(ThreadId(thread)).await?).await
         }
     }
 }
 
-fn display_turn_response(response: ControllerResponse) -> Result<()> {
-    match response {
-        ControllerResponse::ApprovalResolved => Ok(()),
-        ControllerResponse::ThreadCancelled => {
+async fn run_checkpoint(endpoint: &Path, command: CheckpointCommand) -> Result<()> {
+    match command {
+        CheckpointCommand::Create { thread } => {
+            println!(
+                "{}",
+                client(endpoint).checkpoint_create(ThreadId(thread)).await?
+            );
+            Ok(())
+        }
+        CheckpointCommand::List { thread } => {
+            for checkpoint in client(endpoint).checkpoint_list(ThreadId(thread)).await? {
+                println!(
+                    "{}\t{}\t{}",
+                    checkpoint.id, checkpoint.created_at_ms, checkpoint.reason
+                );
+            }
+            Ok(())
+        }
+        CheckpointCommand::Events { checkpoint } => {
+            for event in client(endpoint)
+                .checkpoint_events(CheckpointId(checkpoint))
+                .await?
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).context("failed to encode checkpoint event")?
+                );
+            }
+            Ok(())
+        }
+        CheckpointCommand::Restore { thread, checkpoint } => {
+            client(endpoint)
+                .checkpoint_restore(ThreadId(thread), CheckpointId(checkpoint))
+                .await?;
+            println!("restored");
+            Ok(())
+        }
+    }
+}
+
+fn display_turn_result(result: TurnResult) -> Result<()> {
+    match result {
+        TurnResult::ApprovalResolved => Ok(()),
+        TurnResult::Cancelled => {
             println!("cancelled");
             Ok(())
         }
-        ControllerResponse::TurnCompleted { content } => {
+        TurnResult::Completed { content } => {
             println!("{content}");
             Ok(())
         }
-        ControllerResponse::ApprovalRequired {
+        TurnResult::ApprovalRequired {
             approval_id,
             tool,
             arguments,
-            ..
         } => {
             println!("{approval_id}");
             println!("tool: {tool}");
@@ -782,28 +641,24 @@ fn display_turn_response(response: ControllerResponse) -> Result<()> {
             );
             Ok(())
         }
-        ControllerResponse::Error { message } => bail!("{message}"),
-        response => bail!("controller returned an unexpected response: {response:?}"),
     }
 }
 
-async fn display_turn_stream(endpoint: &Path, request: ControllerRequest) -> Result<()> {
-    let mut connection = atra_client::Connection::open(endpoint, &request).await?;
+async fn display_turn_stream(mut stream: TurnStream) -> Result<()> {
     loop {
-        match connection.receive().await? {
-            ControllerResponse::TurnStarted { .. }
-            | ControllerResponse::TurnDelta { .. }
-            | ControllerResponse::ReasoningSummaryDelta { .. }
-            | ControllerResponse::ReasoningSummaryPartAdded
-            | ControllerResponse::ToolCallStarted { .. }
-            | ControllerResponse::ToolCallDelta { .. }
-            | ControllerResponse::RunnerOperationUpdate { .. }
-            | ControllerResponse::TurnEvent { .. } => {}
-            ControllerResponse::ApprovalRequired {
+        match stream.receive().await? {
+            TurnUpdate::Started { .. }
+            | TurnUpdate::Delta { .. }
+            | TurnUpdate::ReasoningSummaryDelta { .. }
+            | TurnUpdate::ReasoningSummaryPartAdded
+            | TurnUpdate::ToolCallStarted { .. }
+            | TurnUpdate::ToolCallDelta { .. }
+            | TurnUpdate::RunnerOperation { .. }
+            | TurnUpdate::Event { .. } => {}
+            TurnUpdate::ApprovalRequired {
                 approval_id,
                 tool,
                 arguments,
-                ..
             } => {
                 println!("{approval_id}");
                 println!("tool: {tool}");
@@ -815,26 +670,26 @@ async fn display_turn_stream(endpoint: &Path, request: ControllerRequest) -> Res
                     .flush()
                     .context("failed to flush approval request")?;
             }
-            response => return display_turn_response(response),
+            TurnUpdate::Finished(result) => return display_turn_result(result),
         }
     }
 }
 
-fn display_process_response(response: ControllerResponse) -> Result<()> {
-    match response {
-        ControllerResponse::ProcessStarted { process_handle } => {
+fn display_process_result(result: ProcessResult) -> Result<()> {
+    match result {
+        ProcessResult::Started { process_handle } => {
             println!("{process_handle}");
             Ok(())
         }
-        ControllerResponse::ProcessRunning {
+        ProcessResult::Running {
             process_handle,
             output,
         } => {
             print!("{output}");
-            eprintln!("process {process_handle:?} is still running");
+            eprintln!("process \"{process_handle}\" is still running");
             Ok(())
         }
-        ControllerResponse::ProcessFinished { output, exit_code } => {
+        ProcessResult::Finished { output, exit_code } => {
             print!("{output}");
             if exit_code != Some(0) {
                 bail!(
@@ -846,16 +701,14 @@ fn display_process_response(response: ControllerResponse) -> Result<()> {
             }
             Ok(())
         }
-        ControllerResponse::ProcessTimedOut { output } => {
+        ProcessResult::TimedOut { output } => {
             print!("{output}");
             bail!("command timed out")
         }
-        ControllerResponse::ProcessStopped { output } => {
+        ProcessResult::Stopped { output } => {
             print!("{output}");
             Ok(())
         }
-        ControllerResponse::Error { message } => bail!("{message}"),
-        response => bail!("controller returned an unexpected response: {response:?}"),
     }
 }
 
@@ -881,57 +734,4 @@ fn codex_auth_home() -> Result<PathBuf> {
         .get_data_home()
         .context("cannot determine the XDG data directory")?
         .join("atra/codex"))
-}
-
-async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Result<()> {
-    let response = send_controller_request(endpoint, request).await?;
-    match response {
-        ControllerResponse::Running => println!("running"),
-        ControllerResponse::Stopping => println!("stopping"),
-        ControllerResponse::ThreadRenamed => println!("renamed"),
-        ControllerResponse::ThreadModelChanged => println!("model changed"),
-        ControllerResponse::ThreadCheckpointRestored => println!("restored"),
-        ControllerResponse::ThreadRewound => println!("rewound"),
-        ControllerResponse::ThreadCreated { .. }
-        | ControllerResponse::ThreadList { .. }
-        | ControllerResponse::ModelList { .. }
-        | ControllerResponse::TurnStarted { .. }
-        | ControllerResponse::TurnDelta { .. }
-        | ControllerResponse::ReasoningSummaryDelta { .. }
-        | ControllerResponse::ReasoningSummaryPartAdded
-        | ControllerResponse::ToolCallStarted { .. }
-        | ControllerResponse::ToolCallDelta { .. }
-        | ControllerResponse::TurnEvent { .. }
-        | ControllerResponse::TurnCompleted { .. }
-        | ControllerResponse::ThreadCancelled
-        | ControllerResponse::ThreadNotActive
-        | ControllerResponse::ThreadProcessList { .. }
-        | ControllerResponse::ThreadProcessInspect { .. }
-        | ControllerResponse::ThreadProcessStopped
-        | ControllerResponse::ApprovalResolved
-        | ControllerResponse::ApprovalRequired { .. }
-        | ControllerResponse::RunnerOperationUpdate { .. }
-        | ControllerResponse::ThreadEvents { .. }
-        | ControllerResponse::ThreadCheckpointCreated { .. }
-        | ControllerResponse::ThreadCheckpointList { .. }
-        | ControllerResponse::ThreadCheckpointEvents { .. }
-        | ControllerResponse::ThreadForked { .. }
-        | ControllerResponse::RunnerList { .. }
-        | ControllerResponse::CodexLoginRequired
-        | ControllerResponse::CodexLoggedIn { .. }
-        | ControllerResponse::CodexLoggedOut => {
-            bail!("controller returned an unexpected thread response")
-        }
-        ControllerResponse::Launched => println!("launched"),
-        ControllerResponse::AlreadyRunning => println!("already running"),
-        ControllerResponse::ProcessStarted { .. }
-        | ControllerResponse::ProcessRunning { .. }
-        | ControllerResponse::ProcessFinished { .. }
-        | ControllerResponse::ProcessTimedOut { .. }
-        | ControllerResponse::ProcessStopped { .. } => {
-            bail!("controller returned an unexpected process response")
-        }
-        ControllerResponse::Error { message } => bail!("{message}"),
-    }
-    Ok(())
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ControllerRequest, ControllerResponse};
+use atra_protocol::ControllerRequest;
 use rustix::process::getuid;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,9 +19,7 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-use crate::controller_client::{
-    not_running as controller_not_running, request as send_controller_request,
-};
+use crate::controller_client::{client, not_running as controller_not_running};
 
 const CONFIG: &str = ".config/atra.toml";
 const SETUP: &str = ".config/atra-setup.bash";
@@ -308,11 +306,8 @@ pub(crate) async fn stop_controller(endpoint: &Path) -> Result<()> {
 }
 
 pub(crate) async fn controller_status(endpoint: &Path) -> Result<()> {
-    match send_controller_request(endpoint, ControllerRequest::Status).await {
-        Ok(ControllerResponse::Running) => println!("running"),
-        Ok(ControllerResponse::Stopping) => println!("stopping"),
-        Ok(ControllerResponse::Error { message }) => bail!("{message}"),
-        Ok(response) => bail!("controller returned an unexpected response: {response:?}"),
+    match client(endpoint).status().await {
+        Ok(()) => println!("running"),
         Err(error) if controller_not_running(&error) => println!("stopped"),
         Err(error) => return Err(error),
     }
@@ -337,10 +332,8 @@ async fn send_shutdown(endpoint: &Path) -> Result<()> {
 }
 
 async fn controller_is_running(endpoint: &Path) -> Result<bool> {
-    match send_controller_request(endpoint, ControllerRequest::Status).await {
-        Ok(ControllerResponse::Running) => Ok(true),
-        Ok(ControllerResponse::Error { message }) => bail!("{message}"),
-        Ok(response) => bail!("controller returned an unexpected response: {response:?}"),
+    match client(endpoint).status().await {
+        Ok(()) => Ok(true),
         Err(error) if controller_not_running(&error) => Ok(false),
         Err(error) => Err(error),
     }
