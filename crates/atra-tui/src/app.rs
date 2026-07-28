@@ -209,6 +209,13 @@ impl App {
             ControllerResponse::Error { .. } => Vec::new(),
             response => bail!("controller returned an unexpected response: {response:?}"),
         };
+        let new_thread_model = if thread_id.is_none() {
+            models
+                .first()
+                .map(|model| (model.id.clone(), model.default_reasoning_effort.clone()))
+        } else {
+            None
+        };
         let message_history = history::load(&message_history_path)?;
         let command_history = history::load(&command_history_path)?;
         Ok(Self {
@@ -233,7 +240,7 @@ impl App {
                 "/thread · /new · /model · Ctrl-P/Ctrl-/ command · Tab focus · Ctrl-C copies"
                     .to_owned()
             })),
-            new_thread_model: None,
+            new_thread_model,
             login_required,
             view: ViewState::default(),
             layout: ViewLayout::default(),
@@ -758,7 +765,10 @@ impl App {
         self.tool_call_previews.clear();
         self.message_input.clear();
         self.overlay = Overlay::None;
-        self.new_thread_model = None;
+        self.new_thread_model = self
+            .models
+            .first()
+            .map(|model| (model.id.clone(), model.default_reasoning_effort.clone()));
         self.clear_selection();
         self.reset_view();
         self.metrics_stale = false;
