@@ -183,9 +183,10 @@ impl TranscriptState {
                 author: Author::Assistant,
                 ..
             }
-        ) && let Some(entry) = self.entries.last_mut()
-            && entry.is_assistant_message()
-            && entry.sequence.is_none()
+        ) && let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_assistant_message() && entry.sequence.is_none())
         {
             entry.replace_event(sequence, item);
             return;
