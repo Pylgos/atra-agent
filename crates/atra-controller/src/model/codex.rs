@@ -777,14 +777,14 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "name": "runner",
             "description": indoc! {"
                 Execute one or more operations on named Atra Runners.
-                Enclose the complete input with `BEGIN` and `END` on their own lines.
+                End the complete input with `*** Done` on its own line.
                 Start each group with `*** Runner <runner>`; repeat it to switch Runners.
 
                 Processes:
                 Use `*** Command` to wait up to 10000 milliseconds for a Bash command and leave it running if unfinished.
                 Use `*** Background Command <process-id>` to start a named managed process without waiting for it to finish.
                 End every command with `*** End`.
-                Use `*** Wait <process-id> <milliseconds>` to wait for more output or completion.
+                Use `*** Wait <process-id>` to wait up to 10 seconds for more output or completion.
                 Use `*** Stop <process-id>` to stop a managed process.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
 
@@ -802,11 +802,10 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                // Requiring a textual END before the custom tool's special closing token
-                // discourages the model from continuing with unintended operations, notably
-                // repeated Waits, when it means to finish the tool call.
+                // Give completion the same `***` prefix as another operation so the model can
+                // still choose to finish after it has started that common prefix.
                 "definition": indoc! {r#"
-                    start: "BEGIN" LF runner_group+ "END" LF?
+                    start: runner_group+ TOOL_END LF?
                     runner_group: runner operation+
                     runner: "*** Runner " name LF
                     operation: command | patch | wait_process | stop_process
@@ -842,8 +841,9 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
                     range_end: "@ end " INT LF
                     remove_line: "-" /(.*)/ LF
 
-                    wait_process: "*** Wait " process_id " " INT LF
+                    wait_process: "*** Wait " process_id LF
                     stop_process: "*** Stop " process_id LF
+                    TOOL_END: "*** Done"
                     process_id: /[a-z][a-z0-9_-]{0,63}/
 
                     %import common.INT

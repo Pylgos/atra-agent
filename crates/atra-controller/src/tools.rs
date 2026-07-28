@@ -35,6 +35,7 @@ pub(super) struct StopProcessArguments {
 }
 
 const FOREGROUND_TIMEOUT_MS: u64 = 10_000;
+const WAIT_TIMEOUT_MS: u64 = 10_000;
 
 pub(super) enum RunnerOperation {
     Command(ExecCommandArguments),
@@ -71,9 +72,7 @@ impl RunnerOperation {
                 }
             },
             Self::Patch(_) => "Patch".to_owned(),
-            Self::Wait(arguments) => {
-                format!("Wait {} {}", arguments.process_id, arguments.timeout_ms)
-            }
+            Self::Wait(arguments) => format!("Wait {}", arguments.process_id),
             Self::Stop(arguments) => format!("Stop {}", arguments.process_id),
         }
     }
@@ -90,10 +89,10 @@ impl RunnerOperation {
 
 pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
     let lines = input.lines().collect::<Vec<_>>();
-    if lines.first() != Some(&"BEGIN") || lines.last() != Some(&"END") {
-        bail!("runner input must start with 'BEGIN' and end with 'END'");
+    if lines.last() != Some(&"*** Done") {
+        bail!("runner input must end with '*** Done'");
     }
-    let lines = &lines[1..lines.len() - 1];
+    let lines = &lines[..lines.len() - 1];
     let mut index = 0;
     let mut runner = None;
     let mut group_operations = 0;
@@ -150,19 +149,14 @@ pub(super) fn parse_runner_input(input: &str) -> Result<Vec<RunnerOperation>> {
                 index = end + 1;
             }
             header if header.starts_with("*** Wait ") => {
-                let values = &header["*** Wait ".len()..];
-                let (process_id, timeout_ms) = values
-                    .split_once(' ')
-                    .context("wait must include a process ID and timeout")?;
+                let process_id = &header["*** Wait ".len()..];
                 if !valid_process_id(process_id) {
                     bail!("invalid wait process ID '{process_id}'");
                 }
                 operations.push(RunnerOperation::Wait(WaitProcessArguments {
                     runner,
                     process_id: ProcessId(process_id.to_owned()),
-                    timeout_ms: timeout_ms
-                        .parse()
-                        .context("wait timeout must be an integer")?,
+                    timeout_ms: WAIT_TIMEOUT_MS,
                 }));
                 group_operations += 1;
                 index += 1;
