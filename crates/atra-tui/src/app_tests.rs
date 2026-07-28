@@ -65,6 +65,8 @@ fn transcript_render_is_stable() {
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
         metrics_stale: false,
+        processes: Vec::new(),
+        process_refresh_pending: false,
     };
 
     terminal.draw(|frame| app.render(frame)).unwrap();

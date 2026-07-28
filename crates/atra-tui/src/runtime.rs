@@ -65,6 +65,17 @@ pub(crate) enum Effect {
         draft: Option<String>,
         request: ControllerRequest,
     },
+    PollProcesses {
+        endpoint: std::path::PathBuf,
+        thread_id: i64,
+        selected: Option<(String, String)>,
+    },
+    StopProcess {
+        endpoint: std::path::PathBuf,
+        thread_id: i64,
+        runner: String,
+        process_id: String,
+    },
 }
 
 pub(super) async fn run(
@@ -76,6 +87,8 @@ pub(super) async fn run(
     let (updates, mut pending_updates) = mpsc::unbounded_channel();
     let mut redraw = tokio::time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut process_poll = tokio::time::interval(Duration::from_secs(1));
+    process_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     terminal.draw(|frame| app.render(frame))?;
     redraw.tick().await;
     let mut dirty = false;
@@ -99,6 +112,9 @@ pub(super) async fn run(
             }
             Some(effect) = pending_effects.recv() => {
                 effect.start(updates.clone());
+            }
+            _ = process_poll.tick() => {
+                app.poll_processes(&effects);
             }
             _ = redraw.tick() => {
                 if dirty {
@@ -275,6 +291,76 @@ impl Effect {
                     let _ = updates.send(TurnUpdate::HistoryChanged {
                         source_thread_id: thread_id,
                         draft,
+                        result,
+                    });
+                }
+                Self::PollProcesses {
+                    endpoint,
+                    thread_id,
+                    selected,
+                } => {
+                    let result = async {
+                        let processes = match request(
+                            &endpoint,
+                            ControllerRequest::ThreadProcessList { thread_id },
+                        )
+                        .await?
+                        {
+                            ControllerResponse::ThreadProcessList { processes } => processes,
+                            ControllerResponse::Error { message } => anyhow::bail!("{message}"),
+                            response => anyhow::bail!(
+                                "controller returned an unexpected process response: {response:?}"
+                            ),
+                        };
+                        let detail = match selected.filter(|(runner, process_id)| {
+                            processes.iter().any(|process| {
+                                process.runner == *runner && process.process_id == *process_id
+                            })
+                        }) {
+                            Some((runner, process_id)) => match request(
+                                &endpoint,
+                                ControllerRequest::ThreadProcessInspect {
+                                    thread_id,
+                                    runner,
+                                    process_id,
+                                },
+                            )
+                            .await?
+                            {
+                                ControllerResponse::ThreadProcessInspect { process } => {
+                                    Some(process)
+                                }
+                                ControllerResponse::Error { .. } => None,
+                                response => anyhow::bail!(
+                                    "controller returned an unexpected process response: {response:?}"
+                                ),
+                            },
+                            None => None,
+                        };
+                        Ok((processes, detail))
+                    }
+                    .await;
+                    let _ = updates.send(TurnUpdate::ProcessesLoaded { thread_id, result });
+                }
+                Self::StopProcess {
+                    endpoint,
+                    thread_id,
+                    runner,
+                    process_id,
+                } => {
+                    let result = request(
+                        &endpoint,
+                        ControllerRequest::ThreadProcessStop {
+                            thread_id,
+                            runner: runner.clone(),
+                            process_id: process_id.clone(),
+                        },
+                    )
+                    .await;
+                    let _ = updates.send(TurnUpdate::ProcessStopped {
+                        thread_id,
+                        runner,
+                        process_id,
                         result,
                     });
                 }

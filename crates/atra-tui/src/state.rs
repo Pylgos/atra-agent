@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use atra_protocol::{Model, ThreadCheckpoint};
+use atra_protocol::{BackgroundProcessDetail, Model, ThreadCheckpoint};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
@@ -71,6 +71,7 @@ pub(crate) enum Overlay {
     Rename,
     ModelPicker(ModelPicker),
     ThreadPicker(ThreadPicker),
+    Processes(ProcessPicker),
     HistoryConfirmation(HistoryAction),
 }
 
@@ -104,6 +105,13 @@ pub(crate) struct ModelPicker {
 
 pub(crate) struct ThreadPicker {
     pub(crate) selected: usize,
+}
+
+pub(crate) struct ProcessPicker {
+    pub(crate) selected: usize,
+    pub(crate) detail: Option<BackgroundProcessDetail>,
+    pub(crate) output_scroll: usize,
+    pub(crate) confirming_stop: bool,
 }
 
 pub(crate) struct CheckpointPicker {

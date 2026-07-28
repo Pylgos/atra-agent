@@ -75,6 +75,19 @@ pub enum ControllerRequest {
     ThreadCancel {
         thread_id: i64,
     },
+    ThreadProcessList {
+        thread_id: i64,
+    },
+    ThreadProcessInspect {
+        thread_id: i64,
+        runner: String,
+        process_id: String,
+    },
+    ThreadProcessStop {
+        thread_id: i64,
+        runner: String,
+        process_id: String,
+    },
     CodexLogin,
     CodexLogout,
     CodexLoginStatus,
@@ -149,6 +162,13 @@ pub enum ControllerResponse {
     },
     ThreadCancelled,
     ThreadNotActive,
+    ThreadProcessList {
+        processes: Vec<BackgroundProcess>,
+    },
+    ThreadProcessInspect {
+        process: BackgroundProcessDetail,
+    },
+    ThreadProcessStopped,
     ApprovalResolved,
     ApprovalRequired {
         approval_id: u64,
@@ -268,6 +288,30 @@ pub struct Model {
     pub auto_compact_token_limit: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BackgroundProcess {
+    pub runner: String,
+    pub process_id: String,
+    pub command: String,
+    pub started_at_ms: i64,
+    pub status: ProcessStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BackgroundProcessDetail {
+    pub process: BackgroundProcess,
+    pub output_tail: String,
+    pub omitted_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProcessStatus {
+    Running,
+    Exited { exit_code: Option<i32> },
+    Unavailable { message: String },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RunnerRequestEnvelope {
     pub request_id: u64,
@@ -322,6 +366,12 @@ pub enum RunnerRequest {
     StopProcess {
         process_handle: String,
     },
+    InspectProcess {
+        process_handle: String,
+    },
+    ProcessStatus {
+        process_handle: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -352,6 +402,14 @@ pub enum RunnerResponse {
     },
     ProcessStopped {
         output: CommandOutput,
+    },
+    ProcessInspected {
+        process_status: ProcessStatus,
+        output_tail: String,
+        omitted_bytes: usize,
+    },
+    ProcessStatus {
+        process_status: ProcessStatus,
     },
     PatchCompleted {
         result: ApplyPatchResult,

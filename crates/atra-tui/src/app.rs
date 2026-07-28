@@ -6,8 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
-    ControllerRequest, ControllerResponse, Model, RunnerOperationUpdate, Thread, ThreadCheckpoint,
-    ThreadEvent,
+    BackgroundProcess, BackgroundProcessDetail, ControllerRequest, ControllerResponse, Model,
+    ProcessStatus, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -21,8 +21,8 @@ use crate::{
     layout::{SelectionPoint, ViewLayout},
     runtime::Effect,
     state::{
-        Approval, CheckpointPicker, FocusPane, HistoryAction, ModelPicker, Overlay, ThreadPicker,
-        TranscriptMode, TurnState, ViewState,
+        Approval, CheckpointPicker, FocusPane, HistoryAction, ModelPicker, Overlay, ProcessPicker,
+        ThreadPicker, TranscriptMode, TurnState, ViewState,
     },
     transcript::{
         Author, TranscriptEntry, TranscriptItem, item_from_event, merge_runner_tool_result,
@@ -41,6 +41,7 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
     ("/rewind", "Rewind to the selected message"),
     ("/restore", "Restore the displayed checkpoint"),
     ("/continue", "Continue an incomplete turn"),
+    ("/processes", "Inspect background commands"),
     ("/help", "Show this command list"),
     ("/exit", "Exit Atra"),
 ];
@@ -139,6 +140,16 @@ pub(crate) enum TurnUpdate {
             (Vec<TranscriptEntry>, Vec<ThreadEvent>),
         )>,
     },
+    ProcessesLoaded {
+        thread_id: i64,
+        result: Result<(Vec<BackgroundProcess>, Option<BackgroundProcessDetail>)>,
+    },
+    ProcessStopped {
+        thread_id: i64,
+        runner: String,
+        process_id: String,
+        result: Result<ControllerResponse>,
+    },
 }
 
 pub(crate) struct App {
@@ -164,6 +175,8 @@ pub(crate) struct App {
     pub(crate) layout: ViewLayout,
     pub(crate) turn: TurnState,
     pub(crate) metrics_stale: bool,
+    pub(crate) processes: Vec<BackgroundProcess>,
+    pub(crate) process_refresh_pending: bool,
 }
 
 impl App {
@@ -223,6 +236,8 @@ impl App {
             layout: ViewLayout::default(),
             turn: TurnState::Idle,
             metrics_stale: false,
+            processes: Vec::new(),
+            process_refresh_pending: false,
         })
     }
 
@@ -294,6 +309,67 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            return Ok(false);
+        }
+
+        if let Overlay::Processes(picker) = &mut self.overlay {
+            if picker.confirming_stop {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        picker.confirming_stop = false;
+                        if let Some(process) = self.processes.get(picker.selected) {
+                            self.activity =
+                                Some(Activity::Info(format!("Stopping {}…", process.process_id)));
+                            effects
+                                .send(Effect::StopProcess {
+                                    endpoint: self.endpoint.clone(),
+                                    thread_id: self.thread_id.unwrap(),
+                                    runner: process.runner.clone(),
+                                    process_id: process.process_id.clone(),
+                                })
+                                .ok();
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => picker.confirming_stop = false,
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            let mut refresh_detail = false;
+            match key.code {
+                KeyCode::Up => {
+                    let selected = picker.selected.saturating_sub(1);
+                    refresh_detail = selected != picker.selected;
+                    picker.selected = selected;
+                }
+                KeyCode::Down => {
+                    let selected =
+                        (picker.selected + 1).min(self.processes.len().saturating_sub(1));
+                    refresh_detail = selected != picker.selected;
+                    picker.selected = selected;
+                }
+                KeyCode::PageUp => picker.output_scroll = picker.output_scroll.saturating_add(10),
+                KeyCode::PageDown => picker.output_scroll = picker.output_scroll.saturating_sub(10),
+                KeyCode::Char('x')
+                    if self.processes.get(picker.selected).is_some_and(|process| {
+                        matches!(process.status, ProcessStatus::Running)
+                    }) =>
+                {
+                    picker.confirming_stop = true;
+                }
+                KeyCode::Esc => {
+                    self.overlay = Overlay::None;
+                    self.activity = None;
+                }
+                _ => {}
+            }
+            if refresh_detail {
+                if let Overlay::Processes(picker) = &mut self.overlay {
+                    picker.detail = None;
+                    picker.output_scroll = 0;
+                }
+                self.poll_processes(effects);
             }
             return Ok(false);
         }
@@ -606,6 +682,9 @@ impl App {
             "continue" => {
                 self.run_command(|app| app.continue_thread(effects));
             }
+            "processes" => {
+                self.run_command(|app| app.open_processes(effects));
+            }
             "help" => {
                 self.overlay = Overlay::Help;
                 self.activity = Some(Activity::Info("Command help".to_owned()));
@@ -625,8 +704,49 @@ impl App {
         }
     }
 
+    fn open_processes(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        self.thread_id.context("no thread is selected")?;
+        self.overlay = Overlay::Processes(ProcessPicker {
+            selected: 0,
+            detail: None,
+            output_scroll: 0,
+            confirming_stop: false,
+        });
+        self.activity = Some(Activity::Info(
+            "↑/↓ select · PageUp/PageDown output · x stop · Esc close".to_owned(),
+        ));
+        self.poll_processes(effects);
+        Ok(())
+    }
+
+    pub(super) fn poll_processes(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
+        let Some(thread_id) = self.thread_id else {
+            self.processes.clear();
+            return;
+        };
+        if self.process_refresh_pending {
+            return;
+        }
+        let selected = match &self.overlay {
+            Overlay::Processes(picker) => self
+                .processes
+                .get(picker.selected)
+                .map(|process| (process.runner.clone(), process.process_id.clone())),
+            _ => None,
+        };
+        self.process_refresh_pending = true;
+        effects
+            .send(Effect::PollProcesses {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+                selected,
+            })
+            .ok();
+    }
+
     fn start_new_thread(&mut self) {
         self.thread_id = None;
+        self.processes.clear();
         self.transcript.clear();
         self.events.clear();
         self.checkpoint = None;
@@ -1492,6 +1612,7 @@ impl App {
             TurnUpdate::ThreadSelected { thread_id, result } => {
                 let (transcript, events) = result?;
                 self.thread_id = Some(thread_id);
+                self.processes.clear();
                 self.transcript = transcript;
                 self.events = events;
                 self.checkpoint = None;
@@ -1502,6 +1623,82 @@ impl App {
                 self.reset_view();
                 self.metrics_stale = false;
                 self.activity = Some(Activity::Info("Thread selected".to_owned()));
+                return Ok(());
+            }
+            TurnUpdate::ProcessesLoaded { thread_id, result } => {
+                self.process_refresh_pending = false;
+                if self.thread_id != Some(thread_id) {
+                    return Ok(());
+                }
+                let (processes, detail) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if matches!(self.overlay, Overlay::Processes(_)) {
+                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        }
+                        return Ok(());
+                    }
+                };
+                let selected_key = match &self.overlay {
+                    Overlay::Processes(picker) => self
+                        .processes
+                        .get(picker.selected)
+                        .map(|process| (process.runner.clone(), process.process_id.clone())),
+                    _ => None,
+                };
+                self.processes = processes;
+                if let Overlay::Processes(picker) = &mut self.overlay {
+                    picker.selected = selected_key
+                        .and_then(|(runner, process_id)| {
+                            self.processes.iter().position(|process| {
+                                process.runner == runner && process.process_id == process_id
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            picker.selected.min(self.processes.len().saturating_sub(1))
+                        });
+                    let selected = self.processes.get(picker.selected);
+                    picker.detail = detail.filter(|detail| {
+                        selected.is_some_and(|selected| {
+                            detail.process.runner == selected.runner
+                                && detail.process.process_id == selected.process_id
+                        })
+                    });
+                }
+                return Ok(());
+            }
+            TurnUpdate::ProcessStopped {
+                thread_id,
+                runner,
+                process_id,
+                result,
+            } => {
+                if self.thread_id != Some(thread_id) {
+                    return Ok(());
+                }
+                match result {
+                    Ok(ControllerResponse::ThreadProcessStopped) => {
+                        self.processes.retain(|process| {
+                            process.runner != runner || process.process_id != process_id
+                        });
+                        if let Overlay::Processes(picker) = &mut self.overlay {
+                            picker.selected =
+                                picker.selected.min(self.processes.len().saturating_sub(1));
+                            picker.detail = None;
+                            picker.output_scroll = 0;
+                        }
+                        self.activity = Some(Activity::Info(format!("Stopped {process_id}")));
+                    }
+                    Ok(ControllerResponse::Error { message }) => {
+                        self.activity = Some(Activity::Error(sanitize(&message)));
+                    }
+                    Ok(response) => {
+                        bail!("controller returned an unexpected process response: {response:?}")
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
                 return Ok(());
             }
             TurnUpdate::ThreadRenamed {
@@ -1625,6 +1822,7 @@ impl App {
                     }
                 };
                 self.thread_id = Some(thread_id);
+                self.processes.clear();
                 self.threads = threads;
                 self.transcript = transcript;
                 self.events = events;

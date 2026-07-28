@@ -1234,6 +1234,9 @@ async fn controller_request(endpoint: &Path, request: ControllerRequest) -> Resu
         | ControllerResponse::TurnCompleted { .. }
         | ControllerResponse::ThreadCancelled
         | ControllerResponse::ThreadNotActive
+        | ControllerResponse::ThreadProcessList { .. }
+        | ControllerResponse::ThreadProcessInspect { .. }
+        | ControllerResponse::ThreadProcessStopped
         | ControllerResponse::ApprovalResolved
         | ControllerResponse::ApprovalRequired { .. }
         | ControllerResponse::RunnerOperationUpdate { .. }

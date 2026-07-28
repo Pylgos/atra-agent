@@ -15,9 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, CommandEnvironment, CommandOutput, ControllerRequest, ControllerResponse,
-    Runner as RunnerInfo, RunnerOperationUpdate, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
+    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CommandEnvironment, CommandOutput,
+    ControllerRequest, ControllerResponse, ProcessStatus, Runner as RunnerInfo,
+    RunnerOperationUpdate, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
+    RunnerResponseEnvelope, ThreadEvent, TimeoutAction,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -190,7 +191,7 @@ pub(crate) struct State {
     provider: Provider,
     approvals: Mutex<HashMap<u64, PendingApproval>>,
     active_turns: Mutex<HashMap<i64, Arc<ActiveTurn>>>,
-    processes: Mutex<HashMap<ProcessKey, String>>,
+    processes: Mutex<HashMap<ProcessKey, ProcessRecord>>,
     thread_locks: StdMutex<HashMap<i64, Arc<Mutex<()>>>>,
     next_approval_id: AtomicU64,
     platform: Option<Arc<PlatformStore>>,
@@ -216,11 +217,18 @@ struct ActiveTurn {
     process: Mutex<Option<(Arc<Runner>, String)>>,
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct ProcessKey {
     thread_id: i64,
     runner: String,
     process_id: String,
+}
+
+#[derive(Clone)]
+struct ProcessRecord {
+    handle: String,
+    command: String,
+    started_at_ms: i64,
 }
 
 impl State {
@@ -466,6 +474,87 @@ impl State {
                 self.continue_thread(thread_id, None).await
             }
             ControllerRequest::ThreadCancel { thread_id } => self.cancel_thread(thread_id).await,
+            ControllerRequest::ThreadProcessList { thread_id } => {
+                let records = self
+                    .processes
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(key, _)| key.thread_id == thread_id)
+                    .map(|(key, record)| (key.clone(), record.clone()))
+                    .collect::<Vec<_>>();
+                let mut processes = Vec::with_capacity(records.len());
+                for (key, record) in records {
+                    let status = self.process_status(&key, &record).await;
+                    processes.push(BackgroundProcess {
+                        runner: key.runner,
+                        process_id: key.process_id,
+                        command: record.command,
+                        started_at_ms: record.started_at_ms,
+                        status,
+                    });
+                }
+                processes.sort_by(|left, right| {
+                    left.started_at_ms
+                        .cmp(&right.started_at_ms)
+                        .then_with(|| left.process_id.cmp(&right.process_id))
+                });
+                Ok(ControllerResponse::ThreadProcessList { processes })
+            }
+            ControllerRequest::ThreadProcessInspect {
+                thread_id,
+                runner,
+                process_id,
+            } => {
+                let key = ProcessKey {
+                    thread_id,
+                    runner,
+                    process_id,
+                };
+                let record = self
+                    .processes
+                    .lock()
+                    .await
+                    .get(&key)
+                    .cloned()
+                    .context("background process is no longer available")?;
+                Ok(ControllerResponse::ThreadProcessInspect {
+                    process: self.inspect_process(key, record).await,
+                })
+            }
+            ControllerRequest::ThreadProcessStop {
+                thread_id,
+                runner,
+                process_id,
+            } => {
+                let key = ProcessKey {
+                    thread_id,
+                    runner,
+                    process_id,
+                };
+                let record = self
+                    .processes
+                    .lock()
+                    .await
+                    .get(&key)
+                    .cloned()
+                    .context("background process is no longer available")?;
+                match self
+                    .runner(&key.runner)
+                    .await?
+                    .request_raw(RunnerRequest::StopProcess {
+                        process_handle: record.handle,
+                    })
+                    .await?
+                {
+                    RunnerResponse::ProcessStopped { .. } => {
+                        self.processes.lock().await.remove(&key);
+                        Ok(ControllerResponse::ThreadProcessStopped)
+                    }
+                    RunnerResponse::Error { message } => bail!("{message}"),
+                    _ => bail!("runner returned an invalid stop_process response"),
+                }
+            }
             ControllerRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
                 self.provider.reload_auth().await;
@@ -543,6 +632,81 @@ impl State {
                     .request(RunnerRequest::StopProcess { process_handle })
                     .await
             }
+        }
+    }
+
+    async fn inspect_process(
+        &self,
+        key: ProcessKey,
+        record: ProcessRecord,
+    ) -> BackgroundProcessDetail {
+        let response = match self.runner(&key.runner).await {
+            Ok(runner) => {
+                runner
+                    .request_raw(RunnerRequest::InspectProcess {
+                        process_handle: record.handle,
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let (status, output_tail, omitted_bytes) = match response {
+            Ok(RunnerResponse::ProcessInspected {
+                process_status: status,
+                output_tail,
+                omitted_bytes,
+            }) => (status, output_tail, omitted_bytes),
+            Ok(RunnerResponse::Error { message }) => {
+                (ProcessStatus::Unavailable { message }, String::new(), 0)
+            }
+            Ok(_) => (
+                ProcessStatus::Unavailable {
+                    message: "runner returned an invalid inspect_process response".to_owned(),
+                },
+                String::new(),
+                0,
+            ),
+            Err(error) => (
+                ProcessStatus::Unavailable {
+                    message: format!("{error:#}"),
+                },
+                String::new(),
+                0,
+            ),
+        };
+        BackgroundProcessDetail {
+            process: BackgroundProcess {
+                runner: key.runner,
+                process_id: key.process_id,
+                command: record.command,
+                started_at_ms: record.started_at_ms,
+                status,
+            },
+            output_tail,
+            omitted_bytes,
+        }
+    }
+
+    async fn process_status(&self, key: &ProcessKey, record: &ProcessRecord) -> ProcessStatus {
+        let response = match self.runner(&key.runner).await {
+            Ok(runner) => {
+                runner
+                    .request_raw(RunnerRequest::ProcessStatus {
+                        process_handle: record.handle.clone(),
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match response {
+            Ok(RunnerResponse::ProcessStatus { process_status }) => process_status,
+            Ok(RunnerResponse::Error { message }) => ProcessStatus::Unavailable { message },
+            Ok(_) => ProcessStatus::Unavailable {
+                message: "runner returned an invalid process_status response".to_owned(),
+            },
+            Err(error) => ProcessStatus::Unavailable {
+                message: format!("{error:#}"),
+            },
         }
     }
 
@@ -1519,6 +1683,8 @@ impl State {
         match arguments {
             ToolArguments::ExecCommand(arguments) => {
                 let runner_name = arguments.runner.clone();
+                let command = arguments.command.clone();
+                let started_at_ms = checkpoint_time_ms();
                 let runner = self.runner(&arguments.runner).await?;
                 if let Some(process_id) = &arguments.process_id
                     && self.processes.lock().await.contains_key(&ProcessKey {
@@ -1645,7 +1811,11 @@ impl State {
                                 runner: runner_name.clone(),
                                 process_id: process_id.clone(),
                             },
-                            process_handle,
+                            ProcessRecord {
+                                handle: process_handle,
+                                command,
+                                started_at_ms,
+                            },
                         );
                         RunnerResponse::ProcessStarted {
                             process_handle: process_id,
@@ -1674,7 +1844,11 @@ impl State {
                                 runner: runner_name.clone(),
                                 process_id: process_id.clone(),
                             },
-                            process_handle,
+                            ProcessRecord {
+                                handle: process_handle,
+                                command,
+                                started_at_ms,
+                            },
                         );
                         RunnerResponse::ProcessRunning {
                             process_handle: process_id,
@@ -1723,7 +1897,7 @@ impl State {
                         runner: runner_name.clone(),
                         process_id: arguments.process_id.clone(),
                     })
-                    .cloned();
+                    .map(|process| process.handle.clone());
                 let Some(process_handle) = process_handle else {
                     return Ok(ToolOutcome::text(format!(
                         "Process ID '{}' is not running on Runner {runner_name}",
@@ -1811,7 +1985,7 @@ impl State {
                         runner: runner_name.clone(),
                         process_id: arguments.process_id.clone(),
                     })
-                    .cloned();
+                    .map(|process| process.handle.clone());
                 let Some(process_handle) = process_handle else {
                     return Ok(ToolOutcome::text(format!(
                         "Process ID '{}' is not running on Runner {runner_name}",
@@ -2780,6 +2954,12 @@ fn map_runner_response(response: RunnerResponse) -> Result<ControllerResponse> {
         RunnerResponse::PatchCompleted { .. } => {
             bail!("runner returned an unexpected patch response")
         }
+        RunnerResponse::ProcessInspected { .. } => {
+            bail!("runner returned an unexpected process inspection response")
+        }
+        RunnerResponse::ProcessStatus { .. } => {
+            bail!("runner returned an unexpected process status response")
+        }
         RunnerResponse::Error { message } => bail!("{message}"),
     }
 }
@@ -2826,6 +3006,8 @@ fn format_exec_response(runner: &str, response: RunnerResponse) -> Result<String
         | RunnerResponse::TreeReady { .. }
         | RunnerResponse::ObjectStored
         | RunnerResponse::ProcessStopped { .. }
+        | RunnerResponse::ProcessInspected { .. }
+        | RunnerResponse::ProcessStatus { .. }
         | RunnerResponse::PatchCompleted { .. } => {
             bail!("runner returned an invalid tool response")
         }

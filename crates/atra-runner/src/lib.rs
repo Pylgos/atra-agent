@@ -17,8 +17,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    CommandEnvironment, CommandOutput, RunnerRequest, RunnerRequestEnvelope, RunnerResponse,
-    RunnerResponseEnvelope, TimeoutAction,
+    CommandEnvironment, CommandOutput, ProcessStatus, RunnerRequest, RunnerRequestEnvelope,
+    RunnerResponse, RunnerResponseEnvelope, TimeoutAction,
 };
 use atra_store::{PreparedTree, Store};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -195,6 +195,10 @@ async fn handle_request(
                 .await
         }
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
+        RunnerRequest::InspectProcess { process_handle } => {
+            processes.inspect(&process_handle).await
+        }
+        RunnerRequest::ProcessStatus { process_handle } => processes.status(&process_handle).await,
     }
 }
 
@@ -320,6 +324,7 @@ impl ProcessManager {
             os_pid,
             child: Mutex::new(child),
             output: Mutex::new(OutputBuffer::default()),
+            output_tail: Mutex::new(TailBuffer::default()),
             full_output_path,
             output_closed: AtomicBool::new(false),
             changed: Notify::new(),
@@ -346,6 +351,11 @@ impl ProcessManager {
                             break;
                         }
                         output_process.output.lock().await.append(&buffer[..length]);
+                        output_process
+                            .output_tail
+                            .lock()
+                            .await
+                            .append(&buffer[..length]);
                         output_process.changed.notify_waiters();
                     }
                     Err(error) => {
@@ -473,6 +483,29 @@ impl ProcessManager {
         })
     }
 
+    async fn inspect(&self, handle: &str) -> Result<RunnerResponse> {
+        let process = self.process(handle).await?;
+        let process_status = match process.finished().await? {
+            Some(exit_code) => ProcessStatus::Exited { exit_code },
+            None => ProcessStatus::Running,
+        };
+        let (output_tail, omitted_bytes) = process.output_tail.lock().await.snapshot();
+        Ok(RunnerResponse::ProcessInspected {
+            process_status,
+            output_tail,
+            omitted_bytes,
+        })
+    }
+
+    async fn status(&self, handle: &str) -> Result<RunnerResponse> {
+        let process = self.process(handle).await?;
+        let process_status = match process.finished().await? {
+            Some(exit_code) => ProcessStatus::Exited { exit_code },
+            None => ProcessStatus::Running,
+        };
+        Ok(RunnerResponse::ProcessStatus { process_status })
+    }
+
     async fn process(&self, handle: &str) -> Result<Arc<ManagedProcess>> {
         self.processes
             .lock()
@@ -488,6 +521,7 @@ struct ManagedProcess {
     os_pid: Pid,
     child: Mutex<Child>,
     output: Mutex<OutputBuffer>,
+    output_tail: Mutex<TailBuffer>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
     changed: Notify,
@@ -512,6 +546,7 @@ impl ManagedProcess {
 }
 
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_TAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct OutputBuffer {
@@ -559,6 +594,39 @@ impl OutputBuffer {
             omitted_bytes: self.omitted_bytes,
             full_output_path,
         }
+    }
+}
+
+#[derive(Default)]
+struct TailBuffer {
+    bytes: Vec<u8>,
+    omitted_bytes: usize,
+}
+
+impl TailBuffer {
+    fn append(&mut self, bytes: &[u8]) {
+        let total_len = self.bytes.len() + bytes.len();
+        if total_len <= MAX_TAIL_BYTES {
+            self.bytes.extend_from_slice(bytes);
+            return;
+        }
+        let omitted = total_len - MAX_TAIL_BYTES;
+        self.omitted_bytes += omitted;
+        if bytes.len() >= MAX_TAIL_BYTES {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&bytes[bytes.len() - MAX_TAIL_BYTES..]);
+        } else {
+            self.bytes.drain(..omitted);
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    fn snapshot(&self) -> (String, usize) {
+        (
+            String::from_utf8_lossy(&self.bytes).into_owned(),
+            self.omitted_bytes,
+        )
     }
 }
 

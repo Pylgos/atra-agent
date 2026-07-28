@@ -1,3 +1,4 @@
+use atra_protocol::ProcessStatus;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -14,7 +15,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::{Activity, App, COMMAND_HELP},
-    state::{CheckpointPicker, FocusPane, ModelPicker, Overlay, ThreadPicker, TranscriptMode},
+    state::{
+        CheckpointPicker, FocusPane, ModelPicker, Overlay, ProcessPicker, ThreadPicker,
+        TranscriptMode,
+    },
     transcript::{
         layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
     },
@@ -194,7 +198,10 @@ impl App {
         frame.render_widget(Paragraph::new(self.status_line()), status);
         if !matches!(
             self.overlay,
-            Overlay::Command | Overlay::ModelPicker(_) | Overlay::ThreadPicker(_)
+            Overlay::Command
+                | Overlay::ModelPicker(_)
+                | Overlay::ThreadPicker(_)
+                | Overlay::Processes(_)
         ) && self.view.focus == FocusPane::Input
             && show_cursor
         {
@@ -208,6 +215,9 @@ impl App {
         }
         if let Overlay::ThreadPicker(picker) = &self.overlay {
             render_thread_picker(frame, picker, &self.threads);
+        }
+        if let Overlay::Processes(picker) = &self.overlay {
+            render_process_picker(frame, picker, &self.processes);
         }
         if let Some(picker) = &self.checkpoint_picker {
             let [list, _] = Layout::default()
@@ -235,6 +245,7 @@ impl App {
             Overlay::Approval(_)
                 | Overlay::ModelPicker(_)
                 | Overlay::ThreadPicker(_)
+                | Overlay::Processes(_)
                 | Overlay::HistoryConfirmation(_)
         ) && self.view.focus == pane
         {
@@ -317,6 +328,18 @@ impl App {
             ),
         ];
         spans.extend(self.quota_status());
+        let running_processes = self
+            .processes
+            .iter()
+            .filter(|process| matches!(process.status, ProcessStatus::Running))
+            .count();
+        if running_processes != 0 {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(
+                format!("processes {running_processes}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         if let Some(checkpoint) = &self.checkpoint {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
@@ -787,6 +810,160 @@ fn render_thread_picker(
         area,
         &mut state,
     );
+}
+
+fn render_process_picker(
+    frame: &mut Frame<'_>,
+    picker: &ProcessPicker,
+    processes: &[atra_protocol::BackgroundProcess],
+) {
+    let width = frame.area().width.saturating_sub(4).min(120);
+    let height = frame
+        .area()
+        .height
+        .saturating_sub(4)
+        .min(32)
+        .max(8)
+        .min(frame.area().height);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    let [list_area, detail_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .areas(area);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64);
+    let items = processes
+        .iter()
+        .map(|process| {
+            let (status, color) = match &process.status {
+                ProcessStatus::Running => ("running".to_owned(), Color::Green),
+                ProcessStatus::Exited { exit_code } => (
+                    format!(
+                        "exited {}",
+                        exit_code.map_or_else(|| "?".to_owned(), |code| code.to_string())
+                    ),
+                    Color::DarkGray,
+                ),
+                ProcessStatus::Unavailable { .. } => ("unavailable".to_owned(), Color::Red),
+            };
+            let elapsed = format_elapsed_ms(now_ms.saturating_sub(process.started_at_ms));
+            let command = sanitize(&process.command).replace(['\n', '\t'], " ");
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(status, Style::default().fg(color)),
+                    Span::raw(format!(" · {elapsed} · {}", process.process_id)),
+                ]),
+                Line::styled(
+                    format!("  {} · {command}", process.runner),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state =
+        ListState::default().with_selected((!processes.is_empty()).then_some(picker.selected));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("● ").block(
+            Block::default()
+                .title(format!("Background processes · {}", processes.len()))
+                .title_bottom(
+                    Line::from("↑/↓ select · PageUp/PageDown output · x stop · Esc close")
+                        .right_aligned(),
+                )
+                .borders(Borders::ALL),
+        ),
+        list_area,
+        &mut state,
+    );
+
+    let [command_area, output_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(3)])
+        .areas(detail_area);
+    let selected = processes.get(picker.selected);
+    let command = selected
+        .map(|process| sanitize(&process.command))
+        .unwrap_or_else(|| "No background processes".to_owned());
+    frame.render_widget(
+        Paragraph::new(command).block(Block::default().title("Command").borders(Borders::ALL)),
+        command_area,
+    );
+
+    let detail = picker.detail.as_ref().filter(|detail| {
+        selected.is_some_and(|selected| {
+            detail.process.runner == selected.runner
+                && detail.process.process_id == selected.process_id
+        })
+    });
+    let output = detail
+        .map(|detail| sanitize(&detail.output_tail))
+        .unwrap_or_default();
+    let mut lines = output
+        .lines()
+        .map(|line| Line::from(line.to_owned()))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        let message = match selected.map(|process| &process.status) {
+            Some(ProcessStatus::Unavailable { message }) => sanitize(message),
+            Some(_) => "(no output)".to_owned(),
+            None => String::new(),
+        };
+        lines.push(Line::from(message));
+    }
+    let visible_height = usize::from(output_area.height.saturating_sub(2));
+    let bottom = lines.len().saturating_sub(visible_height);
+    let start = bottom.saturating_sub(picker.output_scroll);
+    let end = (start + visible_height).min(lines.len());
+    let omitted_bytes = detail.map_or(0, |detail| detail.omitted_bytes);
+    frame.render_widget(
+        Paragraph::new(lines[start..end].to_vec()).block(
+            Block::default()
+                .title(if omitted_bytes == 0 {
+                    "Output tail".to_owned()
+                } else {
+                    format!("Output tail · {omitted_bytes} earlier bytes omitted")
+                })
+                .borders(Borders::ALL),
+        ),
+        output_area,
+    );
+
+    if picker.confirming_stop {
+        let width = area.width.saturating_sub(8).min(54);
+        let confirmation = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + area.height.saturating_sub(3) / 2,
+            width,
+            3,
+        );
+        frame.render_widget(Clear, confirmation);
+        frame.render_widget(
+            Paragraph::new("[y] Stop process  [n] Cancel").block(
+                Block::default()
+                    .title("Stop background process?")
+                    .borders(Borders::ALL),
+            ),
+            confirmation,
+        );
+    }
+}
+
+fn format_elapsed_ms(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1000;
+    if seconds >= 60 * 60 {
+        format!("{}h{}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn render_checkpoint_picker(
