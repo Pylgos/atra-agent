@@ -1,3 +1,8 @@
 /target/
 /dist/
 /result
+/result-atra
+__pycache__/
+*.py[cod]
+/benchmarks/terminal_bench_2_1/jobs/
+/benchmarks/terminal_bench_2_1/results.csv

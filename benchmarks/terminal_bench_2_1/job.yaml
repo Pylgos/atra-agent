@@ -1,0 +1,46 @@
+job_name: atra-codex-terminal-bench-2-1
+jobs_dir: benchmarks/terminal_bench_2_1/jobs
+n_attempts: 1
+n_concurrent_trials: 1
+timeout_multiplier: 1.0
+environment:
+  type: docker
+  delete: true
+agents:
+  - name: codex
+    model_name: openai/gpt-5.6-sol
+    env:
+      CODEX_FORCE_AUTH_JSON: "true"
+    kwargs:
+      version: "0.146.0"
+      reasoning_effort: medium
+  - import_path: benchmarks.terminal_bench_2_1.atra_agent:AtraAgent
+    model_name: openai/gpt-5.6-sol
+    kwargs:
+      atra_binary: result-atra/bin/atra
+      reasoning_effort: medium
+      agent_version: 69b8481da57f141848e7462939ddb1d600c341ad
+datasets:
+  - name: terminal-bench/terminal-bench-2-1
+    ref: sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a
+    task_names:
+      - terminal-bench/sparql-university
+      - terminal-bench/sam-cell-seg
+      - terminal-bench/extract-moves-from-video
+      - terminal-bench/llm-inference-batching-scheduler
+      - terminal-bench/feal-linear-cryptanalysis
+      - terminal-bench/train-fasttext
+      - terminal-bench/bn-fit-modify
+      - terminal-bench/fix-code-vulnerability
+      - terminal-bench/gpt2-codegolf
+      - terminal-bench/install-windows-3.11
+      - terminal-bench/video-processing
+      - terminal-bench/mcmc-sampling-stan
+      - terminal-bench/feal-differential-cryptanalysis
+      - terminal-bench/dna-assembly
+      - terminal-bench/password-recovery
+      - terminal-bench/fix-ocaml-gc
+      - terminal-bench/configure-git-webserver
+      - terminal-bench/model-extraction-relu-logits
+      - terminal-bench/protein-assembly
+      - terminal-bench/regex-chess
