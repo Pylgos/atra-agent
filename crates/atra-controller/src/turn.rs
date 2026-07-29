@@ -722,11 +722,13 @@ impl State {
         while let Some(response) = responses.pop_front() {
             match response {
                 ModelResponse::AssistantMessage { content, phase } => {
+                    let (content, todos) = parse_todo_annotation(content);
                     self.append_event(
                         thread_id,
                         ThreadEventData::AssistantMessage(AssistantMessageEvent {
                             content: content.clone(),
                             phase,
+                            todos,
                         }),
                         updates,
                     )
@@ -750,7 +752,6 @@ impl State {
                     arguments,
                     call_id,
                 } => {
-                    needs_follow_up = true;
                     self.append_event(
                         thread_id,
                         ThreadEventData::ToolCall(ToolCallEvent::Function {
@@ -762,22 +763,7 @@ impl State {
                     )
                     .await
                     .context("failed to save tool call")?;
-                    match name.as_str() {
-                        "update_todos" => {
-                            let _: UpdateTodosArguments = serde_json::from_value(arguments)
-                                .context("model returned invalid update_todos arguments")?;
-                            self.save_tool_result(
-                                thread_id,
-                                &name,
-                                call_id.as_deref(),
-                                ToolOutcome::text("Todos updated".to_owned()),
-                                false,
-                                updates,
-                            )
-                            .await?;
-                        }
-                        _ => bail!("model requested unsupported tool {name}"),
-                    }
+                    bail!("model requested unsupported tool {name}");
                 }
                 ModelResponse::CustomToolCall {
                     item_id,

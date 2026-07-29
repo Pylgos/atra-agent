@@ -17,8 +17,8 @@ use atra_protocol::{
     CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
     ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
     RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
-    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TokenUsageEvent,
-    ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
+    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
+    TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};

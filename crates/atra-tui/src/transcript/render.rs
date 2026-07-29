@@ -3,7 +3,9 @@ use std::{collections::HashSet, sync::LazyLock};
 use atra_patch::{
     ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
 };
-use atra_protocol::{CommandExecutionArtifact, RunnerOperationArtifact, ToolArtifact};
+use atra_protocol::{
+    CommandExecutionArtifact, RunnerOperationArtifact, TodoItem, TodoStatus, ToolArtifact,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -250,10 +252,23 @@ pub(crate) fn prepare_transcript(
 
 fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Vec<DisplayedLine> {
     let content_width = usize::from(width.saturating_sub(2)).max(1);
-    if let TranscriptItem::Message { author, text } = item {
+    if let TranscriptItem::Message {
+        author,
+        text,
+        todos,
+    } = item
+    {
         let background = (*author == Author::User).then_some(Color::DarkGray);
         let mut first_event_line = true;
-        return render_markdown(text)
+        let mut lines = Vec::new();
+        if !todos.is_empty() {
+            lines.extend(todo_lines(todos));
+            if !text.is_empty() {
+                lines.push(Line::default());
+            }
+        }
+        lines.extend(render_markdown(text));
+        return lines
             .into_iter()
             .flat_map(|line| {
                 wrap_line(line, content_width)
@@ -430,7 +445,6 @@ fn tool_call_lines(
             false,
             false,
         ),
-        "update_todos" => todo_update_lines(object),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
         _ => {
             let mut lines = vec![(
@@ -454,75 +468,31 @@ fn tool_call_lines(
     }
 }
 
-fn todo_update_lines(
-    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Vec<(Option<char>, Line<'static>)> {
-    let mut lines = vec![(
-        Some('◆'),
-        Line::from(Span::styled(
-            "Updated Todos",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    )];
-    if let Some(explanation) = arguments
-        .and_then(|arguments| arguments.get("explanation"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|explanation| !explanation.is_empty())
-    {
-        lines.push((
-            None,
-            Line::from(Span::styled(
-                explanation.to_owned(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-        ));
-    }
-    let Some(todos) = arguments
-        .and_then(|arguments| arguments.get("todos"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return lines;
-    };
-    if todos.is_empty() {
-        lines.push((
-            None,
-            Line::from(Span::styled(
-                "(no todos provided)",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-        ));
-        return lines;
-    }
-    lines.extend(todos.iter().filter_map(|todo| {
-        let step = todo.get("step")?.as_str()?;
-        let (marker, style) = match todo.get("status")?.as_str()? {
-            "completed" => (
+fn todo_lines(todos: &[TodoItem]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "Todos",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(todos.iter().map(|todo| {
+        let (marker, style) = match todo.status {
+            TodoStatus::Completed => (
                 "✔ ",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::CROSSED_OUT),
             ),
-            "in_progress" => (
+            TodoStatus::InProgress => (
                 "□ ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            "pending" => ("□ ", Style::default().fg(Color::DarkGray)),
-            _ => return None,
+            TodoStatus::Pending => ("□ ", Style::default().fg(Color::DarkGray)),
         };
-        Some((
-            None,
-            Line::from(vec![
-                Span::styled(marker, style),
-                Span::styled(step.to_owned(), style),
-            ]),
-        ))
+        Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(todo.step.clone(), style),
+        ])
     }));
     lines
 }

@@ -4,45 +4,6 @@ use indoc::indoc;
 pub(super) fn model_tools() -> Vec<model::ModelTool> {
     vec![
         model::ModelTool::WebSearch,
-        model::ModelTool::Function {
-            name: "update_todos",
-            description: indoc! {"
-                Updates the task todo list.
-                Provide an optional explanation and a list of todos, each with a step and status.
-                At most one todo can be in_progress at a time.
-            "},
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "explanation": {
-                        "type": "string",
-                        "description": "Optional explanation for this todo update."
-                    },
-                    "todos": {
-                        "type": "array",
-                        "description": "The list of todos.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step": {
-                                    "type": "string",
-                                    "description": "Todo step text."
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Todo status."
-                                }
-                            },
-                            "required": ["step", "status"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["todos"],
-                "additionalProperties": false
-            }),
-        },
         model::ModelTool::Custom {
             name: "command",
             description: indoc! {"
@@ -60,7 +21,13 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
 
                 Patches:
                 Run `atri patch` as a foreground command and pass the patch on standard input to add, update, delete, or move files.
-                Use a quoted Bash heredoc so the patch is passed literally.
+                Use a quoted Bash heredoc ending the command line with `<<'PATCH'` and terminating it with `PATCH` on its own line.
+                The command before `<<'PATCH'` may include other shell syntax. A typical invocation is:
+                `atri patch <<'PATCH'`
+                `*** Begin Patch`
+                `...`
+                `*** End Patch`
+                `PATCH`
                 Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>`.
                 Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
                 Paths in patches are relative to the command's working directory unless absolute.
@@ -82,7 +49,8 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                     ?command_item: command_line | patch
                     command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
 
-                    patch: PATCH_BEGIN LF hunk+ PATCH_END LF
+                    patch: HEREDOC_START LF PATCH_BEGIN LF hunk+ PATCH_END LF "PATCH" LF?
+                    HEREDOC_START: /[^\n]+<<'PATCH'/
                     PATCH_BEGIN: "*** Begin Patch"
                     PATCH_END: "*** End Patch"
                     hunk: add_hunk | delete_hunk | update_hunk
@@ -122,29 +90,50 @@ pub(super) struct CommandArguments {
     pub(super) command: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[expect(dead_code, reason = "deserialized to validate model tool arguments")]
-pub(super) struct UpdateTodosArguments {
-    #[serde(default)]
-    pub(super) explanation: Option<String>,
-    pub(super) todos: Vec<TodoArguments>,
-}
+pub(super) fn parse_todo_annotation(content: String) -> (String, Vec<TodoItem>) {
+    const OPEN: &str = "<todo>\n";
+    const CLOSE: &str = "\n</todo>";
+    let Some(body) = content.strip_prefix(OPEN) else {
+        return (content, Vec::new());
+    };
+    let Some(close) = body.find(CLOSE) else {
+        return (content, Vec::new());
+    };
+    let todo_text = &body[..close];
+    let remainder = &body[close + CLOSE.len()..];
+    if !remainder.is_empty() && !remainder.starts_with('\n') {
+        return (content, Vec::new());
+    }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[expect(dead_code, reason = "deserialized to validate model tool arguments")]
-pub(super) struct TodoArguments {
-    pub(super) step: String,
-    pub(super) status: TodoStatus,
-}
+    let mut todos = Vec::new();
+    for line in todo_text.lines() {
+        let (status, step) = if let Some(step) = line.strip_prefix("- [x]: ") {
+            (TodoStatus::Completed, step)
+        } else if let Some(step) = line.strip_prefix("- [-]: ") {
+            (TodoStatus::InProgress, step)
+        } else if let Some(step) = line.strip_prefix("- [ ]: ") {
+            (TodoStatus::Pending, step)
+        } else {
+            return (content, Vec::new());
+        };
+        let step = step.trim();
+        if step.is_empty() {
+            return (content, Vec::new());
+        }
+        todos.push(TodoItem {
+            step: step.to_owned(),
+            status,
+        });
+    }
+    if todos.is_empty() {
+        return (content, Vec::new());
+    }
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum TodoStatus {
-    Pending,
-    InProgress,
-    Completed,
+    let remainder = remainder
+        .strip_prefix("\n\n")
+        .or_else(|| remainder.strip_prefix('\n'))
+        .unwrap_or(remainder);
+    (remainder.to_owned(), todos)
 }
 
 pub(super) const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
@@ -516,4 +505,61 @@ pub(super) fn ceil_char_boundary(value: &str, mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_todo_annotation() {
+        let (content, todos) = parse_todo_annotation(
+            "<todo>\n- [x]: task a\n- [-]: task b\n- [ ]: task c\n</todo>\n\nBody".to_owned(),
+        );
+        assert_eq!(content, "Body");
+        assert_eq!(
+            todos,
+            vec![
+                TodoItem {
+                    step: "task a".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    step: "task b".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    step: "task c".to_owned(),
+                    status: TodoStatus::Pending,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_invalid_todo_annotation() {
+        for content in [
+            "<todo>\n- [!]: task\n</todo>",
+            "<todo>\n- [ ]: \n</todo>",
+            "<todo>\n- [ ]: task",
+            "Body\n<todo>\n- [ ]: task\n</todo>",
+        ] {
+            let (parsed, todos) = parse_todo_annotation(content.to_owned());
+            assert_eq!(parsed, content);
+            assert!(todos.is_empty());
+        }
+    }
+
+    #[test]
+    fn parses_multiple_in_progress_todos() {
+        let (content, todos) =
+            parse_todo_annotation("<todo>\n- [-]: one\n- [-]: two\n</todo>".to_owned());
+        assert!(content.is_empty());
+        assert_eq!(todos.len(), 2);
+        assert!(
+            todos
+                .iter()
+                .all(|todo| todo.status == TodoStatus::InProgress)
+        );
+    }
 }

@@ -462,6 +462,22 @@ pub struct AssistantMessageEvent {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<AssistantMessagePhase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<TodoItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TodoItem {
+    pub step: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

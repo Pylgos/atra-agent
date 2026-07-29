@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use atra_protocol::{
-    EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, ToolCallEvent,
+    EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, TodoItem, ToolCallEvent,
     ToolResultEvent,
 };
 use ratatui::text::Line;
@@ -234,6 +234,7 @@ pub(crate) enum TranscriptItem {
     Message {
         author: Author,
         text: String,
+        todos: Vec<TodoItem>,
     },
     ReasoningSummary {
         text: String,
@@ -270,7 +271,19 @@ pub(crate) enum RunnerResult {
 
 impl TranscriptItem {
     pub(crate) fn message(author: Author, text: String) -> Self {
-        Self::Message { author, text }
+        Self::Message {
+            author,
+            text,
+            todos: Vec::new(),
+        }
+    }
+
+    pub(crate) fn assistant_message(text: String, todos: Vec<TodoItem>) -> Self {
+        Self::Message {
+            author: Author::Assistant,
+            text,
+            todos,
+        }
     }
 
     pub(crate) fn append_message(&mut self, content: &str) {
@@ -464,6 +477,7 @@ impl TranscriptEntry {
             TranscriptItem::Message {
                 author: Author::User,
                 text,
+                ..
             } => Some(text),
             _ => None,
         }
@@ -497,9 +511,16 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             Author::User,
             sanitize(&message.content),
         )),
-        ThreadEventData::AssistantMessage(message) => Some(TranscriptItem::message(
-            Author::Assistant,
+        ThreadEventData::AssistantMessage(message) => Some(TranscriptItem::assistant_message(
             sanitize(&message.content),
+            message
+                .todos
+                .into_iter()
+                .map(|todo| TodoItem {
+                    step: sanitize(&todo.step),
+                    status: todo.status,
+                })
+                .collect(),
         )),
         ThreadEventData::Reasoning(reasoning) => {
             let summary = reasoning.item.pointer("/summary")?.as_array()?;
@@ -554,25 +575,20 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             }
         }
         ThreadEventData::ToolResult(result) => {
-            let (name, result, artifacts, masked_result) = match result {
+            let (result, artifacts, masked_result) = match result {
                 ToolResultEvent::Custom {
-                    name,
                     result,
                     artifacts,
                     masked_result,
                     ..
                 }
                 | ToolResultEvent::Function {
-                    name,
                     result,
                     artifacts,
                     masked_result,
                     ..
-                } => (name, result, artifacts, masked_result),
+                } => (result, artifacts, masked_result),
             };
-            if name == "update_todos" {
-                return None;
-            }
             let masked = masked_result
                 .as_ref()
                 .is_some_and(|masked| masked != &result);
@@ -754,25 +770,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn event_conversion_sanitizes_nested_tool_input() {
+    fn event_conversion_sanitizes_todos() {
         let event = ThreadEvent {
             sequence: EventSequence(1),
-            data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                name: "update\u{1b}[31m_todos".to_owned(),
-                arguments: serde_json::json!({
-                    "todos": [{
-                        "step": "safe\u{1b}]52;c;bad\u{7}",
-                        "status": "pending"
-                    }]
-                }),
-                call_id: None,
+            data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
+                content: "body".to_owned(),
+                phase: None,
+                todos: vec![TodoItem {
+                    step: "safe\u{1b}]52;c;bad\u{7}".to_owned(),
+                    status: atra_protocol::TodoStatus::Pending,
+                }],
             }),
         };
 
-        let Some(TranscriptItem::ToolCall { name, arguments }) = item_from_event(event) else {
-            panic!("tool call event was not converted");
+        let Some(TranscriptItem::Message { todos, .. }) = item_from_event(event) else {
+            panic!("assistant message event was not converted");
         };
-        assert_eq!(name, "update_todos");
-        assert_eq!(arguments.unwrap()["todos"][0]["step"], "safe");
+        assert_eq!(todos[0].step, "safe");
     }
 }

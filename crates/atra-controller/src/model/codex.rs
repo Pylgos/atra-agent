@@ -1036,17 +1036,6 @@ fn tool_definitions(tools: &[ModelTool]) -> Result<ResponsesApiTools> {
                 "type": "web_search",
                 "external_web_access": true
             }),
-            ModelTool::Function {
-                name,
-                description,
-                parameters,
-            } => json!({
-                "type": "function",
-                "name": name,
-                "description": description,
-                "strict": false,
-                "parameters": parameters,
-            }),
             ModelTool::Custom {
                 name,
                 description,

@@ -21,7 +21,7 @@ pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     Guidelines:
     - Be concise in your responses.
     - Show file paths clearly when working with files.
-    - Use update_todos to track non-trivial multi-step work. Keep at most one todo in progress, and mark every todo completed before ending the task.
+    - For non-trivial work, put a todo annotation at the beginning of a commentary message or final answer when the todo state changes. Use `<todo>` and `</todo>` on separate lines with one or more `- [x]: completed`, `- [-]: in progress`, or `- [ ]: pending` lines between them. Omit the annotation when the todo state does not change.
     - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -116,11 +116,6 @@ pub(crate) struct ModelRequest<'a> {
 
 pub(crate) enum ModelTool {
     WebSearch,
-    Function {
-        name: &'static str,
-        description: &'static str,
-        parameters: serde_json::Value,
-    },
     Custom {
         name: &'static str,
         description: &'static str,

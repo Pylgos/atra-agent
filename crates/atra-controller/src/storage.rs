@@ -802,6 +802,7 @@ mod tests {
                     ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                         content: "two".to_owned(),
                         phase: None,
+                        todos: Vec::new(),
                     })
                 )
                 .await
@@ -822,6 +823,7 @@ mod tests {
                     data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                         content: "two".to_owned(),
                         phase: None,
+                        todos: Vec::new(),
                     }),
                 },
             ]
