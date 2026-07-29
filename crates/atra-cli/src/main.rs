@@ -663,6 +663,7 @@ async fn display_turn_stream(mut stream: TurnStream) -> Result<()> {
             | TurnEvent::Delta { .. }
             | TurnEvent::ReasoningSummaryDelta { .. }
             | TurnEvent::ReasoningSummaryPartAdded
+            | TurnEvent::WebSearchUpdate { .. }
             | TurnEvent::ToolCallStarted { .. }
             | TurnEvent::ToolCallDelta { .. }
             | TurnEvent::RunnerOperation { .. }

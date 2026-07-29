@@ -16,7 +16,7 @@ pub(crate) use render::{
 pub(crate) struct TranscriptState {
     pub(crate) entries: Vec<TranscriptEntry>,
     pub(crate) events: Vec<ThreadEvent>,
-    tool_call_previews: HashMap<String, usize>,
+    live_previews: HashMap<String, usize>,
 }
 
 impl TranscriptState {
@@ -24,14 +24,14 @@ impl TranscriptState {
         Self {
             entries,
             events,
-            tool_call_previews: HashMap::new(),
+            live_previews: HashMap::new(),
         }
     }
 
     pub(crate) fn replace(&mut self, entries: Vec<TranscriptEntry>, events: Vec<ThreadEvent>) {
         self.entries = entries;
         self.events = events;
-        self.tool_call_previews.clear();
+        self.live_previews.clear();
     }
 
     pub(crate) fn replace_events(&mut self, events: Vec<ThreadEvent>) {
@@ -88,18 +88,35 @@ impl TranscriptState {
                 name: sanitize(name),
                 arguments: None,
             }));
-        self.tool_call_previews.insert(item_id, index);
+        self.live_previews.insert(item_id, index);
+    }
+
+    pub(crate) fn update_web_search_preview(
+        &mut self,
+        item_id: String,
+        action: Option<serde_json::Value>,
+    ) {
+        let item = TranscriptItem::WebSearch {
+            action: sanitize_value(action.unwrap_or(serde_json::Value::Null)),
+        };
+        if let Some(index) = self.live_previews.get(&item_id) {
+            self.entries[*index].replace(item);
+            return;
+        }
+        let index = self.entries.len();
+        self.entries.push(TranscriptEntry::new(item));
+        self.live_previews.insert(item_id, index);
     }
 
     pub(crate) fn append_tool_preview(&mut self, item_id: &str, content: &str) {
-        if let Some(index) = self.tool_call_previews.get(item_id) {
+        if let Some(index) = self.live_previews.get(item_id) {
             self.entries[*index].append_tool_input(&sanitize(content));
         }
     }
 
-    pub(crate) fn discard_tool_previews(&mut self) {
+    pub(crate) fn discard_live_previews(&mut self) {
         let mut indices = self
-            .tool_call_previews
+            .live_previews
             .drain()
             .map(|(_, index)| index)
             .collect::<Vec<_>>();
@@ -159,6 +176,11 @@ impl TranscriptState {
         self.events.push(event.clone());
         let item_id = match &event.data {
             ThreadEventData::ToolCall(ToolCallEvent::Custom { item_id, .. }) => item_id.clone(),
+            ThreadEventData::WebSearch(search) => search
+                .item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             _ => None,
         };
         let sequence = event.sequence;
@@ -170,9 +192,11 @@ impl TranscriptState {
         };
         if matches!(
             item,
-            TranscriptItem::ToolCall { .. } | TranscriptItem::RunnerTool { .. }
+            TranscriptItem::WebSearch { .. }
+                | TranscriptItem::ToolCall { .. }
+                | TranscriptItem::RunnerTool { .. }
         ) && let Some(item_id) = item_id
-            && let Some(index) = self.tool_call_previews.remove(&item_id)
+            && let Some(index) = self.live_previews.remove(&item_id)
         {
             self.entries[index].replace_event(sequence, item);
             return;

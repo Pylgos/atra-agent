@@ -45,7 +45,7 @@ impl App {
                 return Ok(());
             }
             TurnUpdate::StreamFailed(error) => {
-                self.transcript.discard_tool_previews();
+                self.transcript.discard_live_previews();
                 self.turn = TurnState::Idle;
                 self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                 return Ok(());
@@ -382,6 +382,11 @@ impl App {
             TurnEvent::ReasoningSummaryPartAdded => {
                 if self.target.thread_id() == Some(thread_id) {
                     self.transcript.finish_reasoning_part();
+                }
+            }
+            TurnEvent::WebSearchUpdate { item_id, action } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.update_web_search_preview(item_id, action);
                 }
             }
             TurnEvent::ToolCallStarted { item_id, name } => {

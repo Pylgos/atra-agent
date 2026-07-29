@@ -408,6 +408,22 @@ async fn read_completion(
                     let _ = updates.send(ModelStreamEvent::ReasoningSummaryPartAdded);
                 }
             }
+            ResponseEvent::OutputItemAdded(ResponseItem::WebSearchCall {
+                id: Some(item_id),
+                action,
+                ..
+            }) => {
+                let action = action
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .context("failed to encode live web search action")?;
+                if let Some(updates) = updates {
+                    let _ = updates.send(ModelStreamEvent::WebSearchUpdate {
+                        item_id: item_id.to_string(),
+                        action,
+                    });
+                }
+            }
             ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
                 id: Some(item_id),
                 name,
@@ -426,6 +442,24 @@ async fn read_completion(
                 }
             }
             ResponseEvent::OutputItemDone(item) => {
+                if let ResponseItem::WebSearchCall {
+                    id: Some(item_id),
+                    action,
+                    ..
+                } = &item
+                {
+                    let action = action
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()
+                        .context("failed to encode live web search action")?;
+                    if let Some(updates) = updates {
+                        let _ = updates.send(ModelStreamEvent::WebSearchUpdate {
+                            item_id: item_id.to_string(),
+                            action,
+                        });
+                    }
+                }
                 output.push(item);
             }
             ResponseEvent::Completed {

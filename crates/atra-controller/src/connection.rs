@@ -81,6 +81,9 @@ async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) 
         ModelStreamEvent::ReasoningSummaryPartAdded => {
             ControllerResponse::ReasoningSummaryPartAdded
         }
+        ModelStreamEvent::WebSearchUpdate { item_id, action } => {
+            ControllerResponse::WebSearchUpdate { item_id, action }
+        }
         ModelStreamEvent::ToolCallStarted { item_id, name } => {
             ControllerResponse::ToolCallStarted { item_id, name }
         }

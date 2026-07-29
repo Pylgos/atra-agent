@@ -78,6 +78,10 @@ pub enum TurnEvent {
         content: String,
     },
     ReasoningSummaryPartAdded,
+    WebSearchUpdate {
+        item_id: String,
+        action: Option<Value>,
+    },
     ToolCallStarted {
         item_id: String,
         name: String,
@@ -164,6 +168,9 @@ impl TurnStream {
                 TurnEvent::ReasoningSummaryDelta { content }
             }
             ControllerResponse::ReasoningSummaryPartAdded => TurnEvent::ReasoningSummaryPartAdded,
+            ControllerResponse::WebSearchUpdate { item_id, action } => {
+                TurnEvent::WebSearchUpdate { item_id, action }
+            }
             ControllerResponse::ToolCallStarted { item_id, name } => {
                 TurnEvent::ToolCallStarted { item_id, name }
             }

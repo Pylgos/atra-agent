@@ -237,6 +237,10 @@ pub enum ControllerResponse {
         content: String,
     },
     ReasoningSummaryPartAdded,
+    WebSearchUpdate {
+        item_id: String,
+        action: Option<Value>,
+    },
     ToolCallStarted {
         item_id: String,
         name: String,
