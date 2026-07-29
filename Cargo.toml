@@ -20,6 +20,7 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1.91"
 atra-controller = { path = "crates/atra-controller" }
 atra-id = { path = "crates/atra-id" }
 atra-patch = { path = "crates/atra-patch" }

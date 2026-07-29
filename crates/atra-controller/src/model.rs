@@ -1,22 +1,30 @@
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::storage::Event;
-use anyhow::{Context, Result};
+use anyhow::Result;
+use async_trait::async_trait;
 use atra_protocol::{
     ApprovalId, AssistantMessagePhase, Model, RunnerOperationUpdate, ThreadEvent, ThreadId,
 };
-use codex_protocol::models::{ContentItem, MessagePhase, ResponseItem};
-use codex_protocol::protocol::{RateLimitSnapshot, TokenUsage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use self::{codex::CodexProvider, fake::FakeProvider};
+use crate::storage::Event;
 
-mod codex;
+pub(crate) mod codex;
 mod fake;
 
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
+    You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
 
-#[derive(Debug, Deserialize)]
+    Commands execute on Atra Runners. The available Runners are provided in the conversation context. For each tool call, choose a suitable Runner with no more access than the operation requires.
+
+    Guidelines:
+    - Be concise in your responses.
+    - Show file paths clearly when working with files.
+    - Use update_todos to track non-trivial multi-step work. Keep at most one todo in progress, and mark every todo completed before ending the task.
+    - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ModelResponse {
     AssistantMessage {
@@ -25,7 +33,7 @@ pub(crate) enum ModelResponse {
         phase: Option<AssistantMessagePhase>,
     },
     WebSearch {
-        item: ResponseItem,
+        item: serde_json::Value,
     },
     ToolCall {
         name: String,
@@ -40,7 +48,7 @@ pub(crate) enum ModelResponse {
         call_id: String,
     },
     Reasoning {
-        item: ResponseItem,
+        item: serde_json::Value,
     },
 }
 
@@ -75,217 +83,82 @@ pub(crate) enum ModelStreamEvent {
     ThreadEvent(ThreadEvent),
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ProviderOutput {
+    pub provider: String,
+    pub data: serde_json::Value,
+}
+
 pub(crate) struct ModelCompletion {
-    pub output: Vec<ResponseItem>,
+    pub output: ProviderOutput,
+    pub responses: Vec<ModelResponse>,
     pub response_id: Option<String>,
-    pub token_usage: Option<TokenUsage>,
-    pub rate_limits: Vec<RateLimitSnapshot>,
+    pub token_usage: Option<serde_json::Value>,
+    pub rate_limits: Vec<serde_json::Value>,
 }
 
-pub(crate) fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
-    match item {
-        ResponseItem::Message { content, phase, .. } => {
-            let content = content
-                .into_iter()
-                .filter_map(|item| match item {
-                    ContentItem::OutputText { text } => Some(text),
-                    ContentItem::InputText { .. }
-                    | ContentItem::InputImage { .. }
-                    | ContentItem::InputAudio { .. } => None,
-                })
-                .collect::<String>();
-            let phase = phase.map(|phase| match phase {
-                MessagePhase::Commentary => AssistantMessagePhase::Commentary,
-                MessagePhase::FinalAnswer => AssistantMessagePhase::FinalAnswer,
-            });
-            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content, phase }))
-        }
-        ResponseItem::FunctionCall {
-            name,
-            arguments,
-            call_id,
-            ..
-        } => Ok(Some(ModelResponse::ToolCall {
-            name,
-            arguments: serde_json::from_str(&arguments)
-                .context("Codex returned invalid tool arguments")?,
-            call_id: Some(call_id),
-        })),
-        ResponseItem::CustomToolCall {
-            id,
-            name,
-            input,
-            call_id,
-            ..
-        } => Ok(Some(ModelResponse::CustomToolCall {
-            item_id: id.map(String::from),
-            name,
-            input,
-            call_id,
-        })),
-        item @ ResponseItem::WebSearchCall { .. } => Ok(Some(ModelResponse::WebSearch { item })),
-        item @ ResponseItem::Reasoning { .. } => Ok(Some(ModelResponse::Reasoning { item })),
-        _ => Ok(None),
-    }
+pub(crate) struct ModelRequest<'a> {
+    pub model: &'a str,
+    pub reasoning_effort: &'a str,
+    pub instructions: &'a str,
+    pub tools: &'a [ModelTool],
+    pub events: &'a [Event],
+    pub prompt_cache_key: &'a str,
 }
 
-pub(crate) enum Provider {
-    Fake(FakeProvider),
-    Codex(CodexProvider),
+pub(crate) enum ModelTool {
+    WebSearch,
+    Function {
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    },
+    Custom {
+        name: &'static str,
+        description: &'static str,
+        format: ModelToolFormat,
+    },
 }
 
-pub(crate) enum TurnSession<'a> {
-    Fake(&'a FakeProvider),
-    Codex(codex::CodexTurn),
+pub(crate) struct ModelToolFormat {
+    pub syntax: &'static str,
+    pub definition: &'static str,
 }
 
-impl Provider {
-    pub(crate) fn fake(path: &Path) -> Result<Self> {
-        Ok(Self::Fake(FakeProvider::load(path)?))
-    }
+#[async_trait]
+pub(crate) trait ModelProvider: Send + Sync {
+    async fn models(&self) -> Result<Vec<Model>>;
 
-    pub(crate) async fn codex(auth_home: PathBuf) -> Self {
-        Self::Codex(CodexProvider::new(auth_home).await)
-    }
+    async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>>;
 
-    pub(crate) async fn login_status(&self) -> Option<Option<String>> {
-        match self {
-            Self::Fake(_) => Some(None),
-            Self::Codex(provider) => provider.login_status().await,
-        }
-    }
+    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value>;
 
-    pub(crate) async fn reload_auth(&self) {
-        if let Self::Codex(provider) = self {
-            provider.reload_auth().await;
-        }
-    }
+    fn context_tokens(&self, events: &[Event]) -> Result<usize>;
 
-    pub(crate) async fn logout(&self) -> Result<()> {
-        if let Self::Codex(provider) = self {
-            provider.logout().await?;
-        }
-        Ok(())
-    }
+    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value>;
+}
 
-    pub(crate) async fn models(&self) -> Result<Vec<Model>> {
-        match self {
-            Self::Fake(_) => Ok(vec![Model {
-                id: DEFAULT_MODEL.to_owned(),
-                display_name: DEFAULT_MODEL.to_owned(),
-                description: None,
-                default_reasoning_effort: "medium".to_owned(),
-                supported_reasoning_efforts: ["low", "medium", "high", "xhigh"]
-                    .map(str::to_owned)
-                    .to_vec(),
-                context_window: None,
-                auto_compact_token_limit: None,
-            }]),
-            Self::Codex(provider) => provider.models().await,
-        }
-    }
-
-    pub(crate) async fn rate_limits(&self) -> Result<Vec<RateLimitSnapshot>> {
-        match self {
-            Self::Fake(_) => Ok(Vec::new()),
-            Self::Codex(provider) => provider.rate_limits().await,
-        }
-    }
-
-    pub(crate) async fn start_turn(&self, session_id: &str) -> Result<TurnSession<'_>> {
-        match self {
-            Self::Fake(provider) => Ok(TurnSession::Fake(provider)),
-            Self::Codex(provider) => Ok(TurnSession::Codex(
-                provider.start_turn(session_id.to_owned()).await?,
-            )),
-        }
-    }
-
-    pub(crate) fn completion_snapshot(
+#[async_trait]
+pub(crate) trait ModelSession: Send + Sync {
+    async fn complete(
         &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<serde_json::Value> {
-        match self {
-            Self::Fake(_) => Ok(serde_json::json!({
-                "provider": "fake",
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "events": events,
-            })),
-            Self::Codex(provider) => {
-                provider.completion_snapshot(model, reasoning_effort, events, prompt_cache_key)
-            }
-        }
-    }
+        request: &ModelRequest<'_>,
+        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ModelCompletion>;
 
-    pub(crate) fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        codex::context_tokens(events)
-    }
+    async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>>;
+}
 
-    pub(crate) fn compaction_snapshot(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<serde_json::Value> {
-        match self {
-            Self::Fake(_) => Ok(serde_json::json!({
-                "provider": "fake",
-                "kind": "compaction",
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "events": events,
-            })),
-            Self::Codex(provider) => {
-                provider.compaction_snapshot(model, reasoning_effort, events, prompt_cache_key)
-            }
-        }
-    }
+pub(crate) fn fake(path: &std::path::Path) -> Result<Arc<dyn ModelProvider>> {
+    Ok(Arc::new(fake::FakeProvider::load(path)?))
+}
+
+pub(crate) async fn codex(auth_home: std::path::PathBuf) -> Arc<codex::CodexProvider> {
+    Arc::new(codex::CodexProvider::new(auth_home).await)
 }
 
 pub(crate) fn text_tokens(text: &str) -> usize {
     tiktoken_rs::o200k_base_singleton()
         .encode_ordinary(text)
         .len()
-}
-
-impl TurnSession<'_> {
-    pub(crate) async fn complete(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
-        prompt_cache_key: &str,
-    ) -> Result<ModelCompletion> {
-        match self {
-            Self::Fake(provider) => provider.complete(events).await,
-            Self::Codex(session) => {
-                session
-                    .complete(model, reasoning_effort, events, updates, prompt_cache_key)
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn compact(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<Vec<ResponseItem>> {
-        match self {
-            Self::Fake(_) => Ok(Vec::new()),
-            Self::Codex(session) => {
-                session
-                    .compact(model, reasoning_effort, events, prompt_cache_key)
-                    .await
-            }
-        }
-    }
 }

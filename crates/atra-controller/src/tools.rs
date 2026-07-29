@@ -1,4 +1,120 @@
 use super::*;
+use indoc::indoc;
+
+pub(super) fn model_tools() -> Vec<model::ModelTool> {
+    vec![
+        model::ModelTool::WebSearch,
+        model::ModelTool::Function {
+            name: "update_todos",
+            description: indoc! {"
+                Updates the task todo list.
+                Provide an optional explanation and a list of todos, each with a step and status.
+                At most one todo can be in_progress at a time.
+            "},
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "explanation": {
+                        "type": "string",
+                        "description": "Optional explanation for this todo update."
+                    },
+                    "todos": {
+                        "type": "array",
+                        "description": "The list of todos.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {
+                                    "type": "string",
+                                    "description": "Todo step text."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Todo status."
+                                }
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["todos"],
+                "additionalProperties": false
+            }),
+        },
+        model::ModelTool::Custom {
+            name: "command",
+            description: indoc! {"
+                Execute one or more Bash commands on named Atra Runners.
+                Start each command with `*** Runner <runner>`; repeat it to run another command or switch Runners.
+                A command ends at the next `*** Runner <runner>` line or the end of the tool input.
+
+                Processes:
+                Each command waits up to 120000 milliseconds and is left running if unfinished.
+                Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+                Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
+                Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
+                Run `atri proc stop <process-id>...` to stop named processes.
+                These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
+
+                Patches:
+                Run `atri patch` as a foreground command and pass the patch on standard input to add, update, delete, or move files.
+                Use a quoted Bash heredoc so the patch is passed literally.
+                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>`.
+                Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
+                Paths in patches are relative to the command's working directory unless absolute.
+                Use line ranges for large deletions or replacements when the line numbers are already known.
+                When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
+                Use ordinary diff lines for small changes.
+                Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
+
+                Commands in one tool call execute sequentially, and their results are returned together after all commands have finished.
+                Use a separate tool call when a result is needed to decide the next operation.
+            "},
+            format: model::ModelToolFormat {
+                syntax: "lark",
+                definition: indoc! {r#"
+                    start: runner_group+
+                    runner_group: runner command_item+
+                    runner: "*** Runner " name LF
+
+                    ?command_item: command_line | patch
+                    command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
+
+                    patch: PATCH_BEGIN LF hunk+ PATCH_END LF
+                    PATCH_BEGIN: "*** Begin Patch"
+                    PATCH_END: "*** End Patch"
+                    hunk: add_hunk | delete_hunk | update_hunk
+                    add_hunk: "*** Add File: " filename LF add_line+
+                    delete_hunk: "*** Delete File: " filename LF
+                    update_hunk: "*** Update File: " filename LF change_move? first_update following_update*
+
+                    name: /(.+)/
+                    filename: /(.+)/
+                    add_line: "+" /(.*)/ LF -> line
+
+                    change_move: "*** Move to: " filename LF
+                    first_update: change | range_change
+                    following_update: headed_change | range_change
+                    change: change_context? change_line+ eof_line?
+                    headed_change: change_context change_line+ eof_line?
+                    change_context: ("@@" | "@@ " /(.+)/) LF
+                    change_line: ("+" | "-" | " ") /(.*)/ LF
+                    eof_line: "*** End of File" LF
+
+                    range_change: range_start remove_line (range_end remove_line)? add_line*
+                    range_start: "@ start " INT LF
+                    range_end: "@ end " INT LF
+                    remove_line: "-" /(.*)/ LF
+
+                    %import common.INT
+                    %import common.LF
+                "#},
+            },
+        },
+    ]
+}
 
 #[derive(Deserialize, serde::Serialize)]
 pub(super) struct ExecCommandArguments {

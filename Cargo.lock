@@ -666,6 +666,7 @@ name = "atra-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atra-id",
  "atra-patch",
  "atra-platform",

@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use codex_api::{
     AuthProvider, CompactClient, CompactionInput, ModelsClient, Reasoning, ResponseEvent,
     ResponseStream, ResponsesApiRequest, ResponsesApiTools, ResponsesClient,
@@ -24,27 +25,20 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::{config_types::ReasoningSummary, protocol::RateLimitSnapshot};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
-use indoc::indoc;
 use serde_json::{json, value::RawValue};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 use atra_protocol::{Model, Runner};
 
-use super::{ModelCompletion, ModelStreamEvent, response_from_item};
+use super::{
+    ModelCompletion, ModelProvider, ModelRequest, ModelResponse, ModelSession, ModelStreamEvent,
+    ModelTool, ProviderOutput,
+};
 use crate::storage::Event;
 use atra_protocol::{InstructionEvent, RunnersEvent, ThreadEventData, ToolResultEvent};
 
-const INSTRUCTIONS: &str = indoc! {r#"
-    You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
-
-    Commands execute on Atra Runners. The available Runners are provided in the conversation context. For each tool call, choose a suitable Runner with no more access than the operation requires.
-
-    Guidelines:
-    - Be concise in your responses.
-    - Show file paths clearly when working with files.
-    - Use update_todos to track non-trivial multi-step work. Keep at most one todo in progress, and mark every todo completed before ending the task.
-    - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+const PROVIDER_ID: &str = "codex";
 
 pub(crate) struct CodexProvider {
     auth: Arc<AuthManager>,
@@ -108,7 +102,7 @@ impl CodexProvider {
         }
     }
 
-    pub(super) async fn login_status(&self) -> Option<Option<String>> {
+    pub(crate) async fn login_status(&self) -> Option<Option<String>> {
         self.auth
             .auth()
             .await
@@ -116,14 +110,14 @@ impl CodexProvider {
             .map(|auth| auth.get_account_email())
     }
 
-    pub(super) async fn reload_auth(&self) {
+    pub(crate) async fn reload_auth(&self) {
         self.auth.reload().await;
         *self.models.write().await = None;
         self.sessions.lock().await.clear();
         self.rate_limits.write().await.clear();
     }
 
-    pub(super) async fn logout(&self) -> Result<()> {
+    pub(crate) async fn logout(&self) -> Result<()> {
         self.auth
             .logout_with_revoke()
             .await
@@ -134,7 +128,7 @@ impl CodexProvider {
         Ok(())
     }
 
-    pub(super) async fn rate_limits(&self) -> Result<Vec<RateLimitSnapshot>> {
+    pub(crate) async fn rate_limits(&self) -> Result<Vec<RateLimitSnapshot>> {
         let auth = self
             .auth
             .auth()
@@ -287,39 +281,54 @@ impl CodexProvider {
             rate_limits: self.rate_limits.clone(),
         })
     }
+}
 
-    pub(super) fn completion_snapshot(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<serde_json::Value> {
-        completion_request(model, reasoning_effort, events, prompt_cache_key)
+#[async_trait]
+impl ModelProvider for CodexProvider {
+    async fn models(&self) -> Result<Vec<Model>> {
+        self.models().await
     }
 
-    pub(super) fn compaction_snapshot(
+    async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>> {
+        Ok(Box::new(self.start_turn(session_id.to_owned()).await?))
+    }
+
+    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
+        completion_request(request)
+    }
+
+    fn context_tokens(&self, events: &[Event]) -> Result<usize> {
+        context_tokens(events)
+    }
+
+    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
+        compaction_request(request)
+    }
+}
+
+#[async_trait]
+impl ModelSession for CodexTurn {
+    async fn complete(
         &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<serde_json::Value> {
-        compaction_request(model, reasoning_effort, events, prompt_cache_key)
+        request: &ModelRequest<'_>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ModelCompletion> {
+        self.complete(request, updates).await
+    }
+
+    async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
+        self.compact(request).await
     }
 }
 
 impl CodexTurn {
-    pub(super) async fn complete(
+    async fn complete(
         &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
+        request: &ModelRequest<'_>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-        prompt_cache_key: &str,
     ) -> Result<ModelCompletion> {
         self.session.touch();
-        let request = completion_request(model, reasoning_effort, events, prompt_cache_key)?;
+        let request = completion_request(request)?;
         let mut headers = HeaderMap::new();
         let session_id = HeaderValue::from_str(&self.session.session_id)
             .context("model session ID is not a valid header value")?;
@@ -340,22 +349,17 @@ impl CodexTurn {
         read_completion(stream, updates, &self.rate_limits).await
     }
 
-    pub(super) async fn compact(
-        &self,
-        model: &str,
-        reasoning_effort: &str,
-        events: &[Event],
-        prompt_cache_key: &str,
-    ) -> Result<Vec<ResponseItem>> {
+    async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
         self.session.touch();
-        let request = compaction_request(model, reasoning_effort, events, prompt_cache_key)?;
+        let request = compaction_request(request)?;
         let mut headers = HeaderMap::new();
         let session_id = HeaderValue::from_str(&self.session.session_id)
             .context("model session ID is not a valid header value")?;
         headers.insert("session-id", session_id.clone());
         headers.insert("thread-id", session_id.clone());
         headers.insert("x-client-request-id", session_id);
-        self.session
+        let items = self
+            .session
             .compact
             .compact(
                 request,
@@ -364,7 +368,14 @@ impl CodexTurn {
                 Some(self.turn_state.as_ref()),
             )
             .await
-            .context("Codex compaction failed")
+            .context("Codex compaction failed")?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ProviderOutput {
+            provider: PROVIDER_ID.to_owned(),
+            data: serde_json::to_value(items).context("failed to encode Codex compaction")?,
+        }))
     }
 }
 
@@ -441,70 +452,74 @@ async fn read_completion(
         }
     }
 
-    if !output
+    let responses = output
         .iter()
         .cloned()
         .map(response_from_item)
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
+        .collect::<Vec<_>>();
+    if !responses
+        .iter()
         .any(|response| !matches!(response, super::ModelResponse::Reasoning { .. }))
     {
         anyhow::bail!("Codex response ended without an assistant message or tool call");
     }
     Ok(ModelCompletion {
-        output,
+        output: ProviderOutput {
+            provider: PROVIDER_ID.to_owned(),
+            data: serde_json::to_value(output).context("failed to encode Codex output")?,
+        },
+        responses,
         response_id,
-        token_usage,
-        rate_limits,
+        token_usage: token_usage
+            .map(serde_json::to_value)
+            .transpose()
+            .context("failed to encode Codex token usage")?,
+        rate_limits: rate_limits
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()
+            .context("failed to encode Codex rate limits")?,
     })
 }
 
-fn completion_request(
-    model: &str,
-    reasoning_effort: &str,
-    events: &[Event],
-    prompt_cache_key: &str,
-) -> Result<serde_json::Value> {
+fn completion_request(request: &ModelRequest<'_>) -> Result<serde_json::Value> {
     serde_json::to_value(ResponsesApiRequest {
-        model: model.to_owned(),
-        instructions: INSTRUCTIONS.to_owned(),
-        input: model_input(events)?,
-        tools: Some(tool_definitions()?),
+        model: request.model.to_owned(),
+        instructions: request.instructions.to_owned(),
+        input: model_input(request.events)?,
+        tools: Some(tool_definitions(request.tools)?),
         tool_choice: "auto".to_owned(),
         parallel_tool_calls: true,
-        reasoning: Some(reasoning(reasoning_effort)?),
+        reasoning: Some(reasoning(request.reasoning_effort)?),
         store: false,
         stream: true,
         stream_options: None,
         include: vec!["reasoning.encrypted_content".to_owned()],
         service_tier: None,
-        prompt_cache_key: Some(prompt_cache_key.to_owned()),
+        prompt_cache_key: Some(request.prompt_cache_key.to_owned()),
         text: None,
         client_metadata: Some(HashMap::from([
-            ("session_id".to_owned(), prompt_cache_key.to_owned()),
-            ("thread_id".to_owned(), prompt_cache_key.to_owned()),
+            ("session_id".to_owned(), request.prompt_cache_key.to_owned()),
+            ("thread_id".to_owned(), request.prompt_cache_key.to_owned()),
         ])),
     })
     .context("failed to encode Codex request")
 }
 
-fn compaction_request(
-    model: &str,
-    reasoning_effort: &str,
-    events: &[Event],
-    prompt_cache_key: &str,
-) -> Result<serde_json::Value> {
-    let input = model_input(events)?;
+fn compaction_request(request: &ModelRequest<'_>) -> Result<serde_json::Value> {
+    let input = model_input(request.events)?;
     serde_json::to_value(CompactionInput {
-        model,
+        model: request.model,
         input: &input,
-        instructions: INSTRUCTIONS,
-        tools: Some(tool_definitions()?),
+        instructions: request.instructions,
+        tools: Some(tool_definitions(request.tools)?),
         parallel_tool_calls: false,
-        reasoning: Some(reasoning(reasoning_effort)?),
+        reasoning: Some(reasoning(request.reasoning_effort)?),
         service_tier: None,
-        prompt_cache_key: Some(prompt_cache_key),
+        prompt_cache_key: Some(request.prompt_cache_key),
         text: None,
     })
     .context("failed to encode Codex compaction request")
@@ -520,6 +535,61 @@ fn reasoning(reasoning_effort: &str) -> Result<Reasoning> {
         summary: Some(ReasoningSummary::Detailed),
         context: None,
     })
+}
+
+fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
+    match item {
+        ResponseItem::Message { content, phase, .. } => {
+            let content = content
+                .into_iter()
+                .filter_map(|item| match item {
+                    ContentItem::OutputText { text } => Some(text),
+                    ContentItem::InputText { .. }
+                    | ContentItem::InputImage { .. }
+                    | ContentItem::InputAudio { .. } => None,
+                })
+                .collect::<String>();
+            let phase = phase.map(|phase| match phase {
+                codex_protocol::models::MessagePhase::Commentary => {
+                    atra_protocol::AssistantMessagePhase::Commentary
+                }
+                codex_protocol::models::MessagePhase::FinalAnswer => {
+                    atra_protocol::AssistantMessagePhase::FinalAnswer
+                }
+            });
+            Ok((!content.is_empty()).then_some(ModelResponse::AssistantMessage { content, phase }))
+        }
+        ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        } => Ok(Some(ModelResponse::ToolCall {
+            name,
+            arguments: serde_json::from_str(&arguments)
+                .context("Codex returned invalid tool arguments")?,
+            call_id: Some(call_id),
+        })),
+        ResponseItem::CustomToolCall {
+            id,
+            name,
+            input,
+            call_id,
+            ..
+        } => Ok(Some(ModelResponse::CustomToolCall {
+            item_id: id.map(String::from),
+            name,
+            input,
+            call_id,
+        })),
+        item @ ResponseItem::WebSearchCall { .. } => Ok(Some(ModelResponse::WebSearch {
+            item: serde_json::to_value(item).context("failed to encode Codex web search")?,
+        })),
+        item @ ResponseItem::Reasoning { .. } => Ok(Some(ModelResponse::Reasoning {
+            item: serde_json::to_value(item).context("failed to encode Codex reasoning")?,
+        })),
+        _ => Ok(None),
+    }
 }
 
 struct BearerAuth {
@@ -556,12 +626,19 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
         .iter()
         .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
     {
+        let output = serde_json::from_value::<ProviderOutput>(match &events[index].data {
+            ThreadEventData::Compaction(compaction) => compaction.items.clone(),
+            _ => unreachable!(),
+        })
+        .context("stored compaction contains invalid provider output")?;
+        anyhow::ensure!(
+            output.provider == PROVIDER_ID,
+            "stored compaction belongs to provider {}",
+            output.provider
+        );
         items.extend(
-            serde_json::from_value::<Vec<ResponseItem>>(match &events[index].data {
-                ThreadEventData::Compaction(compaction) => compaction.items.clone(),
-                _ => unreachable!(),
-            })
-            .context("stored compaction contains invalid response items")?,
+            serde_json::from_value::<Vec<ResponseItem>>(output.data)
+                .context("stored compaction contains invalid Codex response items")?,
         );
         &events[index + 1..]
     } else {
@@ -577,9 +654,16 @@ fn model_input(events: &[Event]) -> Result<Vec<ResponseItem>> {
         .unwrap_or_default();
     for event in events {
         if let ThreadEventData::ModelOutput(event) = &event.data {
+            let output = serde_json::from_value::<ProviderOutput>(event.output.clone())
+                .context("stored model output contains invalid provider output")?;
+            anyhow::ensure!(
+                output.provider == PROVIDER_ID,
+                "stored model output belongs to provider {}",
+                output.provider
+            );
             items.extend(
-                serde_json::from_value::<Vec<ResponseItem>>(event.output.clone())
-                    .context("stored model output contains invalid response items")?,
+                serde_json::from_value::<Vec<ResponseItem>>(output.data)
+                    .context("stored model output contains invalid Codex response items")?,
             );
             continue;
         }
@@ -742,127 +826,43 @@ fn format_runners(runners: &[Runner]) -> String {
     lines.join("\n")
 }
 
-fn tool_definitions() -> Result<ResponsesApiTools> {
-    let tools = json!([
-        {
-            "type": "web_search",
-            "external_web_access": true
-        },
-        {
-            "type": "function",
-            "name": "update_todos",
-            "description": indoc! {"
-                Updates the task todo list.
-                Provide an optional explanation and a list of todos, each with a step and status.
-                At most one todo can be in_progress at a time.
-            "},
-            "strict": false,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "explanation": {
-                        "type": "string",
-                        "description": "Optional explanation for this todo update."
-                    },
-                    "todos": {
-                        "type": "array",
-                        "description": "The list of todos.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step": {
-                                    "type": "string",
-                                    "description": "Todo step text."
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Todo status."
-                                }
-                            },
-                            "required": ["step", "status"],
-                            "additionalProperties": false
-                        }
-                    }
+fn tool_definitions(tools: &[ModelTool]) -> Result<ResponsesApiTools> {
+    let tools = tools
+        .iter()
+        .map(|tool| match tool {
+            ModelTool::WebSearch => json!({
+                "type": "web_search",
+                "external_web_access": true
+            }),
+            ModelTool::Function {
+                name,
+                description,
+                parameters,
+            } => json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "strict": false,
+                "parameters": parameters,
+            }),
+            ModelTool::Custom {
+                name,
+                description,
+                format,
+            } => json!({
+                "type": "custom",
+                "name": name,
+                "description": description,
+                "format": {
+                    "type": "grammar",
+                    "syntax": format.syntax,
+                    "definition": format.definition,
                 },
-                "required": ["todos"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "custom",
-            "name": "command",
-            "description": indoc! {"
-                Execute one or more Bash commands on named Atra Runners.
-                Start each command with `*** Runner <runner>`; repeat it to run another command or switch Runners.
-                A command ends at the next `*** Runner <runner>` line or the end of the tool input.
-
-                Processes:
-                Each command waits up to 120000 milliseconds and is left running if unfinished.
-                Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
-                Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
-                Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
-                Run `atri proc stop <process-id>...` to stop named processes.
-                These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
-
-                Patches:
-                Run `atri patch` as a foreground command and pass the patch on standard input to add, update, delete, or move files.
-                Use a quoted Bash heredoc so the patch is passed literally.
-                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>`.
-                Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
-                Paths in patches are relative to the command's working directory unless absolute.
-                Use line ranges for large deletions or replacements when the line numbers are already known.
-                When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
-                Use ordinary diff lines for small changes.
-                Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
-
-                Commands in one tool call execute sequentially, and their results are returned together after all commands have finished.
-                Use a separate tool call when a result is needed to decide the next operation.
-            "},
-            "format": {
-                "type": "grammar",
-                "syntax": "lark",
-                "definition": indoc! {r#"
-                    start: runner_group+
-                    runner_group: runner command_item+
-                    runner: "*** Runner " name LF
-
-                    ?command_item: command_line | patch
-                    command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
-
-                    patch: PATCH_BEGIN LF hunk+ PATCH_END LF
-                    PATCH_BEGIN: "*** Begin Patch"
-                    PATCH_END: "*** End Patch"
-                    hunk: add_hunk | delete_hunk | update_hunk
-                    add_hunk: "*** Add File: " filename LF add_line+
-                    delete_hunk: "*** Delete File: " filename LF
-                    update_hunk: "*** Update File: " filename LF change_move? first_update following_update*
-
-                    name: /(.+)/
-                    filename: /(.+)/
-                    add_line: "+" /(.*)/ LF -> line
-
-                    change_move: "*** Move to: " filename LF
-                    first_update: change | range_change
-                    following_update: headed_change | range_change
-                    change: change_context? change_line+ eof_line?
-                    headed_change: change_context change_line+ eof_line?
-                    change_context: ("@@" | "@@ " /(.+)/) LF
-                    change_line: ("+" | "-" | " ") /(.*)/ LF
-                    eof_line: "*** End of File" LF
-
-                    range_change: range_start remove_line (range_end remove_line)? add_line*
-                    range_start: "@ start " INT LF
-                    range_end: "@ end " INT LF
-                    remove_line: "-" /(.*)/ LF
-
-                    %import common.INT
-                    %import common.LF
-                "#}
-            }
-        },
-    ]);
-    let raw = RawValue::from_string(tools.to_string()).context("failed to encode tool schemas")?;
+            }),
+        })
+        .collect::<Vec<_>>();
+    let raw = RawValue::from_string(serde_json::to_string(&tools)?)
+        .context("failed to encode tool schemas")?;
     Ok(Arc::<RawValue>::from(raw).into())
 }
 
@@ -894,7 +894,16 @@ mod tests {
             },
         ];
 
-        let request = completion_request("model", "medium", &events, "cache").unwrap();
+        let tools = crate::tools::model_tools();
+        let request = completion_request(&ModelRequest {
+            model: "model",
+            reasoning_effort: "medium",
+            instructions: super::super::BASE_INSTRUCTIONS,
+            tools: &tools,
+            events: &events,
+            prompt_cache_key: "cache",
+        })
+        .unwrap();
         let snapshot = serde_json::to_value(request).unwrap();
 
         assert_eq!(snapshot["model"], "model");

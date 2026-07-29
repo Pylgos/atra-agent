@@ -1,17 +1,24 @@
 use std::{collections::VecDeque, fs, path::Path};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use atra_protocol::Model;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::{ContentItem, MessagePhase, ResponseInputItem, ResponseItem};
 use tokio::sync::Mutex;
 
-use super::{ModelCompletion, ModelResponse};
+use super::{
+    DEFAULT_MODEL, ModelCompletion, ModelProvider, ModelRequest, ModelResponse, ModelSession,
+    ModelStreamEvent, ProviderOutput,
+};
 use crate::storage::Event;
 use atra_protocol::{AssistantMessagePhase, ThreadEventData, ToolResultEvent};
 
 pub(crate) struct FakeProvider {
     responses: Mutex<VecDeque<ModelResponse>>,
 }
+
+const PROVIDER_ID: &str = "fake";
 
 impl FakeProvider {
     pub(super) fn load(path: &Path) -> Result<Self> {
@@ -71,8 +78,14 @@ impl FakeProvider {
                 atra_id::generate().replace(' ', "_")
             ));
         }
+        let output = response_item(response.clone())?;
         Ok(ModelCompletion {
-            output: vec![response_item(response)],
+            output: ProviderOutput {
+                provider: PROVIDER_ID.to_owned(),
+                data: serde_json::to_value([output])
+                    .context("failed to encode fake model output")?,
+            },
+            responses: vec![response],
             response_id: None,
             token_usage: None,
             rate_limits: Vec::new(),
@@ -80,8 +93,71 @@ impl FakeProvider {
     }
 }
 
-fn response_item(response: ModelResponse) -> ResponseItem {
-    match response {
+#[async_trait]
+impl ModelProvider for FakeProvider {
+    async fn models(&self) -> Result<Vec<Model>> {
+        Ok(vec![Model {
+            id: DEFAULT_MODEL.to_owned(),
+            display_name: DEFAULT_MODEL.to_owned(),
+            description: None,
+            default_reasoning_effort: "medium".to_owned(),
+            supported_reasoning_efforts: ["low", "medium", "high", "xhigh"]
+                .map(str::to_owned)
+                .to_vec(),
+            context_window: None,
+            auto_compact_token_limit: None,
+        }])
+    }
+
+    async fn start_turn(&self, _session_id: &str) -> Result<Box<dyn ModelSession + '_>> {
+        Ok(Box::new(self))
+    }
+
+    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "provider": PROVIDER_ID,
+            "model": request.model,
+            "reasoning_effort": request.reasoning_effort,
+            "instructions": request.instructions,
+            "tools": request.tools.len(),
+            "events": request.events,
+        }))
+    }
+
+    fn context_tokens(&self, events: &[Event]) -> Result<usize> {
+        Ok(super::text_tokens(&serde_json::to_string(events)?))
+    }
+
+    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "provider": PROVIDER_ID,
+            "kind": "compaction",
+            "model": request.model,
+            "reasoning_effort": request.reasoning_effort,
+            "instructions": request.instructions,
+            "tools": request.tools.len(),
+            "events": request.events,
+        }))
+    }
+}
+
+#[async_trait]
+impl ModelSession for &FakeProvider {
+    async fn complete(
+        &self,
+        request: &ModelRequest<'_>,
+        _updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ModelCompletion> {
+        FakeProvider::complete(self, request.events).await
+    }
+
+    async fn compact(&self, _request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
+        Ok(None)
+    }
+}
+
+fn response_item(response: ModelResponse) -> Result<ResponseItem> {
+    Ok(match response {
         ModelResponse::AssistantMessage { content, phase } => {
             ResponseItem::from(ResponseInputItem::Message {
                 role: "assistant".to_owned(),
@@ -92,7 +168,10 @@ fn response_item(response: ModelResponse) -> ResponseItem {
                 }),
             })
         }
-        ModelResponse::WebSearch { item } | ModelResponse::Reasoning { item } => item,
+        ModelResponse::WebSearch { item } | ModelResponse::Reasoning { item } => {
+            serde_json::from_value(item)
+                .context("fake model script contains invalid output item")?
+        }
         ModelResponse::ToolCall {
             name,
             arguments,
@@ -119,5 +198,5 @@ fn response_item(response: ModelResponse) -> ResponseItem {
             input,
             internal_chat_message_metadata_passthrough: None,
         },
-    }
+    })
 }

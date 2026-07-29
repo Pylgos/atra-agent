@@ -246,6 +246,7 @@ impl State {
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
         let model_session = self.provider.start_turn(&prompt_cache_key).await?;
+        let model_tools = model_tools();
         loop {
             self.sync_runners(thread_id, updates).await?;
             let mut events = self
@@ -290,12 +291,15 @@ impl State {
                 .zip(auto_compact_token_limit)
                 .is_some_and(|(tokens, limit)| tokens >= limit)
             {
-                let request = self.provider.compaction_snapshot(
-                    &model,
-                    &reasoning_effort,
-                    &events,
-                    &prompt_cache_key,
-                )?;
+                let model_request = model::ModelRequest {
+                    model: &model,
+                    reasoning_effort: &reasoning_effort,
+                    instructions: model::BASE_INSTRUCTIONS,
+                    tools: &model_tools,
+                    events: &events,
+                    prompt_cache_key: &prompt_cache_key,
+                };
+                let request = self.provider.compaction_snapshot(&model_request)?;
                 self.append_event(
                     thread_id,
                     ThreadEventData::ModelRequest(ModelRequestEvent {
@@ -316,10 +320,8 @@ impl State {
                     .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
                     .await
                     .context("failed to checkpoint history before compaction")?;
-                let items = model_session
-                    .compact(&model, &reasoning_effort, &events, &prompt_cache_key)
-                    .await?;
-                if !items.is_empty() {
+                let items = model_session.compact(&model_request).await?;
+                if let Some(items) = items {
                     let workspace_instructions = workspace_instructions(&events);
                     let workspace_event = match workspace_instructions {
                         WorkspaceInstructions::Untracked => None,
@@ -348,12 +350,15 @@ impl State {
                         .context("failed to reload compacted model history")?;
                 }
             }
-            let request = self.provider.completion_snapshot(
-                &model,
-                &reasoning_effort,
-                &events,
-                &prompt_cache_key,
-            )?;
+            let model_request = model::ModelRequest {
+                model: &model,
+                reasoning_effort: &reasoning_effort,
+                instructions: model::BASE_INSTRUCTIONS,
+                tools: &model_tools,
+                events: &events,
+                prompt_cache_key: &prompt_cache_key,
+            };
+            let request = self.provider.completion_snapshot(&model_request)?;
             let request_sequence = self
                 .append_event(
                     thread_id,
@@ -371,15 +376,7 @@ impl State {
                 )
                 .await
                 .context("failed to save model request")?;
-            let completion = model_session
-                .complete(
-                    &model,
-                    &reasoning_effort,
-                    &events,
-                    updates,
-                    &prompt_cache_key,
-                )
-                .await?;
+            let completion = model_session.complete(&model_request, updates).await?;
             self.store
                 .append(
                     thread_id,
@@ -397,7 +394,7 @@ impl State {
                     thread_id,
                     ThreadEventData::TokenUsage(TokenUsageEvent {
                         request_sequence,
-                        usage: serde_json::to_value(usage).map_err(|error| anyhow!(error))?,
+                        usage,
                     }),
                     updates,
                 )
@@ -418,14 +415,7 @@ impl State {
                 .context("failed to save rate limits")?;
             }
 
-            let responses = completion
-                .output
-                .into_iter()
-                .map(response_from_item)
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect();
+            let responses = completion.responses.into();
             if let Some(response) = self
                 .execute_model_responses(thread_id, responses, updates)
                 .await?
@@ -749,9 +739,7 @@ impl State {
                 ModelResponse::WebSearch { item } => {
                     self.append_event(
                         thread_id,
-                        ThreadEventData::WebSearch(ItemEvent {
-                            item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
-                        }),
+                        ThreadEventData::WebSearch(ItemEvent { item }),
                         updates,
                     )
                     .await
@@ -885,12 +873,7 @@ impl State {
                 }
                 ModelResponse::Reasoning { item } => {
                     self.store
-                        .append(
-                            thread_id,
-                            ThreadEventData::Reasoning(ItemEvent {
-                                item: serde_json::to_value(item).map_err(|error| anyhow!(error))?,
-                            }),
-                        )
+                        .append(thread_id, ThreadEventData::Reasoning(ItemEvent { item }))
                         .await
                         .context("failed to save reasoning projection")?;
                 }

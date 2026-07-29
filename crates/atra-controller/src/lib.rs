@@ -49,7 +49,7 @@ mod tools;
 mod turn;
 
 use lifecycle::{ApprovalDecision, TurnLifecycle};
-use model::{DEFAULT_MODEL, ModelResponse, ModelStreamEvent, Provider, response_from_item};
+use model::{DEFAULT_MODEL, ModelProvider, ModelResponse, ModelStreamEvent};
 use runner::{CommandOutcome, Runner, RunnerConfig};
 use runner_client::{PrepareTreeResult, RunnerClient, WaitOutcome};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
@@ -123,9 +123,15 @@ pub async fn run(
         "{:x}",
         Sha256::digest(database.as_os_str().as_encoded_bytes())
     );
-    let provider = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
-        Some(path) => Provider::fake(Path::new(&path))?,
-        None => Provider::codex(auth_home.to_owned()).await,
+    let (provider, codex): (
+        Arc<dyn ModelProvider>,
+        Option<Arc<model::codex::CodexProvider>>,
+    ) = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
+        Some(path) => (model::fake(Path::new(&path))?, None),
+        None => {
+            let codex = model::codex(auth_home.to_owned()).await;
+            (codex.clone(), Some(codex))
+        }
     };
     let platform = platform.map(Arc::new);
     let data_home = xdg::BaseDirectories::new()
@@ -160,6 +166,7 @@ pub async fn run(
         runners: RunnerPool::new(platform),
         store,
         provider,
+        codex,
         turns: TurnLifecycle::new(),
         thread_locks: StdMutex::new(HashMap::new()),
         skill_store,
@@ -198,7 +205,8 @@ pub async fn run(
 pub(crate) struct State {
     runners: RunnerPool,
     store: Store,
-    provider: Provider,
+    provider: Arc<dyn ModelProvider>,
+    codex: Option<Arc<model::codex::CodexProvider>>,
     turns: TurnLifecycle,
     thread_locks: StdMutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
     skill_store: AtraStore,
@@ -218,7 +226,11 @@ enum WorkspaceInstructions {
 
 impl State {
     async fn codex_login_status(&self) -> Result<ControllerResponse> {
-        match self.provider.login_status().await {
+        let status = match &self.codex {
+            Some(codex) => codex.login_status().await,
+            None => Some(None),
+        };
+        match status {
             Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
             None => Ok(ControllerResponse::CodexLoginRequired),
         }
@@ -374,17 +386,24 @@ impl State {
             }
             UnaryRequest::CodexLogin => {
                 codex_login(&self.auth_home).await?;
-                self.provider.reload_auth().await;
+                if let Some(codex) = &self.codex {
+                    codex.reload_auth().await;
+                }
                 self.codex_login_status().await
             }
             UnaryRequest::CodexLogout => {
-                self.provider.logout().await?;
+                if let Some(codex) = &self.codex {
+                    codex.logout().await?;
+                }
                 Ok(ControllerResponse::CodexLoggedOut)
             }
             UnaryRequest::CodexLoginStatus => self.codex_login_status().await,
             UnaryRequest::CodexRateLimits => Ok(ControllerResponse::CodexRateLimits {
-                snapshots: serde_json::to_value(self.provider.rate_limits().await?)
-                    .context("failed to encode Codex rate limits")?,
+                snapshots: serde_json::to_value(match &self.codex {
+                    Some(codex) => codex.rate_limits().await?,
+                    None => Vec::new(),
+                })
+                .context("failed to encode Codex rate limits")?,
             }),
             UnaryRequest::ApprovalAllow { approval_id } => {
                 self.resolve_approval(approval_id, true, None).await
