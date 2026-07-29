@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
 
@@ -15,10 +15,11 @@ use codex_api::{
 use codex_backend_client::Client as BackendClient;
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
-    AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthManager, CodexAuth,
-    default_client::create_client,
+    AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthManager, CodexAuth, RefreshTokenError,
+    UnauthorizedRecovery, default_client::create_client,
 };
 use codex_model_provider_info::{CHATGPT_CODEX_BASE_URL, ModelProviderInfo};
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::{
     ContentItem, FunctionCallOutputPayload, ResponseInputItem, ResponseItem,
 };
@@ -26,6 +27,7 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::{config_types::ReasoningSummary, protocol::RateLimitSnapshot};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
+use rand::Rng;
 use serde_json::{json, value::RawValue};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
@@ -51,7 +53,10 @@ pub(crate) struct CodexProvider {
 struct CodexSession {
     responses: ResponsesClient<codex_api::ReqwestTransport>,
     compact: CompactClient<codex_api::ReqwestTransport>,
+    auth: Arc<BearerAuth>,
+    auth_manager: Arc<AuthManager>,
     session_id: String,
+    stream_max_retries: u64,
     last_used_at: StdMutex<Instant>,
 }
 
@@ -70,6 +75,26 @@ impl CodexSession {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         ) >= SESSION_IDLE_TTL
+    }
+
+    async fn recover_unauthorized(&self, recovery: &mut UnauthorizedRecovery) -> Result<bool> {
+        if !recovery.has_next() {
+            return Ok(false);
+        }
+        match recovery.next().await {
+            Ok(_) => {}
+            Err(RefreshTokenError::Permanent(error)) => {
+                return Err(CodexErr::RefreshTokenFailed(error).into());
+            }
+            Err(RefreshTokenError::Transient(error)) => return Err(CodexErr::Io(error).into()),
+        }
+        let auth = self
+            .auth_manager
+            .auth_cached()
+            .filter(CodexAuth::is_chatgpt_auth)
+            .context("Codex login required; run `atra codex login`")?;
+        self.auth.replace(&auth)?;
+        Ok(true)
     }
 }
 
@@ -250,7 +275,9 @@ impl CodexProvider {
             .await
             .filter(CodexAuth::is_chatgpt_auth)
             .context("Codex login required; run `atra codex login`")?;
-        let provider = ModelProviderInfo::create_openai_provider(None)
+        let provider = ModelProviderInfo::create_openai_provider(None);
+        let stream_max_retries = provider.stream_max_retries();
+        let provider = provider
             .to_api_provider(Some(auth.auth_mode()))
             .context("failed to configure Codex model endpoint")?;
         let api_auth = Arc::new(BearerAuth::new(&auth)?);
@@ -263,9 +290,12 @@ impl CodexProvider {
             compact: CompactClient::new(
                 codex_api::ReqwestTransport::from_http_client(create_client()),
                 provider,
-                api_auth,
+                api_auth.clone(),
             ),
+            auth: api_auth,
+            auth_manager: self.auth.clone(),
             session_id,
+            stream_max_retries,
             last_used_at: StdMutex::new(now),
         });
         let mut sessions = self.sessions.lock().await;
@@ -336,18 +366,56 @@ impl CodexTurn {
         headers.insert("session-id", session_id.clone());
         headers.insert("thread-id", session_id.clone());
         headers.insert("x-client-request-id", session_id);
-        let stream = self
-            .session
-            .responses
-            .stream(
-                request,
-                headers,
-                codex_api::Compression::None,
-                Some(self.turn_state.clone()),
-            )
-            .await
-            .context("Codex request failed")?;
-        read_completion(stream, updates, &self.rate_limits).await
+        let mut retries = 0;
+        let mut auth_recovery = self.session.auth_manager.unauthorized_recovery();
+        loop {
+            let stream = match self
+                .session
+                .responses
+                .stream(
+                    request.clone(),
+                    headers.clone(),
+                    codex_api::Compression::None,
+                    Some(self.turn_state.clone()),
+                )
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    if is_unauthorized(&error)
+                        && self
+                            .session
+                            .recover_unauthorized(&mut auth_recovery)
+                            .await?
+                    {
+                        continue;
+                    }
+                    let error = anyhow::Error::new(codex_api::map_api_error(error));
+                    handle_completion_error(
+                        error,
+                        &mut retries,
+                        self.session.stream_max_retries,
+                        updates,
+                        &self.rate_limits,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            match read_completion(stream, updates, &self.rate_limits).await {
+                Ok(completion) => return Ok(completion),
+                Err(error) => {
+                    handle_completion_error(
+                        error,
+                        &mut retries,
+                        self.session.stream_max_retries,
+                        updates,
+                        &self.rate_limits,
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
@@ -359,17 +427,33 @@ impl CodexTurn {
         headers.insert("session-id", session_id.clone());
         headers.insert("thread-id", session_id.clone());
         headers.insert("x-client-request-id", session_id);
-        let items = self
-            .session
-            .compact
-            .compact(
-                request,
-                headers,
-                Duration::from_secs(300),
-                Some(self.turn_state.as_ref()),
-            )
-            .await
-            .context("Codex compaction failed")?;
+        let mut auth_recovery = self.session.auth_manager.unauthorized_recovery();
+        let items = loop {
+            match self
+                .session
+                .compact
+                .compact(
+                    request.clone(),
+                    headers.clone(),
+                    Duration::from_secs(300),
+                    Some(self.turn_state.as_ref()),
+                )
+                .await
+            {
+                Ok(items) => break items,
+                Err(error) => {
+                    if is_unauthorized(&error)
+                        && self
+                            .session
+                            .recover_unauthorized(&mut auth_recovery)
+                            .await?
+                    {
+                        continue;
+                    }
+                    return Err(codex_api::map_api_error(error).into());
+                }
+            }
+        };
         if items.is_empty() {
             return Ok(None);
         }
@@ -391,7 +475,7 @@ async fn read_completion(
     let mut rate_limits = Vec::new();
 
     while let Some(event) = stream.next().await {
-        let event = event.context("Codex response stream failed")?;
+        let event = event.map_err(codex_api::map_api_error)?;
         match event {
             ResponseEvent::OutputTextDelta(delta) => {
                 if let Some(updates) = updates {
@@ -471,16 +555,7 @@ async fn read_completion(
                 token_usage = usage;
             }
             ResponseEvent::RateLimits(snapshot) => {
-                let mut latest = latest_rate_limits.write().await;
-                let limit_id = snapshot.limit_id.as_deref().unwrap_or("codex");
-                if let Some(current) = latest
-                    .iter_mut()
-                    .find(|current| current.limit_id.as_deref().unwrap_or("codex") == limit_id)
-                {
-                    *current = snapshot.clone();
-                } else {
-                    latest.push(snapshot.clone());
-                }
+                update_rate_limit(latest_rate_limits, snapshot.clone()).await;
                 rate_limits.push(snapshot);
             }
             _ => {}
@@ -518,6 +593,68 @@ async fn read_completion(
             .collect::<serde_json::Result<_>>()
             .context("failed to encode Codex rate limits")?,
     })
+}
+
+async fn update_rate_limit(
+    latest_rate_limits: &RwLock<Vec<RateLimitSnapshot>>,
+    snapshot: RateLimitSnapshot,
+) {
+    let mut latest = latest_rate_limits.write().await;
+    let limit_id = snapshot.limit_id.as_deref().unwrap_or("codex");
+    if let Some(current) = latest
+        .iter_mut()
+        .find(|current| current.limit_id.as_deref().unwrap_or("codex") == limit_id)
+    {
+        *current = snapshot;
+    } else {
+        latest.push(snapshot);
+    }
+}
+
+async fn handle_completion_error(
+    error: anyhow::Error,
+    retries: &mut u64,
+    max_retries: u64,
+    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    latest_rate_limits: &RwLock<Vec<RateLimitSnapshot>>,
+) -> Result<()> {
+    let Some(codex_error) = error.downcast_ref::<CodexErr>() else {
+        return Err(error);
+    };
+    if let CodexErr::UsageLimitReached(limit) = codex_error
+        && let Some(snapshot) = limit.rate_limits.as_deref()
+    {
+        update_rate_limit(latest_rate_limits, snapshot.clone()).await;
+    }
+    if !codex_error.is_retryable() || *retries >= max_retries {
+        return Err(error);
+    }
+    *retries += 1;
+    let delay = match codex_error {
+        CodexErr::Stream(_, Some(delay)) => *delay,
+        _ => backoff(*retries),
+    };
+    if let Some(updates) = updates {
+        let _ = updates.send(ModelStreamEvent::Retry {
+            current: *retries,
+            max: max_retries,
+        });
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
+}
+
+fn backoff(attempt: u64) -> Duration {
+    let base_ms = 200.0 * 2.0_f64.powi(attempt.saturating_sub(1) as i32);
+    Duration::from_millis((base_ms * rand::rng().random_range(0.9..1.1)) as u64)
+}
+
+fn is_unauthorized(error: &codex_api::ApiError) -> bool {
+    matches!(
+        error,
+        codex_api::ApiError::Transport(codex_api::TransportError::Http { status, .. })
+            if *status == http::StatusCode::UNAUTHORIZED
+    )
 }
 
 fn completion_request(request: &ModelRequest<'_>) -> Result<serde_json::Value> {
@@ -634,11 +771,31 @@ fn response_from_item(item: ResponseItem) -> Result<Option<ModelResponse>> {
 }
 
 struct BearerAuth {
+    headers: StdRwLock<BearerAuthHeaders>,
+}
+
+struct BearerAuthHeaders {
     token: HeaderValue,
     account_id: Option<HeaderValue>,
 }
 
 impl BearerAuth {
+    fn new(auth: &CodexAuth) -> Result<Self> {
+        Ok(Self {
+            headers: StdRwLock::new(BearerAuthHeaders::new(auth)?),
+        })
+    }
+
+    fn replace(&self, auth: &CodexAuth) -> Result<()> {
+        *self
+            .headers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = BearerAuthHeaders::new(auth)?;
+        Ok(())
+    }
+}
+
+impl BearerAuthHeaders {
     fn new(auth: &CodexAuth) -> Result<Self> {
         Ok(Self {
             token: HeaderValue::from_str(&format!("Bearer {}", auth.get_token()?))
@@ -654,8 +811,12 @@ impl BearerAuth {
 
 impl AuthProvider for BearerAuth {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        headers.insert(http::header::AUTHORIZATION, self.token.clone());
-        if let Some(account_id) = &self.account_id {
+        let auth = self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        headers.insert(http::header::AUTHORIZATION, auth.token.clone());
+        if let Some(account_id) = &auth.account_id {
             headers.insert("ChatGPT-Account-ID", account_id.clone());
         }
     }

@@ -56,6 +56,10 @@ pub(crate) enum ModelStreamEvent {
     TurnStarted {
         thread_id: ThreadId,
     },
+    Retry {
+        current: u64,
+        max: u64,
+    },
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
     ReasoningSummaryPartAdded,

@@ -24,6 +24,7 @@ codex-protocol.workspace = true
 futures-util.workspace = true
 http.workspace = true
 indoc.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

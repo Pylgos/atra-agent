@@ -660,6 +660,7 @@ async fn display_turn_stream(mut stream: TurnStream) -> Result<()> {
     loop {
         match stream.receive().await?.event {
             TurnEvent::Started
+            | TurnEvent::Retry { .. }
             | TurnEvent::Delta { .. }
             | TurnEvent::ReasoningSummaryDelta { .. }
             | TurnEvent::ReasoningSummaryPartAdded

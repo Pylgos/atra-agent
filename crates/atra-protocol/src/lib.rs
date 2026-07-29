@@ -233,6 +233,10 @@ pub enum ControllerResponse {
     TurnDelta {
         content: String,
     },
+    TurnRetry {
+        current: u64,
+        max: u64,
+    },
     ReasoningSummaryDelta {
         content: String,
     },

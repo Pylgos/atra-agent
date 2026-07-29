@@ -71,6 +71,10 @@ pub struct TurnUpdate {
 #[derive(Debug)]
 pub enum TurnEvent {
     Started,
+    Retry {
+        current: u64,
+        max: u64,
+    },
     Delta {
         content: String,
     },
@@ -163,6 +167,7 @@ impl TurnStream {
                 self.ensure_thread(thread_id)?;
                 TurnEvent::Started
             }
+            ControllerResponse::TurnRetry { current, max } => TurnEvent::Retry { current, max },
             ControllerResponse::TurnDelta { content } => TurnEvent::Delta { content },
             ControllerResponse::ReasoningSummaryDelta { content } => {
                 TurnEvent::ReasoningSummaryDelta { content }

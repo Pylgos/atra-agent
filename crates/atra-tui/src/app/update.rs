@@ -369,6 +369,14 @@ impl App {
                     }
                 }
             }
+            TurnEvent::Retry { current, max } => {
+                if self.target.thread_id() == Some(thread_id) {
+                    self.transcript.discard_live_previews();
+                    self.activity = Some(Activity::Info(format!(
+                        "Reconnecting... {current}/{max} · Esc cancels"
+                    )));
+                }
+            }
             TurnEvent::Delta { content } => {
                 if self.target.thread_id() == Some(thread_id) {
                     self.transcript.append_assistant_delta(&content);

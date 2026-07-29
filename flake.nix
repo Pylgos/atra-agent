@@ -47,7 +47,7 @@
             name = "atra-${version}";
             src = cargoSource;
             # hash = pkgs.lib.fakeHash;
-            hash = "sha256-/o8DqCzlXdSUyHv0ppp+KCCZ0rS8bWa8V0QcEGTvTJU=";
+            hash = "sha256-S0iJprIpY/oanciPHo9vfnLofNUnRuW5UvWQx4foSo8=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"

@@ -74,6 +74,7 @@ async fn write_stream_update(stream: &mut UnixStream, update: ModelStreamEvent) 
         ModelStreamEvent::TurnStarted { thread_id } => {
             ControllerResponse::TurnStarted { thread_id }
         }
+        ModelStreamEvent::Retry { current, max } => ControllerResponse::TurnRetry { current, max },
         ModelStreamEvent::AssistantDelta(content) => ControllerResponse::TurnDelta { content },
         ModelStreamEvent::ReasoningSummaryDelta(content) => {
             ControllerResponse::ReasoningSummaryDelta { content }
