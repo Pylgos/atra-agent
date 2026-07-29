@@ -785,6 +785,19 @@ impl State {
                                 return Ok(Some(response));
                             }
                         }
+                        "update_todos" => {
+                            let _: UpdateTodosArguments = serde_json::from_value(arguments)
+                                .context("model returned invalid update_todos arguments")?;
+                            self.save_tool_result(
+                                thread_id,
+                                &name,
+                                call_id.as_deref(),
+                                ToolOutcome::text("Todos updated".to_owned()),
+                                false,
+                                updates,
+                            )
+                            .await?;
+                        }
                         _ => bail!("model requested unsupported tool {name}"),
                     }
                 }

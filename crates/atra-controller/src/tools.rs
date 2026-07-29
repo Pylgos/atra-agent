@@ -6,6 +6,31 @@ pub(super) struct ExecCommandArguments {
     pub(super) command: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "deserialized to validate model tool arguments")]
+pub(super) struct UpdateTodosArguments {
+    #[serde(default)]
+    pub(super) explanation: Option<String>,
+    pub(super) todos: Vec<TodoArguments>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "deserialized to validate model tool arguments")]
+pub(super) struct TodoArguments {
+    pub(super) step: String,
+    pub(super) status: TodoStatus,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
 pub(super) const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
 
 impl ExecCommandArguments {

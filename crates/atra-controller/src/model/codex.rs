@@ -41,6 +41,7 @@ const INSTRUCTIONS: &str = indoc! {r#"
     Guidelines:
     - Be concise in your responses.
     - Show file paths clearly when working with files.
+    - Use update_todos to track non-trivial multi-step work. Keep at most one todo in progress, and mark every todo completed before ending the task.
     - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -705,6 +706,47 @@ fn tool_definitions() -> Result<ResponsesApiTools> {
         {
             "type": "web_search",
             "external_web_access": true
+        },
+        {
+            "type": "function",
+            "name": "update_todos",
+            "description": indoc! {"
+                Updates the task todo list.
+                Provide an optional explanation and a list of todos, each with a step and status.
+                At most one todo can be in_progress at a time.
+            "},
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "explanation": {
+                        "type": "string",
+                        "description": "Optional explanation for this todo update."
+                    },
+                    "todos": {
+                        "type": "array",
+                        "description": "The list of todos.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {
+                                    "type": "string",
+                                    "description": "Todo step text."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Todo status."
+                                }
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["todos"],
+                "additionalProperties": false
+            }
         },
         {
             "type": "custom",

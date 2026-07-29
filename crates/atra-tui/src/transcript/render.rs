@@ -454,6 +454,7 @@ fn tool_call_lines(
             );
             lines
         }
+        "update_todos" => todo_update_lines(object),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
         _ => {
             let mut lines = vec![(
@@ -475,6 +476,79 @@ fn tool_call_lines(
             lines
         }
     }
+}
+
+fn todo_update_lines(
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<(Option<char>, Line<'static>)> {
+    let mut lines = vec![(
+        Some('◆'),
+        Line::from(Span::styled(
+            "Updated Todos",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    )];
+    if let Some(explanation) = arguments
+        .and_then(|arguments| arguments.get("explanation"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|explanation| !explanation.is_empty())
+    {
+        lines.push((
+            None,
+            Line::from(Span::styled(
+                explanation.to_owned(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        ));
+    }
+    let Some(todos) = arguments
+        .and_then(|arguments| arguments.get("todos"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return lines;
+    };
+    if todos.is_empty() {
+        lines.push((
+            None,
+            Line::from(Span::styled(
+                "(no todos provided)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        ));
+        return lines;
+    }
+    lines.extend(todos.iter().filter_map(|todo| {
+        let step = todo.get("step")?.as_str()?;
+        let (marker, style) = match todo.get("status")?.as_str()? {
+            "completed" => (
+                "✔ ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::CROSSED_OUT),
+            ),
+            "in_progress" => (
+                "□ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            "pending" => ("□ ", Style::default().fg(Color::DarkGray)),
+            _ => return None,
+        };
+        Some((
+            None,
+            Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(step.to_owned(), style),
+            ]),
+        ))
+    }));
+    lines
 }
 
 fn runner_tool_lines(

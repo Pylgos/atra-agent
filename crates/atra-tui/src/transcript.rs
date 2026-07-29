@@ -530,20 +530,25 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             }
         }
         ThreadEventData::ToolResult(result) => {
-            let (result, artifacts, masked_result) = match result {
+            let (name, result, artifacts, masked_result) = match result {
                 ToolResultEvent::Custom {
+                    name,
                     result,
                     artifacts,
                     masked_result,
                     ..
                 }
                 | ToolResultEvent::Function {
+                    name,
                     result,
                     artifacts,
                     masked_result,
                     ..
-                } => (result, artifacts, masked_result),
+                } => (name, result, artifacts, masked_result),
             };
+            if name == "update_todos" {
+                return None;
+            }
             let masked = masked_result
                 .as_ref()
                 .is_some_and(|masked| masked != &result);
