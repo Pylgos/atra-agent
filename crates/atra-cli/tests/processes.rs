@@ -52,14 +52,17 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .send_message(thread, "run the scripted command")
         .await;
     assert!(turn.status.success(), "{turn:?}");
-    assert_eq!(turn.stdout, b"observed model-output\n");
+    assert_eq!(
+        turn.stdout,
+        b"observed Operation 1 [one] Command:\nmodel-output\n"
+    );
 
     let denied_thread = system.create_thread().await;
     let mut pending = system.start_message(denied_thread, "request a denied command");
     let pending_stdout = pending.approval().await;
     let denied_approval_id = pending_stdout.lines().next().unwrap().parse().unwrap();
     assert!(
-        pending_stdout.contains("tool: exec_command"),
+        pending_stdout.contains("tool: command"),
         "{pending_stdout:?}"
     );
     assert!(
@@ -75,7 +78,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(denied.status.success(), "{denied:?}");
     assert_eq!(
         denied.stdout,
-        b"denied user denied the tool call: not in this environment\n"
+        b"denied Operation 1 [two] Command:\nuser denied the tool call: not in this environment\n"
     );
     assert!(!system.workspace.path().join("denied-marker").exists());
 
@@ -93,7 +96,10 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     assert!(approval.status.success(), "{approval:?}");
     let allowed = pending.finish().await;
     assert!(allowed.status.success(), "{allowed:?}");
-    assert_eq!(allowed.stdout, b"approved approved-output\n");
+    assert_eq!(
+        allowed.stdout,
+        b"approved Operation 1 [two] Command:\napproved-output\n"
+    );
 
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
     let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
@@ -245,13 +251,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "assistant_message"
         ]
     );
-    assert_eq!(tool_result(&events[6]), serde_json::json!("model-output"));
+    assert_eq!(
+        tool_result(&events[6]),
+        serde_json::json!("Operation 1 [one] Command:\nmodel-output")
+    );
     assert_eq!(
         match &events[9].data {
             ThreadEventData::AssistantMessage(message) => message.content.as_str(),
             _ => panic!("expected assistant message"),
         },
-        "observed model-output"
+        "observed Operation 1 [one] Command:\nmodel-output"
     );
     let denied_events = system.events(denied_thread).await;
     assert_eq!(
@@ -274,7 +283,9 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         tool_result(&denied_events[6]),
-        serde_json::json!("user denied the tool call: not in this environment")
+        serde_json::json!(
+            "Operation 1 [two] Command:\nuser denied the tool call: not in this environment"
+        )
     );
     let allowed_events = system.events(allowed_thread).await;
     assert_eq!(
@@ -297,7 +308,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
     assert_eq!(
         tool_result(&allowed_events[6]),
-        serde_json::json!("approved-output")
+        serde_json::json!("Operation 1 [two] Command:\napproved-output")
     );
 }
 
@@ -357,14 +368,11 @@ impl TestSystem {
             &model_script,
             r#"[
                 {
-                    "tool_call": {
-                        "name": "exec_command",
-                        "arguments": {
-                            "runner": "one",
-                            "command": "printf model-output",
-                            "mode": "foreground",
-                            "timeout_ms": 10000
-                        }
+                    "custom_tool_call": {
+                        "item_id": null,
+                        "name": "command",
+                        "input": "*** Runner one\nprintf model-output",
+                        "call_id": "command_1"
                     }
                 },
                 {
@@ -373,14 +381,11 @@ impl TestSystem {
                     }
                 },
                 {
-                    "tool_call": {
-                        "name": "exec_command",
-                        "arguments": {
-                            "runner": "two",
-                            "command": "printf should-not-run > denied-marker",
-                            "mode": "foreground",
-                            "timeout_ms": 10000
-                        }
+                    "custom_tool_call": {
+                        "item_id": null,
+                        "name": "command",
+                        "input": "*** Runner two\nprintf should-not-run > denied-marker",
+                        "call_id": "command_2"
                     }
                 },
                 {
@@ -389,14 +394,11 @@ impl TestSystem {
                     }
                 },
                 {
-                    "tool_call": {
-                        "name": "exec_command",
-                        "arguments": {
-                            "runner": "two",
-                            "command": "printf approved-output",
-                            "mode": "foreground",
-                            "timeout_ms": 10000
-                        }
+                    "custom_tool_call": {
+                        "item_id": null,
+                        "name": "command",
+                        "input": "*** Runner two\nprintf approved-output",
+                        "call_id": "command_3"
                     }
                 },
                 {

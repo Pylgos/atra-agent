@@ -117,7 +117,7 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
 }
 
 #[derive(Deserialize, serde::Serialize)]
-pub(super) struct ExecCommandArguments {
+pub(super) struct CommandArguments {
     pub(super) runner: String,
     pub(super) command: String,
 }
@@ -149,7 +149,7 @@ pub(super) enum TodoStatus {
 
 pub(super) const FOREGROUND_TIMEOUT_MS: u64 = 120_000;
 
-impl ExecCommandArguments {
+impl CommandArguments {
     pub(super) fn name(&self) -> &'static str {
         "command"
     }
@@ -163,7 +163,7 @@ impl ExecCommandArguments {
     }
 }
 
-pub(super) fn parse_command_input(input: &str) -> Result<Vec<ExecCommandArguments>> {
+pub(super) fn parse_command_input(input: &str) -> Result<Vec<CommandArguments>> {
     let lines = input.lines().collect::<Vec<_>>();
     let mut runner = None;
     let mut command_start = 0;
@@ -175,7 +175,7 @@ pub(super) fn parse_command_input(input: &str) -> Result<Vec<ExecCommandArgument
                 if command_start == index {
                     bail!("runner group must contain a command");
                 }
-                operations.push(ExecCommandArguments {
+                operations.push(CommandArguments {
                     runner,
                     command: lines[command_start..index].join("\n"),
                 });
@@ -193,7 +193,7 @@ pub(super) fn parse_command_input(input: &str) -> Result<Vec<ExecCommandArgument
     if command_start == lines.len() {
         bail!("runner group must contain a command");
     }
-    operations.push(ExecCommandArguments {
+    operations.push(CommandArguments {
         runner,
         command: lines[command_start..].join("\n"),
     });

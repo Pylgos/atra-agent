@@ -734,9 +734,12 @@ mod tests {
         let event = ThreadEvent {
             sequence: EventSequence(1),
             data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                name: "exec\u{1b}[31m_command".to_owned(),
+                name: "update\u{1b}[31m_todos".to_owned(),
                 arguments: serde_json::json!({
-                    "command": "safe\u{1b}]52;c;bad\u{7}"
+                    "todos": [{
+                        "step": "safe\u{1b}]52;c;bad\u{7}",
+                        "status": "pending"
+                    }]
                 }),
                 call_id: None,
             }),
@@ -745,7 +748,7 @@ mod tests {
         let Some(TranscriptItem::ToolCall { name, arguments }) = item_from_event(event) else {
             panic!("tool call event was not converted");
         };
-        assert_eq!(name, "exec_command");
-        assert_eq!(arguments.unwrap()["command"], "safe");
+        assert_eq!(name, "update_todos");
+        assert_eq!(arguments.unwrap()["todos"][0]["step"], "safe");
     }
 }

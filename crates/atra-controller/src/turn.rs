@@ -763,16 +763,6 @@ impl State {
                     .await
                     .context("failed to save tool call")?;
                     match name.as_str() {
-                        "exec_command" => {
-                            let arguments: ExecCommandArguments = serde_json::from_value(arguments)
-                                .context("fake model returned invalid exec_command arguments")?;
-                            if let Some(response) = self
-                                .route_tool(thread_id, name, call_id, arguments, false, updates)
-                                .await?
-                            {
-                                return Ok(Some(response));
-                            }
-                        }
                         "update_todos" => {
                             let _: UpdateTodosArguments = serde_json::from_value(arguments)
                                 .context("model returned invalid update_todos arguments")?;
@@ -885,35 +875,11 @@ impl State {
             .map(|content| ControllerResponse::TurnCompleted { content }))
     }
 
-    pub(super) async fn route_tool(
-        &self,
-        thread_id: ThreadId,
-        name: String,
-        call_id: Option<String>,
-        arguments: ExecCommandArguments,
-        custom: bool,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<Option<ControllerResponse>> {
-        let result = self
-            .approve_and_execute(thread_id, &name, arguments, None, updates)
-            .await?;
-        self.save_tool_result(
-            thread_id,
-            &name,
-            call_id.as_deref(),
-            result,
-            custom,
-            updates,
-        )
-        .await?;
-        Ok(None)
-    }
-
     pub(super) async fn approve_and_execute(
         &self,
         thread_id: ThreadId,
         name: &str,
-        arguments: ExecCommandArguments,
+        arguments: CommandArguments,
         operation: Option<&OperationContext>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ToolOutcome> {
@@ -971,7 +937,7 @@ impl State {
     pub(super) async fn execute(
         &self,
         thread_id: ThreadId,
-        arguments: ExecCommandArguments,
+        arguments: CommandArguments,
         operation: Option<&OperationContext>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<ToolOutcome> {

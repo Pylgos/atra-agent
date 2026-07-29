@@ -436,24 +436,6 @@ fn tool_call_lines(
             false,
             false,
         ),
-        "exec_command" => {
-            let runner = object
-                .and_then(|arguments| arguments.get("runner"))
-                .and_then(serde_json::Value::as_str);
-            let location = runner.unwrap_or(".").to_owned();
-            let command = object
-                .and_then(|arguments| arguments.get("command"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let mut lines = vec![(Some('┌'), Line::from(location))];
-            lines.extend(
-                bash_lines(command)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, line)| ((index == 0).then_some('$'), line)),
-            );
-            lines
-        }
         "update_todos" => todo_update_lines(object),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
         _ => {
