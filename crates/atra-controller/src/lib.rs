@@ -25,7 +25,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
     AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthRouteConfig, CLIENT_ID, ServerOptions,
-    default_client::set_default_originator, logout_with_revoke, run_login_server,
+    logout_with_revoke, run_login_server,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -64,7 +64,6 @@ const MASK_OUTPUT_LINES: usize = 8;
 const MASK_OUTPUT_SIDE_BYTES: usize = 4 * 1024;
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
-    let _ = set_default_originator("atra".to_owned());
     fs::create_dir_all(auth_home)
         .with_context(|| format!("failed to create auth directory {}", auth_home.display()))?;
     fs::set_permissions(auth_home, fs::Permissions::from_mode(0o700)).with_context(|| {
@@ -93,7 +92,6 @@ pub async fn codex_login(auth_home: &Path) -> Result<()> {
 }
 
 pub async fn codex_logout(auth_home: &Path) -> Result<()> {
-    let _ = set_default_originator("atra".to_owned());
     let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
         OutboundProxyPolicy::ReqwestDefault,
     ));
@@ -114,7 +112,6 @@ pub async fn run(
     auth_home: &Path,
     platform: Option<PlatformStore>,
 ) -> Result<()> {
-    let _ = set_default_originator("atra".to_owned());
     let workspace = env::current_dir().context("failed to determine controller workspace")?;
     let store = Store::open(database)
         .await
