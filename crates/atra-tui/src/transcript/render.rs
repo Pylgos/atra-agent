@@ -325,21 +325,15 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
             } else {
                 Vec::new()
             };
-            lines.extend(fold_result_lines(
-                artifacts
-                    .iter()
-                    .flat_map(|artifact| match artifact {
-                        ToolArtifact::RunnerOperation(operation) => {
-                            runner_operation_lines(operation)
-                        }
-                        ToolArtifact::CommandExecution(command) => {
-                            command_execution_lines(command, false)
-                        }
-                        ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
-                    })
-                    .collect(),
-                expanded,
-            ));
+            lines.extend(artifacts.iter().flat_map(|artifact| match artifact {
+                ToolArtifact::RunnerOperation(operation) => {
+                    runner_operation_lines(operation, expanded)
+                }
+                ToolArtifact::CommandExecution(command) => {
+                    fold_result_lines(command_execution_lines(command, false), expanded)
+                }
+                ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
+            }));
             lines
         }
         TranscriptItem::Compaction => {
@@ -656,13 +650,16 @@ fn append_runner_result(
             result_lines
         }
         RunnerResult::Completed(ToolArtifact::RunnerOperation(operation)) => {
-            runner_operation_result_lines(operation)
+            runner_operation_result_lines(operation, expanded)
         }
         RunnerResult::Completed(
             ToolArtifact::CommandExecution(_) | ToolArtifact::PatchOperations(_),
         ) => Vec::new(),
     };
-    lines.extend(fold_result_lines(result_lines, expanded));
+    lines.extend(match result {
+        RunnerResult::Running { .. } => fold_result_lines(result_lines, expanded),
+        RunnerResult::Completed(_) => result_lines,
+    });
 }
 
 fn fold_result_lines(
@@ -877,7 +874,10 @@ fn command_execution_lines(
     lines
 }
 
-fn runner_operation_lines(data: &RunnerOperationArtifact) -> Vec<(Option<char>, Line<'static>)> {
+fn runner_operation_lines(
+    data: &RunnerOperationArtifact,
+    expanded: bool,
+) -> Vec<(Option<char>, Line<'static>)> {
     let mut lines = Vec::new();
     if data.operation > 1 {
         lines.push((None, Line::default()));
@@ -895,19 +895,22 @@ fn runner_operation_lines(data: &RunnerOperationArtifact) -> Vec<(Option<char>, 
         )),
     ));
 
-    lines.extend(runner_operation_result_lines(data));
+    lines.extend(runner_operation_result_lines(data, expanded));
     lines
 }
 
 fn runner_operation_result_lines(
     data: &RunnerOperationArtifact,
+    expanded: bool,
 ) -> Vec<(Option<char>, Line<'static>)> {
     let mut lines = Vec::new();
     for artifact in &data.artifacts {
         let rendered = match artifact {
-            ToolArtifact::CommandExecution(command) => command_execution_lines(command, true),
+            ToolArtifact::CommandExecution(command) => {
+                fold_result_lines(command_execution_lines(command, true), expanded)
+            }
             ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
-            ToolArtifact::RunnerOperation(operation) => runner_operation_lines(operation),
+            ToolArtifact::RunnerOperation(operation) => runner_operation_lines(operation, expanded),
         };
         lines.extend(rendered);
     }
