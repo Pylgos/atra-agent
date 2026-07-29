@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use codex_api::{
-    AuthProvider, CompactClient, CompactionInput, ModelsClient, Reasoning, ResponseEvent,
-    ResponseStream, ResponsesApiRequest, ResponsesApiTools, ResponsesClient,
+    AuthProvider, CompactClient, CompactionInput, ModelsClient, OpenAiVerbosity, Reasoning,
+    ResponseEvent, ResponseStream, ResponsesApiRequest, ResponsesApiTools, ResponsesClient,
+    TextControls,
 };
 use codex_backend_client::Client as BackendClient;
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
@@ -500,7 +501,10 @@ fn completion_request(request: &ModelRequest<'_>) -> Result<serde_json::Value> {
         include: vec!["reasoning.encrypted_content".to_owned()],
         service_tier: None,
         prompt_cache_key: Some(request.prompt_cache_key.to_owned()),
-        text: None,
+        text: Some(TextControls {
+            verbosity: Some(OpenAiVerbosity::Low),
+            format: None,
+        }),
         client_metadata: Some(HashMap::from([
             ("session_id".to_owned(), request.prompt_cache_key.to_owned()),
             ("thread_id".to_owned(), request.prompt_cache_key.to_owned()),
@@ -520,7 +524,10 @@ fn compaction_request(request: &ModelRequest<'_>) -> Result<serde_json::Value> {
         reasoning: Some(reasoning(request.reasoning_effort)?),
         service_tier: None,
         prompt_cache_key: Some(request.prompt_cache_key),
-        text: None,
+        text: Some(TextControls {
+            verbosity: Some(OpenAiVerbosity::Low),
+            format: None,
+        }),
     })
     .context("failed to encode Codex compaction request")
 }
@@ -908,6 +915,7 @@ mod tests {
 
         assert_eq!(snapshot["model"], "model");
         assert_eq!(snapshot["prompt_cache_key"], "cache");
+        assert_eq!(snapshot["text"], json!({"verbosity": "low"}));
         assert_eq!(snapshot["input"].as_array().unwrap().len(), 1);
         assert_eq!(
             snapshot.pointer("/input/0/content/0/text"),
