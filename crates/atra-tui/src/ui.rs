@@ -50,7 +50,7 @@ fn format_quota_window(window: &Value, delta: Option<f64>) -> (String, Option<(S
             Some(format_window_duration((reset - now).max(0) / 60))
         })
         .unwrap_or_else(|| "?".to_owned());
-    let content = format!("{label} {remaining:.0}%/{reset}");
+    let content = format!("{label} {remaining:.3}%/{reset}");
     let delta = delta
         .filter(|delta| *delta > 0.0)
         .map(|delta| (label, delta));
@@ -385,15 +385,7 @@ impl App {
     }
 
     fn quota_status(&self) -> Vec<Span<'static>> {
-        let snapshots = self
-            .transcript
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| match &event.data {
-                ThreadEventData::RateLimits(event) => event.snapshots.as_array(),
-                _ => None,
-            });
+        let snapshots = self.rate_limits.as_array();
         let Some(snapshot) = snapshots.and_then(|snapshots| {
             snapshots
                 .iter()

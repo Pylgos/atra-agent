@@ -278,6 +278,13 @@ impl Client {
         }
     }
 
+    pub async fn codex_rate_limits(&self) -> Result<serde_json::Value> {
+        match self.unary(UnaryRequest::CodexRateLimits).await? {
+            ControllerResponse::CodexRateLimits { snapshots } => Ok(snapshots),
+            response => unexpected(response),
+        }
+    }
+
     pub async fn thread_create(&self, display_name: Option<String>) -> Result<ThreadId> {
         match self
             .unary(UnaryRequest::ThreadCreate { display_name })

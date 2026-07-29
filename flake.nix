@@ -46,7 +46,8 @@
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
             name = "atra-${version}";
             src = cargoSource;
-            hash = "sha256-iq+HB8mlJzc5P3nmeoU8STMNmZWAzVGDxa2yGAnhF+k=";
+            # hash = pkgs.lib.fakeHash;
+            hash = "sha256-/o8DqCzlXdSUyHv0ppp+KCCZ0rS8bWa8V0QcEGTvTJU=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"

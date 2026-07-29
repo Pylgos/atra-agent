@@ -185,6 +185,13 @@ impl Provider {
         }
     }
 
+    pub(crate) async fn rate_limits(&self) -> Result<Vec<RateLimitSnapshot>> {
+        match self {
+            Self::Fake(_) => Ok(Vec::new()),
+            Self::Codex(provider) => provider.rate_limits().await,
+        }
+    }
+
     pub(crate) async fn start_turn(&self, session_id: &str) -> Result<TurnSession<'_>> {
         match self {
             Self::Fake(provider) => Ok(TurnSession::Fake(provider)),

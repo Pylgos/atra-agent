@@ -87,6 +87,14 @@ impl App {
                 match result {
                     Ok(CodexLoginStatus::LoggedIn { .. }) => {
                         self.login_required = false;
+                        if !self.rate_limit_refresh_pending {
+                            self.rate_limit_refresh_pending = true;
+                            effects
+                                .send(Effect::PollRateLimits {
+                                    endpoint: self.endpoint.clone(),
+                                })
+                                .ok();
+                        }
                         self.activity = Some(Activity::Info("Codex login complete".to_owned()));
                     }
                     Ok(CodexLoginStatus::LoginRequired) => {
@@ -96,6 +104,13 @@ impl App {
                     Err(error) => {
                         self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                     }
+                }
+                return Ok(());
+            }
+            TurnUpdate::RateLimitsLoaded(result) => {
+                self.rate_limit_refresh_pending = false;
+                if let Ok(snapshots) = result {
+                    self.rate_limits = snapshots;
                 }
                 return Ok(());
             }
@@ -381,6 +396,9 @@ impl App {
             }
             TurnEvent::Event { event } => {
                 if self.target.thread_id() == Some(thread_id) {
+                    if let ThreadEventData::RateLimits(rate_limits) = &event.data {
+                        self.rate_limits = rate_limits.snapshots.clone();
+                    }
                     let usage_matches_selected_model = match &event.data {
                         ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
                             .and_then(|sequence| {

@@ -136,6 +136,7 @@ pub(crate) enum TurnUpdate {
         result: Result<CancelResult>,
     },
     LoginCompleted(Result<CodexLoginStatus>),
+    RateLimitsLoaded(Result<serde_json::Value>),
     ThreadSelected {
         thread_id: ThreadId,
         result: Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)>,
@@ -191,6 +192,8 @@ pub(crate) struct App {
     pub(crate) layout: ViewLayout,
     pub(crate) turn: TurnState,
     pub(crate) metrics_stale: bool,
+    pub(crate) rate_limits: serde_json::Value,
+    pub(crate) rate_limit_refresh_pending: bool,
     pub(crate) processes: Vec<BackgroundProcess>,
     pub(crate) process_refresh_pending: bool,
 }
@@ -249,6 +252,8 @@ impl App {
             layout: ViewLayout::default(),
             turn: TurnState::Idle,
             metrics_stale: false,
+            rate_limits: serde_json::Value::Array(Vec::new()),
+            rate_limit_refresh_pending: false,
             processes: Vec::new(),
             process_refresh_pending: false,
         })

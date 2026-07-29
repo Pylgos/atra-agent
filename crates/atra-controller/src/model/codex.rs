@@ -10,17 +10,18 @@ use codex_api::{
     AuthProvider, CompactClient, CompactionInput, ModelsClient, Reasoning, ResponseEvent,
     ResponseStream, ResponsesApiRequest, ResponsesApiTools, ResponsesClient,
 };
+use codex_backend_client::Client as BackendClient;
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use codex_login::{
     AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthManager, CodexAuth,
     default_client::create_client,
 };
-use codex_model_provider_info::ModelProviderInfo;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_model_provider_info::{CHATGPT_CODEX_BASE_URL, ModelProviderInfo};
 use codex_protocol::models::{
     ContentItem, FunctionCallOutputPayload, ResponseInputItem, ResponseItem,
 };
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::{config_types::ReasoningSummary, protocol::RateLimitSnapshot};
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use indoc::indoc;
@@ -49,6 +50,7 @@ pub(crate) struct CodexProvider {
     auth: Arc<AuthManager>,
     models: RwLock<Option<Vec<Model>>>,
     sessions: Mutex<HashMap<String, Arc<CodexSession>>>,
+    rate_limits: Arc<RwLock<Vec<RateLimitSnapshot>>>,
 }
 
 struct CodexSession {
@@ -79,6 +81,7 @@ impl CodexSession {
 pub(crate) struct CodexTurn {
     session: Arc<CodexSession>,
     turn_state: Arc<OnceLock<String>>,
+    rate_limits: Arc<RwLock<Vec<RateLimitSnapshot>>>,
 }
 
 impl CodexProvider {
@@ -101,6 +104,7 @@ impl CodexProvider {
             ),
             models: RwLock::new(None),
             sessions: Mutex::new(HashMap::new()),
+            rate_limits: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -116,6 +120,7 @@ impl CodexProvider {
         self.auth.reload().await;
         *self.models.write().await = None;
         self.sessions.lock().await.clear();
+        self.rate_limits.write().await.clear();
     }
 
     pub(super) async fn logout(&self) -> Result<()> {
@@ -125,7 +130,30 @@ impl CodexProvider {
             .context("failed to log out of Codex")?;
         *self.models.write().await = None;
         self.sessions.lock().await.clear();
+        self.rate_limits.write().await.clear();
         Ok(())
+    }
+
+    pub(super) async fn rate_limits(&self) -> Result<Vec<RateLimitSnapshot>> {
+        let auth = self
+            .auth
+            .auth()
+            .await
+            .filter(CodexAuth::is_chatgpt_auth)
+            .context("Codex login required; run `atra codex login`")?;
+        let base_url = CHATGPT_CODEX_BASE_URL
+            .strip_suffix("/codex")
+            .expect("Codex base URL ends in /codex");
+        let snapshots = BackendClient::from_auth(
+            base_url,
+            &auth,
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .get_rate_limits_many()
+        .await
+        .context("failed to fetch Codex rate limits")?;
+        *self.rate_limits.write().await = snapshots.clone();
+        Ok(snapshots)
     }
 
     pub(super) async fn models(&self) -> Result<Vec<Model>> {
@@ -217,6 +245,7 @@ impl CodexProvider {
             return Ok(CodexTurn {
                 session: session.clone(),
                 turn_state: Arc::new(OnceLock::new()),
+                rate_limits: self.rate_limits.clone(),
             });
         }
         drop(sessions);
@@ -255,6 +284,7 @@ impl CodexProvider {
         Ok(CodexTurn {
             session,
             turn_state: Arc::new(OnceLock::new()),
+            rate_limits: self.rate_limits.clone(),
         })
     }
 
@@ -307,7 +337,7 @@ impl CodexTurn {
             )
             .await
             .context("Codex request failed")?;
-        read_completion(stream, updates).await
+        read_completion(stream, updates, &self.rate_limits).await
     }
 
     pub(super) async fn compact(
@@ -341,6 +371,7 @@ impl CodexTurn {
 async fn read_completion(
     mut stream: ResponseStream,
     updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    latest_rate_limits: &RwLock<Vec<RateLimitSnapshot>>,
 ) -> Result<ModelCompletion> {
     let mut output = Vec::new();
     let mut response_id = None;
@@ -394,6 +425,16 @@ async fn read_completion(
                 token_usage = usage;
             }
             ResponseEvent::RateLimits(snapshot) => {
+                let mut latest = latest_rate_limits.write().await;
+                let limit_id = snapshot.limit_id.as_deref().unwrap_or("codex");
+                if let Some(current) = latest
+                    .iter_mut()
+                    .find(|current| current.limit_id.as_deref().unwrap_or("codex") == limit_id)
+                {
+                    *current = snapshot.clone();
+                } else {
+                    latest.push(snapshot.clone());
+                }
                 rate_limits.push(snapshot);
             }
             _ => {}

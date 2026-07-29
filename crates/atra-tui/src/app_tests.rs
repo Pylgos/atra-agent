@@ -81,6 +81,8 @@ fn transcript_render_is_stable() {
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
         metrics_stale: false,
+        rate_limits: serde_json::Value::Array(Vec::new()),
+        rate_limit_refresh_pending: false,
         processes: Vec::new(),
         process_refresh_pending: false,
     };

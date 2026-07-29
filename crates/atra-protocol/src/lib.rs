@@ -177,6 +177,7 @@ pub enum UnaryRequest {
     CodexLogin,
     CodexLogout,
     CodexLoginStatus,
+    CodexRateLimits,
     ApprovalAllow {
         approval_id: ApprovalId,
     },
@@ -315,6 +316,9 @@ pub enum ControllerResponse {
         email: Option<String>,
     },
     CodexLoggedOut,
+    CodexRateLimits {
+        snapshots: Value,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -32,6 +32,7 @@ atra-tui = { path = "crates/atra-tui" }
 base64 = "0.22.1"
 clap = { version = "4.5.51", features = ["derive"] }
 codex-api = { git = "https://github.com/openai/codex.git", rev = "9e1f43dc2da77b0b25bb30bf60d6b5db34afc954" }
+codex-backend-client = { git = "https://github.com/openai/codex.git", rev = "9e1f43dc2da77b0b25bb30bf60d6b5db34afc954" }
 codex-http-client = { git = "https://github.com/openai/codex.git", rev = "9e1f43dc2da77b0b25bb30bf60d6b5db34afc954" }
 codex-login = { git = "https://github.com/openai/codex.git", rev = "9e1f43dc2da77b0b25bb30bf60d6b5db34afc954" }
 codex-model-provider-info = { git = "https://github.com/openai/codex.git", rev = "9e1f43dc2da77b0b25bb30bf60d6b5db34afc954" }

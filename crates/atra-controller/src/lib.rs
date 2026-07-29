@@ -382,6 +382,10 @@ impl State {
                 Ok(ControllerResponse::CodexLoggedOut)
             }
             UnaryRequest::CodexLoginStatus => self.codex_login_status().await,
+            UnaryRequest::CodexRateLimits => Ok(ControllerResponse::CodexRateLimits {
+                snapshots: serde_json::to_value(self.provider.rate_limits().await?)
+                    .context("failed to encode Codex rate limits")?,
+            }),
             UnaryRequest::ApprovalAllow { approval_id } => {
                 self.resolve_approval(approval_id, true, None).await
             }

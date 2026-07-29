@@ -37,6 +37,9 @@ pub(crate) enum Effect {
     Login {
         endpoint: std::path::PathBuf,
     },
+    PollRateLimits {
+        endpoint: std::path::PathBuf,
+    },
     SelectThread {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
@@ -109,6 +112,8 @@ pub(super) async fn run(
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut process_poll = tokio::time::interval(Duration::from_secs(1));
     process_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rate_limit_poll = tokio::time::interval(Duration::from_secs(60));
+    rate_limit_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     terminal.draw(|frame| app.render(frame))?;
     redraw.tick().await;
     let mut dirty = false;
@@ -136,6 +141,14 @@ pub(super) async fn run(
             _ = process_poll.tick() => {
                 app.poll_processes(&effects);
             }
+            _ = rate_limit_poll.tick(), if !app.login_required => {
+                if !app.rate_limit_refresh_pending {
+                    app.rate_limit_refresh_pending = true;
+                    effects.send(Effect::PollRateLimits {
+                        endpoint: app.endpoint.clone(),
+                    }).ok();
+                }
+            }
             _ = redraw.tick() => {
                 if dirty {
                     terminal.draw(|frame| app.render(frame))?;
@@ -153,6 +166,10 @@ impl Effect {
                 Self::Login { endpoint } => {
                     let result = Client::new(&endpoint).codex_login().await;
                     let _ = updates.send(TurnUpdate::LoginCompleted(result));
+                }
+                Self::PollRateLimits { endpoint } => {
+                    let result = Client::new(&endpoint).codex_rate_limits().await;
+                    let _ = updates.send(TurnUpdate::RateLimitsLoaded(result));
                 }
                 Self::SelectThread {
                     endpoint,
