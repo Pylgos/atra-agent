@@ -7,9 +7,12 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
         model::ModelTool::Custom {
             name: "command",
             description: indoc! {"
-                Execute one or more Bash commands on named Atra Runners.
-                Start each command with `*** Runner <runner>`; repeat it to run another command or switch Runners.
-                A command ends at the next `*** Runner <runner>` line or the end of the tool input.
+                Execute one or more Bash scripts on named Atra Runners.
+                Start each script with `*** Runner <runner>`; repeat it to run another script or switch Runners.
+                A script ends at the next `*** Runner <runner>` line or the end of the tool input.
+                Scripts run with `bash -lc` without implicit `set -e`.
+                Use `set -e`, `&&`, or `|| exit 1` when later commands must not run after a failure.
+                Runner scripts execute sequentially; a non-zero exit status does not prevent later Runner scripts from running.
 
                 Processes:
                 Each command waits up to 120000 milliseconds and is left running if unfinished.
@@ -20,9 +23,9 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
 
                 Patches:
-                Run `atri patch` as a foreground command and pass the patch on standard input to add, update, delete, or move files.
-                Use a quoted Bash heredoc ending the command line with `<<'PATCH'` and terminating it with `PATCH` on its own line.
-                The command before `<<'PATCH'` may include other shell syntax. A typical invocation is:
+                Run `atri patch` and pass the patch on standard input to add, update, delete, or move files.
+                Use a quoted Bash heredoc ending the command line with `atri patch <<'PATCH'` and terminate it with `PATCH` on its own line.
+                Preceding and following commands may be joined to `atri patch` with shell operators. A typical invocation is:
                 `atri patch <<'PATCH'`
                 `*** Begin Patch`
                 `...`
@@ -42,15 +45,15 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
             format: model::ModelToolFormat {
                 syntax: "lark",
                 definition: indoc! {r#"
-                    start: runner_group+
-                    runner_group: runner command_item+
+                    start: runner_script+
+                    runner_script: runner command_item+
                     runner: "*** Runner " name LF
 
                     ?command_item: command_line | patch
                     command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
 
-                    patch: HEREDOC_START LF PATCH_BEGIN LF hunk+ PATCH_END LF "PATCH" LF?
-                    HEREDOC_START: /[^\n]+<<'PATCH'/
+                    patch: PATCH_COMMAND_LINE LF PATCH_BEGIN LF hunk+ PATCH_END LF "PATCH" LF?
+                    PATCH_COMMAND_LINE: /([^\n]*[;&|][ \t]*)?[ \t]*atri[ \t]+patch[ \t]*<<'PATCH'([ \t]*(&&|\|\||;)[ \t]*[^\n]+)?/
                     PATCH_BEGIN: "*** Begin Patch"
                     PATCH_END: "*** End Patch"
                     hunk: add_hunk | delete_hunk | update_hunk
