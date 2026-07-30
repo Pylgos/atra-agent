@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock},
     time::{Duration, Instant},
@@ -25,17 +25,17 @@ use codex_protocol::models::{
 };
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::{config_types::ReasoningSummary, protocol::RateLimitSnapshot};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use http::{HeaderMap, HeaderValue};
 use rand::Rng;
 use serde_json::{json, value::RawValue};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 
 use atra_protocol::{Model, Runner};
 
 use super::{
-    ModelCompletion, ModelProvider, ModelRequest, ModelResponse, ModelSession, ModelStreamEvent,
-    ModelTool, ProviderOutput,
+    ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
+    ModelResponseMetadata, ModelSession, ModelStreamEvent, ModelTool, ProviderOutput,
 };
 use crate::storage::Event;
 use atra_protocol::{InstructionEvent, RunnersEvent, ThreadEventData, ToolResultEvent};
@@ -102,6 +102,7 @@ pub(crate) struct CodexTurn {
     session: Arc<CodexSession>,
     turn_state: Arc<OnceLock<String>>,
     rate_limits: Arc<RwLock<Vec<RateLimitSnapshot>>>,
+    retries: Arc<Mutex<u64>>,
 }
 
 impl CodexProvider {
@@ -266,6 +267,7 @@ impl CodexProvider {
                 session: session.clone(),
                 turn_state: Arc::new(OnceLock::new()),
                 rate_limits: self.rate_limits.clone(),
+                retries: Arc::new(Mutex::new(0)),
             });
         }
         drop(sessions);
@@ -310,6 +312,7 @@ impl CodexProvider {
             session,
             turn_state: Arc::new(OnceLock::new()),
             rate_limits: self.rate_limits.clone(),
+            retries: Arc::new(Mutex::new(0)),
         })
     }
 }
@@ -339,12 +342,8 @@ impl ModelProvider for CodexProvider {
 
 #[async_trait]
 impl ModelSession for CodexTurn {
-    async fn complete(
-        &self,
-        request: &ModelRequest<'_>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ModelCompletion> {
-        self.complete(request, updates).await
+    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream> {
+        self.stream(request).await
     }
 
     async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
@@ -353,11 +352,7 @@ impl ModelSession for CodexTurn {
 }
 
 impl CodexTurn {
-    async fn complete(
-        &self,
-        request: &ModelRequest<'_>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ModelCompletion> {
+    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream> {
         self.session.touch();
         let request = completion_request(request)?;
         let mut headers = HeaderMap::new();
@@ -366,56 +361,26 @@ impl CodexTurn {
         headers.insert("session-id", session_id.clone());
         headers.insert("thread-id", session_id.clone());
         headers.insert("x-client-request-id", session_id);
-        let mut retries = 0;
-        let mut auth_recovery = self.session.auth_manager.unauthorized_recovery();
-        loop {
-            let stream = match self
-                .session
-                .responses
-                .stream(
-                    request.clone(),
-                    headers.clone(),
-                    codex_api::Compression::None,
-                    Some(self.turn_state.clone()),
-                )
-                .await
-            {
-                Ok(stream) => stream,
-                Err(error) => {
-                    if is_unauthorized(&error)
-                        && self
-                            .session
-                            .recover_unauthorized(&mut auth_recovery)
-                            .await?
-                    {
-                        continue;
-                    }
-                    let error = anyhow::Error::new(codex_api::map_api_error(error));
-                    handle_completion_error(
-                        error,
-                        &mut retries,
-                        self.session.stream_max_retries,
-                        updates,
-                        &self.rate_limits,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            match read_completion(stream, updates, &self.rate_limits).await {
-                Ok(completion) => return Ok(completion),
-                Err(error) => {
-                    handle_completion_error(
-                        error,
-                        &mut retries,
-                        self.session.stream_max_retries,
-                        updates,
-                        &self.rate_limits,
-                    )
-                    .await?;
-                }
-            }
-        }
+        let state = CodexModelStream {
+            session: self.session.clone(),
+            turn_state: self.turn_state.clone(),
+            latest_rate_limits: self.rate_limits.clone(),
+            request,
+            headers,
+            stream: None,
+            retries: self.retries.clone(),
+            auth_recovery: self.session.auth_manager.unauthorized_recovery(),
+            has_response: false,
+            response_id: None,
+            token_usage: None,
+            rate_limits: Vec::new(),
+            pending: VecDeque::new(),
+            finished: false,
+        };
+        Ok(stream::unfold(state, |mut state| async move {
+            state.next_event().await.map(|event| (event, state))
+        })
+        .boxed())
     }
 
     async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
@@ -464,135 +429,246 @@ impl CodexTurn {
     }
 }
 
-async fn read_completion(
-    mut stream: ResponseStream,
-    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    latest_rate_limits: &RwLock<Vec<RateLimitSnapshot>>,
-) -> Result<ModelCompletion> {
-    let mut output = Vec::new();
-    let mut response_id = None;
-    let mut token_usage = None;
-    let mut rate_limits = Vec::new();
+struct CodexModelStream {
+    session: Arc<CodexSession>,
+    turn_state: Arc<OnceLock<String>>,
+    latest_rate_limits: Arc<RwLock<Vec<RateLimitSnapshot>>>,
+    request: serde_json::Value,
+    headers: HeaderMap,
+    stream: Option<ResponseStream>,
+    retries: Arc<Mutex<u64>>,
+    auth_recovery: UnauthorizedRecovery,
+    has_response: bool,
+    response_id: Option<String>,
+    token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    rate_limits: Vec<RateLimitSnapshot>,
+    pending: VecDeque<Result<ModelEvent>>,
+    finished: bool,
+}
 
-    while let Some(event) = stream.next().await {
-        let event = event.map_err(codex_api::map_api_error)?;
-        match event {
-            ResponseEvent::OutputTextDelta(delta) => {
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::AssistantDelta(delta));
+impl CodexModelStream {
+    async fn next_event(&mut self) -> Option<Result<ModelEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                self.finished |= event.is_err();
+                return Some(event);
+            }
+            if self.finished {
+                return None;
+            }
+            if self.stream.is_none() {
+                match self
+                    .session
+                    .responses
+                    .stream(
+                        self.request.clone(),
+                        self.headers.clone(),
+                        codex_api::Compression::None,
+                        Some(self.turn_state.clone()),
+                    )
+                    .await
+                {
+                    Ok(stream) => self.stream = Some(stream),
+                    Err(error) => {
+                        if is_unauthorized(&error)
+                            && match self
+                                .session
+                                .recover_unauthorized(&mut self.auth_recovery)
+                                .await
+                            {
+                                Ok(recovered) => recovered,
+                                Err(error) => return Some(self.fail(error)),
+                            }
+                        {
+                            continue;
+                        }
+                        let error = anyhow::Error::new(codex_api::map_api_error(error));
+                        return Some(self.retry_or_fail(error).await);
+                    }
                 }
             }
-            ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::ReasoningSummaryDelta(delta));
+
+            let event = self.stream.as_mut().unwrap().next().await;
+            let event = match event {
+                Some(Ok(event)) => event,
+                Some(Err(error)) => {
+                    self.stream = None;
+                    let error = anyhow::Error::new(codex_api::map_api_error(error));
+                    return Some(self.retry_or_fail(error).await);
                 }
-            }
-            ResponseEvent::ReasoningSummaryPartAdded { .. } => {
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::ReasoningSummaryPartAdded);
+                None => {
+                    self.finished = true;
+                    if !self.has_response {
+                        return Some(Err(anyhow::anyhow!(
+                            "Codex response ended without an assistant message or tool call"
+                        )));
+                    }
+                    let token_usage = match self.token_usage.take().map(serde_json::to_value) {
+                        Some(Ok(usage)) => Some(usage),
+                        Some(Err(error)) => {
+                            return Some(Err(error).context("failed to encode Codex token usage"));
+                        }
+                        None => None,
+                    };
+                    let rate_limits = match self
+                        .rate_limits
+                        .drain(..)
+                        .map(serde_json::to_value)
+                        .collect::<serde_json::Result<_>>()
+                    {
+                        Ok(rate_limits) => rate_limits,
+                        Err(error) => {
+                            return Some(Err(error).context("failed to encode Codex rate limits"));
+                        }
+                    };
+                    *self.retries.lock().await = 0;
+                    return Some(Ok(ModelEvent::Completed {
+                        metadata: self.response_id.take().map(|response_id| {
+                            ModelResponseMetadata {
+                                provider: PROVIDER_ID.to_owned(),
+                                response_id,
+                            }
+                        }),
+                        token_usage,
+                        rate_limits,
+                    }));
                 }
-            }
-            ResponseEvent::OutputItemAdded(ResponseItem::WebSearchCall {
-                id: Some(item_id),
-                action,
-                ..
-            }) => {
-                let action = action
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .context("failed to encode live web search action")?;
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::WebSearchUpdate {
-                        item_id: item_id.to_string(),
-                        action,
-                    });
+            };
+
+            match event {
+                ResponseEvent::OutputTextDelta(delta) => {
+                    return Some(Ok(ModelEvent::Update(ModelStreamEvent::AssistantDelta(
+                        delta,
+                    ))));
                 }
-            }
-            ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
-                id: Some(item_id),
-                name,
-                ..
-            }) => {
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::ToolCallStarted {
-                        item_id: item_id.to_string(),
-                        name,
-                    });
+                ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                    return Some(Ok(ModelEvent::Update(
+                        ModelStreamEvent::ReasoningSummaryDelta(delta),
+                    )));
                 }
-            }
-            ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
-                if let Some(updates) = updates {
-                    let _ = updates.send(ModelStreamEvent::ToolCallDelta { item_id, delta });
+                ResponseEvent::ReasoningSummaryPartAdded { .. } => {
+                    return Some(Ok(ModelEvent::Update(
+                        ModelStreamEvent::ReasoningSummaryPartAdded,
+                    )));
                 }
-            }
-            ResponseEvent::OutputItemDone(item) => {
-                if let ResponseItem::WebSearchCall {
+                ResponseEvent::OutputItemAdded(ResponseItem::WebSearchCall {
                     id: Some(item_id),
                     action,
                     ..
-                } = &item
-                {
-                    let action = action
-                        .as_ref()
-                        .map(serde_json::to_value)
-                        .transpose()
-                        .context("failed to encode live web search action")?;
-                    if let Some(updates) = updates {
-                        let _ = updates.send(ModelStreamEvent::WebSearchUpdate {
-                            item_id: item_id.to_string(),
-                            action,
-                        });
-                    }
+                }) => {
+                    let action = match action.map(serde_json::to_value).transpose() {
+                        Ok(action) => action,
+                        Err(error) => {
+                            return Some(
+                                self.fail(
+                                    anyhow::Error::new(error)
+                                        .context("failed to encode live web search action"),
+                                ),
+                            );
+                        }
+                    };
+                    return Some(Ok(ModelEvent::Update(ModelStreamEvent::WebSearchUpdate {
+                        item_id: item_id.to_string(),
+                        action,
+                    })));
                 }
-                output.push(item);
+                ResponseEvent::OutputItemAdded(ResponseItem::CustomToolCall {
+                    id: Some(item_id),
+                    name,
+                    ..
+                }) => {
+                    return Some(Ok(ModelEvent::Update(ModelStreamEvent::ToolCallStarted {
+                        item_id: item_id.to_string(),
+                        name,
+                    })));
+                }
+                ResponseEvent::ToolCallInputDelta { item_id, delta, .. } => {
+                    return Some(Ok(ModelEvent::Update(ModelStreamEvent::ToolCallDelta {
+                        item_id,
+                        delta,
+                    })));
+                }
+                ResponseEvent::OutputItemDone(item) => {
+                    let output = match serde_json::to_value([&item]) {
+                        Ok(data) => ProviderOutput {
+                            provider: PROVIDER_ID.to_owned(),
+                            data,
+                        },
+                        Err(error) => {
+                            return Some(
+                                self.fail(
+                                    anyhow::Error::new(error)
+                                        .context("failed to encode completed Codex output item"),
+                                ),
+                            );
+                        }
+                    };
+                    let response = match response_from_item(item.clone()) {
+                        Ok(response) => response,
+                        Err(error) => return Some(self.fail(error)),
+                    };
+                    if let ResponseItem::WebSearchCall {
+                        id: Some(item_id),
+                        action,
+                        ..
+                    } = &item
+                    {
+                        match action.as_ref().map(serde_json::to_value).transpose() {
+                            Ok(action) => self.pending.push_back(Ok(ModelEvent::Update(
+                                ModelStreamEvent::WebSearchUpdate {
+                                    item_id: item_id.to_string(),
+                                    action,
+                                },
+                            ))),
+                            Err(error) => {
+                                self.pending.push_back(Err(anyhow::Error::new(error)
+                                    .context("failed to encode live web search action")));
+                            }
+                        }
+                    }
+                    if let Some(response) = &response {
+                        self.has_response |= !matches!(response, ModelResponse::Reasoning { .. });
+                    }
+                    return Some(Ok(ModelEvent::OutputItemDone { output, response }));
+                }
+                ResponseEvent::Completed {
+                    response_id,
+                    token_usage,
+                    ..
+                } => {
+                    self.response_id = Some(response_id);
+                    self.token_usage = token_usage;
+                }
+                ResponseEvent::RateLimits(snapshot) => {
+                    update_rate_limit(&self.latest_rate_limits, snapshot.clone()).await;
+                    self.rate_limits.push(snapshot);
+                }
+                _ => {}
             }
-            ResponseEvent::Completed {
-                response_id: id,
-                token_usage: usage,
-                ..
-            } => {
-                response_id = Some(id);
-                token_usage = usage;
-            }
-            ResponseEvent::RateLimits(snapshot) => {
-                update_rate_limit(latest_rate_limits, snapshot.clone()).await;
-                rate_limits.push(snapshot);
-            }
-            _ => {}
         }
     }
 
-    let responses = output
-        .iter()
-        .cloned()
-        .map(response_from_item)
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    if !responses
-        .iter()
-        .any(|response| !matches!(response, super::ModelResponse::Reasoning { .. }))
-    {
-        anyhow::bail!("Codex response ended without an assistant message or tool call");
+    fn fail(&mut self, error: anyhow::Error) -> Result<ModelEvent> {
+        self.finished = true;
+        Err(error)
     }
-    Ok(ModelCompletion {
-        output: ProviderOutput {
-            provider: PROVIDER_ID.to_owned(),
-            data: serde_json::to_value(output).context("failed to encode Codex output")?,
-        },
-        responses,
-        response_id,
-        token_usage: token_usage
-            .map(serde_json::to_value)
-            .transpose()
-            .context("failed to encode Codex token usage")?,
-        rate_limits: rate_limits
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<serde_json::Result<_>>()
-            .context("failed to encode Codex rate limits")?,
-    })
+
+    async fn retry_or_fail(&mut self, error: anyhow::Error) -> Result<ModelEvent> {
+        match completion_retry_event(
+            error,
+            &self.retries,
+            self.session.stream_max_retries,
+            &self.latest_rate_limits,
+        )
+        .await
+        {
+            Ok(event) => {
+                self.finished = true;
+                Ok(event)
+            }
+            Err(error) => self.fail(error),
+        }
+    }
 }
 
 async fn update_rate_limit(
@@ -611,13 +687,12 @@ async fn update_rate_limit(
     }
 }
 
-async fn handle_completion_error(
+async fn completion_retry_event(
     error: anyhow::Error,
-    retries: &mut u64,
+    retries: &Mutex<u64>,
     max_retries: u64,
-    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     latest_rate_limits: &RwLock<Vec<RateLimitSnapshot>>,
-) -> Result<()> {
+) -> Result<ModelEvent> {
     let Some(codex_error) = error.downcast_ref::<CodexErr>() else {
         return Err(error);
     };
@@ -626,6 +701,7 @@ async fn handle_completion_error(
     {
         update_rate_limit(latest_rate_limits, snapshot.clone()).await;
     }
+    let mut retries = retries.lock().await;
     if !codex_error.is_retryable() || *retries >= max_retries {
         return Err(error);
     }
@@ -634,14 +710,11 @@ async fn handle_completion_error(
         CodexErr::Stream(_, Some(delay)) => *delay,
         _ => backoff(*retries),
     };
-    if let Some(updates) = updates {
-        let _ = updates.send(ModelStreamEvent::Retry {
-            current: *retries,
-            max: max_retries,
-        });
-    }
-    tokio::time::sleep(delay).await;
-    Ok(())
+    Ok(ModelEvent::Retry {
+        current: *retries,
+        max: max_retries,
+        delay,
+    })
 }
 
 fn backoff(attempt: u64) -> Duration {

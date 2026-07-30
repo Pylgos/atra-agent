@@ -1,4 +1,64 @@
 use super::*;
+use futures_util::StreamExt;
+
+fn response_event(response: &mut ModelResponse) -> ThreadEventData {
+    match response {
+        ModelResponse::AssistantMessage { content, phase } => {
+            let (projected, todos) = parse_todo_annotation(std::mem::take(content));
+            *content = projected.clone();
+            ThreadEventData::AssistantMessage(AssistantMessageEvent {
+                content: projected,
+                phase: *phase,
+                todos,
+            })
+        }
+        ModelResponse::WebSearch { item } => {
+            ThreadEventData::WebSearch(ItemEvent { item: item.clone() })
+        }
+        ModelResponse::ToolCall {
+            name,
+            arguments,
+            call_id,
+        } => ThreadEventData::ToolCall(ToolCallEvent::Function {
+            name: name.clone(),
+            arguments: arguments.clone(),
+            call_id: call_id.clone(),
+        }),
+        ModelResponse::CustomToolCall {
+            item_id,
+            name,
+            input,
+            call_id,
+        } => ThreadEventData::ToolCall(ToolCallEvent::Custom {
+            call_type: CustomToolType::Custom,
+            item_id: item_id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+            call_id: call_id.clone(),
+        }),
+        ModelResponse::Reasoning { item } => {
+            ThreadEventData::Reasoning(ItemEvent { item: item.clone() })
+        }
+    }
+}
+
+fn tool_result_matches_call(result: &ToolResultEvent, call: &ToolCallEvent) -> bool {
+    match (result, call) {
+        (
+            ToolResultEvent::Custom {
+                call_id: result_id, ..
+            },
+            ToolCallEvent::Custom { call_id, .. },
+        ) => result_id.as_deref() == Some(call_id),
+        (
+            ToolResultEvent::Function {
+                call_id: result_id, ..
+            },
+            ToolCallEvent::Function { call_id, .. },
+        ) => result_id == call_id,
+        _ => false,
+    }
+}
 
 impl State {
     pub(super) async fn handle_streaming(
@@ -154,45 +214,50 @@ impl State {
             .events(thread_id)
             .await
             .context("failed to load thread history")?;
-        let Some(tool_call) = events
+        let active_start = events
             .iter()
-            .rev()
-            .find(|event| {
-                matches!(
-                    event.data,
-                    ThreadEventData::UserMessage(_)
-                        | ThreadEventData::AssistantMessage(_)
-                        | ThreadEventData::ToolCall(_)
-                        | ThreadEventData::ToolResult(_)
-                        | ThreadEventData::Compaction(_)
-                )
-            })
-            .filter(|event| matches!(event.data, ThreadEventData::ToolCall(_)))
-        else {
+            .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
+            .map_or(0, |index| index + 1);
+        let mut pending = Vec::new();
+        for event in &events[active_start..] {
+            match &event.data {
+                ThreadEventData::ToolCall(call) => pending.push(call.clone()),
+                ThreadEventData::ToolResult(result) => {
+                    if let Some(index) = pending
+                        .iter()
+                        .position(|call| tool_result_matches_call(result, call))
+                    {
+                        pending.remove(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if pending.is_empty() {
             return Ok(());
-        };
+        }
         self.turns.clear_approvals(thread_id).await;
-        let ThreadEventData::ToolCall(call) = &tool_call.data else {
-            unreachable!()
-        };
-        let (name, call_id, custom) = match call {
-            ToolCallEvent::Custom { name, call_id, .. } => {
-                (name.as_str(), Some(call_id.as_str()), true)
-            }
-            ToolCallEvent::Function { name, call_id, .. } => {
-                (name.as_str(), call_id.as_deref(), false)
-            }
-        };
-        self.save_tool_result(
-            thread_id,
-            name,
-            call_id,
-            ToolOutcome::text("tool execution was interrupted before completion".to_owned()),
-            custom,
-            updates,
-        )
-        .await
-        .context("failed to save interrupted tool result")
+        for call in pending {
+            let (name, call_id, custom) = match &call {
+                ToolCallEvent::Custom { name, call_id, .. } => {
+                    (name.as_str(), Some(call_id.as_str()), true)
+                }
+                ToolCallEvent::Function { name, call_id, .. } => {
+                    (name.as_str(), call_id.as_deref(), false)
+                }
+            };
+            self.save_tool_result(
+                thread_id,
+                name,
+                call_id,
+                ToolOutcome::text("tool execution was interrupted before completion".to_owned()),
+                custom,
+                updates,
+            )
+            .await
+            .context("failed to save interrupted tool result")?;
+        }
+        Ok(())
     }
 
     pub(super) async fn cancel_thread(&self, thread_id: ThreadId) -> Result<ControllerResponse> {
@@ -376,50 +441,136 @@ impl State {
                 )
                 .await
                 .context("failed to save model request")?;
-            let completion = model_session.complete(&model_request, updates).await?;
-            self.store
-                .append(
-                    thread_id,
-                    ThreadEventData::ModelOutput(ModelOutputEvent {
-                        request_sequence,
-                        output: serde_json::to_value(&completion.output)
-                            .map_err(|error| anyhow!(error))?,
-                        response_id: completion.response_id,
-                    }),
-                )
-                .await
-                .context("failed to save model output")?;
-            if let Some(usage) = completion.token_usage {
-                self.append_event(
-                    thread_id,
-                    ThreadEventData::TokenUsage(TokenUsageEvent {
-                        request_sequence,
-                        usage,
-                    }),
-                    updates,
-                )
-                .await
-                .context("failed to save token usage")?;
+            let mut responses = VecDeque::new();
+            let mut stream = model_session.stream(&model_request).await?;
+            let mut completed = false;
+            let mut retry = None;
+            let mut stream_error = None;
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        stream_error = Some(error);
+                        break;
+                    }
+                };
+                match event {
+                    model::ModelEvent::Update(event) => {
+                        if let Some(updates) = updates {
+                            let _ = updates.send(event);
+                        }
+                    }
+                    model::ModelEvent::OutputItemDone {
+                        output,
+                        mut response,
+                    } => {
+                        let mut events = vec![ThreadEventData::ModelOutput(ModelOutputEvent {
+                            request_sequence,
+                            output: serde_json::to_value(output).map_err(|error| anyhow!(error))?,
+                            response_id: None,
+                        })];
+                        if let Some(response) = &mut response {
+                            events.push(response_event(response));
+                        }
+                        let saved = self
+                            .store
+                            .append_all(thread_id, events.clone())
+                            .await
+                            .context("failed to save completed model output item")?;
+                        if events.len() == 2
+                            && !matches!(events[1], ThreadEventData::Reasoning(_))
+                            && let Some(updates) = updates
+                        {
+                            let _ =
+                                updates.send(model::ModelStreamEvent::ThreadEvent(ThreadEvent {
+                                    sequence: saved[1],
+                                    data: events.pop().unwrap(),
+                                }));
+                        }
+                        if let Some(
+                            response @ (ModelResponse::AssistantMessage { .. }
+                            | ModelResponse::ToolCall { .. }
+                            | ModelResponse::CustomToolCall { .. }),
+                        ) = response
+                        {
+                            responses.push_back(response);
+                        }
+                    }
+                    model::ModelEvent::Retry {
+                        current,
+                        max,
+                        delay,
+                    } => {
+                        retry = Some((current, max, delay));
+                    }
+                    model::ModelEvent::Completed {
+                        metadata,
+                        token_usage,
+                        rate_limits,
+                    } => {
+                        if let Some(metadata) = metadata {
+                            self.store
+                                .append(
+                                    thread_id,
+                                    ThreadEventData::ModelOutput(ModelOutputEvent {
+                                        request_sequence,
+                                        output: serde_json::to_value(model::ProviderOutput {
+                                            provider: metadata.provider,
+                                            data: serde_json::Value::Array(Vec::new()),
+                                        })
+                                        .map_err(|error| anyhow!(error))?,
+                                        response_id: Some(metadata.response_id),
+                                    }),
+                                )
+                                .await
+                                .context("failed to save model response metadata")?;
+                        }
+                        if let Some(usage) = token_usage {
+                            self.append_event(
+                                thread_id,
+                                ThreadEventData::TokenUsage(TokenUsageEvent {
+                                    request_sequence,
+                                    usage,
+                                }),
+                                updates,
+                            )
+                            .await
+                            .context("failed to save token usage")?;
+                        }
+                        if !rate_limits.is_empty() {
+                            self.append_event(
+                                thread_id,
+                                ThreadEventData::RateLimits(RateLimitsEvent {
+                                    request_sequence,
+                                    snapshots: serde_json::to_value(rate_limits)
+                                        .map_err(|error| anyhow!(error))?,
+                                }),
+                                updates,
+                            )
+                            .await
+                            .context("failed to save rate limits")?;
+                        }
+                        completed = true;
+                    }
+                }
             }
-            if !completion.rate_limits.is_empty() {
-                self.append_event(
-                    thread_id,
-                    ThreadEventData::RateLimits(RateLimitsEvent {
-                        request_sequence,
-                        snapshots: serde_json::to_value(completion.rate_limits)
-                            .map_err(|error| anyhow!(error))?,
-                    }),
-                    updates,
-                )
-                .await
-                .context("failed to save rate limits")?;
+            if !completed && retry.is_none() && stream_error.is_none() {
+                stream_error = Some(anyhow!("model stream ended before completion"));
             }
-
-            let responses = completion.responses.into();
-            if let Some(response) = self
+            let response = self
                 .execute_model_responses(thread_id, responses, updates)
-                .await?
-            {
+                .await?;
+            if let Some(error) = stream_error {
+                return Err(error);
+            }
+            if let Some((current, max, delay)) = retry {
+                if let Some(updates) = updates {
+                    let _ = updates.send(model::ModelStreamEvent::Retry { current, max });
+                }
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if let Some(response) = response {
                 return Ok(response);
             }
         }
@@ -722,72 +873,24 @@ impl State {
         while let Some(response) = responses.pop_front() {
             match response {
                 ModelResponse::AssistantMessage { content, phase } => {
-                    let (content, todos) = parse_todo_annotation(content);
-                    self.append_event(
-                        thread_id,
-                        ThreadEventData::AssistantMessage(AssistantMessageEvent {
-                            content: content.clone(),
-                            phase,
-                            todos,
-                        }),
-                        updates,
-                    )
-                    .await
-                    .context("failed to save assistant message")?;
                     if phase != Some(AssistantMessagePhase::Commentary) {
                         final_answer = Some(content);
                     }
                 }
-                ModelResponse::WebSearch { item } => {
-                    self.append_event(
-                        thread_id,
-                        ThreadEventData::WebSearch(ItemEvent { item }),
-                        updates,
-                    )
-                    .await
-                    .context("failed to save web search")?;
-                }
-                ModelResponse::ToolCall {
-                    name,
-                    arguments,
-                    call_id,
-                } => {
-                    self.append_event(
-                        thread_id,
-                        ThreadEventData::ToolCall(ToolCallEvent::Function {
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                            call_id: call_id.clone(),
-                        }),
-                        updates,
-                    )
-                    .await
-                    .context("failed to save tool call")?;
+                ModelResponse::WebSearch { .. } => {}
+                ModelResponse::ToolCall { name, .. } => {
                     bail!("model requested unsupported tool {name}");
                 }
                 ModelResponse::CustomToolCall {
-                    item_id,
                     name,
                     input,
                     call_id,
+                    ..
                 } => {
                     needs_follow_up = true;
                     if name != "command" {
                         bail!("model requested unsupported custom tool {name}");
                     }
-                    self.append_event(
-                        thread_id,
-                        ThreadEventData::ToolCall(ToolCallEvent::Custom {
-                            call_type: CustomToolType::Custom,
-                            item_id: item_id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                            call_id: call_id.clone(),
-                        }),
-                        updates,
-                    )
-                    .await
-                    .context("failed to save tool call")?;
                     let mut results = Vec::new();
                     let mut artifacts = Vec::new();
                     for (index, operation) in parse_command_input(&input)?.into_iter().enumerate() {
@@ -847,12 +950,7 @@ impl State {
                     )
                     .await?;
                 }
-                ModelResponse::Reasoning { item } => {
-                    self.store
-                        .append(thread_id, ThreadEventData::Reasoning(ItemEvent { item }))
-                        .await
-                        .context("failed to save reasoning projection")?;
-                }
+                ModelResponse::Reasoning { .. } => {}
             }
         }
         Ok((!needs_follow_up)

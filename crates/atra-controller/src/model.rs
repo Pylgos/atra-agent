@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use atra_protocol::{
     ApprovalId, AssistantMessagePhase, Model, RunnerOperationUpdate, ThreadEvent, ThreadId,
 };
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::storage::Event;
@@ -97,13 +98,30 @@ pub(crate) struct ProviderOutput {
     pub data: serde_json::Value,
 }
 
-pub(crate) struct ModelCompletion {
-    pub output: ProviderOutput,
-    pub responses: Vec<ModelResponse>,
-    pub response_id: Option<String>,
-    pub token_usage: Option<serde_json::Value>,
-    pub rate_limits: Vec<serde_json::Value>,
+pub(crate) enum ModelEvent {
+    Update(ModelStreamEvent),
+    OutputItemDone {
+        output: ProviderOutput,
+        response: Option<ModelResponse>,
+    },
+    Retry {
+        current: u64,
+        max: u64,
+        delay: std::time::Duration,
+    },
+    Completed {
+        metadata: Option<ModelResponseMetadata>,
+        token_usage: Option<serde_json::Value>,
+        rate_limits: Vec<serde_json::Value>,
+    },
 }
+
+pub(crate) struct ModelResponseMetadata {
+    pub provider: String,
+    pub response_id: String,
+}
+
+pub(crate) type ModelEventStream = BoxStream<'static, Result<ModelEvent>>;
 
 pub(crate) struct ModelRequest<'a> {
     pub model: &'a str,
@@ -143,11 +161,7 @@ pub(crate) trait ModelProvider: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ModelSession: Send + Sync {
-    async fn complete(
-        &self,
-        request: &ModelRequest<'_>,
-        updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ModelCompletion>;
+    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream>;
 
     async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>>;
 }

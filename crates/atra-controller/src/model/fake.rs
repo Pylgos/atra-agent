@@ -5,11 +5,12 @@ use async_trait::async_trait;
 use atra_protocol::Model;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::{ContentItem, MessagePhase, ResponseInputItem, ResponseItem};
+use futures_util::stream;
 use tokio::sync::Mutex;
 
 use super::{
-    DEFAULT_MODEL, ModelCompletion, ModelProvider, ModelRequest, ModelResponse, ModelSession,
-    ModelStreamEvent, ProviderOutput,
+    DEFAULT_MODEL, ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
+    ModelSession, ProviderOutput,
 };
 use crate::storage::Event;
 use atra_protocol::{AssistantMessagePhase, ThreadEventData, ToolResultEvent};
@@ -31,7 +32,7 @@ impl FakeProvider {
         })
     }
 
-    pub(super) async fn complete(&self, events: &[Event]) -> Result<ModelCompletion> {
+    pub(super) async fn stream(&self, events: &[Event]) -> Result<ModelEventStream> {
         let mut response = self
             .responses
             .lock()
@@ -79,17 +80,21 @@ impl FakeProvider {
             ));
         }
         let output = response_item(response.clone())?;
-        Ok(ModelCompletion {
-            output: ProviderOutput {
-                provider: PROVIDER_ID.to_owned(),
-                data: serde_json::to_value([output])
-                    .context("failed to encode fake model output")?,
-            },
-            responses: vec![response],
-            response_id: None,
-            token_usage: None,
-            rate_limits: Vec::new(),
-        })
+        let output = ProviderOutput {
+            provider: PROVIDER_ID.to_owned(),
+            data: serde_json::to_value([output]).context("failed to encode fake model output")?,
+        };
+        Ok(Box::pin(stream::iter([
+            Ok(ModelEvent::OutputItemDone {
+                output,
+                response: Some(response),
+            }),
+            Ok(ModelEvent::Completed {
+                metadata: None,
+                token_usage: None,
+                rate_limits: Vec::new(),
+            }),
+        ])))
     }
 }
 
@@ -143,12 +148,8 @@ impl ModelProvider for FakeProvider {
 
 #[async_trait]
 impl ModelSession for &FakeProvider {
-    async fn complete(
-        &self,
-        request: &ModelRequest<'_>,
-        _updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ModelCompletion> {
-        FakeProvider::complete(self, request.events).await
+    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream> {
+        FakeProvider::stream(self, request.events).await
     }
 
     async fn compact(&self, _request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {

@@ -210,15 +210,31 @@ impl Store {
         thread_id: ThreadId,
         data: ThreadEventData,
     ) -> tokio_rusqlite::Result<EventSequence> {
-        let (kind, payload) = event_columns(&data)?;
-        let payload = serde_json::to_string(&payload).map_err(|error| {
-            tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })?;
+        Ok(self.append_all(thread_id, vec![data]).await?[0])
+    }
+
+    pub async fn append_all(
+        &self,
+        thread_id: ThreadId,
+        events: Vec<ThreadEventData>,
+    ) -> tokio_rusqlite::Result<Vec<EventSequence>> {
+        let events = events
+            .into_iter()
+            .map(|data| {
+                let (kind, payload) = event_columns(&data)?;
+                let payload = serde_json::to_string(&payload).map_err(|error| {
+                    tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        error,
+                    )))
+                })?;
+                Ok((kind, payload))
+            })
+            .collect::<tokio_rusqlite::Result<Vec<_>>>()?;
         self.connection
             .call(move |connection| {
                 let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
-                let sequence = transaction.query_row(
+                let first_sequence: i64 = transaction.query_row(
                     "
                     SELECT COALESCE(MAX(sequence) + 1, 0)
                     FROM events
@@ -227,15 +243,20 @@ impl Store {
                     [thread_id],
                     |row| row.get(0),
                 )?;
-                transaction.execute(
-                    "
-                    INSERT INTO events (thread_id, sequence, kind, payload)
-                    VALUES (?1, ?2, ?3, ?4)
-                    ",
-                    params![thread_id, sequence, kind.as_str(), payload],
-                )?;
+                let mut sequences = Vec::with_capacity(events.len());
+                for (offset, (kind, payload)) in events.into_iter().enumerate() {
+                    let sequence = first_sequence + offset as i64;
+                    transaction.execute(
+                        "
+                        INSERT INTO events (thread_id, sequence, kind, payload)
+                        VALUES (?1, ?2, ?3, ?4)
+                        ",
+                        params![thread_id, sequence, kind.as_str(), payload],
+                    )?;
+                    sequences.push(EventSequence(sequence));
+                }
                 transaction.commit()?;
-                Ok(EventSequence(sequence))
+                Ok(sequences)
             })
             .await
     }
