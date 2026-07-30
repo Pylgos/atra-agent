@@ -14,12 +14,13 @@ agents:
     kwargs:
       version: "0.146.0"
       reasoning_effort: medium
+      web_search: live
   - import_path: benchmarks.terminal_bench_2_1.atra_agent:AtraAgent
     model_name: openai/gpt-5.6-sol
     kwargs:
       atra_binary: result-atra/bin/atra
       reasoning_effort: medium
-      agent_version: 69b8481da57f141848e7462939ddb1d600c341ad
+      agent_version: workspace
 datasets:
   - name: terminal-bench/terminal-bench-2-1
     ref: sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a

@@ -1,12 +1,10 @@
 use super::*;
 use indoc::indoc;
 
-pub(super) fn model_tools() -> Vec<model::ModelTool> {
-    vec![
-        model::ModelTool::WebSearch,
-        model::ModelTool::Custom {
-            name: "command",
-            description: indoc! {"
+pub(super) fn model_tools(web_search: bool) -> Vec<model::ModelTool> {
+    let mut tools = vec![model::ModelTool::Custom {
+        name: "command",
+        description: indoc! {"
                 Execute one or more Bash scripts on named Atra Runners.
                 Start each script with `*** Runner <runner>`; repeat it to run another script or switch Runners.
                 A script ends at the next `*** Runner <runner>` line or the end of the tool input.
@@ -42,9 +40,9 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 Commands in one tool call execute sequentially, and their results are returned together after all commands have finished.
                 Use a separate tool call when a result is needed to decide the next operation.
             "},
-            format: model::ModelToolFormat {
-                syntax: "lark",
-                definition: indoc! {r#"
+        format: model::ModelToolFormat {
+            syntax: "lark",
+            definition: indoc! {r#"
                     start: runner_script+
                     runner_script: runner command_item+
                     runner: "*** Runner " name LF
@@ -82,9 +80,12 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                     %import common.INT
                     %import common.LF
                 "#},
-            },
         },
-    ]
+    }];
+    if web_search {
+        tools.insert(0, model::ModelTool::WebSearch);
+    }
+    tools
 }
 
 #[derive(Deserialize, serde::Serialize)]

@@ -1,139 +1,151 @@
-# Codex–Atra comparison on Terminal-Bench 2.1
+# Terminal-Bench 2.1によるCodex–Atra比較
 
-This benchmark runs Codex and Atra on the same 20 Terminal-Bench 2.1 tasks with
-`gpt-5.6-sol` and `medium` reasoning effort. The checked-in job uses one attempt
-and one concurrent trial to keep the initial usage bounded.
-[Terminal-Bench 2.1][tb21] and the [Harbor dataset][dataset] are the upstream
-sources.
+CodexとAtraを、同じTerminal-Bench 2.1の20 taskで比較するための
+ベンチマークです。モデルは`gpt-5.6-sol`、reasoning effortは`medium`、
+attempt数と同時実行数はともに1へ固定しています。
 
-The task set contains only tasks marked `hard`. It is selected by cycling
-through categories in alphabetical order and, within each category, taking the
-task with the largest expert-time estimate first. This gives broad coverage
-without replacing the selection with tasks that happen to favor either agent.
-The dataset is pinned by content digest. Codex is pinned by CLI version.
-`run.py` derives Atra's `agent_version` from the current Git commit and relevant
-working-tree changes, overriding the checked-in YAML value for each run.
+taskは難易度`hard`のものだけを対象とし、分野が偏らないようcategoryを
+巡回しながら、expert timeが長いものから20件選んでいます。datasetは
+content digestで固定しています。
 
-## Prerequisites
+## ディレクトリ構成
 
-- Docker with the Compose plugin
-- Python 3.12 or newer and `uv`
-- Codex 0.146.0 authenticated with `codex login`
-- A Nix-built and authenticated Atra CLI
+実行ログと、比較に採用する結果を分離しています。
 
-From the repository root:
+```text
+benchmarks/terminal_bench_2_1/
+├── jobs/
+│   └── <job-id>/                 # Harbor jobの生ログ
+│       ├── config.json
+│       ├── job.log
+│       ├── result.json
+│       └── <task>__<trial-id>/
+│           ├── trial.log
+│           ├── result.json
+│           ├── agent/
+│           └── verifier/
+└── campaigns/
+    └── <campaign>/
+        ├── campaign.json         # このcampaignに対応するagent
+        ├── results/
+        │   └── <task> -> ../../../jobs/<job-id>/<trial>
+        └── results.csv
+```
+
+`jobs/`は実際に実行されたHarbor jobを追記していく場所です。
+`campaigns/`は比較に採用するtrialの集合で、`results/`には`jobs/`内の
+trialを指す相対symlinkだけを置きます。
+
+1 campaignは1 agentだけに対応します。同じcampaignを別のagentで
+使うことはできません。campaign間の結果探索や共有、Git revisionによる
+自動選択は行いません。
+
+## 前提条件
+
+- DockerとCompose plugin
+- Python 3.12以降と`uv`
+- `codex login`済みのCodex 0.146.0
+- Nixでビルドでき、`atra codex login`済みのAtra
+
+Atraを初めて使う場合は、リポジトリrootで認証します。
 
 ```bash
 nix build .#atra --out-link result-atra
 result-atra/bin/atra codex login
 ```
 
-The Nix package includes the matching static Runner platform, so a separate
-platform installation is not needed.
+AtraのControllerと認証情報はhostに残ります。task containerへ配置するのは
+static Runnerだけで、taskのcommandとpatchはHarborが検証するcontainer内で
+実行されます。Terminal-Benchのtaskはinternet accessを許可しているため、
+CodexとAtraのWebSearchもどちらも有効にしています。
 
-The Atra adapter keeps the Controller and its credentials on the host. It
-uploads only the static Runner to Harbor's task container, then connects it over
-`docker exec`. All task commands and patches therefore execute inside the same
-container that Harbor verifies.
+## 実行
 
-## Run
-
-`run.py` pins Harbor 0.20.0, builds the current Atra source with Nix, checks
-Docker and authentication, and gives each Harbor batch a unique name.
-
-First validate both agents on one task:
-
-```bash
-./benchmarks/terminal_bench_2_1/run.py pilot
-```
-
-Then run the fixed 20-task campaign:
-
-```bash
-./benchmarks/terminal_bench_2_1/run.py full --campaign first-20
-```
-
-The full command creates 40 trials: 20 tasks × 2 agents × 1 attempt. An official
-leaderboard-style estimate needs repeated attempts, but increasing
-`n_attempts` should be deferred until the one-attempt comparison is useful and
-stable.
-
-### Shared incremental results
-
-Results are append-only and shared across compatible campaigns. Repeating a
-command—or starting another campaign with the same benchmark conditions—skips
-every compatible task-agent pair that already reached the verifier, including
-pairs with reward zero. Missing or interrupted pairs run in a new Harbor batch.
-Failed pairs are held unless retrying them is explicitly requested:
-
-```bash
-./benchmarks/terminal_bench_2_1/run.py full --campaign first-20
-./benchmarks/terminal_bench_2_1/run.py full --campaign first-20 --retry-errors
-```
-
-Compatibility includes the dataset digest, task, execution conditions, agent
-version, model, and reasoning effort. A pilot result can therefore be reused by
-a full campaign for the task they share. Use the explicit override only when a
-fresh completed trial is actually wanted:
+campaign名とagentは必ず明示します。まず1 taskのpilotを実行します。
 
 ```bash
 ./benchmarks/terminal_bench_2_1/run.py pilot \
-  --campaign quota-codex --agent codex --rerun-completed
+  --campaign codex-baseline --agent codex
+
+./benchmarks/terminal_bench_2_1/run.py pilot \
+  --campaign atra-current --agent atra
 ```
 
-Run the agents separately when attributing quota consumption:
+問題がなければ、同じcampaignで20 taskを実行します。pilotで採用済みの
+taskはskipされるため、それぞれ最大19 trialです。
 
 ```bash
 ./benchmarks/terminal_bench_2_1/run.py full \
-  --campaign first-20 --agent codex
+  --campaign codex-baseline --agent codex
+
 ./benchmarks/terminal_bench_2_1/run.py full \
-  --campaign first-20 --agent atra
+  --campaign atra-current --agent atra
 ```
 
-Before calling a provider, the command displays the completed, held-error, and
-pending counts plus the maximum number of new API trials. It asks for
-confirmation unless `--yes` is supplied. Use `--dry-run` to inspect the plan
-without building Atra, starting Docker containers, or calling a provider.
+実行前に、採用済み、保留中のerror、今回実行するtrial数を表示します。
+providerを呼ぶ前に確認を求めるため、想定外のtrial数なら中断できます。
+`--dry-run`ではDocker、Nix、providerを呼ばずにplanだけ確認します。
 
-A campaign records its mode and task selection, but neither its name nor its
-task list forms a cache boundary. Updating Atra therefore schedules the tasks
-for the new Atra revision while reusing a compatible Codex baseline from any
-campaign; a Codex update behaves symmetrically. Reports keep each agent revision
-and setting in a separate row. Every failed attempt remains available for token
-and quota accounting within its row.
+## 再実行
 
-## Report
+正常終了したtrialは、campaignの`results/`にsymlinkがある限りskipします。
+Atraのコード、モデル、effortなどを変更しても自動では再実行しません。
+新しい結果へ置き換える場合はagentとcampaignを明示して実行します。
 
-The campaign command prints a report after each batch and writes `results.csv`
-inside the campaign directory. It includes compatible attempts from all
-campaigns, filtered to the current task selection. Reports count all attempts
-for spend, but use the latest completed attempt for each task-agent pair when
-calculating benchmark scores.
+```bash
+./benchmarks/terminal_bench_2_1/run.py full \
+  --campaign atra-current --agent atra --rerun-completed
+```
 
-The reporter can also aggregate arbitrary Harbor job directories:
+errorになったtrialも`results/`へ採用し、通常実行では保留します。errorだけを
+再実行する場合は次のようにします。
+
+```bash
+./benchmarks/terminal_bench_2_1/run.py full \
+  --campaign atra-current --agent atra --retry-errors
+```
+
+再実行前のjobは`jobs/`に残り、campaignのsymlinkだけが新しいtrialを指す
+ように更新されます。そのため、過去に何を実行したかは失われません。
+
+## レポート
+
+各実行後、そのcampaignで現在採用しているtrialだけを集計し、
+`results.csv`へ保存します。2 agentを比較する場合は、2 campaignの
+`results/`をレポーターへ渡します。標準出力にはagent単位の集計と、
+taskごとのstatus、reward、使用量を整列済みMarkdownで表示します。
 
 ```bash
 python3 benchmarks/terminal_bench_2_1/report.py \
-  benchmarks/terminal_bench_2_1/jobs/atra-codex-terminal-bench-2-1 \
-  --csv benchmarks/terminal_bench_2_1/results.csv
+  benchmarks/terminal_bench_2_1/campaigns/codex-baseline/results \
+  benchmarks/terminal_bench_2_1/campaigns/atra-current/results
 ```
 
-`input_tokens` includes cached input, matching Harbor's definition.
-`uncached_input_tokens` is `input_tokens - cached_input_tokens`. Dollar cost is
-not compared because subscription-backed Codex and Atra runs do not expose a
-meaningful per-trial billed amount. The raw Atra event stream, Controller log,
-and final output are retained in each trial's agent log directory.
+全jobの消費量やerrorも含めて調査したい場合は、`jobs/`を直接渡せます。
 
-Model request counts come from Atra's event metadata and Codex's rollout
-`token_count` events. Quota reporting uses the Codex weekly-window
-`used_percent` snapshots saved by both agents. The observed change excludes the
-first request in each agent's measured range and has one percentage-point
-resolution. A decreasing value or a changed window is reported as an unknown
-reset instead of a consumption estimate.
+```bash
+python3 benchmarks/terminal_bench_2_1/report.py \
+  benchmarks/terminal_bench_2_1/jobs
+```
 
-Harbor redacts values from Codex's authentication JSON in saved artifacts. In
-Harbor 0.20.0 this can replace JSON literals with a bare `[REDACTED]` token; the
-reporter treats those redacted values as `null` while loading results.
+`input_tokens`にはcached inputが含まれます。`uncached_input_tokens`は
+`input_tokens - cached_input_tokens`です。Atraのrequest数はevent metadata、
+Codexのrequest数はsession内の`token_count` eventから集計します。
 
-[tb21]: https://github.com/harbor-framework/terminal-bench-2-1
-[dataset]: https://hub.harborframework.com/datasets/terminal-bench/terminal-bench-2-1/6
+quotaはCodex weekly windowの`used_percent`について、最初と最後に観測した
+値を表示します。最初のrequestによる増加は観測できず、値の分解能は
+1 percentage pointです。windowの切り替わりやresetを検出した場合は
+`reset/unknown`と表示します。
+
+詳細ログは各trialの以下の場所にあります。
+
+- 共通: `trial.log`、`result.json`、`verifier/test-stdout.txt`
+- Atra: `agent/atra-controller.log`、`agent/atra-events.jsonl`、
+  `agent/atra-output.txt`
+- Codex: `agent/codex.txt`、`agent/trajectory.json`、
+  `agent/sessions/**/*.jsonl`
+
+[Terminal-Bench 2.1](https://github.com/harbor-framework/terminal-bench-2-1)
+および
+[Harbor dataset](https://hub.harborframework.com/datasets/terminal-bench/terminal-bench-2-1/6)
+を使用しています。

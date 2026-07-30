@@ -79,7 +79,7 @@ def load_rows(job_dirs: list[Path]) -> list[dict]:
     rows = []
     seen = set()
     for job_dir in job_dirs:
-        paths = list(job_dir.glob("jobs/*/*/result.json"))
+        paths = list(job_dir.glob("*/result.json"))
         if not paths:
             paths = job_dir.rglob("result.json")
         for path in paths:
@@ -147,7 +147,7 @@ def total(rows: list[dict], field: str) -> int | float | None:
 
 def number(value: int | float | None, decimals: int = 0) -> str:
     if value is None:
-        return "—"
+        return "-"
     if decimals:
         return f"{value:,.{decimals}f}"
     return f"{value:,.0f}"
@@ -171,7 +171,7 @@ def quota_change(rows: list[dict]) -> str:
         return "reset/unknown"
     start = first["quota_start_percent"]
     end = last["quota_end_percent"]
-    return f"{number(start, 1)}→{number(end, 1)} (+{number(end - start, 1)} pp)"
+    return f"{number(start, 1)} -> {number(end, 1)} (+{number(end - start, 1)} pp)"
 
 
 def short_version(version: str) -> str:
@@ -185,7 +185,36 @@ def short_version(version: str) -> str:
     return version
 
 
-def markdown(rows: list[dict]) -> str:
+def table(
+    title: str,
+    headers: tuple[str, ...],
+    rows: list[tuple[str, ...]],
+    right_aligned: set[int],
+) -> str:
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows))
+        for index, header in enumerate(headers)
+    ]
+
+    def render(row: tuple[str, ...]) -> str:
+        cells = [
+            value.rjust(widths[index])
+            if index in right_aligned
+            else value.ljust(widths[index])
+            for index, value in enumerate(row)
+        ]
+        return "| " + " | ".join(cells) + " |"
+
+    separator = tuple(
+        "-" * (width - 1) + ":" if index in right_aligned else "-" * width
+        for index, width in enumerate(widths)
+    )
+    return "\n".join(
+        [f"## {title}", "", render(headers), render(separator), *map(render, rows)]
+    )
+
+
+def terminal_report(rows: list[dict]) -> str:
     grouped = defaultdict(list)
     for row in rows:
         grouped[
@@ -197,10 +226,7 @@ def markdown(rows: list[dict]) -> str:
             )
         ].append(row)
 
-    lines = [
-        "| Agent | Revision | Model | Effort | Attempts | Completed | Errors | Mean reward | Passes | Requests | Input | Cached | Uncached | Output | Quota observed* | Agent time |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+    summary_rows = []
     for (agent, version, model, effort), agent_rows in sorted(
         grouped.items(),
         key=lambda item: tuple(value or "" for value in item[0]),
@@ -216,40 +242,114 @@ def markdown(rows: list[dict]) -> str:
         ]
         passes = sum(value > 0 for value in rewards)
         mean_reward = sum(rewards) / len(rewards) if rewards else None
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    agent,
-                    short_version(version),
-                    model or "—",
-                    effort or "—",
-                    str(len(agent_rows)),
-                    str(len(latest_completed)),
-                    str(sum(row["exception"] is not None for row in agent_rows)),
-                    number(mean_reward, 3),
-                    f"{passes}/{len(rewards)}",
-                    number(total(agent_rows, "model_requests")),
-                    number(total(agent_rows, "input_tokens")),
-                    number(total(agent_rows, "cached_input_tokens")),
-                    number(total(agent_rows, "uncached_input_tokens")),
-                    number(total(agent_rows, "output_tokens")),
-                    quota_change(agent_rows),
-                    (
-                        f"{number(total(agent_rows, 'agent_seconds') / 60, 1)} min"
-                        if total(agent_rows, "agent_seconds") is not None
-                        else "—"
-                    ),
-                ]
+        agent_seconds = total(agent_rows, "agent_seconds")
+        summary_rows.append(
+            (
+                agent,
+                short_version(version),
+                model or "-",
+                effort or "-",
+                str(len(agent_rows)),
+                str(len(latest_completed)),
+                str(sum(row["exception"] is not None for row in agent_rows)),
+                number(mean_reward, 3),
+                f"{passes}/{len(rewards)}",
+                number(total(agent_rows, "model_requests")),
+                number(total(agent_rows, "input_tokens")),
+                number(total(agent_rows, "cached_input_tokens")),
+                number(total(agent_rows, "uncached_input_tokens")),
+                number(total(agent_rows, "output_tokens")),
+                quota_change(agent_rows),
+                f"{number(agent_seconds / 60, 1)} min"
+                if agent_seconds is not None
+                else "-",
             )
-            + " |"
         )
-    lines.append("")
-    lines.append(
-        "\\* Quota is the first-to-last observed Codex weekly-window usage. "
+
+    summary = table(
+        "Summary",
+        (
+            "Agent",
+            "Version",
+            "Model",
+            "Effort",
+            "Attempts",
+            "Completed",
+            "Errors",
+            "Mean",
+            "Passes",
+            "Requests",
+            "Input",
+            "Cached",
+            "Uncached",
+            "Output",
+            "Quota observed*",
+            "Time",
+        ),
+        summary_rows,
+        set(range(4, 16)),
+    )
+    task_rows = []
+    for row in sorted(
+        rows,
+        key=lambda row: (
+            row["task"],
+            row["agent"],
+            row["started_at"] or "",
+        ),
+    ):
+        if row["exception"] is not None:
+            status = f"error:{row['exception']}"
+        elif row["completed"]:
+            status = (
+                "pass" if row["reward"] is not None and row["reward"] > 0 else "fail"
+            )
+        else:
+            status = "incomplete"
+        task_rows.append(
+            (
+                row["task"],
+                row["agent"],
+                short_version(row["agent_version"]),
+                status,
+                number(row["reward"], 3),
+                number(row["model_requests"]),
+                number(row["input_tokens"]),
+                number(row["cached_input_tokens"]),
+                number(row["uncached_input_tokens"]),
+                number(row["output_tokens"]),
+                quota_change([row]),
+                (
+                    f"{number(row['agent_seconds'] / 60, 1)} min"
+                    if row["agent_seconds"] is not None
+                    else "-"
+                ),
+            )
+        )
+    tasks = table(
+        "Tasks",
+        (
+            "Task",
+            "Agent",
+            "Version",
+            "Status",
+            "Reward",
+            "Requests",
+            "Input",
+            "Cached",
+            "Uncached",
+            "Output",
+            "Quota observed*",
+            "Time",
+        ),
+        task_rows,
+        set(range(4, 12)),
+    )
+    note = (
+        "* Quota is the first-to-last observed Codex weekly-window usage. "
         "It excludes the first request and has 1 percentage-point resolution."
     )
-    return "\n".join(lines)
+    return f"{summary}\n\n{tasks}\n\n{note}"
 
 
 def main() -> None:
@@ -271,7 +371,7 @@ def main() -> None:
             writer = csv.DictWriter(output, fieldnames=rows[0].keys())
             writer.writeheader()
             writer.writerows(sorted(rows, key=lambda row: (row["task"], row["agent"])))
-    print(markdown(rows))
+    print(terminal_report(rows))
 
 
 if __name__ == "__main__":

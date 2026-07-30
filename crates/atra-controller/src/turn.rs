@@ -246,7 +246,7 @@ impl State {
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
         let model_session = self.provider.start_turn(&prompt_cache_key).await?;
-        let model_tools = model_tools();
+        let model_tools = model_tools(self.web_search);
         loop {
             self.sync_runners(thread_id, updates).await?;
             let mut events = self

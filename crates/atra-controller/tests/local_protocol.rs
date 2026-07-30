@@ -272,7 +272,7 @@ impl TestController {
         let auth_home = directory.path().join("auth");
         let server_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            atra_controller::run(&server_endpoint, &database, &auth_home, None)
+            atra_controller::run(&server_endpoint, &database, &auth_home, None, true)
                 .await
                 .unwrap();
         });

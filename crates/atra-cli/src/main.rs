@@ -65,7 +65,10 @@ enum Command {
 enum ControllerCommand {
     Start,
     Stop,
-    Run,
+    Run {
+        #[arg(long)]
+        disable_web_search: bool,
+    },
     Status,
 }
 
@@ -366,7 +369,7 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Controller {
-            command: ControllerCommand::Run,
+            command: ControllerCommand::Run { disable_web_search },
         } => {
             let database = workspace::database(&workspace_id)?;
             atra_controller::run(
@@ -374,6 +377,7 @@ async fn run(command: Command) -> Result<()> {
                 &database,
                 &codex_auth_home()?,
                 platform::current_platform()?,
+                !disable_web_search,
             )
             .await
         }

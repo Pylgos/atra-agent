@@ -5,11 +5,11 @@
 # ///
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,7 +22,8 @@ import yaml
 
 BENCHMARK_DIR = Path(__file__).resolve().parent
 REPOSITORY = BENCHMARK_DIR.parents[1]
-CAMPAIGNS_DIR = BENCHMARK_DIR / "jobs" / "campaigns"
+JOBS_DIR = BENCHMARK_DIR / "jobs"
+CAMPAIGNS_DIR = BENCHMARK_DIR / "campaigns"
 AGENT_NAMES = ("atra", "codex")
 
 
@@ -43,95 +44,47 @@ def command(
     )
 
 
-def source_version() -> str:
-    commit = command("git", "rev-parse", "HEAD", capture=True).stdout.strip()
-    diff = command(
-        "git",
-        "diff",
-        "--binary",
-        "HEAD",
-        "--",
-        "Cargo.toml",
-        "Cargo.lock",
-        "crates",
-        "flake.lock",
-        "flake.nix",
-        "tools/platform-bundle",
-        "benchmarks/terminal_bench_2_1/atra_agent.py",
-        capture=True,
-    ).stdout
-    if not diff:
-        return commit
-    digest = hashlib.sha256(diff.encode()).hexdigest()[:12]
-    return f"{commit}+dirty.{digest}"
-
-
 def agent_name(agent: dict) -> str:
     return agent.get("name") or "atra"
 
 
-def load_config(mode: str, version: str) -> dict:
+def load_config(mode: str) -> dict:
     path = BENCHMARK_DIR / ("pilot.yaml" if mode == "pilot" else "job.yaml")
-    config = yaml.safe_load(path.read_text())
-    for agent in config["agents"]:
-        if agent_name(agent) == "atra":
-            agent["kwargs"]["agent_version"] = version
-    return config
+    return yaml.safe_load(path.read_text())
 
 
-def benchmark_spec(config: dict) -> dict:
-    datasets = deepcopy(config["datasets"])
-    for dataset in datasets:
-        dataset.pop("task_names")
-    return {
-        "n_attempts": config["n_attempts"],
-        "n_concurrent_trials": config["n_concurrent_trials"],
-        "timeout_multiplier": config["timeout_multiplier"],
-        "environment": config["environment"],
-        "datasets": datasets,
-    }
+def selected_agent(config: dict, name: str) -> dict:
+    return next(agent for agent in config["agents"] if agent_name(agent) == name)
 
 
-def campaign_spec(mode: str, config: dict) -> dict:
-    return {
-        "schema": 3,
-        "mode": mode,
-        "benchmark": benchmark_spec(config),
-        "tasks": config["datasets"][0]["task_names"],
-    }
+def campaign_dir(name: str) -> Path:
+    return CAMPAIGNS_DIR / name
+
+
+def campaign_spec(agent: str) -> dict:
+    return {"schema": 1, "agent": agent}
+
+
+def check_campaign(path: Path, agent: str) -> None:
+    manifest = path / "campaign.json"
+    if not manifest.exists():
+        return
+    if read_json(manifest) != campaign_spec(agent):
+        raise SystemExit(
+            f"campaign belongs to another agent: {manifest}\n"
+            "Use a different --campaign name."
+        )
+
+
+def create_campaign(path: Path, agent: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    manifest = path / "campaign.json"
+    if not manifest.exists():
+        manifest.write_text(json.dumps(campaign_spec(agent), indent=2) + "\n")
 
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text().replace("[REDACTED]", "null"))
-
-
-def compatible_campaigns(spec: dict, campaign_dir: Path) -> list[Path]:
-    campaigns = []
-    if CAMPAIGNS_DIR.exists():
-        for path in CAMPAIGNS_DIR.glob("*/campaign.json"):
-            try:
-                candidate = read_json(path)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if candidate.get("benchmark") == spec:
-                campaigns.append(path.parent)
-    if campaign_dir not in campaigns:
-        campaigns.append(campaign_dir)
-    return campaigns
-
-
-def trial_attempts(campaign_dirs: list[Path]) -> list[dict]:
-    attempts = []
-    for campaign_dir in campaign_dirs:
-        for path in campaign_dir.glob("jobs/*/*/result.json"):
-            try:
-                result = read_json(path)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if "task_name" not in result or not result.get("agent_info"):
-                continue
-            attempts.append(result)
-    return attempts
 
 
 def completed(result: dict) -> bool:
@@ -141,86 +94,64 @@ def completed(result: dict) -> bool:
     )
 
 
-def selected_agents(config: dict, selection: str) -> list[dict]:
-    if selection == "both":
-        return config["agents"]
-    return [agent for agent in config["agents"] if agent_name(agent) == selection]
+def task_key(task: str) -> str:
+    return task.replace("/", "__")
 
 
-def agent_fingerprint(agent: dict) -> tuple[str, str, str, str | None]:
-    name = agent_name(agent)
-    kwargs = agent["kwargs"]
-    version = kwargs["agent_version"] if name == "atra" else kwargs["version"]
-    model = agent["model_name"].rsplit("/", maxsplit=1)[-1]
-    return name, version, model, kwargs.get("reasoning_effort")
-
-
-def result_fingerprint(result: dict) -> tuple[str, str, str | None, str | None]:
-    info = result["agent_info"]
-    kwargs = result["config"]["agent"]["kwargs"]
-    return (
-        info["name"],
-        info["version"],
-        (info.get("model_info") or {}).get("name"),
-        kwargs.get("reasoning_effort"),
-    )
+def selected_result(path: Path, task: str, agent: str) -> dict | None:
+    link = path / "results" / task_key(task)
+    if link.is_symlink() and not link.exists():
+        raise SystemExit(f"selected result link is broken: {link}")
+    if link.exists() and not link.is_symlink():
+        raise SystemExit(f"selected result is not a symlink: {link}")
+    result_path = link / "result.json"
+    if not result_path.exists():
+        return None
+    try:
+        result = read_json(result_path)
+    except (json.JSONDecodeError, OSError) as error:
+        raise SystemExit(f"failed to read selected result: {result_path}: {error}")
+    if (
+        result.get("task_name") != task
+        or (result.get("agent_info") or {}).get("name") != agent
+    ):
+        raise SystemExit(f"selected result does not match its campaign: {result_path}")
+    return result
 
 
 def plan(
     config: dict,
-    campaign_dirs: list[Path],
-    selection: str,
+    path: Path,
+    agent: str,
     retry_errors: bool,
     rerun_completed: bool,
 ) -> dict:
-    attempts = trial_attempts(campaign_dirs)
     tasks = config["datasets"][0]["task_names"]
-    pending_by_agent = {}
-    versions = {}
+    pending = []
+    selected = 0
     held_errors = 0
-    already_completed = 0
-    for agent in selected_agents(config, selection):
-        name = agent_name(agent)
-        fingerprint = agent_fingerprint(agent)
-        versions[name] = fingerprint[1]
-        matching = [
-            result for result in attempts if result_fingerprint(result) == fingerprint
-        ]
-        completed_tasks = {
-            result["task_name"] for result in matching if completed(result)
-        }
-        error_tasks = {
-            result["task_name"]
-            for result in matching
-            if result.get("exception_info") is not None
-        } - completed_tasks
-        pending = []
-        for task in tasks:
-            if task in completed_tasks and not rerun_completed:
-                already_completed += 1
-            elif task in error_tasks and not retry_errors:
-                held_errors += 1
-            else:
-                pending.append(task)
-        pending_by_agent[name] = pending
+    for task in tasks:
+        result = selected_result(path, task, agent)
+        if result is None:
+            pending.append(task)
+        elif completed(result) and not rerun_completed:
+            selected += 1
+        elif result.get("exception_info") is not None and not retry_errors:
+            held_errors += 1
+        else:
+            pending.append(task)
     return {
-        "attempts": len(attempts),
-        "completed": already_completed,
+        "selected": selected,
         "held_errors": held_errors,
-        "pending_by_agent": pending_by_agent,
-        "versions": versions,
-        "will_run": sum(map(len, pending_by_agent.values())),
+        "pending": pending,
     }
 
 
 def print_plan(run_plan: dict) -> None:
-    print(f"Compatible attempts: {run_plan['attempts']}")
-    print(f"Completed:         {run_plan['completed']}")
+    print(f"Selected results:  {run_plan['selected']}")
     print(f"Errors held:       {run_plan['held_errors']}")
-    print(f"Will run:          {run_plan['will_run']}")
-    for agent, tasks in run_plan["pending_by_agent"].items():
-        print(f"  {agent}@{run_plan['versions'][agent]}: {len(tasks)}")
-    print(f"Maximum new API trials: {run_plan['will_run']}")
+    print(f"Will run:          {len(run_plan['pending'])}")
+    print(f"Maximum new API trials: {len(run_plan['pending'])}")
 
 
 def confirm() -> None:
@@ -230,10 +161,7 @@ def confirm() -> None:
         raise SystemExit("cancelled")
 
 
-def check_auth(agent: str) -> None:
-    if agent == "atra":
-        command(REPOSITORY / "result-atra/bin/atra", "codex", "status")
-        return
+def check_codex_auth() -> None:
     codex = shutil.which("codex")
     if codex is None:
         raise SystemExit("codex is not installed")
@@ -261,91 +189,108 @@ def docker_environment() -> tuple[
 
 
 def preflight(
-    agents: list[str],
+    agent: str,
 ) -> tuple[dict[str, str], tempfile.TemporaryDirectory[str] | None]:
     if shutil.which("docker") is None:
         raise SystemExit("docker is not installed")
     if command("docker", "info", check=False, capture=True).returncode != 0:
         raise SystemExit("Docker daemon is unavailable")
     docker_env, docker_config = docker_environment()
-    if "atra" in agents:
+    if agent == "atra":
         command("nix", "build", ".#atra", "--out-link", "result-atra")
-    for agent in agents:
-        check_auth(agent)
+    else:
+        check_codex_auth()
     if shutil.which("harbor") is None:
         raise SystemExit("Harbor is unavailable in the uv environment")
     return docker_env, docker_config
 
 
-def save_campaign(campaign_dir: Path, spec: dict, dry_run: bool) -> None:
-    path = campaign_dir / "campaign.json"
-    if path.exists():
-        if read_json(path) != spec:
-            raise SystemExit(
-                f"campaign configuration changed: {path}\n"
-                "Use a new --campaign name to keep comparisons reproducible."
-            )
-        return
-    if dry_run:
-        return
-    campaign_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(spec, indent=2) + "\n")
+def link_result(path: Path, trial_dir: Path, task: str) -> None:
+    results_dir = path / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    link = results_dir / task_key(task)
+    temporary = results_dir / f".{link.name}.tmp"
+    temporary.unlink(missing_ok=True)
+    relative_target = os.path.relpath(trial_dir, results_dir)
+    temporary.symlink_to(relative_target, target_is_directory=True)
+    os.replace(temporary, link)
 
 
-def run_batch(
+def collect_results(path: Path, job_dir: Path, agent: str) -> None:
+    for result_path in job_dir.glob("*/result.json"):
+        try:
+            result = read_json(result_path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if (
+            result.get("task_name")
+            and (result.get("agent_info") or {}).get("name") == agent
+        ):
+            link_result(path, result_path.parent, result["task_name"])
+
+
+def run_job(
     config: dict,
-    campaign_dir: Path,
+    path: Path,
     agent: str,
     tasks: list[str],
     env: dict[str, str],
 ) -> None:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    job_name = f"batch-{agent}-{timestamp}"
+    job_name = datetime.now(UTC).strftime(f"%Y%m%dT%H%M%S%fZ-{agent}")
     batch = deepcopy(config)
     batch["job_name"] = job_name
-    batch["jobs_dir"] = str(campaign_dir / "jobs")
-    batch["agents"] = [
-        candidate for candidate in config["agents"] if agent_name(candidate) == agent
-    ]
+    batch["jobs_dir"] = str(JOBS_DIR)
+    batch["agents"] = [selected_agent(config, agent)]
     batch["datasets"][0]["task_names"] = tasks
-    configs_dir = campaign_dir / "batch-configs"
-    configs_dir.mkdir(parents=True, exist_ok=True)
-    config_path = configs_dir / f"{job_name}.json"
-    config_path.write_text(json.dumps(batch, indent=2) + "\n")
-    run_env = env.copy()
-    run_env["PYTHONPATH"] = str(REPOSITORY)
-    command("harbor", "run", "-c", config_path, "--yes", env=run_env)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    job_dir = JOBS_DIR / job_name
+    with tempfile.TemporaryDirectory(prefix="atra-benchmark-config-") as directory:
+        config_path = Path(directory) / "job.json"
+        config_path.write_text(json.dumps(batch, indent=2) + "\n")
+        run_env = env.copy()
+        run_env["PYTHONPATH"] = str(REPOSITORY)
+        process = subprocess.Popen(
+            ["harbor", "run", "-c", str(config_path), "--yes"],
+            cwd=REPOSITORY,
+            env=run_env,
+            text=True,
+        )
+        try:
+            try:
+                returncode = process.wait()
+            except KeyboardInterrupt:
+                previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    process.wait()
+                finally:
+                    signal.signal(signal.SIGINT, previous_handler)
+                raise
+        finally:
+            collect_results(path, job_dir, agent)
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, process.args)
 
 
-def report(
-    campaign_dirs: list[Path],
-    campaign_dir: Path,
-    tasks: list[str],
-    write_csv: bool,
-) -> None:
-    result_paths = (
-        path
-        for campaign in campaign_dirs
-        for path in campaign.glob("jobs/*/*/result.json")
-    )
-    if next(result_paths, None) is None:
+def report(path: Path, tasks: list[str], write_csv: bool) -> None:
+    results_dir = path / "results"
+    if not any(results_dir.glob("*/result.json")):
         return
     args = [
         sys.executable,
         BENCHMARK_DIR / "report.py",
-        *campaign_dirs,
+        results_dir,
         *(argument for task in tasks for argument in ("--task", task)),
     ]
     if write_csv:
-        args.extend(("--csv", campaign_dir / "results.csv"))
+        args.extend(("--csv", path / "results.csv"))
     command(*args)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("pilot", "full"))
-    parser.add_argument("--campaign")
-    parser.add_argument("--agent", choices=(*AGENT_NAMES, "both"), default="both")
+    parser.add_argument("--campaign", required=True)
+    parser.add_argument("--agent", choices=AGENT_NAMES, required=True)
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument("--rerun-completed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -355,56 +300,45 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    version = source_version()
-    config = load_config(args.mode, version)
-    campaign = args.campaign or f"terminal-bench-2-1-{args.mode}"
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", campaign):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.campaign):
         raise SystemExit("campaign must contain only letters, numbers, '.', '_' or '-'")
-    campaign_dir = CAMPAIGNS_DIR / campaign
-    save_campaign(campaign_dir, campaign_spec(args.mode, config), args.dry_run)
-    campaign_dirs = compatible_campaigns(benchmark_spec(config), campaign_dir)
+    config = load_config(args.mode)
+    path = campaign_dir(args.campaign)
+    check_campaign(path, args.agent)
     run_plan = plan(
         config,
-        campaign_dirs,
+        path,
         args.agent,
         args.retry_errors,
         args.rerun_completed,
     )
-    print(f"Campaign: {campaign}")
-    print(f"Atra version: {version}")
+    print(f"Campaign: {args.campaign}")
+    print(f"Agent:    {args.agent}")
     print_plan(run_plan)
     sys.stdout.flush()
-    if run_plan["will_run"] == 0 or args.dry_run:
-        report(
-            campaign_dirs,
-            campaign_dir,
-            config["datasets"][0]["task_names"],
-            not args.dry_run,
-        )
+    if not run_plan["pending"] or args.dry_run:
+        report(path, config["datasets"][0]["task_names"], not args.dry_run)
         return
     if not args.yes:
         confirm()
-    agents = [agent for agent, tasks in run_plan["pending_by_agent"].items() if tasks]
-    docker_env, docker_config = preflight(agents)
+    docker_env, docker_config = preflight(args.agent)
     try:
-        for agent in agents:
-            run_batch(
-                config,
-                campaign_dir,
-                agent,
-                run_plan["pending_by_agent"][agent],
-                docker_env,
-            )
+        create_campaign(path, args.agent)
+        run_job(
+            config,
+            path,
+            args.agent,
+            run_plan["pending"],
+            docker_env,
+        )
     finally:
         if docker_config is not None:
             docker_config.cleanup()
-    report(
-        campaign_dirs,
-        campaign_dir,
-        config["datasets"][0]["task_names"],
-        True,
-    )
+    report(path, config["datasets"][0]["task_names"], True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
