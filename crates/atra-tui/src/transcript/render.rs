@@ -22,6 +22,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     layout::{MappedRow, TranscriptLayout},
+    text::expand_line_tabs,
     transcript::{
         Author, DisplayedLine, RenderedItem, RunnerResult, TranscriptEntry, TranscriptItem,
     },
@@ -683,6 +684,7 @@ fn bash_lines(command: &str) -> Vec<Line<'static>> {
 }
 
 fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let line = expand_line_tabs(line);
     let mut rows = vec![Line::default()];
     let mut row_width = 0;
     for span in line.spans {

@@ -19,6 +19,7 @@ use crate::{
         ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
         ProcessPicker, ProcessPickerState, ThreadPicker, TranscriptMode,
     },
+    text::expand_tabs,
     transcript::{
         layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
     },
@@ -176,14 +177,14 @@ impl App {
         if let Some(input_hint) = input_hint {
             input_block = input_block.title_bottom(input_hint);
         }
-        let input_before_cursor = &input_value[..input_cursor];
+        let input_before_cursor = expand_tabs(&input_value[..input_cursor]);
         let cursor_row = input_before_cursor
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
         let cursor_column = input_before_cursor
             .rsplit_once('\n')
-            .map_or(input_before_cursor, |(_, line)| line)
+            .map_or(input_before_cursor.as_str(), |(_, line)| line)
             .width();
         let visible_input_width = usize::from(input.width.saturating_sub(2));
         let visible_input_height = usize::from(input.height.saturating_sub(2));
@@ -192,7 +193,7 @@ impl App {
         let vertical_scroll =
             cursor_row.saturating_sub(visible_input_height.saturating_sub(1)) as u16;
         frame.render_widget(
-            Paragraph::new(input_value)
+            Paragraph::new(expand_tabs(input_value))
                 .scroll((vertical_scroll, horizontal_scroll))
                 .block(
                     input_block
@@ -234,7 +235,10 @@ impl App {
                 Activity::Info(message) => (message, Style::default().fg(Color::Yellow)),
                 Activity::Error(message) => (message, Style::default().fg(Color::Red)),
             };
-            frame.render_widget(Paragraph::new(message.as_str()).style(style), activity_area);
+            frame.render_widget(
+                Paragraph::new(expand_tabs(message)).style(style),
+                activity_area,
+            );
         }
         frame.render_widget(Paragraph::new(self.status_line()), status);
     }
@@ -815,7 +819,7 @@ fn append_request_payload(lines: &mut Vec<Line<'static>>, request: &Value) {
             .as_str()
             .unwrap_or("")
             .lines()
-            .map(|line| Line::from(line.to_owned())),
+            .map(|line| Line::from(expand_tabs(line))),
     );
     lines.push(Line::default());
     lines.push(section("Input"));
@@ -876,7 +880,7 @@ fn render_thread_picker(
             let display_name = thread
                 .display_name
                 .as_deref()
-                .map(|name| sanitize(name).replace(['\n', '\t'], " "))
+                .map(|name| expand_tabs(&sanitize(name)).replace('\n', " "))
                 .unwrap_or_else(|| "Untitled thread".to_owned());
             ListItem::new(display_name)
         })
@@ -960,7 +964,7 @@ fn process_list_items(processes: &[atra_protocol::BackgroundProcess]) -> Vec<Lis
                 ProcessStatus::Unavailable { .. } => ("unavailable".to_owned(), Color::Red),
             };
             let elapsed = format_elapsed_ms(now_ms.saturating_sub(process.started_at_ms));
-            let command = sanitize(&process.command).replace(['\n', '\t'], " ");
+            let command = expand_tabs(&sanitize(&process.command)).replace('\n', " ");
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(status, Style::default().fg(color)),
@@ -987,7 +991,7 @@ fn render_process_detail(
         .areas(area);
     let selected = processes.get(picker.selected);
     let command = selected
-        .map(|process| sanitize(&process.command))
+        .map(|process| expand_tabs(&sanitize(&process.command)))
         .unwrap_or_else(|| "No background processes".to_owned());
     frame.render_widget(
         Paragraph::new(command).block(Block::default().title("Command").borders(Borders::ALL)),
@@ -1001,7 +1005,7 @@ fn render_process_detail(
         })
     });
     let output = detail
-        .map(|detail| sanitize(&detail.output_tail))
+        .map(|detail| expand_tabs(&sanitize(&detail.output_tail)))
         .unwrap_or_default();
     let mut lines = output
         .lines()
@@ -1009,7 +1013,7 @@ fn render_process_detail(
         .collect::<Vec<_>>();
     if lines.is_empty() {
         let message = match selected.map(|process| &process.status) {
-            Some(ProcessStatus::Unavailable { message }) => sanitize(message),
+            Some(ProcessStatus::Unavailable { message }) => expand_tabs(&sanitize(message)),
             Some(_) => "(no output)".to_owned(),
             None => String::new(),
         };

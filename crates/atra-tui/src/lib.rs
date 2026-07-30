@@ -18,6 +18,7 @@ mod input;
 mod layout;
 mod runtime;
 mod state;
+mod text;
 mod transcript;
 mod ui;
 
