@@ -599,6 +599,10 @@ impl CodexModelStream {
                         Ok(response) => response,
                         Err(error) => return Some(self.fail(error)),
                     };
+                    if let Some(response) = &response {
+                        self.has_response |= !matches!(response, ModelResponse::Reasoning { .. });
+                    }
+                    let completed = ModelEvent::OutputItemDone { output, response };
                     if let ResponseItem::WebSearchCall {
                         id: Some(item_id),
                         action,
@@ -606,22 +610,22 @@ impl CodexModelStream {
                     } = &item
                     {
                         match action.as_ref().map(serde_json::to_value).transpose() {
-                            Ok(action) => self.pending.push_back(Ok(ModelEvent::Update(
-                                ModelStreamEvent::WebSearchUpdate {
-                                    item_id: item_id.to_string(),
-                                    action,
-                                },
-                            ))),
+                            Ok(action) => {
+                                self.pending.push_back(Ok(completed));
+                                return Some(Ok(ModelEvent::Update(
+                                    ModelStreamEvent::WebSearchUpdate {
+                                        item_id: item_id.to_string(),
+                                        action,
+                                    },
+                                )));
+                            }
                             Err(error) => {
                                 self.pending.push_back(Err(anyhow::Error::new(error)
                                     .context("failed to encode live web search action")));
                             }
                         }
                     }
-                    if let Some(response) = &response {
-                        self.has_response |= !matches!(response, ModelResponse::Reasoning { .. });
-                    }
-                    return Some(Ok(ModelEvent::OutputItemDone { output, response }));
+                    return Some(Ok(completed));
                 }
                 ResponseEvent::Completed {
                     response_id,
