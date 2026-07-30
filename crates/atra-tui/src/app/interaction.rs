@@ -478,6 +478,9 @@ impl App {
             "continue" => {
                 self.run_command(|app| app.continue_thread(effects));
             }
+            "compact" => {
+                self.run_command(|app| app.compact_thread(effects));
+            }
             "processes" => {
                 self.run_command(|app| app.open_processes(effects));
             }
@@ -779,6 +782,25 @@ impl App {
         self.activity = Some(Activity::Info("Starting turn… · Esc cancels".to_owned()));
         effects
             .send(Effect::ContinueTurn {
+                endpoint: self.endpoint.clone(),
+                thread_id,
+            })
+            .ok();
+        Ok(())
+    }
+
+    fn compact_thread(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        let thread_id = self.target.thread_id().context("no thread is selected")?;
+        if self.target.checkpoint().is_some() {
+            bail!("cannot compact a checkpoint view");
+        }
+        if self.turn.is_running() {
+            bail!("a turn is already running");
+        }
+        self.turn = TurnState::Starting;
+        self.activity = Some(Activity::Info("Compacting… · Esc cancels".to_owned()));
+        effects
+            .send(Effect::CompactTurn {
                 endpoint: self.endpoint.clone(),
                 thread_id,
             })

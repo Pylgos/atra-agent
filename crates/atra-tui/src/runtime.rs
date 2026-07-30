@@ -1,7 +1,7 @@
 use std::{io, time::Duration};
 
 use anyhow::Result;
-use atra_client::Client;
+use atra_client::{Client, TurnResult};
 use atra_protocol::{ApprovalId, CheckpointId, EventSequence, ProcessId, ThreadId};
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
@@ -62,6 +62,10 @@ pub(crate) enum Effect {
         message: String,
     },
     ContinueTurn {
+        endpoint: std::path::PathBuf,
+        thread_id: ThreadId,
+    },
+    CompactTurn {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
     },
@@ -231,6 +235,26 @@ impl Effect {
                     .await;
                     if let Err(error) = result {
                         let _ = updates.send(TurnUpdate::StreamFailed(error));
+                    }
+                }
+                Self::CompactTurn {
+                    endpoint,
+                    thread_id,
+                } => {
+                    let result = async {
+                        let stream = Client::new(&endpoint).thread_compact(thread_id).await?;
+                        forward_turn(stream, &updates).await
+                    }
+                    .await;
+                    match result {
+                        Ok(TurnResult::Compacted) => {
+                            let result = load_transcript(&endpoint, thread_id).await;
+                            let _ = updates.send(TurnUpdate::Compacted { thread_id, result });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = updates.send(TurnUpdate::StreamFailed(error));
+                        }
                     }
                 }
                 Self::ResolveApproval {
@@ -412,5 +436,6 @@ async fn send_turn(
         }
     };
     let stream = client.thread_send(thread_id, message).await?;
-    forward_turn(stream, updates).await
+    forward_turn(stream, updates).await?;
+    Ok(())
 }

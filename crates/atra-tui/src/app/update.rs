@@ -50,6 +50,25 @@ impl App {
                 self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                 return Ok(());
             }
+            TurnUpdate::Compacted { thread_id, result } => {
+                self.turn = TurnState::Idle;
+                if self.target.thread_id() != Some(thread_id) {
+                    return Ok(());
+                }
+                match result {
+                    Ok((transcript, events)) => {
+                        self.transcript.replace(transcript, events);
+                        self.clear_selection();
+                        self.reset_view();
+                        self.metrics_stale = false;
+                        self.activity = Some(Activity::Info("Thread compacted".to_owned()));
+                    }
+                    Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
             TurnUpdate::ApprovalResolved {
                 approval_id,
                 result,
@@ -481,7 +500,11 @@ impl App {
                 }
             }
             TurnEvent::Finished(result) => {
-                self.turn = TurnState::Idle;
+                self.turn = if matches!(result, TurnResult::Compacted) {
+                    TurnState::Reloading
+                } else {
+                    TurnState::Idle
+                };
                 if self.target.thread_id() == Some(thread_id) {
                     match result {
                         TurnResult::Completed { .. }
@@ -514,6 +537,9 @@ impl App {
             }
             TurnResult::Cancelled => {
                 self.activity = Some(Activity::Info("Cancelled".to_owned()));
+            }
+            TurnResult::Compacted => {
+                self.activity = Some(Activity::Info("Reloading compacted thread…".to_owned()));
             }
             result => bail!("controller returned an unexpected turn result: {result:?}"),
         }

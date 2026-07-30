@@ -30,6 +30,7 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
     ("/rewind", "Rewind to the selected message"),
     ("/restore", "Restore the displayed checkpoint"),
     ("/continue", "Continue an incomplete turn"),
+    ("/compact", "Compact the current thread"),
     ("/processes", "Inspect background commands"),
     ("/help", "Show this command list"),
     ("/exit", "Exit Atra"),
@@ -127,6 +128,10 @@ pub(crate) enum TurnUpdate {
     },
     Stream(atra_client::TurnUpdate),
     StreamFailed(anyhow::Error),
+    Compacted {
+        thread_id: ThreadId,
+        result: Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)>,
+    },
     ApprovalResolved {
         approval_id: ApprovalId,
         result: Result<TurnResult>,

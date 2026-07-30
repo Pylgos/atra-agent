@@ -121,6 +121,9 @@ pub enum TurnRequest {
     ThreadContinue {
         thread_id: ThreadId,
     },
+    ThreadCompact {
+        thread_id: ThreadId,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -259,6 +262,7 @@ pub enum ControllerResponse {
     TurnCompleted {
         content: String,
     },
+    ThreadCompacted,
     ThreadCancelled,
     ThreadNotActive,
     ThreadProcessList {

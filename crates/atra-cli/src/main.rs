@@ -139,6 +139,10 @@ enum ThreadCommand {
         #[arg(long)]
         thread: i64,
     },
+    Compact {
+        #[arg(long)]
+        thread: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -586,6 +590,9 @@ async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
         ThreadCommand::Continue { thread } => {
             display_turn_stream(client(endpoint).thread_continue(ThreadId(thread)).await?).await
         }
+        ThreadCommand::Compact { thread } => {
+            display_turn_stream(client(endpoint).thread_compact(ThreadId(thread)).await?).await
+        }
     }
 }
 
@@ -634,6 +641,10 @@ fn display_turn_result(result: TurnResult) -> Result<()> {
         TurnResult::ApprovalResolved => Ok(()),
         TurnResult::Cancelled => {
             println!("cancelled");
+            Ok(())
+        }
+        TurnResult::Compacted => {
+            println!("compacted");
             Ok(())
         }
         TurnResult::Completed { content } => {

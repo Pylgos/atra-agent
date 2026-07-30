@@ -48,10 +48,11 @@ pub enum LaunchResult {
     AlreadyRunning,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum TurnResult {
     ApprovalResolved,
     Cancelled,
+    Compacted,
     Completed {
         content: String,
     },
@@ -216,6 +217,7 @@ impl TurnStream {
             ControllerResponse::TurnCompleted { content } => {
                 TurnEvent::Finished(TurnResult::Completed { content })
             }
+            ControllerResponse::ThreadCompacted => TurnEvent::Finished(TurnResult::Compacted),
             ControllerResponse::Error { message } => bail!("{message}"),
             response => return unexpected(response),
         };
@@ -257,6 +259,11 @@ impl Client {
 
     pub async fn thread_continue(&self, thread_id: ThreadId) -> Result<TurnStream> {
         self.turn_stream(TurnRequest::ThreadContinue { thread_id })
+            .await
+    }
+
+    pub async fn thread_compact(&self, thread_id: ThreadId) -> Result<TurnStream> {
+        self.turn_stream(TurnRequest::ThreadCompact { thread_id })
             .await
     }
 
@@ -594,7 +601,8 @@ impl Client {
     async fn turn_stream(&self, request: TurnRequest) -> Result<TurnStream> {
         let thread_id = match &request {
             TurnRequest::ThreadSend { thread_id, .. }
-            | TurnRequest::ThreadContinue { thread_id } => *thread_id,
+            | TurnRequest::ThreadContinue { thread_id }
+            | TurnRequest::ThreadCompact { thread_id } => *thread_id,
         };
         let request = ControllerRequest::Turn(request);
         Ok(TurnStream {
@@ -616,6 +624,7 @@ fn decode_turn(response: ControllerResponse) -> Result<TurnResult> {
     match response {
         ControllerResponse::ApprovalResolved => Ok(TurnResult::ApprovalResolved),
         ControllerResponse::ThreadCancelled => Ok(TurnResult::Cancelled),
+        ControllerResponse::ThreadCompacted => Ok(TurnResult::Compacted),
         ControllerResponse::TurnCompleted { content } => Ok(TurnResult::Completed { content }),
         ControllerResponse::ApprovalRequired {
             approval_id,

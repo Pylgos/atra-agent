@@ -28,6 +28,7 @@ pub(crate) enum TurnState {
     Idle,
     Starting,
     Running,
+    Reloading,
     Cancelling,
     AwaitingApproval(Approval),
     ResolvingApproval(Approval),

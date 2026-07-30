@@ -68,7 +68,8 @@ impl State {
     ) -> Result<ControllerResponse> {
         let thread_id = match &request {
             TurnRequest::ThreadSend { thread_id, .. }
-            | TurnRequest::ThreadContinue { thread_id } => *thread_id,
+            | TurnRequest::ThreadContinue { thread_id }
+            | TurnRequest::ThreadCompact { thread_id } => *thread_id,
         };
         let active = self.turns.start(thread_id).await?;
         updates
@@ -83,6 +84,9 @@ impl State {
                 }
                 TurnRequest::ThreadContinue { thread_id } => {
                     self.continue_thread(thread_id, Some(updates)).await
+                }
+                TurnRequest::ThreadCompact { thread_id } => {
+                    self.compact_thread(thread_id, Some(updates)).await
                 }
             }
         });
@@ -301,6 +305,123 @@ impl State {
         self.turns.ensure_no_pending_approval(thread_id).await
     }
 
+    pub(super) async fn compact_thread(
+        &self,
+        thread_id: ThreadId,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<ControllerResponse> {
+        let _guard = self.thread_lock(thread_id).lock_owned().await;
+        self.prepare_thread_for_turn(thread_id, updates).await?;
+        self.sync_skills(thread_id, updates).await?;
+        self.sync_runners(thread_id, updates).await?;
+        self.sync_workspace_instructions(thread_id).await?;
+        let prompt_cache_key = format!(
+            "{:x}",
+            Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
+        );
+        let model_session = self.provider.start_turn(&prompt_cache_key).await?;
+        let model_tools = model_tools();
+        let mut events = self
+            .store
+            .events(thread_id)
+            .await
+            .context("failed to load model history")?;
+        self.mask_old_command_results(thread_id, &mut events, updates)
+            .await?;
+        let (model, reasoning_effort) = self
+            .store
+            .thread_model(thread_id)
+            .await
+            .context("failed to load thread model")?;
+        let selected_model = self
+            .provider
+            .models()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == model);
+        let context_window = selected_model
+            .as_ref()
+            .and_then(|model| model.context_window);
+        let auto_compact_token_limit =
+            selected_model.and_then(|model| model.auto_compact_token_limit);
+        let model_request = model::ModelRequest {
+            model: &model,
+            reasoning_effort: &reasoning_effort,
+            instructions: model::BASE_INSTRUCTIONS,
+            tools: &model_tools,
+            events: &events,
+            prompt_cache_key: &prompt_cache_key,
+        };
+        if !self
+            .compact_history(
+                thread_id,
+                model_session.as_ref(),
+                &model_request,
+                context_window,
+                auto_compact_token_limit,
+                updates,
+            )
+            .await?
+        {
+            bail!("model returned an empty compaction");
+        }
+        Ok(ControllerResponse::ThreadCompacted)
+    }
+
+    async fn compact_history(
+        &self,
+        thread_id: ThreadId,
+        model_session: &dyn model::ModelSession,
+        model_request: &model::ModelRequest<'_>,
+        context_window: Option<i64>,
+        auto_compact_token_limit: Option<i64>,
+        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    ) -> Result<bool> {
+        let request = self.provider.compaction_snapshot(model_request)?;
+        self.append_event(
+            thread_id,
+            ThreadEventData::ModelRequest(ModelRequestEvent {
+                kind: ModelRequestKind::Compaction,
+                started_at_ms: unix_time_ms(),
+                request,
+                context_window,
+                auto_compact_token_limit,
+                compacted: model_request
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save compaction request")?;
+        self.store
+            .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
+            .await
+            .context("failed to checkpoint history before compaction")?;
+        let Some(items) = model_session.compact(model_request).await? else {
+            return Ok(false);
+        };
+        let workspace_event = match workspace_instructions(model_request.events) {
+            WorkspaceInstructions::Untracked => None,
+            WorkspaceInstructions::Present(content) => Some(InstructionEvent::Initial(content)),
+            WorkspaceInstructions::Removed => Some(InstructionEvent::Removal),
+        };
+        self.store
+            .replace_with_compaction(
+                thread_id,
+                CompactionEvent {
+                    items: serde_json::to_value(items).map_err(|error| anyhow!(error))?,
+                },
+                workspace_event,
+                skill_event(model_request.events),
+                runner_event(model_request.events),
+            )
+            .await
+            .context("failed to replace history after compaction")?;
+        Ok(true)
+    }
+
     pub(super) async fn continue_turn(
         &self,
         thread_id: ThreadId,
@@ -364,50 +485,17 @@ impl State {
                     events: &events,
                     prompt_cache_key: &prompt_cache_key,
                 };
-                let request = self.provider.compaction_snapshot(&model_request)?;
-                self.append_event(
-                    thread_id,
-                    ThreadEventData::ModelRequest(ModelRequestEvent {
-                        kind: ModelRequestKind::Compaction,
-                        started_at_ms: unix_time_ms(),
-                        request,
+                if self
+                    .compact_history(
+                        thread_id,
+                        model_session.as_ref(),
+                        &model_request,
                         context_window,
                         auto_compact_token_limit,
-                        compacted: events
-                            .iter()
-                            .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
-                    }),
-                    updates,
-                )
-                .await
-                .context("failed to save compaction request")?;
-                self.store
-                    .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
-                    .await
-                    .context("failed to checkpoint history before compaction")?;
-                let items = model_session.compact(&model_request).await?;
-                if let Some(items) = items {
-                    let workspace_instructions = workspace_instructions(&events);
-                    let workspace_event = match workspace_instructions {
-                        WorkspaceInstructions::Untracked => None,
-                        WorkspaceInstructions::Present(content) => {
-                            Some(InstructionEvent::Initial(content))
-                        }
-                        WorkspaceInstructions::Removed => Some(InstructionEvent::Removal),
-                    };
-                    self.store
-                        .replace_with_compaction(
-                            thread_id,
-                            CompactionEvent {
-                                items: serde_json::to_value(items)
-                                    .map_err(|error| anyhow!(error))?,
-                            },
-                            workspace_event,
-                            skill_event(&events),
-                            runner_event(&events),
-                        )
-                        .await
-                        .context("failed to replace history after compaction")?;
+                        updates,
+                    )
+                    .await?
+                {
                     events = self
                         .store
                         .events(thread_id)
