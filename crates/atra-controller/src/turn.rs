@@ -1041,9 +1041,7 @@ impl State {
         let process_handle = runner
             .start_command(arguments.command, thread_id, &process_id)
             .await?;
-        active
-            .set_process(Arc::clone(&runner), process_handle.clone())
-            .await;
+        active.set_process(Arc::clone(&runner), process_handle.clone());
         send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted)?;
         let deadline = Instant::now() + std::time::Duration::from_millis(FOREGROUND_TIMEOUT_MS);
         let mut collected = None;
@@ -1102,7 +1100,6 @@ impl State {
                 }
             }
         };
-        active.clear_process().await;
         let response = match response {
             WaitOutcome::Running {
                 process_handle,
@@ -1124,6 +1121,7 @@ impl State {
                         },
                     )
                     .await;
+                active.clear_process();
                 CommandOutcome::Running {
                     process_id,
                     output,
@@ -1135,11 +1133,14 @@ impl State {
                 exit_code,
                 patch_results,
                 ..
-            } => CommandOutcome::Finished {
-                output,
-                exit_code,
-                patch_results,
-            },
+            } => {
+                active.clear_process();
+                CommandOutcome::Finished {
+                    output,
+                    exit_code,
+                    patch_results,
+                }
+            }
         };
         let artifact = command_artifact(&response, &runner_name);
         let mut artifacts = vec![ToolArtifact::CommandExecution(artifact)];

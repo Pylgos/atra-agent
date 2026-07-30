@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -22,7 +22,7 @@ pub(super) struct ActiveTurn {
     cancel_requested: watch::Sender<bool>,
     cancellation: watch::Sender<Option<Result<(), String>>>,
     cancelling: AtomicBool,
-    process: Mutex<Option<(Arc<Runner>, ProcessHandle)>>,
+    process: StdMutex<Option<(Arc<Runner>, ProcessHandle)>>,
 }
 
 pub(super) struct ApprovalDecision {
@@ -144,7 +144,7 @@ impl ActiveTurn {
             cancel_requested,
             cancellation,
             cancelling: AtomicBool::new(false),
-            process: Mutex::new(None),
+            process: StdMutex::new(None),
         }
     }
 
@@ -160,16 +160,16 @@ impl ActiveTurn {
         self.cancelling.load(Ordering::Acquire)
     }
 
-    pub(super) async fn set_process(&self, runner: Arc<Runner>, process_handle: ProcessHandle) {
-        *self.process.lock().await = Some((runner, process_handle));
+    pub(super) fn set_process(&self, runner: Arc<Runner>, process_handle: ProcessHandle) {
+        *self.process.lock().unwrap() = Some((runner, process_handle));
     }
 
-    pub(super) async fn clear_process(&self) {
-        self.process.lock().await.take();
+    pub(super) fn clear_process(&self) {
+        self.process.lock().unwrap().take();
     }
 
     pub(super) async fn request_cancellation(&self) -> Result<()> {
-        let process = self.process.lock().await.take();
+        let process = self.process.lock().unwrap().take();
         self.cancel_requested.send_replace(true);
         if let Some((runner, process_handle)) = process {
             runner.stop(process_handle).await?;
