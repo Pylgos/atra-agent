@@ -1015,7 +1015,10 @@ impl App {
 
     fn cancel_turn(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
         self.overlay = Overlay::None;
-        let started = matches!(self.turn, TurnState::Running);
+        let started = matches!(
+            self.turn,
+            TurnState::Running | TurnState::AwaitingApproval(_) | TurnState::ResolvingApproval(_)
+        );
         self.turn = TurnState::Cancelling;
         self.activity = Some(Activity::Info("Cancelling…".to_owned()));
         if started {
