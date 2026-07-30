@@ -28,7 +28,8 @@ impl App {
         if matches!(
             self.turn,
             TurnState::Starting | TurnState::Running | TurnState::ResolvingApproval(_)
-        ) && key.code == KeyCode::Esc
+        ) && self.overlay.is_none()
+            && key.code == KeyCode::Esc
         {
             self.cancel_turn(effects);
             return Ok(false);
