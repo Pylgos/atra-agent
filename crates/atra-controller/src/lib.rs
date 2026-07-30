@@ -111,7 +111,6 @@ pub async fn run(
     database: &Path,
     auth_home: &Path,
     platform: Option<PlatformStore>,
-    web_search: bool,
 ) -> Result<()> {
     let workspace = env::current_dir().context("failed to determine controller workspace")?;
     let store = Store::open(database)
@@ -173,7 +172,6 @@ pub async fn run(
         auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
         workspace,
-        web_search,
     });
 
     let (shutdown, mut shutdown_requested) = watch::channel(false);
@@ -214,7 +212,6 @@ pub(crate) struct State {
     auth_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
-    web_search: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
