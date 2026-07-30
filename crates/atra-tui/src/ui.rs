@@ -17,7 +17,7 @@ use crate::{
     app::{Activity, App, COMMAND_HELP},
     state::{
         ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, TranscriptMode,
+        ProcessPicker, ProcessPickerState, ThreadPicker,
     },
     text::expand_tabs,
     transcript::{
@@ -116,10 +116,7 @@ impl App {
             main
         };
         self.layout.transcript_area = transcript_area;
-        match self.view.transcript_mode {
-            TranscriptMode::Coding => self.render_coding_transcript(frame, transcript_area),
-            TranscriptMode::Debug => self.render_debug_transcript(frame, transcript_area),
-        }
+        self.render_coding_transcript(frame, transcript_area);
         self.render_composer(frame, input);
         self.render_activity_and_status(frame, activity_area, status);
         self.render_overlays(frame, main);
@@ -308,11 +305,6 @@ impl App {
                 self.transcript.events.iter().rev().find_map(|event| {
                     if let ThreadEventData::ModelRequest(request) = &event.data
                         && request.kind == ModelRequestKind::Response
-                        && request
-                            .request
-                            .pointer("/model")
-                            .and_then(|value| value.as_str())
-                            == Some(model)
                     {
                         self.usage_for(event.sequence).map(|usage| (event, usage))
                     } else {
@@ -473,8 +465,6 @@ impl App {
     }
 
     fn render_coding_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.layout.request_list_area = Rect::default();
-        self.layout.detail_area = Rect::default();
         let block = Block::default()
             .title("Transcript")
             .borders(Borders::ALL)
@@ -559,115 +549,6 @@ impl App {
         }
     }
 
-    fn render_debug_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        self.layout.item_areas.clear();
-        self.layout.transcript_scrollbar_area = Rect::default();
-        self.layout.transcript_max_scroll = 0;
-        self.layout.transcript_scrollbar_drag_offset = None;
-        let [requests, detail] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(27), Constraint::Min(20)])
-            .areas(area);
-        self.layout.request_list_area = requests;
-        self.layout.detail_area = detail;
-        let request_events = self
-            .transcript
-            .events
-            .iter()
-            .filter(|event| matches!(event.data, ThreadEventData::ModelRequest(_)))
-            .collect::<Vec<_>>();
-        if !request_events.is_empty() && self.view.selected_request.is_none() {
-            self.view.selected_request = Some(request_events.len() - 1);
-        }
-        let selected = self
-            .view
-            .selected_request
-            .unwrap_or(0)
-            .min(request_events.len().saturating_sub(1));
-        self.view.selected_request = (!request_events.is_empty()).then_some(selected);
-        let request_lines = request_events
-            .iter()
-            .enumerate()
-            .flat_map(|(index, event)| {
-                let marker = if index == selected { "●" } else { " " };
-                let ThreadEventData::ModelRequest(request) = &event.data else {
-                    unreachable!()
-                };
-                let kind = match request.kind {
-                    ModelRequestKind::Compaction => "compaction",
-                    ModelRequestKind::Response => "response",
-                };
-                let model = request
-                    .request
-                    .pointer("/model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let usage = self.usage_for(event.sequence);
-                let tokens = usage.map_or_else(
-                    || "pending".to_owned(),
-                    |usage| {
-                        let input = usage["input_tokens"].as_f64().unwrap_or_default();
-                        let cached = usage["cached_input_tokens"].as_f64().unwrap_or_default();
-                        let hit_rate = if input > 0.0 {
-                            cached / input * 100.0
-                        } else {
-                            0.0
-                        };
-                        format!(
-                            "{} tok · {hit_rate:.0}% cache",
-                            usage["total_tokens"].as_i64().unwrap_or_default()
-                        )
-                    },
-                );
-                let seconds = request.started_at_ms / 1_000;
-                let millis = request.started_at_ms % 1_000;
-                [
-                    Line::from(Span::styled(
-                        format!("{marker} {kind}"),
-                        if index == selected {
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(ratatui::style::Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
-                    )),
-                    Line::from(format!("  {model} · {seconds}.{millis:03}")),
-                    Line::from(format!("  {tokens}")),
-                ]
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(request_lines).block(
-                Block::default()
-                    .title("LLM requests")
-                    .borders(Borders::ALL)
-                    .border_style(self.focus_border_style(FocusPane::Requests)),
-            ),
-            requests,
-        );
-
-        let lines = request_events
-            .get(selected)
-            .map(|event| self.request_detail_lines(event))
-            .unwrap_or_else(|| vec![Line::from("No LLM requests recorded")]);
-        let max_scroll = lines
-            .len()
-            .saturating_sub(usize::from(detail.height.saturating_sub(2)));
-        self.view.detail_scroll = self.view.detail_scroll.min(max_scroll);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .scroll((self.view.detail_scroll as u16, 0))
-                .block(
-                    Block::default()
-                        .title("Context · r raw/semantic")
-                        .borders(Borders::ALL)
-                        .border_style(self.focus_border_style(FocusPane::Detail)),
-                ),
-            detail,
-        );
-    }
-
     fn usage_for(
         &self,
         request_sequence: atra_protocol::EventSequence,
@@ -684,179 +565,10 @@ impl App {
                 _ => None,
             })
     }
-
-    fn request_detail_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
-        let ThreadEventData::ModelRequest(model_request) = &event.data else {
-            return Vec::new();
-        };
-        let request = &model_request.request;
-        if self.view.raw_request {
-            return serde_json::to_string_pretty(request)
-                .unwrap_or_else(|_| request.to_string())
-                .lines()
-                .map(|line| Line::from(line.to_owned()))
-                .collect();
-        }
-        let mut lines = self.request_summary_lines(event);
-        append_request_payload(&mut lines, request);
-        lines
-    }
-
-    fn request_summary_lines(&self, event: &atra_protocol::ThreadEvent) -> Vec<Line<'static>> {
-        let ThreadEventData::ModelRequest(model_request) = &event.data else {
-            return Vec::new();
-        };
-        let request = &model_request.request;
-        let mut lines = Vec::new();
-        let kind = match model_request.kind {
-            ModelRequestKind::Compaction => "compaction",
-            ModelRequestKind::Response => "response",
-        };
-        let started = model_request.started_at_ms;
-        let model = request["model"].as_str().unwrap_or("?");
-        lines.push(Line::from(Span::styled(
-            format!("{kind} · {model}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        )));
-        lines.push(Line::from(format!("started_at_ms: {started}")));
-        lines.push(Line::from(format!(
-            "context window: {} · auto compact: {} · compacted: {}",
-            model_request
-                .context_window
-                .map_or_else(|| "—".to_owned(), |value| value.to_string()),
-            model_request
-                .auto_compact_token_limit
-                .map_or_else(|| "—".to_owned(), |value| value.to_string()),
-            model_request.compacted,
-        )));
-        if let Some(usage) = self.usage_for(event.sequence) {
-            let input = usage["input_tokens"].as_f64().unwrap_or_default();
-            let cached = usage["cached_input_tokens"].as_f64().unwrap_or_default();
-            let hit_rate = if input > 0.0 {
-                cached / input * 100.0
-            } else {
-                0.0
-            };
-            let utilization = model_request
-                .context_window
-                .map(|value| value as f64)
-                .filter(|window| *window > 0.0)
-                .map(|window| input / window * 100.0);
-            lines.push(Line::from(format!(
-                "tokens: input {} · cached {} ({hit_rate:.1}%) · cache-write {} · output {} · reasoning {} · total {} · context {}",
-                value_or_dash(&usage["input_tokens"]),
-                value_or_dash(&usage["cached_input_tokens"]),
-                value_or_dash(&usage["cache_write_input_tokens"]),
-                value_or_dash(&usage["output_tokens"]),
-                value_or_dash(&usage["reasoning_output_tokens"]),
-                value_or_dash(&usage["total_tokens"]),
-                utilization.map_or_else(|| "—".to_owned(), |value| format!("{value:.1}%")),
-            )));
-        }
-        let input = request["input"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let message_count = input
-            .iter()
-            .filter(|item| item["type"] == "message")
-            .count();
-        let tool_count = input
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item["type"].as_str(),
-                    Some(
-                        "function_call"
-                            | "function_call_output"
-                            | "custom_tool_call"
-                            | "custom_tool_call_output"
-                    )
-                )
-            })
-            .count();
-        let reasoning_count = input
-            .iter()
-            .filter(|item| item["type"] == "reasoning")
-            .count();
-        lines.push(Line::from(format!(
-            "items: {} · messages {message_count} · tools {tool_count} · reasoning {reasoning_count}",
-            input.len()
-        )));
-        lines.push(Line::from(format!(
-            "serialized: request {} B · instructions {} chars/{} B · tools {} B",
-            serde_json::to_vec(request).map_or(0, |value| value.len()),
-            request["instructions"]
-                .as_str()
-                .map_or(0, |text| text.chars().count()),
-            request["instructions"].as_str().map_or(0, str::len),
-            serde_json::to_vec(&request["tools"]).map_or(0, |value| value.len()),
-        )));
-        lines
-    }
 }
 
 fn rounded_divide(numerator: usize, denominator: usize) -> usize {
     (numerator + denominator / 2) / denominator
-}
-
-fn section(name: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        name.to_owned(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    ))
-}
-
-fn append_request_payload(lines: &mut Vec<Line<'static>>, request: &Value) {
-    lines.push(Line::default());
-    lines.push(section("Instructions"));
-    lines.extend(
-        request["instructions"]
-            .as_str()
-            .unwrap_or("")
-            .lines()
-            .map(|line| Line::from(expand_tabs(line))),
-    );
-    lines.push(Line::default());
-    lines.push(section("Input"));
-    for (index, item) in request["input"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-    {
-        let encoded = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
-        lines.push(Line::from(Span::styled(
-            format!(
-                "[{index}] {} · {} chars/{} B",
-                item["type"].as_str().unwrap_or("item"),
-                encoded.chars().count(),
-                encoded.len()
-            ),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.extend(encoded.lines().map(|line| Line::from(line.to_owned())));
-    }
-    lines.push(Line::default());
-    lines.push(section("Tools"));
-    lines.extend(
-        serde_json::to_string_pretty(&request["tools"])
-            .unwrap_or_else(|_| request["tools"].to_string())
-            .lines()
-            .map(|line| Line::from(line.to_owned())),
-    );
-}
-
-fn value_or_dash(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "—".to_owned(),
-        value => value.to_string(),
-    }
 }
 
 fn render_thread_picker(

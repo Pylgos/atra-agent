@@ -8,18 +8,10 @@ use atra_protocol::{
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptMode {
-    Coding,
-    Debug,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusPane {
     Input,
     Checkpoints,
     Transcript,
-    Requests,
-    Detail,
 }
 
 #[derive(Default)]
@@ -57,12 +49,8 @@ impl TurnState {
 pub(crate) struct ViewState {
     pub(crate) selection_start: Option<SelectionPoint>,
     pub(crate) selection_end: Option<SelectionPoint>,
-    pub(crate) transcript_mode: TranscriptMode,
     pub(crate) focus: FocusPane,
     pub(crate) transcript_scroll: usize,
-    pub(crate) detail_scroll: usize,
-    pub(crate) selected_request: Option<usize>,
-    pub(crate) raw_request: bool,
     pub(crate) expanded_tools: HashSet<usize>,
     pub(crate) selected_item: Option<usize>,
 }
@@ -72,12 +60,8 @@ impl Default for ViewState {
         Self {
             selection_start: None,
             selection_end: None,
-            transcript_mode: TranscriptMode::Coding,
             focus: FocusPane::Input,
             transcript_scroll: 0,
-            detail_scroll: 0,
-            selected_request: None,
-            raw_request: false,
             expanded_tools: HashSet::new(),
             selected_item: None,
         }

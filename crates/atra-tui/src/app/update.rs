@@ -6,9 +6,7 @@ use tokio::sync::mpsc;
 use super::{Activity, App, HistoryChange, Target, ThreadView, TurnUpdate};
 use crate::{
     runtime::Effect,
-    state::{
-        Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, TranscriptMode, TurnState,
-    },
+    state::{Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, TurnState},
     transcript::{Author, TranscriptEntry, sanitize},
 };
 
@@ -287,7 +285,6 @@ impl App {
                     };
                     self.clear_selection();
                     self.reset_view();
-                    self.view.transcript_mode = TranscriptMode::Coding;
                     self.view.focus = FocusPane::Checkpoints;
                     self.activity = Some(Activity::Info(
                         "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
@@ -431,33 +428,7 @@ impl App {
                     if let ThreadEventData::RateLimits(rate_limits) = &event.data {
                         self.rate_limits = rate_limits.snapshots.clone();
                     }
-                    let usage_matches_selected_model = match &event.data {
-                        ThreadEventData::TokenUsage(usage) => Some(usage.request_sequence)
-                            .and_then(|sequence| {
-                                self.transcript
-                                    .events
-                                    .iter()
-                                    .find(|event| event.sequence == sequence)
-                            })
-                            .and_then(|event| match &event.data {
-                                ThreadEventData::ModelRequest(request) => {
-                                    request.request.pointer("/model")
-                                }
-                                _ => None,
-                            })
-                            .and_then(serde_json::Value::as_str)
-                            .zip(
-                                self.threads
-                                    .iter()
-                                    .find(|thread| thread.id == thread_id)
-                                    .map(|thread| thread.model.as_str()),
-                            )
-                            .is_some_and(|(request_model, selected_model)| {
-                                request_model == selected_model
-                            }),
-                        _ => false,
-                    };
-                    if usage_matches_selected_model {
+                    if matches!(&event.data, ThreadEventData::TokenUsage(_)) {
                         self.metrics_stale = false;
                     }
                     self.transcript.apply_event(event);

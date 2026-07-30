@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ApprovalId, EventSequence, ProcessStatus, ThreadEventData, ThreadId};
+use atra_protocol::{ApprovalId, EventSequence, ProcessStatus, ThreadId};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
@@ -14,7 +14,7 @@ use crate::{
     runtime::{ApprovalDecision, Effect, HistoryOperation},
     state::{
         ApprovalState, FocusPane, HistoryAction, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, TranscriptMode, TurnState,
+        ProcessPicker, ProcessPickerState, ThreadPicker, TurnState,
     },
     transcript::{sanitize, transcript_text},
 };
@@ -442,21 +442,6 @@ impl App {
             )?;
         }
         match command {
-            "view" => {
-                self.view.transcript_mode = match self.view.transcript_mode {
-                    TranscriptMode::Coding => TranscriptMode::Debug,
-                    TranscriptMode::Debug => TranscriptMode::Coding,
-                };
-                self.view.focus = FocusPane::Input;
-                self.clear_selection();
-                self.activity = Some(Activity::Info(
-                    match self.view.transcript_mode {
-                        TranscriptMode::Coding => "Coding transcript",
-                        TranscriptMode::Debug => "LLM request inspector",
-                    }
-                    .to_owned(),
-                ));
-            }
             "thread" => self.open_thread_picker(),
             "new" => self.start_new_thread(),
             "model" => self.open_model_picker()?,
@@ -885,31 +870,13 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self
-                    .layout
-                    .detail_area
-                    .contains((mouse.column, mouse.row).into())
-                {
-                    self.view.detail_scroll = self.view.detail_scroll.saturating_sub(3);
-                    self.view.focus = FocusPane::Detail;
-                } else {
-                    self.view.transcript_scroll = self.view.transcript_scroll.saturating_add(3);
-                    self.view.focus = FocusPane::Transcript;
-                }
+                self.view.transcript_scroll = self.view.transcript_scroll.saturating_add(3);
+                self.view.focus = FocusPane::Transcript;
                 return Ok(());
             }
             MouseEventKind::ScrollDown => {
-                if self
-                    .layout
-                    .detail_area
-                    .contains((mouse.column, mouse.row).into())
-                {
-                    self.view.detail_scroll = self.view.detail_scroll.saturating_add(3);
-                    self.view.focus = FocusPane::Detail;
-                } else {
-                    self.view.transcript_scroll = self.view.transcript_scroll.saturating_sub(3);
-                    self.view.focus = FocusPane::Transcript;
-                }
+                self.view.transcript_scroll = self.view.transcript_scroll.saturating_sub(3);
+                self.view.focus = FocusPane::Transcript;
                 return Ok(());
             }
             _ => {}
@@ -925,33 +892,6 @@ impl App {
             return Ok(());
         }
 
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .layout
-                .request_list_area
-                .contains((mouse.column, mouse.row).into())
-        {
-            let row = usize::from(
-                mouse
-                    .row
-                    .saturating_sub(self.layout.request_list_area.y + 1),
-            ) / 3;
-            if row < self.request_count() {
-                self.view.selected_request = Some(row);
-                self.view.detail_scroll = 0;
-            }
-            self.view.focus = FocusPane::Requests;
-            return Ok(());
-        }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .layout
-                .detail_area
-                .contains((mouse.column, mouse.row).into())
-        {
-            self.view.focus = FocusPane::Detail;
-            return Ok(());
-        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some((index, _)) = self
                 .layout
@@ -972,11 +912,10 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.view.transcript_mode == TranscriptMode::Coding
-                    && self
-                        .layout
-                        .transcript_area
-                        .contains((mouse.column, mouse.row).into())
+                if self
+                    .layout
+                    .transcript_area
+                    .contains((mouse.column, mouse.row).into())
                 {
                     self.view.focus = FocusPane::Transcript;
                 }
@@ -1200,9 +1139,6 @@ impl App {
 
     pub(super) fn reset_view(&mut self) {
         self.view.transcript_scroll = 0;
-        self.view.detail_scroll = 0;
-        self.view.selected_request = None;
-        self.view.raw_request = false;
         self.view.expanded_tools.clear();
         self.view.selected_item = None;
         self.view.focus = FocusPane::Input;
@@ -1212,12 +1148,7 @@ impl App {
         let panes: &[FocusPane] = if self.target.checkpoint_picker().is_some() {
             &[FocusPane::Checkpoints, FocusPane::Transcript]
         } else {
-            match self.view.transcript_mode {
-                TranscriptMode::Coding => &[FocusPane::Input, FocusPane::Transcript],
-                TranscriptMode::Debug => {
-                    &[FocusPane::Input, FocusPane::Requests, FocusPane::Detail]
-                }
-            }
+            &[FocusPane::Input, FocusPane::Transcript]
         };
         let current = panes
             .iter()
@@ -1261,59 +1192,8 @@ impl App {
                 KeyCode::End => self.view.transcript_scroll = 0,
                 _ => {}
             },
-            FocusPane::Requests => match key.code {
-                KeyCode::Up => {
-                    let selected = self.view.selected_request.unwrap_or(self.request_count());
-                    self.view.selected_request = Some(selected.saturating_sub(1));
-                    self.view.detail_scroll = 0;
-                }
-                KeyCode::Down => {
-                    let last = self.request_count().saturating_sub(1);
-                    self.view.selected_request = Some(
-                        self.view
-                            .selected_request
-                            .unwrap_or(last)
-                            .saturating_add(1)
-                            .min(last),
-                    );
-                    self.view.detail_scroll = 0;
-                }
-                _ => {}
-            },
-            FocusPane::Detail => match key.code {
-                KeyCode::Up => self.view.detail_scroll = self.view.detail_scroll.saturating_sub(1),
-                KeyCode::Down => {
-                    self.view.detail_scroll = self.view.detail_scroll.saturating_add(1)
-                }
-                KeyCode::PageUp => {
-                    self.view.detail_scroll = self
-                        .view
-                        .detail_scroll
-                        .saturating_sub(usize::from(self.layout.detail_area.height))
-                }
-                KeyCode::PageDown => {
-                    self.view.detail_scroll = self
-                        .view
-                        .detail_scroll
-                        .saturating_add(usize::from(self.layout.detail_area.height))
-                }
-                KeyCode::Char('r') => {
-                    self.view.raw_request = !self.view.raw_request;
-                    self.view.detail_scroll = 0;
-                }
-                KeyCode::End => self.view.detail_scroll = 0,
-                _ => {}
-            },
             FocusPane::Input => {}
         }
-    }
-
-    fn request_count(&self) -> usize {
-        self.transcript
-            .events
-            .iter()
-            .filter(|event| matches!(event.data, ThreadEventData::ModelRequest(_)))
-            .count()
     }
 
     fn select_item(&mut self, forward: bool) {

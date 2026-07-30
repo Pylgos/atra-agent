@@ -567,11 +567,7 @@ pub struct CompactionEvent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ModelRequestEvent {
     pub kind: ModelRequestKind,
-    pub started_at_ms: u64,
-    pub request: Value,
     pub context_window: Option<i64>,
-    pub auto_compact_token_limit: Option<i64>,
-    pub compacted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -118,31 +118,8 @@ impl ModelProvider for FakeProvider {
         Ok(Box::new(self))
     }
 
-    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "provider": PROVIDER_ID,
-            "model": request.model,
-            "reasoning_effort": request.reasoning_effort,
-            "instructions": request.instructions,
-            "tools": request.tools.len(),
-            "events": request.events,
-        }))
-    }
-
     fn context_tokens(&self, events: &[Event]) -> Result<usize> {
         Ok(super::text_tokens(&serde_json::to_string(events)?))
-    }
-
-    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "provider": PROVIDER_ID,
-            "kind": "compaction",
-            "model": request.model,
-            "reasoning_effort": request.reasoning_effort,
-            "instructions": request.instructions,
-            "tools": request.tools.len(),
-            "events": request.events,
-        }))
     }
 }
 

@@ -152,11 +152,7 @@ pub(crate) trait ModelProvider: Send + Sync {
 
     async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>>;
 
-    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value>;
-
     fn context_tokens(&self, events: &[Event]) -> Result<usize>;
-
-    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value>;
 }
 
 #[async_trait]

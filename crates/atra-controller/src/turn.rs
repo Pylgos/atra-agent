@@ -338,8 +338,6 @@ impl State {
         let context_window = selected_model
             .as_ref()
             .and_then(|model| model.context_window);
-        let auto_compact_token_limit =
-            selected_model.and_then(|model| model.auto_compact_token_limit);
         let model_request = model::ModelRequest {
             model: &model,
             reasoning_effort: &reasoning_effort,
@@ -354,7 +352,6 @@ impl State {
                 model_session.as_ref(),
                 &model_request,
                 context_window,
-                auto_compact_token_limit,
                 updates,
             )
             .await?
@@ -370,22 +367,13 @@ impl State {
         model_session: &dyn model::ModelSession,
         model_request: &model::ModelRequest<'_>,
         context_window: Option<i64>,
-        auto_compact_token_limit: Option<i64>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
     ) -> Result<bool> {
-        let request = self.provider.compaction_snapshot(model_request)?;
         self.append_event(
             thread_id,
             ThreadEventData::ModelRequest(ModelRequestEvent {
                 kind: ModelRequestKind::Compaction,
-                started_at_ms: unix_time_ms(),
-                request,
                 context_window,
-                auto_compact_token_limit,
-                compacted: model_request
-                    .events
-                    .iter()
-                    .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
             }),
             updates,
         )
@@ -487,7 +475,6 @@ impl State {
                         model_session.as_ref(),
                         &model_request,
                         context_window,
-                        auto_compact_token_limit,
                         updates,
                     )
                     .await?
@@ -507,19 +494,12 @@ impl State {
                 events: &events,
                 prompt_cache_key: &prompt_cache_key,
             };
-            let request = self.provider.completion_snapshot(&model_request)?;
             let request_sequence = self
                 .append_event(
                     thread_id,
                     ThreadEventData::ModelRequest(ModelRequestEvent {
                         kind: ModelRequestKind::Response,
-                        started_at_ms: unix_time_ms(),
-                        request,
                         context_window,
-                        auto_compact_token_limit,
-                        compacted: events
-                            .iter()
-                            .any(|event| matches!(event.data, ThreadEventData::Compaction(_))),
                     }),
                     updates,
                 )

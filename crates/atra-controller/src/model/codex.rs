@@ -327,16 +327,8 @@ impl ModelProvider for CodexProvider {
         Ok(Box::new(self.start_turn(session_id.to_owned()).await?))
     }
 
-    fn completion_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
-        completion_request(request)
-    }
-
     fn context_tokens(&self, events: &[Event]) -> Result<usize> {
         context_tokens(events)
-    }
-
-    fn compaction_snapshot(&self, request: &ModelRequest<'_>) -> Result<serde_json::Value> {
-        compaction_request(request)
     }
 }
 
@@ -1137,7 +1129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_snapshot_contains_exact_context_and_omits_observer_events() {
+    fn completion_request_contains_exact_context_and_omits_observer_events() {
         let events = vec![
             Event {
                 sequence: atra_protocol::EventSequence(0),
@@ -1149,11 +1141,7 @@ mod tests {
                 sequence: atra_protocol::EventSequence(1),
                 data: ThreadEventData::ModelRequest(atra_protocol::ModelRequestEvent {
                     kind: atra_protocol::ModelRequestKind::Response,
-                    started_at_ms: 0,
-                    request: json!("observer-only"),
                     context_window: None,
-                    auto_compact_token_limit: None,
-                    compacted: false,
                 }),
             },
         ];

@@ -20,7 +20,6 @@ mod interaction;
 mod update;
 
 pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
-    ("/view", "Switch between coding and debug views"),
     ("/thread", "Select a thread"),
     ("/new", "Start a new thread"),
     ("/model", "Select the model and reasoning effort"),
