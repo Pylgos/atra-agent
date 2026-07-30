@@ -215,15 +215,11 @@ impl State {
     ) -> Result<()> {
         let events = self
             .store
-            .events(thread_id)
+            .active_tool_events(thread_id)
             .await
-            .context("failed to load thread history")?;
-        let active_start = events
-            .iter()
-            .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
-            .map_or(0, |index| index + 1);
+            .context("failed to load active tool history")?;
         let mut pending = Vec::new();
-        for event in &events[active_start..] {
+        for event in &events {
             match &event.data {
                 ThreadEventData::ToolCall(call) => pending.push(call.clone()),
                 ThreadEventData::ToolResult(result) => {
@@ -800,10 +796,14 @@ impl State {
         let content = self.read_workspace_instructions().await?;
         let events = self
             .store
-            .events(thread_id)
+            .latest_event(thread_id, "workspace_instructions")
             .await
             .context("failed to load workspace instruction state")?;
-        let previous = workspace_instructions(&events);
+        let previous = events
+            .as_ref()
+            .map_or(WorkspaceInstructions::Untracked, |event| {
+                workspace_instructions(std::slice::from_ref(event))
+            });
         if matches!(
             (&previous, &content),
             (WorkspaceInstructions::Present(previous), Some(content)) if previous == content
@@ -847,10 +847,14 @@ impl State {
 
         let events = self
             .store
-            .events(thread_id)
+            .latest_event(thread_id, "skills")
             .await
             .context("failed to load skill state")?;
-        let previous = current_skills(&events);
+        let previous = events
+            .as_ref()
+            .map_or(WorkspaceInstructions::Untracked, |event| {
+                current_skills(std::slice::from_ref(event))
+            });
         if matches!(
             (&previous, &generation.prompt),
             (WorkspaceInstructions::Present(previous), Some(content)) if previous == content
@@ -897,10 +901,12 @@ impl State {
         let runners = self.runners.list().await?;
         let events = self
             .store
-            .events(thread_id)
+            .latest_event(thread_id, "runners")
             .await
             .context("failed to load runner state")?;
-        let previous = current_runners(&events);
+        let previous = events
+            .as_ref()
+            .and_then(|event| current_runners(std::slice::from_ref(event)));
         if previous.as_ref() == Some(&runners) {
             return Ok(());
         }

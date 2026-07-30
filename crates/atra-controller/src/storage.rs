@@ -291,6 +291,65 @@ impl Store {
             .await
     }
 
+    pub async fn active_tool_events(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio_rusqlite::Result<Vec<Event>> {
+        self.connection
+            .call(move |connection| {
+                read_events(
+                    connection,
+                    "
+                    SELECT sequence, kind, payload
+                    FROM events
+                    WHERE thread_id = ?1
+                        AND sequence > COALESCE(
+                            (
+                                SELECT MAX(sequence)
+                                FROM events
+                                WHERE thread_id = ?1 AND kind = 'compaction'
+                            ),
+                            -1
+                        )
+                        AND kind IN ('tool_call', 'tool_result')
+                    ORDER BY sequence
+                    ",
+                    thread_id.0,
+                )
+            })
+            .await
+    }
+
+    pub async fn latest_event(
+        &self,
+        thread_id: ThreadId,
+        kind: &'static str,
+    ) -> tokio_rusqlite::Result<Option<Event>> {
+        self.connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "
+                    SELECT sequence, payload
+                    FROM events
+                    WHERE thread_id = ?1 AND kind = ?2
+                    ORDER BY sequence DESC
+                    LIMIT 1
+                    ",
+                )?;
+                let mut rows = statement.query(params![thread_id.0, kind])?;
+                let Some(row) = rows.next()? else {
+                    return Ok(None);
+                };
+                let sequence = EventSequence(row.get(0)?);
+                let payload: String = row.get(1)?;
+                Ok(Some(Event {
+                    sequence,
+                    data: event_data(kind, &payload)?,
+                }))
+            })
+            .await
+    }
+
     pub async fn freeze_event_payloads(
         &self,
         thread_id: ThreadId,
