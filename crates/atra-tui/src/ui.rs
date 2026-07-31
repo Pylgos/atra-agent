@@ -3,7 +3,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState,
@@ -19,7 +19,7 @@ use crate::{
         ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
         ProcessPicker, ProcessPickerState, ThreadPicker,
     },
-    text::expand_tabs,
+    text::{expand_line_tabs, expand_tabs},
     transcript::{
         layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_ranges,
     },
@@ -66,6 +66,34 @@ fn format_window_duration(minutes: i64) -> String {
     } else {
         format!("{minutes}m")
     }
+}
+
+fn selected_input_text(value: &str, selection: Option<(usize, usize)>) -> Text<'static> {
+    let selection_style = Style::default().bg(Color::DarkGray);
+    let mut offset = 0;
+    let lines = value
+        .split('\n')
+        .map(|line| {
+            let spans = line
+                .char_indices()
+                .map(|(byte, character)| {
+                    let selected = selection
+                        .is_some_and(|(start, end)| start <= offset + byte && offset + byte < end);
+                    Span::styled(
+                        character.to_string(),
+                        if selected {
+                            selection_style
+                        } else {
+                            Style::default()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            offset += line.len() + 1;
+            expand_line_tabs(Line::from(spans))
+        })
+        .collect::<Vec<_>>();
+    Text::from(lines)
 }
 
 pub(crate) fn preserve_transcript_viewport(
@@ -122,8 +150,8 @@ impl App {
         self.render_overlays(frame, main);
     }
 
-    fn render_composer(&self, frame: &mut Frame<'_>, input: Rect) {
-        let (input_title, input_hint, input_value, input_cursor, show_cursor) =
+    fn render_composer(&mut self, frame: &mut Frame<'_>, input: Rect) {
+        let (input_title, input_hint, input_value, input_cursor, input_selection, show_cursor) =
             if let Some(approval) = self.turn.approval() {
                 match &approval.state {
                     ApprovalState::EnteringDenyReason(reason) => (
@@ -131,6 +159,7 @@ impl App {
                         Some(Line::from("Enter: deny · Esc: back").right_aligned()),
                         reason.value.as_str(),
                         reason.cursor,
+                        reason.selection_range(),
                         true,
                     ),
                     ApprovalState::Pending => {
@@ -148,6 +177,7 @@ impl App {
                             None,
                             "[y] Allow  [n] Deny",
                             0,
+                            None,
                             false,
                         )
                     }
@@ -159,6 +189,7 @@ impl App {
                         None,
                         self.message_input.value.as_str(),
                         self.message_input.cursor,
+                        self.message_input.selection_range(),
                         true,
                     ),
                     _ => (
@@ -166,6 +197,7 @@ impl App {
                         Some(Line::from("Enter: newline · Ctrl-G: send").right_aligned()),
                         self.message_input.value.as_str(),
                         self.message_input.cursor,
+                        self.message_input.selection_range(),
                         true,
                     ),
                 }
@@ -189,8 +221,15 @@ impl App {
             cursor_column.saturating_sub(visible_input_width.saturating_sub(1)) as u16;
         let vertical_scroll =
             cursor_row.saturating_sub(visible_input_height.saturating_sub(1)) as u16;
+        self.layout.input_text_area = Rect::new(
+            input.x.saturating_add(1),
+            input.y.saturating_add(1),
+            input.width.saturating_sub(2),
+            input.height.saturating_sub(2),
+        );
+        self.layout.input_scroll = (vertical_scroll, horizontal_scroll);
         frame.render_widget(
-            Paragraph::new(expand_tabs(input_value))
+            Paragraph::new(selected_input_text(input_value, input_selection))
                 .scroll((vertical_scroll, horizontal_scroll))
                 .block(
                     input_block
@@ -215,19 +254,42 @@ impl App {
         }
     }
 
-    fn render_activity_and_status(&self, frame: &mut Frame<'_>, activity_area: Rect, status: Rect) {
+    fn render_activity_and_status(
+        &mut self,
+        frame: &mut Frame<'_>,
+        activity_area: Rect,
+        status: Rect,
+    ) {
         if matches!(self.overlay, Overlay::Command) {
+            let input_area = Rect::new(
+                activity_area.x.saturating_add(1),
+                activity_area.y,
+                activity_area.width.saturating_sub(1),
+                activity_area.height,
+            );
+            let cursor_column =
+                expand_tabs(&self.command_input.value[..self.command_input.cursor]).width();
+            let horizontal_scroll = cursor_column
+                .saturating_sub(usize::from(input_area.width).saturating_sub(1))
+                as u16;
+            self.layout.command_input_area = input_area;
+            self.layout.command_input_scroll = horizontal_scroll;
+            frame.render_widget(Paragraph::new("/"), activity_area);
             frame.render_widget(
-                Paragraph::new(format!("/{}", self.command_input.value)),
-                activity_area,
+                Paragraph::new(selected_input_text(
+                    &self.command_input.value,
+                    self.command_input.selection_range(),
+                ))
+                .scroll((0, horizontal_scroll)),
+                input_area,
             );
             frame.set_cursor_position((
-                activity_area.x
-                    + self.command_input.value[..self.command_input.cursor].width() as u16
-                    + 1,
+                input_area.x + cursor_column as u16 - horizontal_scroll,
                 activity_area.y,
             ));
         } else if let Some(activity) = &self.activity {
+            self.layout.command_input_area = Rect::default();
+            self.layout.command_input_scroll = 0;
             let (message, style) = match activity {
                 Activity::Info(message) => (message, Style::default().fg(Color::Yellow)),
                 Activity::Error(message) => (message, Style::default().fg(Color::Red)),
@@ -236,6 +298,9 @@ impl App {
                 Paragraph::new(expand_tabs(message)).style(style),
                 activity_area,
             );
+        } else {
+            self.layout.command_input_area = Rect::default();
+            self.layout.command_input_scroll = 0;
         }
         frame.render_widget(Paragraph::new(self.status_line()), status);
     }

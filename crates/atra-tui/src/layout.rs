@@ -29,6 +29,10 @@ pub(crate) struct ViewLayout {
     pub(crate) transcript_scrollbar_thumb_len: u16,
     pub(crate) transcript_scrollbar_drag_offset: Option<u16>,
     pub(crate) input_area: Rect,
+    pub(crate) input_text_area: Rect,
+    pub(crate) input_scroll: (u16, u16),
+    pub(crate) command_input_area: Rect,
+    pub(crate) command_input_scroll: u16,
     pub(crate) item_areas: Vec<(usize, Rect)>,
     pub(crate) transcript_item_ranges: Vec<(usize, Range<usize>)>,
 }

@@ -6,44 +6,13 @@ use crate::transcript::{
     sanitize, transcript_lines, transcript_text,
 };
 use crate::ui::preserve_transcript_viewport;
+use crate::{layout::SelectionPoint, runtime::Effect};
 use atra_protocol::CommandExecutionArtifact;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, layout::Rect, text::Line};
 
-#[test]
-fn sanitizes_terminal_control_sequences() {
-    assert_eq!(
-        sanitize("safe\x1b[31m red\x1b[0m\x1b]52;c;bad\x07\nnext"),
-        "safe red\nnext"
-    );
-}
-
-#[test]
-fn transcript_scroll_follows_new_content_from_bottom() {
-    assert_eq!(preserve_transcript_viewport(0, 20, 35), 0);
-}
-
-#[test]
-fn transcript_scroll_preserves_viewport_when_content_grows() {
-    assert_eq!(preserve_transcript_viewport(8, 20, 35), 23);
-}
-
-#[test]
-fn transcript_scroll_clamps_viewport_when_content_shrinks() {
-    assert_eq!(preserve_transcript_viewport(8, 20, 10), 0);
-}
-
-#[test]
-fn transcript_render_is_stable() {
-    let items = vec![
-        TranscriptEntry::message(Author::User, "hello".to_owned()),
-        TranscriptEntry::message(
-            Author::Assistant,
-            "a deliberately wrapped response".to_owned(),
-        ),
-    ];
-    let backend = ratatui::backend::TestBackend::new(42, 10);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App {
+fn test_app(items: Vec<TranscriptEntry>) -> App {
+    App {
         endpoint: PathBuf::new(),
         message_history_path: PathBuf::new(),
         command_history_path: PathBuf::new(),
@@ -85,11 +54,154 @@ fn transcript_render_is_stable() {
         rate_limit_refresh_pending: false,
         processes: Vec::new(),
         process_refresh_pending: false,
-    };
+    }
+}
+
+#[test]
+fn sanitizes_terminal_control_sequences() {
+    assert_eq!(
+        sanitize("safe\x1b[31m red\x1b[0m\x1b]52;c;bad\x07\nnext"),
+        "safe red\nnext"
+    );
+}
+
+#[test]
+fn transcript_scroll_follows_new_content_from_bottom() {
+    assert_eq!(preserve_transcript_viewport(0, 20, 35), 0);
+}
+
+#[test]
+fn transcript_scroll_preserves_viewport_when_content_grows() {
+    assert_eq!(preserve_transcript_viewport(8, 20, 35), 23);
+}
+
+#[test]
+fn transcript_scroll_clamps_viewport_when_content_shrinks() {
+    assert_eq!(preserve_transcript_viewport(8, 20, 10), 0);
+}
+
+#[test]
+fn transcript_render_is_stable() {
+    let items = vec![
+        TranscriptEntry::message(Author::User, "hello".to_owned()),
+        TranscriptEntry::message(
+            Author::Assistant,
+            "a deliberately wrapped response".to_owned(),
+        ),
+    ];
+    let backend = ratatui::backend::TestBackend::new(42, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = test_app(items);
 
     terminal.draw(|frame| app.render(frame)).unwrap();
 
     insta::assert_snapshot!(terminal.backend().to_string());
+}
+
+#[test]
+fn mouse_selection_can_be_deleted_in_message_and_command_inputs() {
+    let backend = ratatui::backend::TestBackend::new(42, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = test_app(Vec::new());
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.message_input.set("abcdef".to_owned());
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let message_area = app.layout.input_text_area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: message_area.x + 1,
+        row: message_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: message_area.x + 4,
+        row: message_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &effects)
+        .unwrap();
+    assert_eq!(app.message_input.value, "aef");
+
+    app.overlay = Overlay::Command;
+    app.command_input.set("checkpoint".to_owned());
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let command_area = app.layout.command_input_area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: command_area.x + 5,
+        row: command_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: command_area.x + 10,
+        row: command_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        &effects,
+    )
+    .unwrap();
+    assert_eq!(app.command_input.value, "check");
+}
+
+#[test]
+fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    let mut items = vec![TranscriptEntry::message(
+        Author::User,
+        "transcript".to_owned(),
+    )];
+    prepare_transcript(&mut items, &HashSet::new(), 42);
+    let mut app = test_app(items);
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+    app.message_input.set("message".to_owned());
+    app.message_input.begin_selection(0);
+    app.message_input.extend_selection(3);
+    app.view.selection_start = Some(SelectionPoint { offset: 0 });
+    app.view.selection_end = Some(SelectionPoint { offset: 3 });
+    app.turn = TurnState::Running;
+    app.handle_key(ctrl_c, &effects).unwrap();
+    assert_eq!(app.message_input.value, "message");
+    assert!(matches!(app.turn, TurnState::Running));
+    assert!(pending_effects.try_recv().is_err());
+
+    app.message_input.set("message".to_owned());
+    app.handle_key(ctrl_c, &effects).unwrap();
+    assert!(matches!(app.turn, TurnState::Running));
+    assert!(pending_effects.try_recv().is_err());
+
+    app.clear_selection();
+    app.handle_key(ctrl_c, &effects).unwrap();
+    assert!(matches!(app.turn, TurnState::Cancelling));
+    assert!(matches!(
+        pending_effects.try_recv(),
+        Ok(Effect::CancelTurn { .. })
+    ));
+
+    let mut app = test_app(Vec::new());
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+    app.overlay = Overlay::Command;
+    app.command_input.set("checkpoint".to_owned());
+    app.command_input.begin_selection(5);
+    app.command_input.extend_selection(10);
+    app.turn = TurnState::Running;
+    app.handle_key(ctrl_c, &effects).unwrap();
+    assert_eq!(app.command_input.value, "checkpoint");
+    assert!(matches!(app.turn, TurnState::Running));
+
+    app.command_input.set("checkpoint".to_owned());
+    app.turn = TurnState::Idle;
+    app.handle_key(ctrl_c, &effects).unwrap();
+    assert!(app.command_input.value.is_empty());
 }
 
 #[test]

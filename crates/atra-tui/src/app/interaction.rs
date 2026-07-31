@@ -16,8 +16,25 @@ use crate::{
         ApprovalState, FocusPane, HistoryAction, ModelPicker, ModelPickerStage, Overlay,
         ProcessPicker, ProcessPickerState, ThreadPicker, TurnState,
     },
+    text::offset_at_position,
     transcript::{sanitize, transcript_text},
 };
+
+fn input_offset_at(
+    value: &str,
+    area: ratatui::layout::Rect,
+    scroll: (u16, u16),
+    column: u16,
+    row: u16,
+) -> usize {
+    let visual_row = usize::from(row.saturating_sub(area.y).saturating_add(scroll.0));
+    let visual_column = usize::from(column.saturating_sub(area.x).saturating_add(scroll.1));
+    offset_at_position(value, visual_row, visual_column)
+}
+
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+}
 
 impl App {
     pub(crate) fn handle_key(
@@ -45,6 +62,10 @@ impl App {
         }
 
         if matches!(self.overlay, Overlay::Command) {
+            if is_ctrl_c(key) {
+                self.handle_ctrl_c(effects)?;
+                return Ok(false);
+            }
             let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
             if toggle || key.code == KeyCode::Esc {
@@ -61,6 +82,11 @@ impl App {
                 let command = self.command_input.take();
                 return self.execute_command(&command, effects);
             }
+            return Ok(false);
+        }
+
+        if self.turn.approval().is_some() && is_ctrl_c(key) {
+            self.handle_ctrl_c(effects)?;
             return Ok(false);
         }
 
@@ -167,6 +193,10 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Char('c') {
+                self.handle_ctrl_c(effects)?;
+                return Ok(false);
+            }
             if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/')) && self.overlay.is_none()
             {
                 self.command_input.clear();
@@ -211,23 +241,6 @@ impl App {
                             endpoint: self.endpoint.clone(),
                         })
                         .ok();
-                }
-                KeyCode::Char('c')
-                    if self
-                        .selection_range()
-                        .is_some_and(|(start, end)| start != end) =>
-                {
-                    self.copy_selection()?
-                }
-                KeyCode::Char('c') => {
-                    if !self.message_input.value.is_empty() {
-                        let input = self.message_input.take();
-                        history::record(
-                            &self.message_history_path,
-                            &mut self.message_input,
-                            input,
-                        )?;
-                    }
                 }
                 _ => {
                     self.message_input.handle_key(key, &self.word_segmenter);
@@ -868,6 +881,37 @@ impl App {
             _ => {}
         }
 
+        if matches!(self.overlay, Overlay::Command) {
+            let area = self.layout.command_input_area;
+            let scroll = self.layout.command_input_scroll;
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if area.contains((mouse.column, mouse.row).into()) =>
+                {
+                    let offset = input_offset_at(
+                        &self.command_input.value,
+                        area,
+                        (0, scroll),
+                        mouse.column,
+                        mouse.row,
+                    );
+                    self.command_input.begin_selection(offset);
+                }
+                MouseEventKind::Drag(MouseButton::Left) if self.command_input.is_selecting() => {
+                    let offset = input_offset_at(
+                        &self.command_input.value,
+                        area,
+                        (0, scroll),
+                        mouse.column,
+                        mouse.row,
+                    );
+                    self.command_input.extend_selection(offset);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.view.transcript_scroll = self.view.transcript_scroll.saturating_add(3);
@@ -881,15 +925,45 @@ impl App {
             }
             _ => {}
         }
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.target.checkpoint_picker().is_none()
-            && self
-                .layout
-                .input_area
-                .contains((mouse.column, mouse.row).into())
-        {
-            self.view.focus = FocusPane::Input;
-            return Ok(());
+        if self.target.checkpoint_picker().is_none() {
+            let area = self.layout.input_text_area;
+            let scroll = self.layout.input_scroll;
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self
+                        .layout
+                        .input_area
+                        .contains((mouse.column, mouse.row).into())
+                        && self.composer_input().is_some() =>
+                {
+                    let offset = input_offset_at(
+                        &self.composer_input().unwrap().value,
+                        area,
+                        scroll,
+                        mouse.column,
+                        mouse.row,
+                    );
+                    self.clear_selection();
+                    self.view.focus = FocusPane::Input;
+                    self.composer_input_mut().unwrap().begin_selection(offset);
+                    return Ok(());
+                }
+                MouseEventKind::Drag(MouseButton::Left)
+                    if self.view.focus == FocusPane::Input
+                        && self.composer_input().is_some_and(InputBuffer::is_selecting) =>
+                {
+                    let offset = input_offset_at(
+                        &self.composer_input().unwrap().value,
+                        area,
+                        scroll,
+                        mouse.column,
+                        mouse.row,
+                    );
+                    self.composer_input_mut().unwrap().extend_selection(offset);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1105,6 +1179,26 @@ impl App {
         })
     }
 
+    fn composer_input(&self) -> Option<&InputBuffer> {
+        if let Some(approval) = self.turn.approval() {
+            return match &approval.state {
+                ApprovalState::EnteringDenyReason(reason) => Some(reason),
+                ApprovalState::Pending => None,
+            };
+        }
+        matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&self.message_input)
+    }
+
+    fn composer_input_mut(&mut self) -> Option<&mut InputBuffer> {
+        if let Some(approval) = self.turn.approval_mut() {
+            return match &mut approval.state {
+                ApprovalState::EnteringDenyReason(reason) => Some(reason),
+                ApprovalState::Pending => None,
+            };
+        }
+        matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&mut self.message_input)
+    }
+
     pub(crate) fn selection_range(&self) -> Option<(usize, usize)> {
         let start = self.view.selection_start?.offset;
         let end = self.view.selection_end?.offset;
@@ -1120,7 +1214,10 @@ impl App {
             return Ok(());
         };
         let text = transcript_text(&self.transcript.entries);
-        let text = &text[start..end];
+        self.copy_text(&text[start..end])
+    }
+
+    fn copy_text(&mut self, text: &str) -> Result<()> {
         write!(
             io::stdout(),
             "\x1b]52;c;{}\x07",
@@ -1130,6 +1227,55 @@ impl App {
         io::stdout().flush().context("failed to flush OSC 52")?;
         self.activity = Some(Activity::Info("Copied selection".to_owned()));
         Ok(())
+    }
+
+    fn handle_ctrl_c(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
+        if let Some(text) = self.input_selection_text() {
+            return self.copy_text(&text);
+        }
+        if self
+            .selection_range()
+            .is_some_and(|(start, end)| start != end)
+        {
+            return self.copy_selection();
+        }
+        if matches!(
+            self.turn,
+            TurnState::Starting
+                | TurnState::Running
+                | TurnState::AwaitingApproval(_)
+                | TurnState::ResolvingApproval(_)
+        ) {
+            self.cancel_turn(effects);
+            return Ok(());
+        }
+
+        if matches!(self.overlay, Overlay::Command) {
+            self.command_input.clear();
+        } else if let Some(approval) = self.turn.approval_mut()
+            && let ApprovalState::EnteringDenyReason(reason) = &mut approval.state
+        {
+            reason.clear();
+        } else if !self.message_input.value.is_empty() {
+            let input = self.message_input.take();
+            history::record(&self.message_history_path, &mut self.message_input, input)?;
+        }
+        Ok(())
+    }
+
+    fn input_selection_text(&self) -> Option<String> {
+        let input = if matches!(self.overlay, Overlay::Command) {
+            &self.command_input
+        } else if let Some(approval) = self.turn.approval() {
+            match &approval.state {
+                ApprovalState::EnteringDenyReason(reason) => reason,
+                ApprovalState::Pending => return None,
+            }
+        } else {
+            &self.message_input
+        };
+        let (start, end) = input.selection_range()?;
+        Some(input.value[start..end].to_owned())
     }
 
     pub(super) fn clear_selection(&mut self) {
