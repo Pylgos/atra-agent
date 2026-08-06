@@ -1,6 +1,4 @@
 {
-  description = "Atra";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     crane.url = "github:ipetkov/crane";
@@ -19,7 +17,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      version = (builtins.fromTOML (builtins.readFile ./crates/atra-cli/Cargo.toml)).package.version;
+      version = (fromTOML (builtins.readFile ./crates/atra-cli/Cargo.toml)).package.version;
     in
     {
       packages = forAllSystems (
