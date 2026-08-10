@@ -148,19 +148,15 @@ impl Store {
 
         let destination = self.root.join("objects").join(expected);
         if destination.exists() {
+            set_object_permissions(&destination, executable)?;
             return Ok(());
         }
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(if executable {
-                0o555
-            } else {
-                0o444
-            }))
-            .context("failed to set object permissions")?;
+        set_object_permissions(temporary.path(), executable)?;
         match temporary.persist_noclobber(&destination) {
             Ok(_) => Ok(()),
-            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+                set_object_permissions(&destination, executable)
+            }
             Err(error) => Err(error.error)
                 .with_context(|| format!("failed to store object {}", destination.display())),
         }
@@ -309,6 +305,14 @@ fn object_hasher(executable: bool) -> Sha256 {
     digest
 }
 
+fn set_object_permissions(path: &Path, executable: bool) -> Result<()> {
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 }),
+    )
+    .with_context(|| format!("failed to set object permissions on {}", path.display()))
+}
+
 fn validate_tree_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.starts_with('/')
@@ -420,5 +424,31 @@ mod tests {
             store.read_manifest(&manifest.digest()).unwrap().digest(),
             manifest.digest()
         );
+    }
+
+    #[test]
+    fn restores_permissions_when_putting_an_existing_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store")).unwrap();
+        let content = b"skill content";
+        let object = object_digest(content, false);
+        let path = temporary.path().join("store/objects").join(&object);
+
+        store
+            .put_object(&object, false, Cursor::new(content))
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o454)).unwrap();
+
+        store
+            .put_object(&object, false, Cursor::new(content))
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        let mut copied = Vec::new();
+        assert!(!store.copy_object_to(&object, &mut copied).unwrap());
+        assert_eq!(copied, content);
     }
 }
