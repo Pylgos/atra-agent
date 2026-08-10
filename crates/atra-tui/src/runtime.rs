@@ -50,6 +50,10 @@ pub(crate) enum Effect {
         thread_id: ThreadId,
         display_name: String,
     },
+    DeleteThread {
+        endpoint: std::path::PathBuf,
+        thread_id: ThreadId,
+    },
     ChangeModel {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
@@ -204,6 +208,13 @@ impl Effect {
                         display_name,
                         result,
                     });
+                }
+                Self::DeleteThread {
+                    endpoint,
+                    thread_id,
+                } => {
+                    let result = Client::new(&endpoint).thread_delete(thread_id).await;
+                    let _ = updates.send(TurnUpdate::ThreadDeleted { thread_id, result });
                 }
                 Self::ChangeModel {
                     endpoint,

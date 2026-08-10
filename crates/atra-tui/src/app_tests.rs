@@ -9,7 +9,7 @@ use crate::ui::{preserve_transcript_viewport, render_model_picker};
 use crate::{
     layout::SelectionPoint,
     runtime::Effect,
-    state::{ModelPicker, ModelPickerStage},
+    state::{ModelPicker, ModelPickerStage, Overlay, ThreadPicker, ThreadPickerState},
 };
 use atra_protocol::CommandExecutionArtifact;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -195,6 +195,95 @@ fn ignores_rate_limits_loaded_for_a_previous_provider() {
 
     assert_eq!(app.rate_limits, serde_json::json!([]));
     assert!(!app.rate_limit_refresh_pending);
+}
+
+#[test]
+fn deleting_the_last_thread_closes_the_picker() {
+    let mut app = test_app(Vec::new());
+    app.threads.truncate(1);
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 0,
+        state: ThreadPickerState::Deleting,
+    });
+    let thread_id = app.threads[0].id;
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.update(
+        TurnUpdate::ThreadDeleted {
+            thread_id,
+            result: Ok(()),
+        },
+        &effects,
+    )
+    .unwrap();
+
+    assert!(app.threads.is_empty());
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(matches!(app.target, Target::New { .. }));
+}
+
+#[test]
+fn empty_thread_picker_closes_before_handling_input() {
+    let mut app = test_app(Vec::new());
+    app.threads.clear();
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 0,
+        state: ThreadPickerState::Browsing,
+    });
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(matches!(
+        app.activity,
+        Some(Activity::Info(ref message)) if message == "No threads are available"
+    ));
+    assert!(pending_effects.try_recv().is_err());
+}
+
+#[test]
+fn thread_picker_ignores_input_while_deleting() {
+    let mut app = test_app(Vec::new());
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 0,
+        state: ThreadPickerState::ConfirmingDelete,
+    });
+    let deleted_thread = app.threads[0].id;
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &effects,
+    )
+    .unwrap();
+    assert!(matches!(
+        pending_effects.try_recv().unwrap(),
+        Effect::DeleteThread {
+            thread_id,
+            ..
+        } if thread_id == deleted_thread
+    ));
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            state: ThreadPickerState::Deleting,
+            ..
+        })
+    ));
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(pending_effects.try_recv().is_err());
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            selected: 0,
+            state: ThreadPickerState::Deleting,
+        })
+    ));
 }
 
 #[test]

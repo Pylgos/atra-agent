@@ -14,7 +14,7 @@ use crate::{
     runtime::{ApprovalDecision, Effect, HistoryOperation},
     state::{
         ApprovalState, FocusPane, HistoryAction, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, TurnState,
+        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
     },
     text::offset_at_position,
     transcript::{sanitize, transcript_text},
@@ -387,11 +387,44 @@ impl App {
             return Ok(false);
         }
 
+        if matches!(self.overlay, Overlay::ThreadPicker(_)) && self.threads.is_empty() {
+            self.overlay = Overlay::None;
+            self.activity = Some(Activity::Info("No threads are available".to_owned()));
+            return Ok(false);
+        }
+
         if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+            if matches!(picker.state, ThreadPickerState::Deleting) {
+                return Ok(false);
+            }
+            if matches!(picker.state, ThreadPickerState::ConfirmingDelete) {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        let thread_id = self.threads[picker.selected].id;
+                        self.activity = Some(Activity::Info("Deleting thread…".to_owned()));
+                        effects
+                            .send(Effect::DeleteThread {
+                                endpoint: self.endpoint.clone(),
+                                thread_id,
+                            })
+                            .ok();
+                        picker.state = ThreadPickerState::Deleting;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        picker.state = ThreadPickerState::Browsing;
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
                 KeyCode::Down => {
-                    picker.selected = (picker.selected + 1).min(self.threads.len() - 1);
+                    picker.selected =
+                        (picker.selected + 1).min(self.threads.len().saturating_sub(1));
+                }
+                KeyCode::Char('x') => {
+                    picker.state = ThreadPickerState::ConfirmingDelete;
                 }
                 KeyCode::Enter => {
                     let thread_id = self.threads[picker.selected].id;
@@ -596,6 +629,11 @@ impl App {
     }
 
     fn start_new_thread(&mut self) {
+        self.reset_to_new_thread();
+        self.overlay = Overlay::None;
+    }
+
+    pub(super) fn reset_to_new_thread(&mut self) {
         self.target = Target::New {
             model: self.models.first().map(|model| {
                 (
@@ -608,7 +646,6 @@ impl App {
         self.processes.clear();
         self.transcript.clear();
         self.message_input.clear();
-        self.overlay = Overlay::None;
         self.clear_selection();
         self.reset_view();
         self.metrics_stale = false;
@@ -685,9 +722,12 @@ impl App {
             .iter()
             .position(|thread| Some(thread.id) == self.target.thread_id())
             .unwrap_or(0);
-        self.overlay = Overlay::ThreadPicker(ThreadPicker { selected });
+        self.overlay = Overlay::ThreadPicker(ThreadPicker {
+            selected,
+            state: ThreadPickerState::Browsing,
+        });
         self.activity = Some(Activity::Info(
-            "Select thread · Enter switches · Esc cancels".to_owned(),
+            "Select thread · Enter switches · x delete · Esc cancels".to_owned(),
         ));
     }
 

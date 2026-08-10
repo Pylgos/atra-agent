@@ -15,8 +15,9 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 Runner scripts execute sequentially; a non-zero exit status does not prevent later Runner scripts from running.
 
                 Processes:
-                Each command waits up to 120000 milliseconds and is left running if unfinished.
+                Each command waits up to 120000 milliseconds. If it is still running, it is detached and returned as a managed process.
                 Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+                A process ID reported after a foreground timeout can be passed directly to `atri proc wait` or `atri proc stop`; do not rerun the command.
                 Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
                 Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 10 seconds and may not exceed 60 seconds.
                 Run `atri proc stop <process-id>...` to stop named processes.
@@ -390,7 +391,14 @@ pub(super) fn format_command_response(runner: &str, response: CommandOutcome) ->
             process_id, output, ..
         } => append_process_status(
             model_command_output(&output, runner),
-            &format!("Process {process_id} is still running"),
+            &format!(
+                "Foreground timeout reached after {FOREGROUND_TIMEOUT_MS} milliseconds. \
+                 The command was detached and remains managed.\n\
+                 Process ID: {process_id}\n\
+                 Continue with: `atri proc wait {process_id} --timeout 60`\n\
+                 Stop with: `atri proc stop {process_id}`\n\
+                 Do not rerun the command."
+            ),
         ),
         CommandOutcome::Finished {
             output,

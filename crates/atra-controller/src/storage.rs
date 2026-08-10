@@ -163,6 +163,33 @@ impl Store {
             .await
     }
 
+    pub async fn delete_thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<()> {
+        self.connection
+            .call(move |connection| {
+                let thread_id = thread_id.0;
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "DELETE FROM checkpoint_events WHERE checkpoint_id IN (SELECT id FROM checkpoints WHERE thread_id = ?1)",
+                    [thread_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM checkpoints WHERE thread_id = ?1",
+                    [thread_id],
+                )?;
+                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
+                let updated = transaction.execute(
+                    "DELETE FROM threads WHERE id = ?1",
+                    [thread_id],
+                )?;
+                if updated == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn set_thread_model(
         &self,
         thread_id: ThreadId,
@@ -1104,5 +1131,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_thread_removes_events_and_checkpoints() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let thread = store
+            .create_thread(
+                Some("To delete".to_owned()),
+                "fake".to_owned(),
+                "model-a".to_owned(),
+                "low".to_owned(),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                thread,
+                ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "hello".to_owned(),
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .create_checkpoint(thread, 1_000, "manual".to_owned())
+            .await
+            .unwrap();
+
+        store.delete_thread(thread).await.unwrap();
+
+        assert!(store.threads().await.unwrap().is_empty());
+        assert!(store.events(thread).await.unwrap().is_empty());
+        assert!(store.checkpoints(thread).await.unwrap().is_empty());
     }
 }

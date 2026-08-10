@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,9 +13,14 @@ use tokio::sync::{Mutex, oneshot, watch};
 use crate::Runner;
 
 pub(super) struct TurnLifecycle {
-    active: Mutex<HashMap<ThreadId, Arc<ActiveTurn>>>,
+    threads: Mutex<ThreadActivity>,
     approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
     next_approval_id: AtomicU64,
+}
+
+struct ThreadActivity {
+    active: HashMap<ThreadId, Arc<ActiveTurn>>,
+    deleting: HashSet<ThreadId>,
 }
 
 pub(super) struct ActiveTurn {
@@ -38,49 +43,73 @@ struct PendingApproval {
 impl TurnLifecycle {
     pub(super) fn new() -> Self {
         Self {
-            active: Mutex::new(HashMap::new()),
+            threads: Mutex::new(ThreadActivity {
+                active: HashMap::new(),
+                deleting: HashSet::new(),
+            }),
             approvals: Mutex::new(HashMap::new()),
             next_approval_id: AtomicU64::new(0),
         }
     }
 
     pub(super) async fn start(&self, thread_id: ThreadId) -> Result<Arc<ActiveTurn>> {
-        let mut active = self.active.lock().await;
-        if active.contains_key(&thread_id) {
+        let mut threads = self.threads.lock().await;
+        if threads.active.contains_key(&thread_id) {
             bail!("thread already has an active turn");
         }
+        if threads.deleting.contains(&thread_id) {
+            bail!("thread is being deleted");
+        }
         let turn = Arc::new(ActiveTurn::new());
-        active.insert(thread_id, Arc::clone(&turn));
+        threads.active.insert(thread_id, Arc::clone(&turn));
         Ok(turn)
     }
 
     pub(super) async fn get(&self, thread_id: ThreadId) -> Option<Arc<ActiveTurn>> {
-        self.active.lock().await.get(&thread_id).cloned()
+        self.threads.lock().await.active.get(&thread_id).cloned()
     }
 
     pub(super) async fn begin_cancellation(&self, thread_id: ThreadId) -> Option<Arc<ActiveTurn>> {
-        let turn = self.active.lock().await.get(&thread_id).cloned()?;
+        let turn = self.threads.lock().await.active.get(&thread_id).cloned()?;
         turn.cancelling.store(true, Ordering::Release);
         Some(turn)
     }
 
     pub(super) async fn finish(&self, thread_id: ThreadId, turn: &Arc<ActiveTurn>) {
-        let mut active = self.active.lock().await;
-        if active
+        let mut threads = self.threads.lock().await;
+        if threads
+            .active
             .get(&thread_id)
             .is_some_and(|current| Arc::ptr_eq(current, turn))
         {
-            active.remove(&thread_id);
+            threads.active.remove(&thread_id);
         }
+        drop(threads);
         self.clear_approvals(thread_id).await;
+    }
+
+    pub(super) async fn begin_delete(&self, thread_id: ThreadId) -> Result<()> {
+        let mut threads = self.threads.lock().await;
+        if threads.active.contains_key(&thread_id) {
+            bail!("cannot delete a thread with an active turn");
+        }
+        if !threads.deleting.insert(thread_id) {
+            bail!("thread deletion is already in progress");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn finish_delete(&self, thread_id: ThreadId) {
+        self.threads.lock().await.deleting.remove(&thread_id);
     }
 
     pub(super) async fn register_approval(
         &self,
         thread_id: ThreadId,
     ) -> Result<(ApprovalId, oneshot::Receiver<ApprovalDecision>)> {
-        let active = self.active.lock().await;
-        let turn = active
+        let threads = self.threads.lock().await;
+        let turn = threads
+            .active
             .get(&thread_id)
             .context("thread has no active turn")?;
         if turn.is_cancelling() {
@@ -179,5 +208,26 @@ impl ActiveTurn {
 
     pub(super) fn complete_cancellation(&self, outcome: Result<(), String>) {
         self.cancellation.send_replace(Some(outcome));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deletion_and_turns_are_mutually_exclusive() {
+        let lifecycle = TurnLifecycle::new();
+        let thread_id = ThreadId(1);
+        let turn = lifecycle.start(thread_id).await.unwrap();
+
+        assert!(lifecycle.begin_delete(thread_id).await.is_err());
+
+        lifecycle.finish(thread_id, &turn).await;
+        lifecycle.begin_delete(thread_id).await.unwrap();
+        assert!(lifecycle.start(thread_id).await.is_err());
+
+        lifecycle.finish_delete(thread_id).await;
+        assert!(lifecycle.start(thread_id).await.is_ok());
     }
 }

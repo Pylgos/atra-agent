@@ -321,6 +321,20 @@ impl State {
                     .context("failed to rename thread")?;
                 Ok(ControllerResponse::ThreadRenamed)
             }
+            UnaryRequest::ThreadDelete { thread_id } => {
+                self.turns.begin_delete(thread_id).await?;
+                let result = async {
+                    let _guard = self.thread_lock(thread_id).lock_owned().await;
+                    self.store
+                        .delete_thread(thread_id)
+                        .await
+                        .context("failed to delete thread")
+                }
+                .await;
+                self.turns.finish_delete(thread_id).await;
+                result?;
+                Ok(ControllerResponse::ThreadDeleted)
+            }
             UnaryRequest::ThreadSetModel {
                 thread_id,
                 provider,

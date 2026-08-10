@@ -396,6 +396,13 @@ impl Client {
         )
     }
 
+    pub async fn thread_delete(&self, thread_id: ThreadId) -> Result<()> {
+        expect_unit(
+            self.unary(UnaryRequest::ThreadDelete { thread_id }).await?,
+            ControllerResponse::ThreadDeleted,
+        )
+    }
+
     pub async fn thread_set_model(
         &self,
         thread_id: ThreadId,

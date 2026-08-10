@@ -158,6 +158,10 @@ pub(crate) enum TurnUpdate {
         display_name: String,
         result: Result<()>,
     },
+    ThreadDeleted {
+        thread_id: ThreadId,
+        result: Result<()>,
+    },
     ModelChanged {
         thread_id: ThreadId,
         provider: String,

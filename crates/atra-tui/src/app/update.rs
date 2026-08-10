@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use super::{Activity, App, HistoryChange, Target, ThreadView, TurnUpdate};
 use crate::{
     runtime::Effect,
-    state::{Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, TurnState},
+    state::{
+        Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, ThreadPickerState, TurnState,
+    },
     transcript::{Author, TranscriptEntry, sanitize},
 };
 
@@ -239,6 +241,33 @@ impl App {
                         self.activity = Some(Activity::Info("Thread renamed".to_owned()));
                     }
                     Err(error) => {
+                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                    }
+                }
+                return Ok(());
+            }
+            TurnUpdate::ThreadDeleted { thread_id, result } => {
+                match result {
+                    Ok(()) => {
+                        self.threads.retain(|thread| thread.id != thread_id);
+                        if self.target.thread_id() == Some(thread_id) {
+                            self.reset_to_new_thread();
+                        }
+                        if self.threads.is_empty()
+                            && matches!(self.overlay, Overlay::ThreadPicker(_))
+                        {
+                            self.overlay = Overlay::None;
+                        } else if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+                            picker.selected =
+                                picker.selected.min(self.threads.len().saturating_sub(1));
+                            picker.state = ThreadPickerState::Browsing;
+                        }
+                        self.activity = Some(Activity::Info("Thread deleted".to_owned()));
+                    }
+                    Err(error) => {
+                        if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+                            picker.state = ThreadPickerState::Browsing;
+                        }
                         self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
                     }
                 }

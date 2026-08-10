@@ -139,6 +139,9 @@ pub enum UnaryRequest {
         thread_id: ThreadId,
         display_name: String,
     },
+    ThreadDelete {
+        thread_id: ThreadId,
+    },
     ThreadSetModel {
         thread_id: ThreadId,
         provider: String,
@@ -242,6 +245,7 @@ pub enum ControllerResponse {
         models: Vec<Model>,
     },
     ThreadRenamed,
+    ThreadDeleted,
     ThreadModelChanged,
     TurnStarted {
         thread_id: ThreadId,

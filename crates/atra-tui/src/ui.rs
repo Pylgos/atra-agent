@@ -17,7 +17,7 @@ use crate::{
     app::{Activity, App, COMMAND_HELP},
     state::{
         ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker,
+        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState,
     },
     text::{expand_line_tabs, expand_tabs},
     transcript::{
@@ -676,11 +676,52 @@ fn render_thread_picker(
         List::new(items).highlight_symbol("● ").block(
             Block::default()
                 .title("Select thread")
-                .title_bottom(Line::from("Enter switches · Esc cancels").right_aligned())
+                .title_bottom(Line::from("Enter switches · x delete · Esc cancels").right_aligned())
                 .borders(Borders::ALL),
         ),
         area,
         &mut state,
+    );
+
+    match picker.state {
+        ThreadPickerState::ConfirmingDelete => render_delete_confirmation(frame, area),
+        ThreadPickerState::Deleting => render_delete_progress(frame, area),
+        ThreadPickerState::Browsing => {}
+    }
+}
+
+fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width.saturating_sub(8).min(54);
+    let confirmation = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + area.height.saturating_sub(3) / 2,
+        width,
+        3,
+    );
+    frame.render_widget(Clear, confirmation);
+    frame.render_widget(
+        Paragraph::new("[y] Delete thread  [n] Cancel").block(
+            Block::default()
+                .title("Delete thread?")
+                .borders(Borders::ALL),
+        ),
+        confirmation,
+    );
+}
+
+fn render_delete_progress(frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width.saturating_sub(8).min(36);
+    let progress = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + area.height.saturating_sub(3) / 2,
+        width,
+        3,
+    );
+    frame.render_widget(Clear, progress);
+    frame.render_widget(
+        Paragraph::new("Deleting thread…")
+            .block(Block::default().title("Please wait").borders(Borders::ALL)),
+        progress,
     );
 }
 

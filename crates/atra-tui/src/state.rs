@@ -185,6 +185,13 @@ impl ModelPicker {
 
 pub(crate) struct ThreadPicker {
     pub(crate) selected: usize,
+    pub(crate) state: ThreadPickerState,
+}
+
+pub(crate) enum ThreadPickerState {
+    Browsing,
+    ConfirmingDelete,
+    Deleting,
 }
 
 pub(crate) struct ProcessPicker {
