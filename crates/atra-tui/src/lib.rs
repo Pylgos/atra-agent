@@ -16,6 +16,7 @@ mod controller;
 mod history;
 mod input;
 mod layout;
+mod notification;
 mod runtime;
 mod state;
 mod text;

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use super::{Activity, App, HistoryChange, Target, ThreadView, TurnUpdate};
 use crate::{
+    notification,
     runtime::Effect,
     state::{
         Approval, ApprovalState, CheckpointPicker, FocusPane, Overlay, ThreadPickerState, TurnState,
@@ -489,6 +490,7 @@ impl App {
                 operation_index,
                 operation_label,
             } => {
+                let _ = notification::send("Approval required");
                 if self.target.thread_id() == Some(thread_id) {
                     if operation_index.is_some() {
                         self.transcript.set_pending_approval(operation_index);
@@ -509,6 +511,9 @@ impl App {
                 }
             }
             TurnEvent::Finished(result) => {
+                if let TurnResult::Completed { content } = &result {
+                    let _ = notification::send(content);
+                }
                 self.turn = if matches!(result, TurnResult::Compacted) {
                     TurnState::Reloading
                 } else {
