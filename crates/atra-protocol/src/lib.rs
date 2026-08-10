@@ -743,6 +743,14 @@ pub enum RunnerRequest {
         cwd: PathBuf,
         patch: String,
     },
+    ReplaceText {
+        process_handle: ProcessHandle,
+        cwd: PathBuf,
+        path: PathBuf,
+        old: String,
+        new: String,
+        replace_all: bool,
+    },
     WaitProcess {
         process_handle: ProcessHandle,
         timeout_ms: u64,
@@ -797,6 +805,9 @@ pub enum RunnerResponse {
         process_status: ProcessStatus,
     },
     PatchCompleted {
+        result: ApplyPatchResult,
+    },
+    ReplaceCompleted {
         result: ApplyPatchResult,
     },
     Error {

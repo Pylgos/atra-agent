@@ -38,6 +38,11 @@ enum Command {
         command: ProcCommand,
     },
     Patch,
+    Replace {
+        #[arg(long)]
+        all: bool,
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,6 +103,44 @@ async fn run(cli: Cli) -> Result<bool> {
     match cli.command {
         Command::Proc { command } => run_proc(endpoint, command).await,
         Command::Patch => run_patch(&endpoint).await,
+        Command::Replace { all, path } => run_replace(&endpoint, path, all).await,
+    }
+}
+
+async fn run_replace(endpoint: &Path, path: PathBuf, replace_all: bool) -> Result<bool> {
+    let process_handle = ProcessHandle(
+        env::var("ATRI_PROCESS_HANDLE")
+            .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
+    );
+    let cwd = env::current_dir().context("failed to determine the current directory")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .await
+        .context("failed to read replacement from stdin")?;
+    let input = input
+        .strip_prefix("*** Old\n")
+        .context("replacement must start with '*** Old'")?;
+    let (old, new) = input
+        .split_once("\n*** New\n")
+        .context("replacement must contain a line with '*** New'")?;
+    let new = new.strip_suffix('\n').unwrap_or(new);
+    match request(
+        endpoint,
+        RunnerRequest::ReplaceText {
+            process_handle,
+            cwd,
+            path,
+            old: old.to_owned(),
+            new: new.to_owned(),
+            replace_all,
+        },
+    )
+    .await?
+    {
+        RunnerResponse::ReplaceCompleted { result } => Ok(display_patch_result(&result)),
+        RunnerResponse::Error { message } => bail!("{message}"),
+        _ => bail!("Runner returned an invalid replace response"),
     }
 }
 

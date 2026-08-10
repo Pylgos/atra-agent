@@ -174,6 +174,18 @@ async fn handle_request(
             cwd,
             patch,
         } => processes.apply_patch(&process_handle, cwd, patch).await,
+        RunnerRequest::ReplaceText {
+            process_handle,
+            cwd,
+            path,
+            old,
+            new,
+            replace_all,
+        } => {
+            processes
+                .replace_text(&process_handle, cwd, path, old, new, replace_all)
+                .await
+        }
         RunnerRequest::WaitProcess {
             process_handle,
             timeout_ms,
@@ -254,6 +266,18 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
             cwd,
             patch,
         } => processes.apply_patch(&process_handle, cwd, patch).await,
+        RunnerRequest::ReplaceText {
+            process_handle,
+            cwd,
+            path,
+            old,
+            new,
+            replace_all,
+        } => {
+            processes
+                .replace_text(&process_handle, cwd, path, old, new, replace_all)
+                .await
+        }
         _ => bail!("unsupported Runner control request"),
     }
     .unwrap_or_else(|error| RunnerResponse::Error {
@@ -576,6 +600,27 @@ impl ProcessManager {
             .context("patch task failed")?;
         process.patch_results.lock().await.push(result.clone());
         Ok(RunnerResponse::PatchCompleted { result })
+    }
+
+    async fn replace_text(
+        &self,
+        handle: &ProcessHandle,
+        cwd: PathBuf,
+        path: PathBuf,
+        old: String,
+        new: String,
+        replace_all: bool,
+    ) -> Result<RunnerResponse> {
+        let process = self.process(handle).await?;
+        let _patching = process.patching.lock().await;
+        tracing::info!(process_handle = %handle, path = %path.display(), "replacing text");
+        let result = tokio::task::spawn_blocking(move || {
+            atra_patch::replace(&path, &old, &new, replace_all, &cwd)
+        })
+        .await
+        .context("replace task failed")?;
+        process.patch_results.lock().await.push(result.clone());
+        Ok(RunnerResponse::ReplaceCompleted { result })
     }
 
     async fn inspect(&self, handle: &ProcessHandle) -> Result<RunnerResponse> {

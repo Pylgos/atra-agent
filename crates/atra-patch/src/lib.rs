@@ -104,6 +104,66 @@ pub fn apply(patch: &str, cwd: &Path) -> ApplyPatchResult {
     }
 }
 
+pub fn replace(
+    path: &Path,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    cwd: &Path,
+) -> ApplyPatchResult {
+    let outcome = replace_text(path, old, new, replace_all, cwd);
+    ApplyPatchResult::Operations {
+        results: vec![PatchOperationResult::Updated {
+            path: path.to_owned(),
+            outcome,
+        }],
+    }
+}
+
+fn replace_text(
+    path: &Path,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    cwd: &Path,
+) -> PatchOperationOutcome {
+    let resolved = resolve(cwd, path);
+    let result = (|| {
+        if old.is_empty() {
+            bail!("Replacement text must not be empty");
+        }
+        let original = fs::read_to_string(&resolved)
+            .with_context(|| format!("Failed to read file to replace {}", path.display()))?;
+        let count = original.matches(old).count();
+        if count == 0 {
+            bail!("Text to replace was not found in {}", path.display());
+        }
+        if !replace_all && count != 1 {
+            bail!(
+                "Text to replace occurs {count} times in {}; use --all to replace every occurrence",
+                path.display()
+            );
+        }
+        let content = if replace_all {
+            original.replace(old, new)
+        } else {
+            original.replacen(old, new, 1)
+        };
+        let permissions = fs::metadata(&resolved)
+            .with_context(|| format!("Failed to read metadata for {}", path.display()))?
+            .permissions();
+        atomic_write(&resolved, &content, Some(permissions), true)
+            .with_context(|| format!("Failed to write file {}", path.display()))?;
+        Ok(file_diff(
+            Some(path.to_owned()),
+            Some(path.to_owned()),
+            &original,
+            &content,
+        ))
+    })();
+    result.into()
+}
+
 fn apply_operation(operation: Operation, cwd: &Path) -> PatchOperationResult {
     match operation {
         Operation::Add { path, content } => {
@@ -773,5 +833,93 @@ mod tests {
             ApplyPatchResult::ParseError { ref error }
                 if error == "Update file hunk for path 'file.txt' is empty"
         ));
+    }
+
+    #[test]
+    fn replaces_a_unique_exact_match() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "before\nold text\nafter\n").unwrap();
+
+        let result = replace(
+            Path::new("file.txt"),
+            "old text",
+            "new text",
+            false,
+            directory.path(),
+        );
+
+        assert!(matches!(
+            result,
+            ApplyPatchResult::Operations { ref results }
+                if matches!(
+                    results.as_slice(),
+                    [PatchOperationResult::Updated {
+                        outcome: PatchOperationOutcome::Applied { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "before\nnew text\nafter\n"
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_matches_without_modifying_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        let original = "same\nsame\n";
+        fs::write(&path, original).unwrap();
+
+        let result = replace(
+            Path::new("file.txt"),
+            "same",
+            "changed",
+            false,
+            directory.path(),
+        );
+
+        assert!(matches!(
+            result,
+            ApplyPatchResult::Operations { ref results }
+                if matches!(
+                    results.as_slice(),
+                    [PatchOperationResult::Updated {
+                        outcome: PatchOperationOutcome::Failed { error },
+                        ..
+                    }] if error.contains("occurs 2 times")
+                )
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn replaces_multiple_matches_with_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "same\nsame\n").unwrap();
+
+        let result = replace(
+            Path::new("file.txt"),
+            "same",
+            "changed",
+            true,
+            directory.path(),
+        );
+
+        assert!(matches!(
+            result,
+            ApplyPatchResult::Operations { ref results }
+                if matches!(
+                    results.as_slice(),
+                    [PatchOperationResult::Updated {
+                        outcome: PatchOperationOutcome::Applied { .. },
+                        ..
+                    }]
+                )
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "changed\nchanged\n");
     }
 }
