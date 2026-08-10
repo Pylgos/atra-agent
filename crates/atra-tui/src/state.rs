@@ -107,14 +107,80 @@ pub(crate) enum ApprovalState {
 
 pub(crate) struct ModelPicker {
     pub(crate) models: Vec<Model>,
+    pub(crate) provider_index: usize,
     pub(crate) model_index: usize,
     pub(crate) effort_index: usize,
+    pub(crate) query: String,
     pub(crate) stage: ModelPickerStage,
 }
 
 pub(crate) enum ModelPickerStage {
+    Provider,
     Model,
     Effort,
+}
+
+impl ModelPicker {
+    pub(crate) fn providers(&self) -> Vec<&str> {
+        let mut providers = Vec::new();
+        for model in &self.models {
+            if !providers.contains(&model.provider.as_str()) {
+                providers.push(model.provider.as_str());
+            }
+        }
+        providers
+    }
+
+    pub(crate) fn visible_model_indices(&self) -> Vec<usize> {
+        let providers = self.providers();
+        let Some(provider) = providers.get(self.provider_index) else {
+            return Vec::new();
+        };
+        let query = self.query.to_lowercase();
+        self.models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                model.provider == *provider
+                    && (query.is_empty()
+                        || model.id.to_lowercase().contains(&query)
+                        || model.display_name.to_lowercase().contains(&query)
+                        || model
+                            .description
+                            .as_deref()
+                            .is_some_and(|description| description.to_lowercase().contains(&query)))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub(crate) fn selected_model(&self) -> Option<&Model> {
+        self.models.get(self.model_index)
+    }
+
+    pub(crate) fn select_provider(&mut self, provider_index: usize) {
+        self.provider_index = provider_index.min(self.providers().len().saturating_sub(1));
+        self.query.clear();
+        if let Some(model_index) = self.visible_model_indices().first().copied() {
+            self.select_model(model_index);
+        }
+    }
+
+    pub(crate) fn select_first_visible_model(&mut self) {
+        if let Some(model_index) = self.visible_model_indices().first().copied() {
+            self.select_model(model_index);
+        }
+    }
+
+    pub(crate) fn select_model(&mut self, model_index: usize) {
+        self.model_index = model_index;
+        let model = &self.models[model_index];
+        self.effort_index = model
+            .supported_reasoning_efforts
+            .iter()
+            .position(|effort| effort == &model.default_reasoning_effort)
+            .unwrap_or(0);
+    }
 }
 
 pub(crate) struct ThreadPicker {

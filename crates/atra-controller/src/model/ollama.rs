@@ -365,7 +365,10 @@ impl ModelSession for OllamaTurn<'_> {
         let state = OllamaStream {
             response,
             buffer: Vec::new(),
-            message: Message::default(),
+            message: Message {
+                role: "assistant".to_owned(),
+                ..Message::default()
+            },
             session_id: self.session_id.clone(),
             pending: VecDeque::new(),
             finished: false,
@@ -592,21 +595,29 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
                 ));
             }
             ModelTool::Custom {
-                name, description, ..
-            } => definitions.push(function_tool(
                 name,
                 description,
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "input": {
-                            "type": "string",
-                            "description": "The complete custom tool input."
-                        }
-                    },
-                    "required": ["input"]
-                }),
-            )),
+                format,
+            } => {
+                let description = format!(
+                    "{description}\n\nThe complete input must conform to this {} grammar:\n\n{}",
+                    format.syntax, format.definition
+                );
+                definitions.push(function_tool(
+                    name,
+                    &description,
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "The complete custom tool input."
+                            }
+                        },
+                        "required": ["input"]
+                    }),
+                ));
+            }
         }
     }
     definitions
@@ -771,6 +782,9 @@ mod tests {
             .filter_map(|tool| tool.pointer("/function/name")?.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["web_search", "web_fetch", "command"]);
+        let command_description = definitions[2]["function"]["description"].as_str().unwrap();
+        assert!(command_description.contains("lark grammar"));
+        assert!(command_description.contains("add_line: \"+\""));
     }
 
     #[test]

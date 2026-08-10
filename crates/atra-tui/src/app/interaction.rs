@@ -277,56 +277,110 @@ impl App {
 
         if let Overlay::ModelPicker(picker) = &mut self.overlay {
             match key.code {
-                KeyCode::Up => {
-                    if matches!(picker.stage, ModelPickerStage::Effort) {
-                        picker.effort_index = picker.effort_index.saturating_sub(1);
-                    } else {
-                        picker.model_index = picker.model_index.saturating_sub(1);
-                        let model = &picker.models[picker.model_index];
-                        picker.effort_index = model
-                            .supported_reasoning_efforts
-                            .iter()
-                            .position(|effort| effort == &model.default_reasoning_effort)
-                            .unwrap_or(0);
+                KeyCode::Up => match picker.stage {
+                    ModelPickerStage::Provider => {
+                        let provider_index = picker.provider_index.saturating_sub(1);
+                        if provider_index != picker.provider_index {
+                            picker.select_provider(provider_index);
+                        }
                     }
-                }
-                KeyCode::Down => {
-                    if matches!(picker.stage, ModelPickerStage::Effort) {
-                        let count = picker.models[picker.model_index]
-                            .supported_reasoning_efforts
-                            .len();
+                    ModelPickerStage::Model => {
+                        let visible = picker.visible_model_indices();
+                        if let Some(position) = visible
+                            .iter()
+                            .position(|index| *index == picker.model_index)
+                        {
+                            picker.select_model(visible[position.saturating_sub(1)]);
+                        }
+                    }
+                    ModelPickerStage::Effort => {
+                        picker.effort_index = picker.effort_index.saturating_sub(1);
+                    }
+                },
+                KeyCode::Down => match picker.stage {
+                    ModelPickerStage::Provider => {
+                        let last = picker.providers().len().saturating_sub(1);
+                        let provider_index = (picker.provider_index + 1).min(last);
+                        if provider_index != picker.provider_index {
+                            picker.select_provider(provider_index);
+                        }
+                    }
+                    ModelPickerStage::Model => {
+                        let visible = picker.visible_model_indices();
+                        if let Some(position) = visible
+                            .iter()
+                            .position(|index| *index == picker.model_index)
+                        {
+                            let position = (position + 1).min(visible.len().saturating_sub(1));
+                            picker.select_model(visible[position]);
+                        }
+                    }
+                    ModelPickerStage::Effort => {
+                        let count = picker
+                            .selected_model()
+                            .map_or(0, |model| model.supported_reasoning_efforts.len());
                         picker.effort_index =
                             (picker.effort_index + 1).min(count.saturating_sub(1));
-                    } else {
-                        picker.model_index =
-                            (picker.model_index + 1).min(picker.models.len().saturating_sub(1));
-                        let model = &picker.models[picker.model_index];
-                        picker.effort_index = model
-                            .supported_reasoning_efforts
-                            .iter()
-                            .position(|effort| effort == &model.default_reasoning_effort)
-                            .unwrap_or(0);
                     }
-                }
+                },
                 KeyCode::Enter if matches!(picker.stage, ModelPickerStage::Effort) => {
                     self.change_model(effects)?
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter if matches!(picker.stage, ModelPickerStage::Provider) => {
+                    picker.stage = ModelPickerStage::Model;
+                    self.activity = Some(Activity::Info(
+                        "Select model · Type to search · Enter chooses effort · Esc goes back"
+                            .to_owned(),
+                    ));
+                }
+                KeyCode::Enter if picker.visible_model_indices().contains(&picker.model_index) => {
                     picker.stage = ModelPickerStage::Effort;
                     self.activity = Some(Activity::Info(
                         "Select reasoning effort · Enter applies · Esc goes back".to_owned(),
                     ));
                 }
-                KeyCode::Esc => {
-                    if matches!(picker.stage, ModelPickerStage::Effort) {
+                KeyCode::Esc => match picker.stage {
+                    ModelPickerStage::Effort => {
                         picker.stage = ModelPickerStage::Model;
                         self.activity = Some(Activity::Info(
-                            "Select model · Enter chooses effort · Esc cancels".to_owned(),
+                            "Select model · Type to search · Enter chooses effort · Esc goes back"
+                                .to_owned(),
                         ));
-                    } else {
+                    }
+                    ModelPickerStage::Model if !picker.query.is_empty() => {
+                        picker.query.clear();
+                        picker.select_first_visible_model();
+                    }
+                    ModelPickerStage::Model => {
+                        picker.stage = ModelPickerStage::Provider;
+                        self.activity = Some(Activity::Info(
+                            "Select provider · Enter chooses models · Esc cancels".to_owned(),
+                        ));
+                    }
+                    ModelPickerStage::Provider => {
                         self.overlay = Overlay::None;
                         self.activity = None;
                     }
+                },
+                KeyCode::Backspace if matches!(picker.stage, ModelPickerStage::Model) => {
+                    picker.query.pop();
+                    picker.select_first_visible_model();
+                }
+                KeyCode::Char('u')
+                    if matches!(picker.stage, ModelPickerStage::Model)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    picker.query.clear();
+                    picker.select_first_visible_model();
+                }
+                KeyCode::Char(character)
+                    if matches!(picker.stage, ModelPickerStage::Model)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    picker.query.push(character);
+                    picker.select_first_visible_model();
                 }
                 _ => {}
             }
@@ -600,14 +654,22 @@ impl App {
             .iter()
             .position(|effort| selected.is_some_and(|(_, _, selected)| effort == selected))
             .unwrap_or(0);
-        self.overlay = Overlay::ModelPicker(ModelPicker {
+        let mut picker = ModelPicker {
             models: self.models.clone(),
+            provider_index: 0,
             model_index,
             effort_index,
-            stage: ModelPickerStage::Model,
-        });
+            query: String::new(),
+            stage: ModelPickerStage::Provider,
+        };
+        picker.provider_index = picker
+            .providers()
+            .iter()
+            .position(|provider| *provider == picker.models[model_index].provider)
+            .unwrap_or(0);
+        self.overlay = Overlay::ModelPicker(picker);
         self.activity = Some(Activity::Info(
-            "Select model · Enter chooses effort · Esc cancels".to_owned(),
+            "Select provider · Enter chooses models · Esc cancels".to_owned(),
         ));
         Ok(())
     }
@@ -1106,7 +1168,7 @@ impl App {
             .overlay
             .model_picker()
             .context("model picker is closed")?;
-        let selected = &picker.models[picker.model_index];
+        let selected = picker.selected_model().context("no model is selected")?;
         let provider = selected.provider.clone();
         let model = selected.id.clone();
         let reasoning_effort = selected

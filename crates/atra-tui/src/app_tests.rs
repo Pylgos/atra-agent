@@ -5,8 +5,12 @@ use crate::transcript::{
     Author, ToolArtifact, TranscriptItem, TranscriptState, layout_transcript, prepare_transcript,
     sanitize, transcript_lines, transcript_text,
 };
-use crate::ui::preserve_transcript_viewport;
-use crate::{layout::SelectionPoint, runtime::Effect};
+use crate::ui::{preserve_transcript_viewport, render_model_picker};
+use crate::{
+    layout::SelectionPoint,
+    runtime::Effect,
+    state::{ModelPicker, ModelPickerStage},
+};
 use atra_protocol::CommandExecutionArtifact;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, layout::Rect, text::Line};
@@ -57,6 +61,119 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         processes: Vec::new(),
         process_refresh_pending: false,
     }
+}
+
+fn model(provider: &str, id: &str, display_name: &str, description: &str) -> Model {
+    Model {
+        provider: provider.to_owned(),
+        id: id.to_owned(),
+        display_name: display_name.to_owned(),
+        description: Some(description.to_owned()),
+        default_reasoning_effort: "medium".to_owned(),
+        supported_reasoning_efforts: vec!["low".to_owned(), "medium".to_owned()],
+        context_window: None,
+        auto_compact_token_limit: None,
+    }
+}
+
+#[test]
+fn model_picker_selects_provider_and_filters_its_models() {
+    let mut app = test_app(Vec::new());
+    app.overlay = Overlay::ModelPicker(ModelPicker {
+        models: vec![
+            model("codex", "gpt-5.6-sol", "GPT 5.6", "Frontier model"),
+            model("codex", "gpt-5-mini", "GPT Mini", "Fast model"),
+            model("ollama", "qwen3:8b", "Qwen 3", "Local model"),
+        ],
+        provider_index: 0,
+        model_index: 0,
+        effort_index: 1,
+        query: String::new(),
+        stage: ModelPickerStage::Provider,
+    });
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    let Overlay::ModelPicker(picker) = &app.overlay else {
+        panic!("model picker was not opened");
+    };
+    assert!(matches!(picker.stage, ModelPickerStage::Provider));
+    assert_eq!(picker.providers(), vec!["codex", "ollama"]);
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+    let Overlay::ModelPicker(picker) = &app.overlay else {
+        panic!("model picker was closed");
+    };
+    assert!(matches!(picker.stage, ModelPickerStage::Model));
+    assert_eq!(picker.selected_model().unwrap().provider, "ollama");
+
+    for character in "qwen".chars() {
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            &effects,
+        )
+        .unwrap();
+    }
+    let Overlay::ModelPicker(picker) = &app.overlay else {
+        panic!("model picker was closed");
+    };
+    assert_eq!(picker.query, "qwen");
+    assert_eq!(picker.visible_model_indices(), vec![2]);
+}
+
+#[test]
+fn model_picker_search_matches_id_name_and_description() {
+    let mut picker = ModelPicker {
+        models: vec![
+            model("codex", "alpha", "First", "General model"),
+            model("codex", "beta-mini", "Second", "Quick response"),
+            model("ollama", "beta-mini", "Local", "Quick response"),
+        ],
+        provider_index: 0,
+        model_index: 0,
+        effort_index: 1,
+        query: "MINI".to_owned(),
+        stage: ModelPickerStage::Model,
+    };
+    assert_eq!(picker.visible_model_indices(), vec![1]);
+
+    picker.query = "second".to_owned();
+    assert_eq!(picker.visible_model_indices(), vec![1]);
+    picker.query = "quick".to_owned();
+    assert_eq!(picker.visible_model_indices(), vec![1]);
+}
+
+#[test]
+fn model_picker_keeps_the_last_model_visible_in_a_long_list() {
+    let models = (0..20)
+        .map(|index| {
+            model(
+                "codex",
+                &format!("model-{index:02}"),
+                &format!("Model {index:02}"),
+                "Description",
+            )
+        })
+        .collect::<Vec<_>>();
+    let picker = ModelPicker {
+        model_index: models.len() - 1,
+        models,
+        provider_index: 0,
+        effort_index: 1,
+        query: String::new(),
+        stage: ModelPickerStage::Model,
+    };
+    let backend = ratatui::backend::TestBackend::new(60, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| render_model_picker(frame, &picker))
+        .unwrap();
+    let rendered = terminal.backend().to_string();
+    assert!(rendered.contains("Model 19 · model-19"));
+    assert!(!rendered.contains("Model 00 · model-00"));
 }
 
 #[test]

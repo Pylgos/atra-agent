@@ -916,60 +916,109 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
         height,
     );
     frame.render_widget(Clear, area);
-    let selected_model = &picker.models[picker.model_index];
-    if matches!(picker.stage, ModelPickerStage::Effort) {
-        let items = selected_model
-            .supported_reasoning_efforts
-            .iter()
-            .enumerate()
-            .map(|(index, effort)| {
-                let marker = if index == picker.effort_index {
-                    "●"
-                } else {
-                    " "
-                };
-                ListItem::new(format!("{marker} {effort}"))
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .title(format!(
-                        "Reasoning effort · {}",
-                        selected_model.display_name
-                    ))
-                    .borders(Borders::ALL),
-            ),
-            area,
-        );
-    } else {
-        let items = picker
-            .models
-            .iter()
-            .enumerate()
-            .map(|(index, model)| {
-                let marker = if index == picker.model_index {
-                    "●"
-                } else {
-                    " "
-                };
-                let description = model.description.as_deref().unwrap_or_default();
-                ListItem::new(vec![
-                    Line::from(format!(
-                        "{marker} {} · {}",
-                        model.provider, model.display_name
-                    )),
-                    Line::from(Span::styled(
-                        format!("  {description}"),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(items).block(Block::default().title("Select model").borders(Borders::ALL)),
-            area,
-        );
+    match picker.stage {
+        ModelPickerStage::Provider => {
+            let providers = picker.providers();
+            let items = providers
+                .iter()
+                .map(|provider| {
+                    let count = picker
+                        .models
+                        .iter()
+                        .filter(|model| model.provider == **provider)
+                        .count();
+                    ListItem::new(format!("{} ({count})", sanitize(provider)))
+                })
+                .collect::<Vec<_>>();
+            let mut state = ListState::default().with_selected(Some(picker.provider_index));
+            frame.render_stateful_widget(
+                List::new(items).highlight_symbol("● ").block(
+                    Block::default()
+                        .title("Select provider")
+                        .title_bottom(
+                            Line::from("↑/↓ select · Enter models · Esc cancel").right_aligned(),
+                        )
+                        .borders(Borders::ALL),
+                ),
+                area,
+                &mut state,
+            );
+        }
+        ModelPickerStage::Model => {
+            let visible = picker.visible_model_indices();
+            let selected = visible
+                .iter()
+                .position(|index| *index == picker.model_index);
+            let mut items = visible
+                .iter()
+                .map(|index| {
+                    let model = &picker.models[*index];
+                    let description = model.description.as_deref().unwrap_or_default();
+                    ListItem::new(vec![
+                        Line::from(sanitize(&format!("{} · {}", model.display_name, model.id))),
+                        Line::from(Span::styled(
+                            format!("  {}", sanitize(description)),
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                items.push(ListItem::new("No matching models"));
+            }
+            let provider = picker
+                .providers()
+                .get(picker.provider_index)
+                .map_or_else(String::new, |provider| sanitize(provider));
+            let title = if picker.query.is_empty() {
+                format!("Select model · {provider}")
+            } else {
+                format!(
+                    "Select model · {provider} · Search: {}",
+                    sanitize(&picker.query)
+                )
+            };
+            let mut state = ListState::default().with_selected(selected);
+            frame.render_stateful_widget(
+                List::new(items).highlight_symbol("● ").block(
+                    Block::default()
+                        .title(title)
+                        .title_bottom(
+                            Line::from("Type to search · ↑/↓ select · Enter effort · Esc back")
+                                .right_aligned(),
+                        )
+                        .borders(Borders::ALL),
+                ),
+                area,
+                &mut state,
+            );
+        }
+        ModelPickerStage::Effort => {
+            let Some(selected_model) = picker.selected_model() else {
+                return;
+            };
+            let items = selected_model
+                .supported_reasoning_efforts
+                .iter()
+                .map(|effort| ListItem::new(effort.as_str()))
+                .collect::<Vec<_>>();
+            let mut state = ListState::default().with_selected(Some(picker.effort_index));
+            frame.render_stateful_widget(
+                List::new(items).highlight_symbol("● ").block(
+                    Block::default()
+                        .title(format!(
+                            "Reasoning effort · {}",
+                            sanitize(&selected_model.display_name)
+                        ))
+                        .title_bottom(
+                            Line::from("↑/↓ select · Enter apply · Esc back").right_aligned(),
+                        )
+                        .borders(Borders::ALL),
+                ),
+                area,
+                &mut state,
+            );
+        }
     }
 }
 
