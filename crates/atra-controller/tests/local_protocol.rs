@@ -55,12 +55,14 @@ async fn lists_threads_newest_first() {
                 Thread {
                     id: ThreadId(2),
                     display_name: None,
+                    provider: "codex".to_owned(),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
                     id: ThreadId(1),
                     display_name: Some("Named".to_owned()),
+                    provider: "codex".to_owned(),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 }
@@ -128,12 +130,14 @@ async fn lists_threads_newest_first() {
                 Thread {
                     id: ThreadId(2),
                     display_name: Some("First prompt".to_owned()),
+                    provider: "codex".to_owned(),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 },
                 Thread {
                     id: ThreadId(1),
                     display_name: Some("Renamed".to_owned()),
+                    provider: "codex".to_owned(),
                     model: "gpt-5.6-sol".to_owned(),
                     reasoning_effort: "medium".to_owned(),
                 }

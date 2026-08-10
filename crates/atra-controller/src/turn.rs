@@ -315,22 +315,22 @@ impl State {
             "{:x}",
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
-        let model_session = self.provider.start_turn(&prompt_cache_key).await?;
         let model_tools = model_tools();
         let mut events = self
             .store
             .events(thread_id)
             .await
             .context("failed to load model history")?;
-        self.mask_old_command_results(thread_id, &mut events, updates)
-            .await?;
-        let (model, reasoning_effort) = self
+        let (provider_id, model, reasoning_effort) = self
             .store
             .thread_model(thread_id)
             .await
             .context("failed to load thread model")?;
-        let selected_model = self
-            .provider
+        let provider = self.provider(&provider_id)?;
+        let model_session = provider.start_turn(&prompt_cache_key).await?;
+        self.mask_old_command_results(provider.as_ref(), thread_id, &mut events, updates)
+            .await?;
+        let selected_model = provider
             .models()
             .await?
             .into_iter()
@@ -415,7 +415,13 @@ impl State {
             "{:x}",
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
-        let model_session = self.provider.start_turn(&prompt_cache_key).await?;
+        let (provider_id, model, reasoning_effort) = self
+            .store
+            .thread_model(thread_id)
+            .await
+            .context("failed to load thread model")?;
+        let provider = self.provider(&provider_id)?;
+        let model_session = provider.start_turn(&prompt_cache_key).await?;
         let model_tools = model_tools();
         loop {
             self.sync_runners(thread_id, updates).await?;
@@ -424,13 +430,7 @@ impl State {
                 .events(thread_id)
                 .await
                 .context("failed to load model history")?;
-            let (model, reasoning_effort) = self
-                .store
-                .thread_model(thread_id)
-                .await
-                .context("failed to load thread model")?;
-            let selected_model = self
-                .provider
+            let selected_model = provider
                 .models()
                 .await?
                 .into_iter()
@@ -441,7 +441,7 @@ impl State {
             let auto_compact_token_limit =
                 selected_model.and_then(|model| model.auto_compact_token_limit);
             let masked_tokens = self
-                .mask_old_command_results(thread_id, &mut events, updates)
+                .mask_old_command_results(provider.as_ref(), thread_id, &mut events, updates)
                 .await?;
             let masked_tokens = i64::try_from(masked_tokens).unwrap_or(i64::MAX);
             let active_history_start = events
@@ -622,7 +622,7 @@ impl State {
                 stream_error = Some(anyhow!("model stream ended before completion"));
             }
             let response = self
-                .execute_model_responses(thread_id, responses, updates)
+                .execute_model_responses(provider.as_ref(), thread_id, responses, updates)
                 .await?;
             if let Some(error) = stream_error {
                 return Err(error);
@@ -642,6 +642,7 @@ impl State {
 
     pub(super) async fn mask_old_command_results(
         &self,
+        provider: &dyn model::ModelProvider,
         thread_id: ThreadId,
         events: &mut Vec<storage::Event>,
         stream_updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
@@ -661,15 +662,15 @@ impl State {
         let active_start = active_through.map_or(0, |sequence| {
             events.partition_point(|event| event.sequence <= sequence)
         });
-        if self.provider.context_tokens(&events[active_start..])? <= ACTIVE_CONTEXT_HIGH_TOKENS {
+        if provider.context_tokens(&events[active_start..])? <= ACTIVE_CONTEXT_HIGH_TOKENS {
             return Ok(0);
         }
-        let context_tokens_before = self.provider.context_tokens(events)?;
+        let context_tokens_before = provider.context_tokens(events)?;
         let mut suffix_start = active_start;
         let mut suffix_end = events.len();
         while suffix_start < suffix_end {
             let middle = suffix_start + (suffix_end - suffix_start) / 2;
-            if self.provider.context_tokens(&events[middle..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
+            if provider.context_tokens(&events[middle..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
                 suffix_end = middle;
             } else {
                 suffix_start = middle + 1;
@@ -738,7 +739,7 @@ impl State {
             data: ThreadEventData::FrozenBoundary(boundary_data.clone()),
         });
         let masked_tokens =
-            context_tokens_before.saturating_sub(self.provider.context_tokens(&projected_events)?);
+            context_tokens_before.saturating_sub(provider.context_tokens(&projected_events)?);
         if masked_tokens == 0 {
             return Ok(0);
         }
@@ -938,6 +939,7 @@ impl State {
 
     pub(super) async fn execute_model_responses(
         &self,
+        provider: &dyn model::ModelProvider,
         thread_id: ThreadId,
         mut responses: VecDeque<ModelResponse>,
         updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
@@ -952,8 +954,44 @@ impl State {
                     }
                 }
                 ModelResponse::WebSearch { .. } => {}
-                ModelResponse::ToolCall { name, .. } => {
-                    bail!("model requested unsupported tool {name}");
+                ModelResponse::ToolCall {
+                    name,
+                    arguments,
+                    call_id,
+                } => {
+                    let result = provider
+                        .execute_tool(&name, &arguments)
+                        .await?
+                        .with_context(|| format!("model requested unsupported tool {name}"))?;
+                    needs_follow_up = true;
+                    if matches!(name.as_str(), "web_search" | "web_fetch") {
+                        self.append_event(
+                            thread_id,
+                            ThreadEventData::WebSearch(ItemEvent {
+                                item: serde_json::json!({
+                                    "action": {
+                                        "type": &name,
+                                        "arguments": &arguments,
+                                    },
+                                    "result": &result,
+                                }),
+                            }),
+                            updates,
+                        )
+                        .await?;
+                    }
+                    self.save_tool_result(
+                        thread_id,
+                        &name,
+                        call_id.as_deref(),
+                        ToolOutcome {
+                            result,
+                            artifacts: Vec::new(),
+                        },
+                        false,
+                        updates,
+                    )
+                    .await?;
                 }
                 ModelResponse::CustomToolCall {
                     name,

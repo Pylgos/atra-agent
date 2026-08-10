@@ -1,6 +1,6 @@
 ---
 source: crates/atra-tui/src/app_tests.rs
-assertion_line: 89
+assertion_line: 100
 expression: terminal.backend().to_string()
 ---
 "┌Transcript──────────────────────────────┐"

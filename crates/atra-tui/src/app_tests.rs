@@ -20,12 +20,14 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
             Thread {
                 id: atra_protocol::ThreadId(2),
                 display_name: Some("Current work".to_owned()),
+                provider: "codex".to_owned(),
                 model: "gpt-5.6-sol".to_owned(),
                 reasoning_effort: "medium".to_owned(),
             },
             Thread {
                 id: atra_protocol::ThreadId(1),
                 display_name: None,
+                provider: "codex".to_owned(),
                 model: "gpt-5.6-sol".to_owned(),
                 reasoning_effort: "medium".to_owned(),
             },
@@ -55,6 +57,27 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         processes: Vec::new(),
         process_refresh_pending: false,
     }
+}
+
+#[test]
+fn ignores_rate_limits_loaded_for_a_previous_provider() {
+    let mut app = test_app(Vec::new());
+    app.threads[0].provider = "ollama".to_owned();
+    app.rate_limit_refresh_pending = true;
+    let snapshots = serde_json::json!([{"limit_id": "codex"}]);
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.update(
+        TurnUpdate::RateLimitsLoaded {
+            provider: "codex".to_owned(),
+            result: Ok(snapshots),
+        },
+        &effects,
+    )
+    .unwrap();
+
+    assert_eq!(app.rate_limits, serde_json::json!([]));
+    assert!(!app.rate_limit_refresh_pending);
 }
 
 #[test]

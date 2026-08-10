@@ -39,6 +39,7 @@ pub(crate) enum Effect {
     },
     PollRateLimits {
         endpoint: std::path::PathBuf,
+        provider: String,
     },
     SelectThread {
         endpoint: std::path::PathBuf,
@@ -52,13 +53,14 @@ pub(crate) enum Effect {
     ChangeModel {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
+        provider: String,
         model: String,
         reasoning_effort: String,
     },
     SendTurn {
         endpoint: std::path::PathBuf,
         thread_id: Option<ThreadId>,
-        new_thread_model: Option<(String, String)>,
+        new_thread_model: Option<(String, String, String)>,
         message: String,
     },
     ContinueTurn {
@@ -145,11 +147,14 @@ pub(super) async fn run(
             _ = process_poll.tick() => {
                 app.poll_processes(&effects);
             }
-            _ = rate_limit_poll.tick(), if !app.login_required => {
-                if !app.rate_limit_refresh_pending {
+            _ = rate_limit_poll.tick() => {
+                if !app.rate_limit_refresh_pending
+                    && let Some(provider) = app.selected_provider().map(str::to_owned)
+                {
                     app.rate_limit_refresh_pending = true;
                     effects.send(Effect::PollRateLimits {
                         endpoint: app.endpoint.clone(),
+                        provider,
                     }).ok();
                 }
             }
@@ -168,12 +173,16 @@ impl Effect {
         tokio::spawn(async move {
             match self {
                 Self::Login { endpoint } => {
-                    let result = Client::new(&endpoint).codex_login().await;
+                    let result = Client::new(&endpoint)
+                        .provider_login("codex".to_owned(), None)
+                        .await;
                     let _ = updates.send(TurnUpdate::LoginCompleted(result));
                 }
-                Self::PollRateLimits { endpoint } => {
-                    let result = Client::new(&endpoint).codex_rate_limits().await;
-                    let _ = updates.send(TurnUpdate::RateLimitsLoaded(result));
+                Self::PollRateLimits { endpoint, provider } => {
+                    let result = Client::new(&endpoint)
+                        .provider_rate_limits(provider.clone())
+                        .await;
+                    let _ = updates.send(TurnUpdate::RateLimitsLoaded { provider, result });
                 }
                 Self::SelectThread {
                     endpoint,
@@ -199,14 +208,21 @@ impl Effect {
                 Self::ChangeModel {
                     endpoint,
                     thread_id,
+                    provider,
                     model,
                     reasoning_effort,
                 } => {
                     let result = Client::new(&endpoint)
-                        .thread_set_model(thread_id, model.clone(), reasoning_effort.clone())
+                        .thread_set_model(
+                            thread_id,
+                            provider.clone(),
+                            model.clone(),
+                            reasoning_effort.clone(),
+                        )
                         .await;
                     let _ = updates.send(TurnUpdate::ModelChanged {
                         thread_id,
+                        provider,
                         model,
                         reasoning_effort,
                         result,
@@ -410,7 +426,7 @@ impl Effect {
 async fn send_turn(
     endpoint: &std::path::Path,
     existing_thread_id: Option<ThreadId>,
-    new_thread_model: Option<(String, String)>,
+    new_thread_model: Option<(String, String, String)>,
     message: String,
     updates: &mpsc::UnboundedSender<TurnUpdate>,
 ) -> Result<()> {
@@ -419,9 +435,9 @@ async fn send_turn(
         Some(thread_id) => thread_id,
         None => {
             let thread_id = client.thread_create(None).await?;
-            if let Some((model, reasoning_effort)) = new_thread_model {
+            if let Some((provider, model, reasoning_effort)) = new_thread_model {
                 client
-                    .thread_set_model(thread_id, model, reasoning_effort)
+                    .thread_set_model(thread_id, provider, model, reasoning_effort)
                     .await?;
             }
             let threads = client.thread_list().await?;

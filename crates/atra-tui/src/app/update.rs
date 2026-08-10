@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use atra_client::{CancelResult, CodexLoginStatus, TurnEvent, TurnResult};
+use atra_client::{CancelResult, ProviderLoginStatus, TurnEvent, TurnResult};
 use atra_protocol::ThreadEventData;
 use tokio::sync::mpsc;
 
@@ -102,19 +102,22 @@ impl App {
             }
             TurnUpdate::LoginCompleted(result) => {
                 match result {
-                    Ok(CodexLoginStatus::LoggedIn { .. }) => {
+                    Ok(ProviderLoginStatus::LoggedIn { .. }) => {
                         self.login_required = false;
-                        if !self.rate_limit_refresh_pending {
+                        if !self.rate_limit_refresh_pending
+                            && self.selected_provider() == Some("codex")
+                        {
                             self.rate_limit_refresh_pending = true;
                             effects
                                 .send(Effect::PollRateLimits {
                                     endpoint: self.endpoint.clone(),
+                                    provider: "codex".to_owned(),
                                 })
                                 .ok();
                         }
                         self.activity = Some(Activity::Info("Codex login complete".to_owned()));
                     }
-                    Ok(CodexLoginStatus::LoginRequired) => {
+                    Ok(ProviderLoginStatus::LoginRequired) => {
                         self.login_required = true;
                         self.activity = Some(Activity::Info("Codex login required".to_owned()));
                     }
@@ -124,9 +127,11 @@ impl App {
                 }
                 return Ok(());
             }
-            TurnUpdate::RateLimitsLoaded(result) => {
+            TurnUpdate::RateLimitsLoaded { provider, result } => {
                 self.rate_limit_refresh_pending = false;
-                if let Ok(snapshots) = result {
+                if self.selected_provider() == Some(provider.as_str())
+                    && let Ok(snapshots) = result
+                {
                     self.rate_limits = snapshots;
                 }
                 return Ok(());
@@ -143,6 +148,7 @@ impl App {
                 self.clear_selection();
                 self.reset_view();
                 self.metrics_stale = false;
+                self.rate_limits = serde_json::Value::Array(Vec::new());
                 self.activity = Some(Activity::Info("Thread selected".to_owned()));
                 return Ok(());
             }
@@ -240,6 +246,7 @@ impl App {
             }
             TurnUpdate::ModelChanged {
                 thread_id,
+                provider,
                 model,
                 reasoning_effort,
                 result,
@@ -251,10 +258,12 @@ impl App {
                             .iter_mut()
                             .find(|thread| thread.id == thread_id)
                         {
+                            thread.provider = provider;
                             thread.model = model;
                             thread.reasoning_effort = reasoning_effort;
                         }
                         self.metrics_stale = true;
+                        self.rate_limits = serde_json::Value::Array(Vec::new());
                         self.activity = Some(Activity::Info("Thread model changed".to_owned()));
                     }
                     Err(error) => {

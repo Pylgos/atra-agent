@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use super::{
     DEFAULT_MODEL, ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
-    ModelSession, ProviderOutput,
+    ModelSession, ProviderLoginStatus, ProviderOutput,
 };
 use crate::storage::Event;
 use atra_protocol::{AssistantMessagePhase, ThreadEventData, ToolResultEvent};
@@ -19,7 +19,7 @@ pub(crate) struct FakeProvider {
     responses: Mutex<VecDeque<ModelResponse>>,
 }
 
-const PROVIDER_ID: &str = "fake";
+const PROVIDER_ID: &str = super::FAKE_PROVIDER;
 
 impl FakeProvider {
     pub(super) fn load(path: &Path) -> Result<Self> {
@@ -100,8 +100,13 @@ impl FakeProvider {
 
 #[async_trait]
 impl ModelProvider for FakeProvider {
+    fn id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
     async fn models(&self) -> Result<Vec<Model>> {
         Ok(vec![Model {
+            provider: PROVIDER_ID.to_owned(),
             id: DEFAULT_MODEL.to_owned(),
             display_name: DEFAULT_MODEL.to_owned(),
             description: None,
@@ -112,6 +117,34 @@ impl ModelProvider for FakeProvider {
             context_window: None,
             auto_compact_token_limit: None,
         }])
+    }
+
+    async fn login(&self, _credential: Option<String>) -> Result<ProviderLoginStatus> {
+        Ok(ProviderLoginStatus::LoggedIn(None))
+    }
+
+    async fn login_status(&self) -> Result<ProviderLoginStatus> {
+        Ok(ProviderLoginStatus::LoggedIn(None))
+    }
+
+    async fn reload_auth(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn logout(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn rate_limits(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::Array(Vec::new()))
+    }
+
+    async fn execute_tool(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 
     async fn start_turn(&self, _session_id: &str) -> Result<Box<dyn ModelSession + '_>> {

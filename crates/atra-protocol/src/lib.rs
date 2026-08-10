@@ -141,6 +141,7 @@ pub enum UnaryRequest {
     },
     ThreadSetModel {
         thread_id: ThreadId,
+        provider: String,
         model: String,
         reasoning_effort: String,
     },
@@ -177,10 +178,22 @@ pub enum UnaryRequest {
         runner: String,
         process_id: ProcessId,
     },
-    CodexLogin,
-    CodexLogout,
-    CodexLoginStatus,
-    CodexRateLimits,
+    ProviderLogin {
+        provider: String,
+        credential: Option<String>,
+    },
+    ProviderReloadAuth {
+        provider: String,
+    },
+    ProviderLogout {
+        provider: String,
+    },
+    ProviderLoginStatus {
+        provider: String,
+    },
+    ProviderRateLimits {
+        provider: String,
+    },
     ApprovalAllow {
         approval_id: ApprovalId,
     },
@@ -323,12 +336,18 @@ pub enum ControllerResponse {
     Error {
         message: String,
     },
-    CodexLoginRequired,
-    CodexLoggedIn {
-        email: Option<String>,
+    ProviderLoginRequired {
+        provider: String,
     },
-    CodexLoggedOut,
-    CodexRateLimits {
+    ProviderLoggedIn {
+        provider: String,
+        account: Option<String>,
+    },
+    ProviderLoggedOut {
+        provider: String,
+    },
+    ProviderRateLimits {
+        provider: String,
         snapshots: Value,
     },
 }
@@ -593,6 +612,7 @@ pub struct RateLimitsEvent {
 pub struct Thread {
     pub id: ThreadId,
     pub display_name: Option<String>,
+    pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
 }
@@ -625,6 +645,7 @@ pub struct Runner {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Model {
+    pub provider: String,
     pub id: String,
     pub display_name: String,
     pub description: Option<String>,

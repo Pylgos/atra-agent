@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use atra_client::{CancelResult, CodexLoginStatus, TurnResult};
+use atra_client::{CancelResult, ProviderLoginStatus, TurnResult};
 use atra_protocol::{
     ApprovalId, BackgroundProcess, BackgroundProcessDetail, Model, ProcessId, Thread,
     ThreadCheckpoint, ThreadEvent, ThreadId,
@@ -49,8 +49,13 @@ pub(crate) enum Activity {
 }
 
 pub(crate) enum Target {
-    New { model: Option<(String, String)> },
-    Thread { id: ThreadId, view: ThreadView },
+    New {
+        model: Option<(String, String, String)>,
+    },
+    Thread {
+        id: ThreadId,
+        view: ThreadView,
+    },
 }
 
 pub(crate) enum ThreadView {
@@ -111,7 +116,7 @@ impl Target {
         }
     }
 
-    pub(crate) fn new_thread_model(&self) -> Option<&(String, String)> {
+    pub(crate) fn new_thread_model(&self) -> Option<&(String, String, String)> {
         match self {
             Self::New { model } => model.as_ref(),
             Self::Thread { .. } => None,
@@ -139,8 +144,11 @@ pub(crate) enum TurnUpdate {
         thread_id: ThreadId,
         result: Result<CancelResult>,
     },
-    LoginCompleted(Result<CodexLoginStatus>),
-    RateLimitsLoaded(Result<serde_json::Value>),
+    LoginCompleted(Result<ProviderLoginStatus>),
+    RateLimitsLoaded {
+        provider: String,
+        result: Result<serde_json::Value>,
+    },
     ThreadSelected {
         thread_id: ThreadId,
         result: Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)>,
@@ -152,6 +160,7 @@ pub(crate) enum TurnUpdate {
     },
     ModelChanged {
         thread_id: ThreadId,
+        provider: String,
         model: String,
         reasoning_effort: String,
         result: Result<()>,
@@ -203,6 +212,18 @@ pub(crate) struct App {
 }
 
 impl App {
+    pub(crate) fn selected_provider(&self) -> Option<&str> {
+        self.threads
+            .iter()
+            .find(|thread| Some(thread.id) == self.target.thread_id())
+            .map(|thread| thread.provider.as_str())
+            .or_else(|| {
+                self.target
+                    .new_thread_model()
+                    .map(|(provider, _, _)| provider.as_str())
+            })
+    }
+
     pub(super) async fn load(
         endpoint: PathBuf,
         message_history_path: PathBuf,
@@ -215,9 +236,9 @@ impl App {
             Some(thread_id) => load_transcript(&endpoint, thread_id).await?,
             None => (Vec::new(), Vec::new()),
         };
-        let login_required = match client.codex_login_status().await? {
-            CodexLoginStatus::LoginRequired => true,
-            CodexLoginStatus::LoggedIn { .. } => false,
+        let login_required = match client.provider_login_status("codex".to_owned()).await? {
+            ProviderLoginStatus::LoginRequired => true,
+            ProviderLoginStatus::LoggedIn { .. } => false,
         };
         let models = client.model_list().await.unwrap_or_default();
         let target = match thread_id {
@@ -226,9 +247,13 @@ impl App {
                 view: ThreadView::Live,
             },
             None => Target::New {
-                model: models
-                    .first()
-                    .map(|model| (model.id.clone(), model.default_reasoning_effort.clone())),
+                model: models.first().map(|model| {
+                    (
+                        model.provider.clone(),
+                        model.id.clone(),
+                        model.default_reasoning_effort.clone(),
+                    )
+                }),
             },
         };
         let message_history = history::load(&message_history_path)?;

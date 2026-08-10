@@ -12,7 +12,11 @@ use crate::storage::Event;
 
 pub(crate) mod codex;
 mod fake;
+pub(crate) mod ollama;
 
+pub(crate) const CODEX_PROVIDER: &str = "codex";
+pub(crate) const FAKE_PROVIDER: &str = "fake";
+pub(crate) const OLLAMA_PROVIDER: &str = "ollama";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
@@ -121,6 +125,11 @@ pub(crate) struct ModelResponseMetadata {
     pub response_id: String,
 }
 
+pub(crate) enum ProviderLoginStatus {
+    LoggedIn(Option<String>),
+    LoginRequired,
+}
+
 pub(crate) type ModelEventStream = BoxStream<'static, Result<ModelEvent>>;
 
 pub(crate) struct ModelRequest<'a> {
@@ -148,7 +157,25 @@ pub(crate) struct ModelToolFormat {
 
 #[async_trait]
 pub(crate) trait ModelProvider: Send + Sync {
+    fn id(&self) -> &'static str;
+
     async fn models(&self) -> Result<Vec<Model>>;
+
+    async fn login(&self, credential: Option<String>) -> Result<ProviderLoginStatus>;
+
+    async fn login_status(&self) -> Result<ProviderLoginStatus>;
+
+    async fn reload_auth(&self) -> Result<()>;
+
+    async fn logout(&self) -> Result<()>;
+
+    async fn rate_limits(&self) -> Result<serde_json::Value>;
+
+    async fn execute_tool(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>>;
 
     async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>>;
 
@@ -168,6 +195,10 @@ pub(crate) fn fake(path: &std::path::Path) -> Result<Arc<dyn ModelProvider>> {
 
 pub(crate) async fn codex(auth_home: std::path::PathBuf) -> Arc<codex::CodexProvider> {
     Arc::new(codex::CodexProvider::new(auth_home).await)
+}
+
+pub(crate) fn ollama(auth_home: std::path::PathBuf) -> Arc<ollama::OllamaProvider> {
+    Arc::new(ollama::OllamaProvider::new(auth_home))
 }
 
 pub(crate) fn text_tokens(text: &str) -> usize {

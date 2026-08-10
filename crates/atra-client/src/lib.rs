@@ -31,8 +31,8 @@ pub struct TurnStream {
 }
 
 #[derive(Debug)]
-pub enum CodexLoginStatus {
-    LoggedIn { email: Option<String> },
+pub enum ProviderLoginStatus {
+    LoggedIn { account: Option<String> },
     LoginRequired,
 }
 
@@ -267,17 +267,41 @@ impl Client {
             .await
     }
 
-    pub async fn codex_logout(&self) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::CodexLogout).await?,
-            ControllerResponse::CodexLoggedOut,
-        )
+    pub async fn provider_logout(&self, provider: String) -> Result<()> {
+        match self
+            .unary(UnaryRequest::ProviderLogout {
+                provider: provider.clone(),
+            })
+            .await?
+        {
+            ControllerResponse::ProviderLoggedOut {
+                provider: logged_out,
+            } if logged_out == provider => Ok(()),
+            response => unexpected(response),
+        }
     }
 
-    pub async fn codex_login(&self) -> Result<CodexLoginStatus> {
-        match self.unary(UnaryRequest::CodexLogin).await? {
-            ControllerResponse::CodexLoggedIn { email } => Ok(CodexLoginStatus::LoggedIn { email }),
-            ControllerResponse::CodexLoginRequired => Ok(CodexLoginStatus::LoginRequired),
+    pub async fn provider_login(
+        &self,
+        provider: String,
+        credential: Option<String>,
+    ) -> Result<ProviderLoginStatus> {
+        match self
+            .unary(UnaryRequest::ProviderLogin {
+                provider: provider.clone(),
+                credential,
+            })
+            .await?
+        {
+            ControllerResponse::ProviderLoggedIn {
+                provider: logged_in,
+                account,
+            } if logged_in == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
+            ControllerResponse::ProviderLoginRequired { provider: required }
+                if required == provider =>
+            {
+                Ok(ProviderLoginStatus::LoginRequired)
+            }
             response => unexpected(response),
         }
     }
@@ -289,17 +313,57 @@ impl Client {
         }
     }
 
-    pub async fn codex_login_status(&self) -> Result<CodexLoginStatus> {
-        match self.unary(UnaryRequest::CodexLoginStatus).await? {
-            ControllerResponse::CodexLoggedIn { email } => Ok(CodexLoginStatus::LoggedIn { email }),
-            ControllerResponse::CodexLoginRequired => Ok(CodexLoginStatus::LoginRequired),
+    pub async fn provider_login_status(&self, provider: String) -> Result<ProviderLoginStatus> {
+        match self
+            .unary(UnaryRequest::ProviderLoginStatus {
+                provider: provider.clone(),
+            })
+            .await?
+        {
+            ControllerResponse::ProviderLoggedIn {
+                provider: logged_in,
+                account,
+            } if logged_in == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
+            ControllerResponse::ProviderLoginRequired { provider: required }
+                if required == provider =>
+            {
+                Ok(ProviderLoginStatus::LoginRequired)
+            }
             response => unexpected(response),
         }
     }
 
-    pub async fn codex_rate_limits(&self) -> Result<serde_json::Value> {
-        match self.unary(UnaryRequest::CodexRateLimits).await? {
-            ControllerResponse::CodexRateLimits { snapshots } => Ok(snapshots),
+    pub async fn provider_reload_auth(&self, provider: String) -> Result<ProviderLoginStatus> {
+        match self
+            .unary(UnaryRequest::ProviderReloadAuth {
+                provider: provider.clone(),
+            })
+            .await?
+        {
+            ControllerResponse::ProviderLoggedIn {
+                provider: reloaded,
+                account,
+            } if reloaded == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
+            ControllerResponse::ProviderLoginRequired { provider: required }
+                if required == provider =>
+            {
+                Ok(ProviderLoginStatus::LoginRequired)
+            }
+            response => unexpected(response),
+        }
+    }
+
+    pub async fn provider_rate_limits(&self, provider: String) -> Result<serde_json::Value> {
+        match self
+            .unary(UnaryRequest::ProviderRateLimits {
+                provider: provider.clone(),
+            })
+            .await?
+        {
+            ControllerResponse::ProviderRateLimits {
+                provider: response_provider,
+                snapshots,
+            } if response_provider == provider => Ok(snapshots),
             response => unexpected(response),
         }
     }
@@ -335,12 +399,14 @@ impl Client {
     pub async fn thread_set_model(
         &self,
         thread_id: ThreadId,
+        provider: String,
         model: String,
         reasoning_effort: String,
     ) -> Result<()> {
         expect_unit(
             self.unary(UnaryRequest::ThreadSetModel {
                 thread_id,
+                provider,
                 model,
                 reasoning_effort,
             })

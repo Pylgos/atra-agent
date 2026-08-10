@@ -35,15 +35,17 @@ use atra_protocol::{Model, Runner};
 
 use super::{
     ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
-    ModelResponseMetadata, ModelSession, ModelStreamEvent, ModelTool, ProviderOutput,
+    ModelResponseMetadata, ModelSession, ModelStreamEvent, ModelTool, ProviderLoginStatus,
+    ProviderOutput,
 };
 use crate::storage::Event;
 use atra_protocol::{InstructionEvent, RunnersEvent, ThreadEventData, ToolResultEvent};
 
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
-const PROVIDER_ID: &str = "codex";
+const PROVIDER_ID: &str = super::CODEX_PROVIDER;
 
 pub(crate) struct CodexProvider {
+    auth_home: PathBuf,
     auth: Arc<AuthManager>,
     models: RwLock<Option<Vec<Model>>>,
     sessions: Mutex<HashMap<String, Arc<CodexSession>>>,
@@ -111,6 +113,7 @@ impl CodexProvider {
             OutboundProxyPolicy::ReqwestDefault,
         ));
         Self {
+            auth_home: auth_home.clone(),
             auth: Arc::new(
                 AuthManager::new(
                     auth_home,
@@ -243,6 +246,7 @@ impl CodexProvider {
                     supported_reasoning_efforts.push(default_reasoning_effort.clone());
                 }
                 Model {
+                    provider: PROVIDER_ID.to_owned(),
                     id: model.slug,
                     display_name: model.display_name,
                     description: model.description,
@@ -319,8 +323,54 @@ impl CodexProvider {
 
 #[async_trait]
 impl ModelProvider for CodexProvider {
+    fn id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
     async fn models(&self) -> Result<Vec<Model>> {
         self.models().await
+    }
+
+    async fn login(&self, credential: Option<String>) -> Result<ProviderLoginStatus> {
+        anyhow::ensure!(
+            credential.is_none(),
+            "Codex login does not accept a credential"
+        );
+        crate::codex_login(&self.auth_home).await?;
+        self.reload_auth().await;
+        Ok(match self.login_status().await {
+            Some(account) => ProviderLoginStatus::LoggedIn(account),
+            None => ProviderLoginStatus::LoginRequired,
+        })
+    }
+
+    async fn login_status(&self) -> Result<ProviderLoginStatus> {
+        Ok(match self.login_status().await {
+            Some(account) => ProviderLoginStatus::LoggedIn(account),
+            None => ProviderLoginStatus::LoginRequired,
+        })
+    }
+
+    async fn reload_auth(&self) -> Result<()> {
+        self.reload_auth().await;
+        Ok(())
+    }
+
+    async fn logout(&self) -> Result<()> {
+        self.logout().await
+    }
+
+    async fn rate_limits(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.rate_limits().await?)
+            .context("failed to encode Codex rate limits")
+    }
+
+    async fn execute_tool(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 
     async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>> {

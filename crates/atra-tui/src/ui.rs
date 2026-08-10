@@ -356,13 +356,21 @@ impl App {
             .threads
             .iter()
             .find(|thread| Some(thread.id) == self.target.thread_id())
-            .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
+            .map(|thread| {
+                (
+                    thread.provider.as_str(),
+                    thread.model.as_str(),
+                    thread.reasoning_effort.as_str(),
+                )
+            })
             .or_else(|| {
                 self.target
                     .new_thread_model()
-                    .map(|(model, effort)| (model.as_str(), effort.as_str()))
+                    .map(|(provider, model, effort)| {
+                        (provider.as_str(), model.as_str(), effort.as_str())
+                    })
             });
-        let Some((model, effort)) = selected else {
+        let Some((_, model, effort)) = selected else {
             return Line::from("model — · context — · cache —");
         };
         let usage = (!self.metrics_stale)
@@ -947,7 +955,10 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
                 };
                 let description = model.description.as_deref().unwrap_or_default();
                 ListItem::new(vec![
-                    Line::from(format!("{marker} {}", model.display_name)),
+                    Line::from(format!(
+                        "{marker} {} · {}",
+                        model.provider, model.display_name
+                    )),
                     Line::from(Span::styled(
                         format!("  {description}"),
                         Style::default().fg(Color::DarkGray),

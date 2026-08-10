@@ -54,6 +54,7 @@ impl Store {
                     CREATE TABLE IF NOT EXISTS threads (
                         id INTEGER PRIMARY KEY,
                         display_name TEXT,
+                        provider TEXT NOT NULL,
                         model TEXT NOT NULL,
                         reasoning_effort TEXT NOT NULL
                     );
@@ -72,6 +73,7 @@ impl Store {
                         created_at_ms INTEGER NOT NULL,
                         reason TEXT NOT NULL,
                         display_name TEXT,
+                        provider TEXT NOT NULL,
                         model TEXT NOT NULL,
                         reasoning_effort TEXT NOT NULL
                     );
@@ -85,6 +87,18 @@ impl Store {
                     );
                     ",
                 )?;
+                let transaction = connection.transaction()?;
+                if !has_column(&transaction, "threads", "provider")? {
+                    transaction.execute_batch(
+                        "ALTER TABLE threads ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';",
+                    )?;
+                }
+                if !has_column(&transaction, "checkpoints", "provider")? {
+                    transaction.execute_batch(
+                        "ALTER TABLE checkpoints ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';",
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(())
             })
             .await?;
@@ -94,14 +108,15 @@ impl Store {
     pub async fn create_thread(
         &self,
         display_name: Option<String>,
+        provider: String,
         model: String,
         reasoning_effort: String,
     ) -> tokio_rusqlite::Result<ThreadId> {
         self.connection
             .call(move |connection| {
                 connection.execute(
-                    "INSERT INTO threads (display_name, model, reasoning_effort) VALUES (?1, ?2, ?3)",
-                    params![display_name, model, reasoning_effort],
+                    "INSERT INTO threads (display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4)",
+                    params![display_name, provider, model, reasoning_effort],
                 )?;
                 Ok(ThreadId(connection.last_insert_rowid()))
             })
@@ -112,14 +127,15 @@ impl Store {
         self.connection
             .call(|connection| {
                 let mut statement = connection
-                    .prepare("SELECT id, display_name, model, reasoning_effort FROM threads ORDER BY id DESC")?;
+                    .prepare("SELECT id, display_name, provider, model, reasoning_effort FROM threads ORDER BY id DESC")?;
                 statement
                     .query_map([], |row| {
                         Ok(Thread {
                             id: ThreadId(row.get(0)?),
                             display_name: row.get(1)?,
-                            model: row.get(2)?,
-                            reasoning_effort: row.get(3)?,
+                            provider: row.get(2)?,
+                            model: row.get(3)?,
+                            reasoning_effort: row.get(4)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -150,6 +166,7 @@ impl Store {
     pub async fn set_thread_model(
         &self,
         thread_id: ThreadId,
+        provider: String,
         model: String,
         reasoning_effort: String,
     ) -> tokio_rusqlite::Result<()> {
@@ -157,8 +174,8 @@ impl Store {
             .call(move |connection| {
                 let thread_id = thread_id.0;
                 let updated = connection.execute(
-                    "UPDATE threads SET model = ?1, reasoning_effort = ?2 WHERE id = ?3",
-                    params![model, reasoning_effort, thread_id],
+                    "UPDATE threads SET provider = ?1, model = ?2, reasoning_effort = ?3 WHERE id = ?4",
+                    params![provider, model, reasoning_effort, thread_id],
                 )?;
                 if updated == 0 {
                     return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -171,14 +188,14 @@ impl Store {
     pub async fn thread_model(
         &self,
         thread_id: ThreadId,
-    ) -> tokio_rusqlite::Result<(String, String)> {
+    ) -> tokio_rusqlite::Result<(String, String, String)> {
         self.connection
             .call(move |connection| {
                 let thread_id = thread_id.0;
                 connection.query_row(
-                    "SELECT model, reasoning_effort FROM threads WHERE id = ?1",
+                    "SELECT provider, model, reasoning_effort FROM threads WHERE id = ?1",
                     [thread_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
             })
             .await
@@ -485,33 +502,42 @@ impl Store {
                 let transaction = connection.transaction()?;
                 let kind =
                     validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
-                let (source_name, model, reasoning_effort): (Option<String>, String, String) =
-                    match checkpoint_id {
-                        Some(checkpoint_id) => transaction.query_row(
-                            "
-                            SELECT display_name, model, reasoning_effort
+                let (source_name, provider, model, reasoning_effort): (
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                ) = match checkpoint_id {
+                    Some(checkpoint_id) => transaction.query_row(
+                        "
+                            SELECT display_name, provider, model, reasoning_effort
                             FROM checkpoints
                             WHERE id = ?1 AND thread_id = ?2
                             ",
-                            params![checkpoint_id, thread_id],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )?,
-                        None => transaction.query_row(
-                            "
-                            SELECT display_name, model, reasoning_effort
+                        params![checkpoint_id, thread_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?,
+                    None => transaction.query_row(
+                        "
+                            SELECT display_name, provider, model, reasoning_effort
                             FROM threads
                             WHERE id = ?1
                             ",
-                            [thread_id],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )?,
-                    };
+                        [thread_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?,
+                };
                 transaction.execute(
                     "
-                    INSERT INTO threads (display_name, model, reasoning_effort)
-                    VALUES (?1, ?2, ?3)
+                    INSERT INTO threads (display_name, provider, model, reasoning_effort)
+                    VALUES (?1, ?2, ?3, ?4)
                     ",
-                    params![display_name.or(source_name), model, reasoning_effort],
+                    params![
+                        display_name.or(source_name),
+                        provider,
+                        model,
+                        reasoning_effort
+                    ],
                 )?;
                 let new_thread_id = transaction.last_insert_rowid();
                 copy_events(
@@ -559,29 +585,31 @@ impl Store {
                         (Some(checkpoint_id.0), None, "restore")
                     }
                 };
-                let checkpoint_settings: Option<(Option<String>, String, String)> = checkpoint_id
-                    .map(|checkpoint_id| {
-                        transaction.query_row(
-                            "
-                            SELECT display_name, model, reasoning_effort
+                let checkpoint_settings: Option<(Option<String>, String, String, String)> =
+                    checkpoint_id
+                        .map(|checkpoint_id| {
+                            transaction.query_row(
+                                "
+                            SELECT display_name, provider, model, reasoning_effort
                             FROM checkpoints
                             WHERE id = ?1 AND thread_id = ?2
                             ",
-                            params![checkpoint_id, thread_id],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )
-                    })
-                    .transpose()?;
+                                params![checkpoint_id, thread_id],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                            )
+                        })
+                        .transpose()?;
                 let saved = create_checkpoint(&transaction, thread_id, created_at_ms, reason)?;
                 transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
-                if let Some((display_name, model, reasoning_effort)) = checkpoint_settings {
+                if let Some((display_name, provider, model, reasoning_effort)) = checkpoint_settings
+                {
                     transaction.execute(
                         "
                         UPDATE threads
-                        SET display_name = ?1, model = ?2, reasoning_effort = ?3
-                        WHERE id = ?4
+                        SET display_name = ?1, provider = ?2, model = ?3, reasoning_effort = ?4
+                        WHERE id = ?5
                         ",
-                        params![display_name, model, reasoning_effort, thread_id],
+                        params![display_name, provider, model, reasoning_effort, thread_id],
                     )?;
                 }
                 copy_events(
@@ -674,6 +702,18 @@ impl Store {
     }
 }
 
+fn has_column(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|candidate| candidate == column))
+}
+
 fn to_sql_error(error: serde_json::Error) -> tokio_rusqlite::Error {
     tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
@@ -706,28 +746,33 @@ fn create_checkpoint(
     created_at_ms: i64,
     reason: &str,
 ) -> rusqlite::Result<i64> {
-    let (display_name, model, reasoning_effort): (Option<String>, String, String) = transaction
-        .query_row(
-            "
-            SELECT display_name, model, reasoning_effort
+    let (display_name, provider, model, reasoning_effort): (
+        Option<String>,
+        String,
+        String,
+        String,
+    ) = transaction.query_row(
+        "
+            SELECT display_name, provider, model, reasoning_effort
             FROM threads
             WHERE id = ?1
             ",
-            [thread_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        [thread_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     transaction.execute(
         "
         INSERT INTO checkpoints (
-            thread_id, created_at_ms, reason, display_name, model, reasoning_effort
+            thread_id, created_at_ms, reason, display_name, provider, model, reasoning_effort
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
         params![
             thread_id,
             created_at_ms,
             reason,
             display_name,
+            provider,
             model,
             reasoning_effort
         ],
@@ -859,7 +904,12 @@ mod tests {
     async fn events_keep_their_thread_order() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
         let thread = store
-            .create_thread(None, "test-model".to_owned(), "medium".to_owned())
+            .create_thread(
+                None,
+                "fake".to_owned(),
+                "test-model".to_owned(),
+                "medium".to_owned(),
+            )
             .await
             .unwrap();
 
@@ -916,7 +966,12 @@ mod tests {
         let database = directory.path().join("controller.sqlite3");
         let store = Store::open(&database).await.unwrap();
         let thread = store
-            .create_thread(None, "test-model".to_owned(), "medium".to_owned())
+            .create_thread(
+                None,
+                "fake".to_owned(),
+                "test-model".to_owned(),
+                "medium".to_owned(),
+            )
             .await
             .unwrap();
         store
@@ -944,18 +999,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adds_codex_provider_to_existing_threads_and_checkpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("controller.sqlite3");
+        let legacy = rusqlite::Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "
+                CREATE TABLE threads (
+                    id INTEGER PRIMARY KEY,
+                    display_name TEXT,
+                    model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL
+                );
+                CREATE TABLE checkpoints (
+                    id INTEGER PRIMARY KEY,
+                    thread_id INTEGER NOT NULL REFERENCES threads(id),
+                    created_at_ms INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    display_name TEXT,
+                    model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL
+                );
+                INSERT INTO threads (id, display_name, model, reasoning_effort)
+                VALUES (1, 'Legacy', 'gpt-5.6-sol', 'medium');
+                INSERT INTO checkpoints (
+                    id, thread_id, created_at_ms, reason, display_name, model, reasoning_effort
+                )
+                VALUES (1, 1, 1, 'legacy', 'Legacy', 'gpt-5.6-sol', 'medium');
+                ",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let store = Store::open(&database).await.unwrap();
+
+        assert_eq!(store.threads().await.unwrap()[0].provider, "codex");
+        assert_eq!(
+            store
+                .connection
+                .call(|connection| {
+                    connection.query_row(
+                        "SELECT provider FROM checkpoints WHERE id = 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                })
+                .await
+                .unwrap(),
+            "codex"
+        );
+        drop(store);
+
+        assert_eq!(
+            Store::open(&database)
+                .await
+                .unwrap()
+                .threads()
+                .await
+                .unwrap()[0]
+                .provider,
+            "codex"
+        );
+    }
+
+    #[tokio::test]
     async fn threads_are_listed_newest_first() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
         let first = store
             .create_thread(
                 Some("First".to_owned()),
+                "fake".to_owned(),
                 "model-a".to_owned(),
                 "low".to_owned(),
             )
             .await
             .unwrap();
         let second = store
-            .create_thread(None, "model-b".to_owned(), "high".to_owned())
+            .create_thread(
+                None,
+                "fake".to_owned(),
+                "model-b".to_owned(),
+                "high".to_owned(),
+            )
             .await
             .unwrap();
 
@@ -965,12 +1091,14 @@ mod tests {
                 Thread {
                     id: second,
                     display_name: None,
+                    provider: "fake".to_owned(),
                     model: "model-b".to_owned(),
                     reasoning_effort: "high".to_owned(),
                 },
                 Thread {
                     id: first,
                     display_name: Some("First".to_owned()),
+                    provider: "fake".to_owned(),
                     model: "model-a".to_owned(),
                     reasoning_effort: "low".to_owned(),
                 },

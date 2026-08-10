@@ -15,7 +15,7 @@ use atra_protocol::{
     ApprovalId, ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
     CommandExecutionArtifact, CommandMode, CommandOutput, CompactionEvent, ControllerResponse,
     CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
-    ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
+    Model, ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
     RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
     RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
     TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
@@ -106,10 +106,21 @@ pub async fn codex_logout(auth_home: &Path) -> Result<()> {
     Ok(())
 }
 
+pub async fn ollama_login(auth_home: &Path, api_key: String) -> Result<()> {
+    let provider = model::ollama(auth_home.to_owned());
+    provider.login(Some(api_key)).await?;
+    Ok(())
+}
+
+pub async fn ollama_logout(auth_home: &Path) -> Result<()> {
+    let provider = model::ollama(auth_home.to_owned());
+    provider.logout().await
+}
+
 pub async fn run(
     endpoint: &Path,
     database: &Path,
-    auth_home: &Path,
+    provider_auth_home: &Path,
     platform: Option<PlatformStore>,
 ) -> Result<()> {
     let workspace = env::current_dir().context("failed to determine controller workspace")?;
@@ -120,16 +131,29 @@ pub async fn run(
         "{:x}",
         Sha256::digest(database.as_os_str().as_encoded_bytes())
     );
-    let (provider, codex): (
-        Arc<dyn ModelProvider>,
-        Option<Arc<model::codex::CodexProvider>>,
-    ) = match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
-        Some(path) => (model::fake(Path::new(&path))?, None),
-        None => {
-            let codex = model::codex(auth_home.to_owned()).await;
-            (codex.clone(), Some(codex))
-        }
-    };
+    let (providers, default_provider): (HashMap<String, Arc<dyn ModelProvider>>, String) =
+        match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
+            Some(path) => {
+                let provider = model::fake(Path::new(&path))?;
+                (
+                    HashMap::from([(provider.id().to_owned(), provider)]),
+                    model::FAKE_PROVIDER.to_owned(),
+                )
+            }
+            None => {
+                let codex: Arc<dyn ModelProvider> =
+                    model::codex(provider_auth_home.join(model::CODEX_PROVIDER)).await;
+                let ollama: Arc<dyn ModelProvider> =
+                    model::ollama(provider_auth_home.join(model::OLLAMA_PROVIDER));
+                (
+                    HashMap::from([
+                        (codex.id().to_owned(), codex),
+                        (ollama.id().to_owned(), ollama),
+                    ]),
+                    model::CODEX_PROVIDER.to_owned(),
+                )
+            }
+        };
     let platform = platform.map(Arc::new);
     let data_home = xdg::BaseDirectories::new()
         .get_data_home()
@@ -162,14 +186,13 @@ pub async fn run(
     let state = Arc::new(State {
         runners: RunnerPool::new(platform),
         store,
-        provider,
-        codex,
+        providers,
+        default_provider,
         turns: TurnLifecycle::new(),
         thread_locks: StdMutex::new(HashMap::new()),
         skill_store,
         skill_generation: Mutex::new(None),
         data_home,
-        auth_home: auth_home.to_owned(),
         prompt_cache_namespace,
         workspace,
     });
@@ -202,14 +225,13 @@ pub async fn run(
 pub(crate) struct State {
     runners: RunnerPool,
     store: Store,
-    provider: Arc<dyn ModelProvider>,
-    codex: Option<Arc<model::codex::CodexProvider>>,
+    providers: HashMap<String, Arc<dyn ModelProvider>>,
+    default_provider: String,
     turns: TurnLifecycle,
     thread_locks: StdMutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
     skill_store: AtraStore,
     skill_generation: Mutex<Option<Arc<skills::SkillGeneration>>>,
     data_home: PathBuf,
-    auth_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
 }
@@ -222,15 +244,41 @@ enum WorkspaceInstructions {
 }
 
 impl State {
-    async fn codex_login_status(&self) -> Result<ControllerResponse> {
-        let status = match &self.codex {
-            Some(codex) => codex.login_status().await,
-            None => Some(None),
-        };
-        match status {
-            Some(email) => Ok(ControllerResponse::CodexLoggedIn { email }),
-            None => Ok(ControllerResponse::CodexLoginRequired),
+    pub(crate) fn provider(&self, id: &str) -> Result<&Arc<dyn ModelProvider>> {
+        self.providers
+            .get(id)
+            .with_context(|| format!("unknown model provider {id}"))
+    }
+
+    async fn models(&self) -> Result<Vec<Model>> {
+        let mut models = Vec::new();
+        let mut first_error = None;
+        let mut providers = self.providers.values().collect::<Vec<_>>();
+        providers.sort_by_key(|provider| provider.id() != self.default_provider);
+        for provider in providers {
+            if matches!(
+                provider.login_status().await?,
+                model::ProviderLoginStatus::LoggedIn(_)
+            ) {
+                match provider.models().await {
+                    Ok(provider_models) => models.extend(provider_models),
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = provider.id(),
+                            error = %format!("{error:#}"),
+                            "failed to list provider models"
+                        );
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
         }
+        if models.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
+        }
+        Ok(models)
     }
 
     async fn handle(&self, request: UnaryRequest) -> Result<ControllerResponse> {
@@ -239,7 +287,12 @@ impl State {
             UnaryRequest::ThreadCreate { display_name } => {
                 let thread_id = self
                     .store
-                    .create_thread(display_name, DEFAULT_MODEL.to_owned(), "medium".to_owned())
+                    .create_thread(
+                        display_name,
+                        self.default_provider.clone(),
+                        DEFAULT_MODEL.to_owned(),
+                        "medium".to_owned(),
+                    )
                     .await
                     .context("failed to create thread")?;
                 Ok(ControllerResponse::ThreadCreated { thread_id })
@@ -253,7 +306,7 @@ impl State {
                 Ok(ControllerResponse::ThreadList { threads })
             }
             UnaryRequest::ModelList => Ok(ControllerResponse::ModelList {
-                models: self.provider.models().await?,
+                models: self.models().await?,
             }),
             UnaryRequest::ThreadRename {
                 thread_id,
@@ -270,6 +323,7 @@ impl State {
             }
             UnaryRequest::ThreadSetModel {
                 thread_id,
+                provider,
                 model,
                 reasoning_effort,
             } => {
@@ -279,20 +333,30 @@ impl State {
                 if reasoning_effort.trim().is_empty() {
                     bail!("reasoning effort must not be empty");
                 }
-                let models = self.provider.models().await?;
+                let models = self.provider(&provider)?.models().await?;
                 let selected = models
                     .iter()
-                    .find(|candidate| candidate.id == model)
-                    .with_context(|| format!("unknown model {model}"))?;
+                    .find(|candidate| candidate.provider == provider && candidate.id == model)
+                    .with_context(|| format!("unknown model {provider}/{model}"))?;
                 if !selected
                     .supported_reasoning_efforts
                     .iter()
                     .any(|candidate| candidate == &reasoning_effort)
                 {
-                    bail!("reasoning effort {reasoning_effort} is not supported by model {model}");
+                    bail!(
+                        "reasoning effort {reasoning_effort} is not supported by model {provider}/{model}"
+                    );
+                }
+                let (current_provider, _, _) = self
+                    .store
+                    .thread_model(thread_id)
+                    .await
+                    .context("failed to load thread model")?;
+                if current_provider != provider && !self.store.events(thread_id).await?.is_empty() {
+                    bail!("cannot change provider after the thread history has started");
                 }
                 self.store
-                    .set_thread_model(thread_id, model, reasoning_effort)
+                    .set_thread_model(thread_id, provider, model, reasoning_effort)
                     .await
                     .context("failed to change thread model")?;
                 Ok(ControllerResponse::ThreadModelChanged)
@@ -381,27 +445,49 @@ impl State {
                     process: self.runners.inspect_process(key, record).await,
                 })
             }
-            UnaryRequest::CodexLogin => {
-                codex_login(&self.auth_home).await?;
-                if let Some(codex) = &self.codex {
-                    codex.reload_auth().await;
+            UnaryRequest::ProviderLogin {
+                provider,
+                credential,
+            } => match self.provider(&provider)?.login(credential).await? {
+                model::ProviderLoginStatus::LoggedIn(account) => {
+                    Ok(ControllerResponse::ProviderLoggedIn { provider, account })
                 }
-                self.codex_login_status().await
-            }
-            UnaryRequest::CodexLogout => {
-                if let Some(codex) = &self.codex {
-                    codex.logout().await?;
+                model::ProviderLoginStatus::LoginRequired => {
+                    Ok(ControllerResponse::ProviderLoginRequired { provider })
                 }
-                Ok(ControllerResponse::CodexLoggedOut)
+            },
+            UnaryRequest::ProviderLogout { provider } => {
+                self.provider(&provider)?.logout().await?;
+                Ok(ControllerResponse::ProviderLoggedOut { provider })
             }
-            UnaryRequest::CodexLoginStatus => self.codex_login_status().await,
-            UnaryRequest::CodexRateLimits => Ok(ControllerResponse::CodexRateLimits {
-                snapshots: serde_json::to_value(match &self.codex {
-                    Some(codex) => codex.rate_limits().await?,
-                    None => Vec::new(),
+            UnaryRequest::ProviderReloadAuth { provider } => {
+                self.provider(&provider)?.reload_auth().await?;
+                match self.provider(&provider)?.login_status().await? {
+                    model::ProviderLoginStatus::LoggedIn(account) => {
+                        Ok(ControllerResponse::ProviderLoggedIn { provider, account })
+                    }
+                    model::ProviderLoginStatus::LoginRequired => {
+                        Ok(ControllerResponse::ProviderLoginRequired { provider })
+                    }
+                }
+            }
+            UnaryRequest::ProviderLoginStatus { provider } => {
+                match self.provider(&provider)?.login_status().await? {
+                    model::ProviderLoginStatus::LoggedIn(account) => {
+                        Ok(ControllerResponse::ProviderLoggedIn { provider, account })
+                    }
+                    model::ProviderLoginStatus::LoginRequired => {
+                        Ok(ControllerResponse::ProviderLoginRequired { provider })
+                    }
+                }
+            }
+            UnaryRequest::ProviderRateLimits { provider } => {
+                let snapshots = self.provider(&provider)?.rate_limits().await?;
+                Ok(ControllerResponse::ProviderRateLimits {
+                    provider,
+                    snapshots,
                 })
-                .context("failed to encode Codex rate limits")?,
-            }),
+            }
             UnaryRequest::ApprovalAllow { approval_id } => {
                 self.resolve_approval(approval_id, true, None).await
             }

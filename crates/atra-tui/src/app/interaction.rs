@@ -543,10 +543,13 @@ impl App {
 
     fn start_new_thread(&mut self) {
         self.target = Target::New {
-            model: self
-                .models
-                .first()
-                .map(|model| (model.id.clone(), model.default_reasoning_effort.clone())),
+            model: self.models.first().map(|model| {
+                (
+                    model.provider.clone(),
+                    model.id.clone(),
+                    model.default_reasoning_effort.clone(),
+                )
+            }),
         };
         self.processes.clear();
         self.transcript.clear();
@@ -555,6 +558,7 @@ impl App {
         self.clear_selection();
         self.reset_view();
         self.metrics_stale = false;
+        self.rate_limits = serde_json::Value::Array(Vec::new());
         self.activity = Some(Activity::Info("New thread".to_owned()));
     }
 
@@ -568,21 +572,33 @@ impl App {
             .threads
             .iter()
             .find(|thread| Some(thread.id) == self.target.thread_id())
-            .map(|thread| (thread.model.as_str(), thread.reasoning_effort.as_str()))
+            .map(|thread| {
+                (
+                    thread.provider.as_str(),
+                    thread.model.as_str(),
+                    thread.reasoning_effort.as_str(),
+                )
+            })
             .or_else(|| {
                 self.target
                     .new_thread_model()
-                    .map(|(model, effort)| (model.as_str(), effort.as_str()))
+                    .map(|(provider, model, effort)| {
+                        (provider.as_str(), model.as_str(), effort.as_str())
+                    })
             });
         let model_index = self
             .models
             .iter()
-            .position(|model| selected.is_some_and(|(selected, _)| model.id == selected))
+            .position(|model| {
+                selected.is_some_and(|(provider, selected, _)| {
+                    model.provider == provider && model.id == selected
+                })
+            })
             .unwrap_or(0);
         let effort_index = self.models[model_index]
             .supported_reasoning_efforts
             .iter()
-            .position(|effort| selected.is_some_and(|(_, selected)| effort == selected))
+            .position(|effort| selected.is_some_and(|(_, _, selected)| effort == selected))
             .unwrap_or(0);
         self.overlay = Overlay::ModelPicker(ModelPicker {
             models: self.models.clone(),
@@ -1091,6 +1107,7 @@ impl App {
             .model_picker()
             .context("model picker is closed")?;
         let selected = &picker.models[picker.model_index];
+        let provider = selected.provider.clone();
         let model = selected.id.clone();
         let reasoning_effort = selected
             .supported_reasoning_efforts
@@ -1099,8 +1116,9 @@ impl App {
             .unwrap_or_else(|| selected.default_reasoning_effort.clone());
         let Some(thread_id) = self.target.thread_id() else {
             self.target = Target::New {
-                model: Some((model, reasoning_effort)),
+                model: Some((provider, model, reasoning_effort)),
             };
+            self.rate_limits = serde_json::Value::Array(Vec::new());
             self.overlay = Overlay::None;
             self.metrics_stale = true;
             self.activity = Some(Activity::Info("Model selected for new thread".to_owned()));
@@ -1112,6 +1130,7 @@ impl App {
             .send(Effect::ChangeModel {
                 endpoint: self.endpoint.clone(),
                 thread_id,
+                provider,
                 model,
                 reasoning_effort,
             })

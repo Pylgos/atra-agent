@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use atra_client::{
-    CodexLoginStatus, LaunchResult, ProcessResult, TurnEvent, TurnResult, TurnStream,
+    LaunchResult, ProcessResult, ProviderLoginStatus, TurnEvent, TurnResult, TurnStream,
 };
 use atra_protocol::{
     ApprovalId, ApprovalPolicy, CheckpointId, CommandMode, EventSequence, ProcessId, ThreadId,
@@ -58,6 +58,10 @@ enum Command {
         #[command(subcommand)]
         command: CodexCommand,
     },
+    Ollama {
+        #[command(subcommand)]
+        command: OllamaCommand,
+    },
     Tui,
 }
 
@@ -83,6 +87,13 @@ enum CodexCommand {
 }
 
 #[derive(Subcommand)]
+enum OllamaCommand {
+    Login,
+    Logout,
+    Status,
+}
+
+#[derive(Subcommand)]
 enum ThreadCommand {
     Create {
         #[arg(long)]
@@ -98,6 +109,8 @@ enum ThreadCommand {
     Model {
         #[arg(long)]
         thread: i64,
+        #[arg(long)]
+        provider: String,
         #[arg(long)]
         model: String,
         #[arg(long)]
@@ -315,17 +328,24 @@ async fn run(command: Command) -> Result<()> {
         Command::Codex {
             command: CodexCommand::Login,
         } => {
-            atra_controller::codex_login(&codex_auth_home()?).await?;
+            atra_controller::codex_login(&provider_auth_home()?.join("codex")).await?;
+            if let Err(error) = client(&endpoint)
+                .provider_reload_auth("codex".to_owned())
+                .await
+                && !controller_not_running(&error)
+            {
+                return Err(error);
+            }
             println!("logged in");
             Ok(())
         }
         Command::Codex {
             command: CodexCommand::Logout,
         } => {
-            match client(&endpoint).codex_logout().await {
+            match client(&endpoint).provider_logout("codex".to_owned()).await {
                 Ok(()) => {}
                 Err(error) if controller_not_running(&error) => {
-                    atra_controller::codex_logout(&codex_auth_home()?).await?;
+                    atra_controller::codex_logout(&provider_auth_home()?.join("codex")).await?;
                 }
                 Err(error) => return Err(error),
             }
@@ -334,17 +354,66 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Codex {
             command: CodexCommand::Status,
-        } => match client(&endpoint).codex_login_status().await? {
-            CodexLoginStatus::LoggedIn { email } => {
+        } => match client(&endpoint)
+            .provider_login_status("codex".to_owned())
+            .await?
+        {
+            ProviderLoginStatus::LoggedIn { account } => {
                 println!(
                     "logged in{}",
-                    email
-                        .map(|email| format!(" as {email}"))
+                    account
+                        .map(|account| format!(" as {account}"))
                         .unwrap_or_default()
                 );
                 Ok(())
             }
-            CodexLoginStatus::LoginRequired => {
+            ProviderLoginStatus::LoginRequired => {
+                println!("logged out");
+                Ok(())
+            }
+        },
+        Command::Ollama {
+            command: OllamaCommand::Login,
+        } => {
+            let api_key = rpassword::prompt_password("Ollama API key: ")?;
+            match client(&endpoint)
+                .provider_login("ollama".to_owned(), Some(api_key.clone()))
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if controller_not_running(&error) => {
+                    atra_controller::ollama_login(&provider_auth_home()?.join("ollama"), api_key)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+            println!("logged in");
+            Ok(())
+        }
+        Command::Ollama {
+            command: OllamaCommand::Logout,
+        } => {
+            match client(&endpoint).provider_logout("ollama".to_owned()).await {
+                Ok(()) => {}
+                Err(error) if controller_not_running(&error) => {
+                    atra_controller::ollama_logout(&provider_auth_home()?.join("ollama")).await?;
+                }
+                Err(error) => return Err(error),
+            }
+            println!("logged out");
+            Ok(())
+        }
+        Command::Ollama {
+            command: OllamaCommand::Status,
+        } => match client(&endpoint)
+            .provider_login_status("ollama".to_owned())
+            .await?
+        {
+            ProviderLoginStatus::LoggedIn { .. } => {
+                println!("logged in");
+                Ok(())
+            }
+            ProviderLoginStatus::LoginRequired => {
                 println!("logged out");
                 Ok(())
             }
@@ -376,7 +445,7 @@ async fn run(command: Command) -> Result<()> {
             atra_controller::run(
                 &endpoint,
                 &database,
-                &codex_auth_home()?,
+                &provider_auth_home()?,
                 platform::current_platform()?,
             )
             .await
@@ -526,11 +595,12 @@ async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
         }
         ThreadCommand::Model {
             thread,
+            provider,
             model,
             reasoning_effort,
         } => {
             client(endpoint)
-                .thread_set_model(ThreadId(thread), model, reasoning_effort)
+                .thread_set_model(ThreadId(thread), provider, model, reasoning_effort)
                 .await?;
             println!("model changed");
             Ok(())
@@ -748,9 +818,9 @@ fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
     ])
 }
 
-fn codex_auth_home() -> Result<PathBuf> {
+fn provider_auth_home() -> Result<PathBuf> {
     Ok(xdg::BaseDirectories::new()
         .get_data_home()
         .context("cannot determine the XDG data directory")?
-        .join("atra/codex"))
+        .join("atra/providers"))
 }

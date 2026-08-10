@@ -21,6 +21,7 @@ atra-tui.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
