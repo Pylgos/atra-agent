@@ -43,9 +43,9 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 Replacements:
                 Run `atri replace <path>` and pass exact old and new text on standard input:
                 `atri replace path/to/file <<'REPLACE'`
-                `*** Old`
+                `--- Old`
                 `old text`
-                `*** New`
+                `--- New`
                 `new text`
                 `REPLACE`
                 The replacement fails without changing the file unless the old text occurs exactly once.
@@ -56,12 +56,13 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
             "},
             format: model::ModelToolFormat {
                 syntax: "lark",
+                // Codex's Lark parser does not support regex lookaround such as `(?!...)`.
                 definition: indoc! {r#"
                     start: runner_script+
                     runner_script: runner command_item+
                     runner: "*** Runner " name LF
 
-                    ?command_item: command_line | patch | replace
+                    ?command_item: command_line | patch
                     command_line: /([^*].*|\*[^*].*|\*\*[^*].*|\*\*\*[^ ].*|\*|\*\*|\*\*\*)/ LF? | LF
 
                     patch: PATCH_COMMAND_LINE LF PATCH_BEGIN LF hunk+ PATCH_END LF "PATCH" LF?
@@ -91,13 +92,6 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                     range_start: "@ start " INT LF
                     range_end: "@ end " INT LF
                     remove_line: "-" /(.*)/ LF
-
-                    replace: REPLACE_COMMAND_LINE LF "*** Old" LF replace_old "*** New" LF replace_new "REPLACE" LF?
-                    REPLACE_COMMAND_LINE: /([^\n]*[;&|][ \t]*)?[ \t]*atri[ \t]+replace([ \t]+--all)?[ \t]+[^<\n]+<<'REPLACE'([ \t]*(&&|\|\||;)[ \t]*[^\n]+)?/
-                    replace_old: replace_old_line*
-                    replace_new: replace_new_line*
-                    replace_old_line: /(?!\*\*\* New\n)[^\n]+/ LF | LF
-                    replace_new_line: /(?!REPLACE(?:\n|$))[^\n]+/ LF | LF
 
                     %import common.INT
                     %import common.LF

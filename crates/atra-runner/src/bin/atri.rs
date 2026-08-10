@@ -119,11 +119,11 @@ async fn run_replace(endpoint: &Path, path: PathBuf, replace_all: bool) -> Resul
         .await
         .context("failed to read replacement from stdin")?;
     let input = input
-        .strip_prefix("*** Old\n")
-        .context("replacement must start with '*** Old'")?;
+        .strip_prefix("--- Old\n")
+        .context("replacement must start with '--- Old'")?;
     let (old, new) = input
-        .split_once("\n*** New\n")
-        .context("replacement must contain a line with '*** New'")?;
+        .split_once("\n--- New\n")
+        .context("replacement must contain a line with '--- New'")?;
     let new = new.strip_suffix('\n').unwrap_or(new);
     match request(
         endpoint,
