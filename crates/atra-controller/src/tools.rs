@@ -31,7 +31,7 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 `...`
                 `*** End Patch`
                 `PATCH`
-                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>`.
+                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>` and may omit change lines when the contents are unchanged.
                 Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
                 Paths in patches are relative to the command's working directory unless absolute.
                 Use line ranges for large deletions or replacements when the line numbers are already known.
@@ -59,13 +59,14 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                     hunk: add_hunk | delete_hunk | update_hunk
                     add_hunk: "*** Add File: " filename LF add_line+
                     delete_hunk: "*** Delete File: " filename LF
-                    update_hunk: "*** Update File: " filename LF change_move? first_update following_update*
+                    update_hunk: "*** Update File: " filename LF (change_move move_changes? | first_update following_update*)
 
                     name: /(.+)/
                     filename: /(.+)/
                     add_line: "+" /(.*)/ LF -> line
 
                     change_move: "*** Move to: " filename LF
+                    move_changes: first_update following_update*
                     first_update: change | range_change
                     following_update: headed_change | range_change
                     change: change_context? change_line+ eof_line?

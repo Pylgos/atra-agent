@@ -201,7 +201,11 @@ fn apply_move(
         let permissions = fs::metadata(&resolved)
             .with_context(|| format!("Failed to read metadata for {}", path.display()))?
             .permissions();
-        let content = update_content(&original, path, chunks)?;
+        let content = if chunks.is_empty() {
+            original.clone()
+        } else {
+            update_content(&original, path, chunks)?
+        };
         if resolved == resolved_destination {
             atomic_write(&resolved, &content, Some(permissions), true)
                 .with_context(|| format!("Failed to write file {}", path.display()))?;
@@ -440,7 +444,7 @@ impl Parser<'_> {
                 chunks.push(self.parse_content(chunks.is_empty())?);
             }
         }
-        if chunks.is_empty() {
+        if chunks.is_empty() && move_path.is_none() {
             bail!("Update file hunk for path '{path}' is empty");
         }
         Ok(Operation::Update {
@@ -725,4 +729,49 @@ fn normalize(value: &str) -> String {
             character => character,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moves_without_changes_and_preserves_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("before.txt");
+        let destination = directory.path().join("after.txt");
+        let contents = b"no trailing newline";
+        fs::write(&source, contents).unwrap();
+
+        let result = apply(
+            "*** Update File: before.txt\n*** Move to: after.txt",
+            directory.path(),
+        );
+
+        assert!(matches!(
+            result,
+            ApplyPatchResult::Operations { ref results }
+                if matches!(
+                    results.as_slice(),
+                    [PatchOperationResult::Moved {
+                        from,
+                        to,
+                        outcome: PatchOperationOutcome::Applied { .. },
+                    }] if from == Path::new("before.txt") && to == Path::new("after.txt")
+                )
+        ));
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), contents);
+    }
+
+    #[test]
+    fn rejects_update_without_changes_or_move() {
+        let result = apply("*** Update File: file.txt", Path::new("."));
+
+        assert!(matches!(
+            result,
+            ApplyPatchResult::ParseError { ref error }
+                if error == "Update file hunk for path 'file.txt' is empty"
+        ));
+    }
 }
