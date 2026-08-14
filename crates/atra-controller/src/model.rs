@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::Event;
 
 pub(crate) mod codex;
+pub(crate) mod codex_auth;
 mod fake;
 pub(crate) mod ollama;
 
@@ -107,11 +108,6 @@ pub(crate) enum ModelEvent {
     OutputItemDone {
         output: ProviderOutput,
         response: Option<ModelResponse>,
-    },
-    Retry {
-        current: u64,
-        max: u64,
-        delay: std::time::Duration,
     },
     Completed {
         metadata: Option<ModelResponseMetadata>,

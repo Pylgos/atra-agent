@@ -508,7 +508,6 @@ impl State {
             let mut responses = VecDeque::new();
             let mut stream = model_session.stream(&model_request).await?;
             let mut completed = false;
-            let mut retry = None;
             let mut stream_error = None;
             while let Some(event) = stream.next().await {
                 let event = match event {
@@ -559,13 +558,6 @@ impl State {
                         {
                             responses.push_back(response);
                         }
-                    }
-                    model::ModelEvent::Retry {
-                        current,
-                        max,
-                        delay,
-                    } => {
-                        retry = Some((current, max, delay));
                     }
                     model::ModelEvent::Completed {
                         metadata,
@@ -618,7 +610,7 @@ impl State {
                     }
                 }
             }
-            if !completed && retry.is_none() && stream_error.is_none() {
+            if !completed && stream_error.is_none() {
                 stream_error = Some(anyhow!("model stream ended before completion"));
             }
             let response = self
@@ -626,13 +618,6 @@ impl State {
                 .await?;
             if let Some(error) = stream_error {
                 return Err(error);
-            }
-            if let Some((current, max, delay)) = retry {
-                if let Some(updates) = updates {
-                    let _ = updates.send(model::ModelStreamEvent::Retry { current, max });
-                }
-                tokio::time::sleep(delay).await;
-                continue;
             }
             if let Some(response) = response {
                 return Ok(response);

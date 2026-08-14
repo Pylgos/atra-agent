@@ -3,9 +3,8 @@ use std::{collections::VecDeque, fs, path::Path};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use atra_protocol::Model;
-use codex_protocol::ResponseItemId;
-use codex_protocol::models::{ContentItem, MessagePhase, ResponseInputItem, ResponseItem};
 use futures_util::stream;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::{
@@ -167,47 +166,53 @@ impl ModelSession for &FakeProvider {
     }
 }
 
-fn response_item(response: ModelResponse) -> Result<ResponseItem> {
+fn response_item(response: ModelResponse) -> Result<Value> {
     Ok(match response {
-        ModelResponse::AssistantMessage { content, phase } => {
-            ResponseItem::from(ResponseInputItem::Message {
-                role: "assistant".to_owned(),
-                content: vec![ContentItem::OutputText { text: content }],
-                phase: phase.map(|phase| match phase {
+        ModelResponse::AssistantMessage { content, phase } => json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}],
+            "phase": phase.map(|phase| match phase {
                     AssistantMessagePhase::Commentary => MessagePhase::Commentary,
                     AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
-                }),
             })
-        }
+        }),
         ModelResponse::WebSearch { item } | ModelResponse::Reasoning { item } => {
-            serde_json::from_value(item)
-                .context("fake model script contains invalid output item")?
+            anyhow::ensure!(
+                item.is_object(),
+                "fake model script contains invalid output item"
+            );
+            item
         }
         ModelResponse::ToolCall {
             name,
             arguments,
             call_id,
-        } => ResponseItem::FunctionCall {
-            id: None,
-            name,
-            namespace: None,
-            arguments: arguments.to_string(),
-            call_id: call_id.expect("fake function tool call ID was assigned"),
-            internal_chat_message_metadata_passthrough: None,
-        },
+        } => json!({
+            "type": "function_call",
+            "name": name,
+            "arguments": arguments.to_string(),
+            "call_id": call_id.expect("fake function tool call ID was assigned"),
+        }),
         ModelResponse::CustomToolCall {
             item_id,
             name,
             input,
             call_id,
-        } => ResponseItem::CustomToolCall {
-            id: item_id.map(ResponseItemId::from_server),
-            status: Some("completed".to_owned()),
-            call_id,
-            name,
-            namespace: None,
-            input,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        } => json!({
+            "type": "custom_tool_call",
+            "id": item_id,
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": input,
+        }),
     })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MessagePhase {
+    Commentary,
+    FinalAnswer,
 }

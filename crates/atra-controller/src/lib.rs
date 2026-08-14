@@ -22,11 +22,6 @@ use atra_protocol::{
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
-use codex_login::{
-    AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthRouteConfig, CLIENT_ID, ServerOptions,
-    logout_with_revoke, run_login_server,
-};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -64,46 +59,11 @@ const MASK_OUTPUT_LINES: usize = 8;
 const MASK_OUTPUT_SIDE_BYTES: usize = 4 * 1024;
 
 pub async fn codex_login(auth_home: &Path) -> Result<()> {
-    fs::create_dir_all(auth_home)
-        .with_context(|| format!("failed to create auth directory {}", auth_home.display()))?;
-    fs::set_permissions(auth_home, fs::Permissions::from_mode(0o700)).with_context(|| {
-        format!(
-            "failed to set permissions on auth directory {}",
-            auth_home.display()
-        )
-    })?;
-    let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
-        OutboundProxyPolicy::ReqwestDefault,
-    ));
-    let server = run_login_server(ServerOptions::new(
-        auth_home.to_owned(),
-        CLIENT_ID.to_owned(),
-        None,
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-        route,
-    ))
-    .context("failed to start Codex login")?;
-    eprintln!("Open this URL to sign in:\n{}", server.auth_url);
-    server
-        .block_until_done()
-        .await
-        .context("Codex login failed")
+    model::codex_auth::login(auth_home).await
 }
 
 pub async fn codex_logout(auth_home: &Path) -> Result<()> {
-    let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
-        OutboundProxyPolicy::ReqwestDefault,
-    ));
-    logout_with_revoke(
-        auth_home,
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-        &route,
-    )
-    .await
-    .context("failed to log out of Codex")?;
-    Ok(())
+    model::codex_auth::logout(auth_home).await
 }
 
 pub async fn ollama_login(auth_home: &Path, api_key: String) -> Result<()> {

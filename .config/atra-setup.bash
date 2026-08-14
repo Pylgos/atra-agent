@@ -53,8 +53,8 @@ runner="$(
 )"
 
 "$atra" runner launch \
-  --name container \
-  --description "Container environment" \
+  --name sandbox \
+  --description "Sandboxed container environment" \
   --approval allow \
   -- \
   "${container[@]}" \
