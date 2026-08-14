@@ -120,7 +120,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
     );
 
     let one = system.exec("one", "printf one; printf one-err >&2; pwd");
-    let two = system.exec("two", "printf two; printf two-err >&2; exit 7");
+    let two = system.exec("two", "printf two; printf two-err >&2; (exit 7)");
     let (one, two) = tokio::join!(one, two);
     let one = one.unwrap();
     let two = two.unwrap();
