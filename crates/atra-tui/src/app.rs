@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use atra_client::{CheckpointSubscription, ProcessSubscription, ThreadSubscription};
 use atra_protocol::{
-    ActiveTurn, ApprovalId, Model, PendingApproval, ProcessId, Thread, ThreadCheckpoint,
+    ActiveTurn, ApprovalId, CheckpointId, Model, PendingApproval, Thread, ThreadCheckpoint,
     ThreadEvent, ThreadId,
 };
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
@@ -37,14 +37,8 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
 ];
 
 pub(crate) struct HistoryChange {
-    pub(super) message: String,
     pub(super) thread_id: ThreadId,
     pub(super) subscription: ThreadSubscription,
-}
-
-pub(crate) enum Activity {
-    Info(String),
-    Error(String),
 }
 
 pub(crate) enum Target {
@@ -149,7 +143,10 @@ pub(crate) enum TurnUpdate {
         thread_id: ThreadId,
         result: Result<Option<CheckpointSubscription>>,
     },
-    CheckpointLoaded(Result<CheckpointSubscription>),
+    CheckpointLoaded {
+        checkpoint_id: CheckpointId,
+        result: Result<CheckpointSubscription>,
+    },
     HistoryChanged {
         source_thread_id: ThreadId,
         draft: Option<String>,
@@ -161,7 +158,6 @@ pub(crate) enum TurnUpdate {
     },
     ProcessStopped {
         thread_id: ThreadId,
-        process_id: ProcessId,
         result: Result<()>,
     },
 }
@@ -176,8 +172,9 @@ pub(crate) struct App {
     pub(crate) command_input: InputBuffer,
     pub(crate) overlay: Overlay,
     pub(crate) word_segmenter: WordSegmenterBorrowed<'static>,
-    pub(crate) activity: Option<Activity>,
+    pub(crate) error: Option<anyhow::Error>,
     pub(crate) login_required: bool,
+    pub(crate) login_pending: bool,
     pub(crate) view: ViewState,
     pub(crate) layout: ViewLayout,
     pub(crate) turn: TurnState,
@@ -356,13 +353,9 @@ impl App {
             command_input: InputBuffer::new(command_history, false),
             overlay: Overlay::None,
             word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
-            activity: Some(Activity::Info(if login_required {
-                "Codex login required · Ctrl-L login".to_owned()
-            } else {
-                "/thread · /new · /model · Ctrl-P/Ctrl-/ command · Tab focus · Ctrl-C copies"
-                    .to_owned()
-            })),
+            error: None,
             login_required,
+            login_pending: false,
             view: ViewState::default(),
             layout: ViewLayout::default(),
             turn: TurnState::Idle,

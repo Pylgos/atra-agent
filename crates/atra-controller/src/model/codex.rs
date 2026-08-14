@@ -421,6 +421,7 @@ async fn stream_response(
                 let delay = backoff(attempt);
                 if sender
                     .send(Ok(ModelEvent::Update(ModelStreamEvent::Retry {
+                        summary: error.to_string(),
                         current: attempt,
                         max: STREAM_MAX_RETRIES,
                     })))

@@ -237,6 +237,36 @@ pub enum TurnPhase {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryStatus {
+    summary: String,
+    current: u64,
+    max: u64,
+}
+
+impl RetryStatus {
+    pub fn new(summary: String, current: u64, max: u64) -> Self {
+        Self {
+            summary,
+            current,
+            max,
+        }
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn current(&self) -> u64 {
+        self.current
+    }
+
+    pub fn max(&self) -> u64 {
+        self.max
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActiveItemData {
     Assistant {
@@ -352,6 +382,7 @@ pub struct ActiveTurn {
     phase: TurnPhase,
     items: Vec<ActiveItem>,
     pending_approval: Option<PendingApproval>,
+    retry: Option<Box<RetryStatus>>,
 }
 
 impl ActiveTurn {
@@ -360,6 +391,7 @@ impl ActiveTurn {
             phase,
             items: Vec::new(),
             pending_approval: None,
+            retry: None,
         }
     }
 
@@ -373,6 +405,10 @@ impl ActiveTurn {
 
     pub fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approval.as_ref()
+    }
+
+    pub fn retry(&self) -> Option<&RetryStatus> {
+        self.retry.as_deref()
     }
 }
 
@@ -558,6 +594,9 @@ pub enum ThreadOperation {
     PhaseChanged {
         phase: TurnPhase,
     },
+    RetryScheduled {
+        retry: RetryStatus,
+    },
     ApprovalRequested {
         approval: PendingApproval,
     },
@@ -696,7 +735,15 @@ impl ThreadOperation {
                 })
             }
             Self::PhaseChanged { phase } => {
-                active_turn_mut(state)?.phase = phase;
+                let turn = active_turn_mut(state)?;
+                turn.phase = phase;
+                turn.retry = None;
+                Ok(ThreadChange::Phase)
+            }
+            Self::RetryScheduled { retry } => {
+                let turn = active_turn_mut(state)?;
+                turn.phase = TurnPhase::Retrying;
+                turn.retry = Some(Box::new(retry));
                 Ok(ThreadChange::Phase)
             }
             Self::ApprovalRequested { approval } => {
@@ -705,6 +752,7 @@ impl ThreadOperation {
                     return Err(ApplyError::new("thread already has a pending approval"));
                 }
                 turn.phase = TurnPhase::AwaitingApproval;
+                turn.retry = None;
                 turn.pending_approval = Some(approval);
                 Ok(ThreadChange::Approval)
             }
@@ -722,6 +770,7 @@ impl ThreadOperation {
                 }
                 turn.pending_approval = None;
                 turn.phase = TurnPhase::Running;
+                turn.retry = None;
                 Ok(ThreadChange::Approval)
             }
             Self::TurnFinished { outcome } => {
@@ -1193,6 +1242,35 @@ mod tests {
         let turn = state.active_turn().unwrap();
         assert_eq!(turn.phase(), TurnPhase::Cancelling);
         assert_eq!(turn.pending_approval().unwrap().id(), ApprovalId(1));
+    }
+
+    #[test]
+    fn retry_status_is_part_of_the_active_turn_state() {
+        let mut state =
+            ThreadState::materialize(thread(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::RetryScheduled {
+            retry: RetryStatus::new("overloaded".to_owned(), 2, 5),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let turn = state.active_turn().unwrap();
+        assert_eq!(turn.phase(), TurnPhase::Retrying);
+        assert_eq!(turn.retry().unwrap().summary(), "overloaded");
+        assert_eq!(turn.retry().unwrap().current(), 2);
+        assert_eq!(turn.retry().unwrap().max(), 5);
+
+        ThreadOperation::PhaseChanged {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        assert!(state.active_turn().unwrap().retry().is_none());
     }
 
     #[test]

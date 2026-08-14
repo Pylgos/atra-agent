@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use atra_protocol::{ApprovalId, CheckpointId, EventSequence, Model, ProcessId};
+use atra_protocol::{ApprovalId, CheckpointId, EventSequence, Model, ProcessId, TurnPhase};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
@@ -15,7 +15,9 @@ pub(crate) enum FocusPane {
 pub(crate) enum TurnState {
     #[default]
     Idle,
-    Starting,
+    Starting {
+        phase: TurnPhase,
+    },
     Cancelling,
     EnteringDenyReason {
         approval_id: ApprovalId,
@@ -62,6 +64,9 @@ pub(crate) enum Overlay {
     ModelPicker(ModelPicker),
     ThreadPicker(ThreadPicker),
     Processes(ProcessPicker),
+    LoadingCheckpoints,
+    NoCheckpoints,
+    Operation(OperationOverlay),
     HistoryConfirmation(HistoryAction),
 }
 
@@ -76,6 +81,15 @@ impl Overlay {
             _ => None,
         }
     }
+}
+
+pub(crate) enum OperationOverlay {
+    RenamingThread,
+    ChangingModel,
+    CreatingCheckpoint,
+    ForkingThread,
+    RewindingThread,
+    RestoringCheckpoint,
 }
 
 pub(crate) struct ModelPicker {
@@ -163,6 +177,7 @@ pub(crate) struct ThreadPicker {
 
 pub(crate) enum ThreadPickerState {
     Browsing,
+    Selecting,
     ConfirmingDelete,
     Deleting,
 }
@@ -175,6 +190,9 @@ pub(crate) struct ProcessPicker {
 
 pub(crate) enum ProcessPickerState {
     Browsing,
+    Stopping {
+        process_id: ProcessId,
+    },
     ConfirmingStop {
         runner: String,
         process_id: ProcessId,
@@ -183,6 +201,7 @@ pub(crate) enum ProcessPickerState {
 
 pub(crate) struct CheckpointPicker {
     pub(crate) selected: CheckpointId,
+    pub(crate) loading: bool,
 }
 
 pub(crate) enum HistoryAction {

@@ -58,6 +58,7 @@ pub(crate) enum ModelResponse {
 
 pub(crate) enum ModelStreamEvent {
     Retry {
+        summary: String,
         current: u64,
         max: u64,
     },

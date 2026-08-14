@@ -137,7 +137,6 @@ pub(super) async fn run(
                     Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::Deleted) => {
                         app.thread_subscription = None;
                         app.reset_to_new_thread();
-                        app.activity = Some(crate::app::Activity::Info("Thread deleted".to_owned()));
                         dirty = true;
                         continue;
                     }
@@ -163,8 +162,16 @@ pub(super) async fn run(
                     return Ok(());
                 };
                 match event {
-                    Event::Key(key) if app.handle_key(key, &effects)? => return Ok(()),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse)?,
+                    Event::Key(key) => match app.handle_key(key, &effects) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(error) => app.error = Some(error),
+                    },
+                    Event::Mouse(mouse) => {
+                        if let Err(error) = app.handle_mouse(mouse) {
+                            app.error = Some(error);
+                        }
+                    }
                     Event::Resize(_, _) => {}
                     _ => {}
                 }
@@ -373,7 +380,10 @@ impl Effect {
                     let result = Client::new(&endpoint)
                         .subscribe_checkpoint(checkpoint_id)
                         .await;
-                    let _ = updates.send(TurnUpdate::CheckpointLoaded(result));
+                    let _ = updates.send(TurnUpdate::CheckpointLoaded {
+                        checkpoint_id,
+                        result,
+                    });
                 }
                 Self::HistoryRequest {
                     endpoint,
@@ -383,7 +393,7 @@ impl Effect {
                 } => {
                     let result = async {
                         let client = Client::new(&endpoint);
-                        let (selected_thread_id, message) = match operation {
+                        let selected_thread_id = match operation {
                             HistoryOperation::CreateCheckpoint => {
                                 let mut subscription = client.subscribe_thread(thread_id).await?;
                                 accepted(
@@ -391,33 +401,30 @@ impl Effect {
                                         .command(StateCommand::ThreadCheckpointCreate { thread_id })
                                         .await?,
                                 )?;
-                                let checkpoint_id = loop {
-                                    if let atra_protocol::ThreadChange::Checkpoint(id) =
+                                loop {
+                                    if let atra_protocol::ThreadChange::Checkpoint(_) =
                                         subscription.receive().await?
                                     {
-                                        break id;
+                                        break;
                                     }
-                                };
-                                (thread_id, format!("Checkpoint {checkpoint_id} created"))
+                                }
+                                thread_id
                             }
                             HistoryOperation::Fork {
                                 checkpoint_id,
                                 sequence,
-                            } => (
-                                match client
-                                    .command(StateCommand::ThreadFork {
-                                        thread_id,
-                                        checkpoint_id,
-                                        sequence,
-                                        display_name: None,
-                                    })
-                                    .await?
-                                {
-                                    CommandResult::ThreadForked { thread_id } => thread_id,
-                                    result => bail!("unexpected command result: {result:?}"),
-                                },
-                                "Thread forked".to_owned(),
-                            ),
+                            } => match client
+                                .command(StateCommand::ThreadFork {
+                                    thread_id,
+                                    checkpoint_id,
+                                    sequence,
+                                    display_name: None,
+                                })
+                                .await?
+                            {
+                                CommandResult::ThreadForked { thread_id } => thread_id,
+                                result => bail!("unexpected command result: {result:?}"),
+                            },
                             HistoryOperation::Rewind {
                                 checkpoint_id,
                                 sequence,
@@ -433,7 +440,7 @@ impl Effect {
                                         })
                                         .await?,
                                 )?;
-                                (thread_id, "Thread rewound".to_owned())
+                                thread_id
                             }
                             HistoryOperation::Restore { checkpoint_id } => {
                                 accepted(
@@ -444,12 +451,11 @@ impl Effect {
                                         })
                                         .await?,
                                 )?;
-                                (thread_id, "Checkpoint restored".to_owned())
+                                thread_id
                             }
                         };
                         let subscription = client.subscribe_thread(selected_thread_id).await?;
                         Ok(HistoryChange {
-                            message,
                             thread_id: selected_thread_id,
                             subscription,
                         })
@@ -497,11 +503,7 @@ impl Effect {
                         })
                         .await
                         .and_then(accepted);
-                    let _ = updates.send(TurnUpdate::ProcessStopped {
-                        thread_id,
-                        process_id,
-                        result,
-                    });
+                    let _ = updates.send(TurnUpdate::ProcessStopped { thread_id, result });
                 }
             }
         });

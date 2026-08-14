@@ -1,15 +1,15 @@
 ---
 source: crates/atra-tui/src/app_tests.rs
-assertion_line: 100
+assertion_line: 360
 expression: terminal.backend().to_string()
 ---
 "┌Transcript──────────────────────────────┐"
-"│                                        ▲"
-"│• a deliberately wrapped response       █"
-"│                                        ▼"
+"│• hello                                 │"
+"│                                        │"
+"│• a deliberately wrapped response       │"
+"│                                        │"
 "└────────────────────────────────────────┘"
 "┌Message─────────────────────────────────┐"
 "│next                                    │"
 "└───────────Enter: newline · Ctrl-G: send┘"
-"                                          "
 "gpt-5.6-sol (medium) · context — · cache —"

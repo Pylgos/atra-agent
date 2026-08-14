@@ -1,11 +1,8 @@
 use anyhow::Result;
 use atra_protocol::{ControllerChange, ThreadChange, TurnPhase};
 
-use super::{Activity, App, HistoryChange, Target, ThreadView, TurnUpdate};
-use crate::{
-    state::{CheckpointPicker, FocusPane, Overlay, ThreadPickerState, TurnState},
-    transcript::sanitize,
-};
+use super::{App, HistoryChange, Target, ThreadView, TurnUpdate};
+use crate::state::{CheckpointPicker, FocusPane, Overlay, ThreadPickerState, TurnState};
 
 impl App {
     pub(crate) fn apply_controller_change(&mut self, _change: ControllerChange) {
@@ -37,7 +34,7 @@ impl App {
             .and_then(|turn| turn.pending_approval())
             .map(|approval| approval.id());
         self.turn = match std::mem::take(&mut self.turn) {
-            TurnState::Starting if active => TurnState::Idle,
+            TurnState::Starting { .. } if active => TurnState::Idle,
             TurnState::Cancelling if cancelling || !active => TurnState::Idle,
             TurnState::EnteringDenyReason {
                 approval_id,
@@ -80,7 +77,7 @@ impl App {
                     self.transcript.rebuild(subscription.state());
                 }
                 self.reset_turn_interaction();
-                self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                self.error = Some(error);
                 Ok(())
             }
             TurnUpdate::ApprovalResolved {
@@ -91,7 +88,7 @@ impl App {
                     Ok(()) => {}
                     Err(error) => {
                         self.restore_failed_approval(approval_id);
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        self.error = Some(error);
                     }
                 }
                 Ok(())
@@ -102,26 +99,35 @@ impl App {
                         Ok(()) => {}
                         Err(error) => {
                             self.reset_turn_interaction();
-                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                            self.error = Some(error);
                         }
                     }
                 }
                 Ok(())
             }
             TurnUpdate::LoginCompleted(result) => {
+                self.login_pending = false;
                 match result {
                     Ok(()) => {
                         self.login_required = false;
-                        self.activity = Some(Activity::Info("Codex login complete".to_owned()));
                     }
                     Err(error) => {
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        self.error = Some(error);
                     }
                 }
                 Ok(())
             }
             TurnUpdate::ThreadSelected { thread_id, result } => {
-                let subscription = result?;
+                let subscription = match result {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+                            picker.state = ThreadPickerState::Browsing;
+                        }
+                        self.error = Some(error);
+                        return Ok(());
+                    }
+                };
                 self.transcript.rebuild(subscription.state());
                 self.thread_subscription = Some(subscription.into());
                 self.reset_turn_interaction();
@@ -133,7 +139,6 @@ impl App {
                 self.overlay = Overlay::None;
                 self.clear_selection();
                 self.reset_view();
-                self.activity = Some(Activity::Info("Thread selected".to_owned()));
                 Ok(())
             }
             TurnUpdate::ProcessesLoaded { thread_id, result } => {
@@ -145,7 +150,7 @@ impl App {
                     Ok(result) => result,
                     Err(error) => {
                         if matches!(self.overlay, Overlay::Processes(_)) {
-                            self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                            self.error = Some(error);
                         }
                         return Ok(());
                     }
@@ -165,11 +170,7 @@ impl App {
                 }
                 Ok(())
             }
-            TurnUpdate::ProcessStopped {
-                thread_id,
-                process_id,
-                result,
-            } => {
+            TurnUpdate::ProcessStopped { thread_id, result } => {
                 if self.target.thread_id() != Some(thread_id) {
                     return Ok(());
                 }
@@ -180,23 +181,27 @@ impl App {
                         if let Overlay::Processes(picker) = &mut self.overlay {
                             picker.selected = picker.selected.min(process_count.saturating_sub(1));
                             picker.output_scroll = 0;
+                            picker.state = crate::state::ProcessPickerState::Browsing;
                         }
-                        self.activity = Some(Activity::Info(format!("Stopped {process_id}")));
                     }
                     Err(error) => {
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        if let Overlay::Processes(picker) = &mut self.overlay {
+                            picker.state = crate::state::ProcessPickerState::Browsing;
+                        }
+                        self.error = Some(error);
                     }
                 }
                 Ok(())
             }
             TurnUpdate::ThreadRenamed { result } => {
-                match result {
-                    Ok(()) => {
-                        self.activity = Some(Activity::Info("Thread renamed".to_owned()));
-                    }
-                    Err(error) => {
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
-                    }
+                if matches!(
+                    self.overlay,
+                    Overlay::Operation(crate::state::OperationOverlay::RenamingThread)
+                ) {
+                    self.overlay = Overlay::None;
+                }
+                if let Err(error) = result {
+                    self.error = Some(error);
                 }
                 Ok(())
             }
@@ -207,25 +212,25 @@ impl App {
                             self.reset_to_new_thread();
                         }
                         self.overlay = Overlay::None;
-                        self.activity = Some(Activity::Info("Thread deleted".to_owned()));
                     }
                     Err(error) => {
                         if let Overlay::ThreadPicker(picker) = &mut self.overlay {
                             picker.state = ThreadPickerState::Browsing;
                         }
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
+                        self.error = Some(error);
                     }
                 }
                 Ok(())
             }
             TurnUpdate::ModelChanged { result } => {
-                match result {
-                    Ok(()) => {
-                        self.activity = Some(Activity::Info("Thread model changed".to_owned()));
-                    }
-                    Err(error) => {
-                        self.activity = Some(Activity::Error(sanitize(&format!("{error:#}"))));
-                    }
+                if matches!(
+                    self.overlay,
+                    Overlay::Operation(crate::state::OperationOverlay::ChangingModel)
+                ) {
+                    self.overlay = Overlay::None;
+                }
+                if let Err(error) = result {
+                    self.error = Some(error);
                 }
                 Ok(())
             }
@@ -233,11 +238,22 @@ impl App {
                 if self.target.thread_id() != Some(thread_id) {
                     return Ok(());
                 }
-                let checkpoint_subscription = result?;
+                if !matches!(self.overlay, Overlay::LoadingCheckpoints) {
+                    return Ok(());
+                }
+                let checkpoint_subscription = match result {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        self.overlay = Overlay::None;
+                        self.error = Some(error);
+                        return Ok(());
+                    }
+                };
                 if checkpoint_subscription.is_none() {
                     self.checkpoint_subscription = None;
-                    self.activity = Some(Activity::Info("No checkpoints are available".to_owned()));
+                    self.overlay = Overlay::NoCheckpoints;
                 } else {
+                    self.overlay = Overlay::None;
                     self.checkpoint_subscription = checkpoint_subscription.map(Into::into);
                     let subscription = self
                         .checkpoint_subscription
@@ -249,40 +265,56 @@ impl App {
                     self.target = Target::Thread {
                         id: thread_id,
                         view: ThreadView::Checkpoint {
-                            picker: CheckpointPicker { selected },
+                            picker: CheckpointPicker {
+                                selected,
+                                loading: false,
+                            },
                         },
                     };
                     self.clear_selection();
                     self.reset_view();
                     self.view.focus = FocusPane::Checkpoints;
-                    self.activity = Some(Activity::Info(
-                        "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
-                    ));
                 }
                 Ok(())
             }
-            TurnUpdate::CheckpointLoaded(result) => {
-                let subscription = result?;
+            TurnUpdate::CheckpointLoaded {
+                checkpoint_id,
+                result,
+            } => {
+                let Some(picker) = self.target.checkpoint_picker() else {
+                    return Ok(());
+                };
+                if picker.selected != checkpoint_id {
+                    return Ok(());
+                }
+                let subscription = match result {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        self.target
+                            .checkpoint_picker_mut()
+                            .expect("checkpoint picker was present")
+                            .loading = false;
+                        self.error = Some(error);
+                        return Ok(());
+                    }
+                };
                 let checkpoint = subscription.state().metadata();
                 if self.target.thread_id() != Some(checkpoint.thread_id) {
                     return Ok(());
                 }
-                if let Some(picker) = self.target.checkpoint_picker()
-                    && picker.selected != checkpoint.id
-                {
+                if checkpoint.id != checkpoint_id {
                     return Ok(());
                 }
                 self.transcript
                     .replace_events(subscription.state().events());
                 self.checkpoint_subscription = Some(subscription.into());
+                self.target
+                    .checkpoint_picker_mut()
+                    .expect("checkpoint picker was present")
+                    .loading = false;
                 self.clear_selection();
                 self.reset_view();
-                if self.target.checkpoint_picker().is_some() {
-                    self.view.focus = FocusPane::Checkpoints;
-                }
-                self.activity = Some(Activity::Info(
-                    "Browse checkpoints · Tab switches pane · Esc returns".to_owned(),
-                ));
+                self.view.focus = FocusPane::Checkpoints;
                 Ok(())
             }
             TurnUpdate::HistoryChanged {
@@ -294,11 +326,18 @@ impl App {
                     return Ok(());
                 }
                 let HistoryChange {
-                    message,
                     thread_id,
                     subscription,
-                } = result?;
+                } = match result {
+                    Ok(change) => change,
+                    Err(error) => {
+                        self.overlay = Overlay::None;
+                        self.error = Some(error);
+                        return Ok(());
+                    }
+                };
                 self.transcript.rebuild(subscription.state());
+                self.overlay = Overlay::None;
                 self.thread_subscription = Some(subscription.into());
                 self.reset_turn_interaction();
                 self.target = Target::Thread {
@@ -306,14 +345,12 @@ impl App {
                     view: ThreadView::Live,
                 };
                 self.process_subscription = None;
-                self.overlay = Overlay::None;
                 self.clear_selection();
                 self.reset_view();
                 if let Some(draft) = draft {
                     self.message_input.set(draft);
                     self.view.focus = FocusPane::Input;
                 }
-                self.activity = Some(Activity::Info(message));
                 Ok(())
             }
         }

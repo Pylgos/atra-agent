@@ -1,4 +1,4 @@
-use atra_protocol::{ModelRequestKind, ProcessStatus, ThreadEventData};
+use atra_protocol::{ActiveItemData, ModelRequestKind, ProcessStatus, ThreadEventData, TurnPhase};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
+        ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 use serde_json::Value;
@@ -14,10 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{Activity, App, COMMAND_HELP},
+    app::{App, COMMAND_HELP},
     state::{
-        CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay, ProcessPicker,
-        ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
+        CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, OperationOverlay, Overlay,
+        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
     },
     text::{expand_line_tabs, expand_tabs},
     transcript::{
@@ -137,12 +137,11 @@ impl App {
                 + 3)
             .min(frame.area().height.saturating_sub(6).max(3))
         };
-        let [main, input, activity_area, status] = Layout::default()
+        let [main, input, status] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(4),
                 Constraint::Length(input_height),
-                Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .areas(frame.area());
@@ -159,7 +158,7 @@ impl App {
         self.layout.transcript_area = transcript_area;
         self.render_coding_transcript(frame, transcript_area);
         self.render_composer(frame, input);
-        self.render_activity_and_status(frame, activity_area, status);
+        frame.render_widget(Paragraph::new(self.status_line()), status);
         self.render_overlays(frame, main);
     }
 
@@ -269,58 +268,12 @@ impl App {
         }
     }
 
-    fn render_activity_and_status(
-        &mut self,
-        frame: &mut Frame<'_>,
-        activity_area: Rect,
-        status: Rect,
-    ) {
+    fn render_overlays(&mut self, frame: &mut Frame<'_>, main: Rect) {
+        self.layout.command_input_area = Rect::default();
+        self.layout.command_input_scroll = 0;
         if matches!(self.overlay, Overlay::Command) {
-            let input_area = Rect::new(
-                activity_area.x.saturating_add(1),
-                activity_area.y,
-                activity_area.width.saturating_sub(1),
-                activity_area.height,
-            );
-            let cursor_column =
-                expand_tabs(&self.command_input.value[..self.command_input.cursor]).width();
-            let horizontal_scroll = cursor_column
-                .saturating_sub(usize::from(input_area.width).saturating_sub(1))
-                as u16;
-            self.layout.command_input_area = input_area;
-            self.layout.command_input_scroll = horizontal_scroll;
-            frame.render_widget(Paragraph::new("/"), activity_area);
-            frame.render_widget(
-                Paragraph::new(selected_input_text(
-                    &self.command_input.value,
-                    self.command_input.selection_range(),
-                ))
-                .scroll((0, horizontal_scroll)),
-                input_area,
-            );
-            frame.set_cursor_position((
-                input_area.x + cursor_column as u16 - horizontal_scroll,
-                activity_area.y,
-            ));
-        } else if let Some(activity) = &self.activity {
-            self.layout.command_input_area = Rect::default();
-            self.layout.command_input_scroll = 0;
-            let (message, style) = match activity {
-                Activity::Info(message) => (message, Style::default().fg(Color::Yellow)),
-                Activity::Error(message) => (message, Style::default().fg(Color::Red)),
-            };
-            frame.render_widget(
-                Paragraph::new(expand_tabs(message)).style(style),
-                activity_area,
-            );
-        } else {
-            self.layout.command_input_area = Rect::default();
-            self.layout.command_input_scroll = 0;
+            self.render_command_input(frame);
         }
-        frame.render_widget(Paragraph::new(self.status_line()), status);
-    }
-
-    fn render_overlays(&self, frame: &mut Frame<'_>, main: Rect) {
         if let Overlay::ModelPicker(picker) = &self.overlay {
             render_model_picker(frame, picker);
         }
@@ -353,19 +306,82 @@ impl App {
         if matches!(self.overlay, Overlay::HistoryConfirmation(_)) {
             render_history_confirmation(frame);
         }
+        if matches!(self.overlay, Overlay::LoadingCheckpoints) {
+            render_message_overlay(frame, "Checkpoints", "Loading checkpoints…", "Esc close");
+        }
+        if matches!(self.overlay, Overlay::NoCheckpoints) {
+            render_message_overlay(frame, "Checkpoints", "No checkpoints", "Enter/Esc close");
+        }
+        if let Overlay::Operation(operation) = &self.overlay {
+            let message = match operation {
+                OperationOverlay::RenamingThread => "Renaming thread…",
+                OperationOverlay::ChangingModel => "Changing model…",
+                OperationOverlay::CreatingCheckpoint => "Creating checkpoint…",
+                OperationOverlay::ForkingThread => "Forking thread…",
+                OperationOverlay::RewindingThread => "Rewinding thread…",
+                OperationOverlay::RestoringCheckpoint => "Restoring checkpoint…",
+            };
+            render_message_overlay(frame, "Please wait", message, "");
+        }
         if matches!(self.overlay, Overlay::Help) {
             render_command_help(frame);
         }
+        if let Some(error) = &self.error {
+            render_error(frame, error);
+        }
+    }
+
+    fn render_command_input(&mut self, frame: &mut Frame<'_>) {
+        let width = frame
+            .area()
+            .width
+            .saturating_sub(8)
+            .clamp(3, 72)
+            .min(frame.area().width);
+        let area = Rect::new(
+            frame.area().x + (frame.area().width - width) / 2,
+            frame.area().y + frame.area().height.saturating_sub(3) / 2,
+            width,
+            3,
+        );
+        let block = Block::default()
+            .title("Command")
+            .title_bottom(Line::from("Enter run · Esc close").right_aligned())
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        let input_area = Rect::new(
+            inner.x.saturating_add(1),
+            inner.y,
+            inner.width.saturating_sub(1),
+            inner.height,
+        );
+        let cursor_column =
+            expand_tabs(&self.command_input.value[..self.command_input.cursor]).width();
+        let horizontal_scroll =
+            cursor_column.saturating_sub(usize::from(input_area.width).saturating_sub(1)) as u16;
+        self.layout.command_input_area = input_area;
+        self.layout.command_input_scroll = horizontal_scroll;
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new("/"), inner);
+        frame.render_widget(
+            Paragraph::new(selected_input_text(
+                &self.command_input.value,
+                self.command_input.selection_range(),
+            ))
+            .scroll((0, horizontal_scroll)),
+            input_area,
+        );
+        frame.set_cursor_position((
+            input_area.x + cursor_column as u16 - horizontal_scroll,
+            input_area.y,
+        ));
     }
 
     fn focus_border_style(&self, pane: FocusPane) -> Style {
-        if !matches!(
-            self.overlay,
-            Overlay::ModelPicker(_)
-                | Overlay::ThreadPicker(_)
-                | Overlay::Processes(_)
-                | Overlay::HistoryConfirmation(_)
-        ) && self.pending_approval().is_none()
+        if self.overlay.is_none()
+            && self.error.is_none()
+            && self.pending_approval().is_none()
             && !matches!(self.turn, TurnState::EnteringDenyReason { .. })
             && self.view.focus == pane
         {
@@ -376,6 +392,10 @@ impl App {
     }
 
     fn status_line(&self) -> Line<'static> {
+        let mut spans = self.current_status();
+        if !spans.is_empty() {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
         let selected = self
             .threads()
             .iter()
@@ -395,7 +415,8 @@ impl App {
                     })
             });
         let Some((_, model, effort)) = selected else {
-            return Line::from("model — · context — · cache —");
+            spans.push(Span::raw("model — · context — · cache —"));
+            return Line::from(spans);
         };
         let usage = self.displayed_events().iter().rev().find_map(|event| {
             if let ThreadEventData::ModelRequest(request) = &event.data
@@ -432,7 +453,7 @@ impl App {
                 (context, cache)
             },
         );
-        let mut spans = vec![
+        spans.extend([
             Span::styled(
                 format!("{model} ({effort})"),
                 Style::default()
@@ -449,7 +470,7 @@ impl App {
                 format!("cache {cache}"),
                 Style::default().fg(Color::LightMagenta),
             ),
-        ];
+        ]);
         spans.extend(self.quota_status());
         let running_processes = self
             .processes()
@@ -471,6 +492,72 @@ impl App {
             ));
         }
         Line::from(spans)
+    }
+
+    fn current_status(&self) -> Vec<Span<'static>> {
+        if self.login_pending {
+            return vec![Span::styled(
+                "Completing login",
+                Style::default().fg(Color::Yellow),
+            )];
+        }
+        let (message, color) = match self.turn {
+            TurnState::Starting {
+                phase: TurnPhase::Compacting,
+            } => ("Compacting".to_owned(), Color::Yellow),
+            TurnState::Starting { .. } => ("Starting".to_owned(), Color::Yellow),
+            TurnState::Cancelling => ("Cancelling".to_owned(), Color::Yellow),
+            TurnState::ResolvingApproval { .. } => ("Resuming".to_owned(), Color::Yellow),
+            TurnState::EnteringDenyReason { .. } => ("Approval required".to_owned(), Color::Yellow),
+            TurnState::Idle => {
+                let Some(turn) = self.active_turn() else {
+                    if self.login_required {
+                        return vec![Span::styled(
+                            "Login required · ctrl-l login",
+                            Style::default().fg(Color::Yellow),
+                        )];
+                    }
+                    return Vec::new();
+                };
+                match turn.phase() {
+                    TurnPhase::Retrying => {
+                        let message = turn.retry().map_or_else(
+                            || "Retrying".to_owned(),
+                            |retry| {
+                                let summary =
+                                    expand_tabs(&sanitize(retry.summary())).replace('\n', " ");
+                                format!("{summary}: retrying {}/{}", retry.current(), retry.max())
+                            },
+                        );
+                        (message, Color::Red)
+                    }
+                    TurnPhase::AwaitingApproval => ("Approval required".to_owned(), Color::Yellow),
+                    TurnPhase::Cancelling => ("Cancelling".to_owned(), Color::Yellow),
+                    TurnPhase::Compacting => ("Compacting".to_owned(), Color::Yellow),
+                    TurnPhase::Running => {
+                        let message =
+                            turn.items()
+                                .last()
+                                .map_or("Working", |item| match item.data() {
+                                    ActiveItemData::Assistant { .. } => "Responding",
+                                    ActiveItemData::Reasoning { .. } => "Thinking",
+                                    ActiveItemData::WebSearch { .. } => "Searching the web",
+                                    ActiveItemData::ToolCall { .. } => "Preparing tool",
+                                    ActiveItemData::RunnerTool { .. } => "Running tool",
+                                });
+                        (message.to_owned(), Color::Yellow)
+                    }
+                }
+            }
+        };
+        let mut spans = vec![Span::styled(message, Style::default().fg(color))];
+        if self.turn_is_running() && !matches!(self.turn, TurnState::Cancelling) {
+            spans.push(Span::styled(
+                " · esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans
     }
 
     fn quota_status(&self) -> Vec<Span<'static>> {
@@ -690,13 +777,16 @@ fn render_thread_picker(
             ListItem::new(display_name)
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(picker.selected));
+    let mut state =
+        ListState::default().with_selected((!threads.is_empty()).then_some(picker.selected));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("● ").block(
             Block::default()
                 .title("Select thread")
-                .title_bottom(Line::from("Enter switches · x delete · Esc cancels").right_aligned())
+                .title_bottom(
+                    Line::from("↑/↓ select · Enter switch · x delete · Esc close").right_aligned(),
+                )
                 .borders(Borders::ALL),
         ),
         area,
@@ -706,6 +796,9 @@ fn render_thread_picker(
     match picker.state {
         ThreadPickerState::ConfirmingDelete => render_delete_confirmation(frame, area),
         ThreadPickerState::Deleting => render_delete_progress(frame, area),
+        ThreadPickerState::Selecting => {
+            render_progress(frame, area, "Please wait", "Loading thread…")
+        }
         ThreadPickerState::Browsing => {}
     }
 }
@@ -730,7 +823,11 @@ fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_delete_progress(frame: &mut Frame<'_>, area: Rect) {
-    let width = area.width.saturating_sub(8).min(36);
+    render_progress(frame, area, "Please wait", "Deleting thread…");
+}
+
+fn render_progress(frame: &mut Frame<'_>, area: Rect, title: &str, message: &str) {
+    let width = area.width.saturating_sub(8).min(54);
     let progress = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + area.height.saturating_sub(3) / 2,
@@ -739,9 +836,55 @@ fn render_delete_progress(frame: &mut Frame<'_>, area: Rect) {
     );
     frame.render_widget(Clear, progress);
     frame.render_widget(
-        Paragraph::new("Deleting thread…")
-            .block(Block::default().title("Please wait").borders(Borders::ALL)),
+        Paragraph::new(message.to_owned()).block(
+            Block::default()
+                .title(title.to_owned())
+                .borders(Borders::ALL),
+        ),
         progress,
+    );
+}
+
+fn render_message_overlay(frame: &mut Frame<'_>, title: &str, message: &str, footer: &str) {
+    let width = frame.area().width.saturating_sub(8).min(54);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + frame.area().height.saturating_sub(3) / 2,
+        width,
+        3,
+    );
+    frame.render_widget(Clear, area);
+    let mut block = Block::default()
+        .title(title.to_owned())
+        .borders(Borders::ALL);
+    if !footer.is_empty() {
+        block = block.title_bottom(Line::from(footer.to_owned()).right_aligned());
+    }
+    frame.render_widget(Paragraph::new(message.to_owned()).block(block), area);
+}
+
+fn render_error(frame: &mut Frame<'_>, error: &anyhow::Error) {
+    let message = expand_tabs(&sanitize(&format!("{error:#}")));
+    let width = frame.area().width.saturating_sub(8).min(72);
+    let height = (message.lines().count() as u16 + 2)
+        .clamp(3, 10)
+        .min(frame.area().height);
+    let area = Rect::new(
+        frame.area().x + (frame.area().width - width) / 2,
+        frame.area().y + (frame.area().height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(message).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title("Error")
+                .title_bottom(Line::from("Enter/Esc close").right_aligned())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        area,
     );
 }
 
@@ -777,7 +920,7 @@ fn render_process_picker(
             Block::default()
                 .title(format!("Background processes · {}", processes.len()))
                 .title_bottom(
-                    Line::from("↑/↓ select · PageUp/PageDown output · x stop · Esc close")
+                    Line::from("↑/↓ select · PgUp/PgDn output · x stop · Esc close")
                         .right_aligned(),
                 )
                 .borders(Borders::ALL),
@@ -787,8 +930,15 @@ fn render_process_picker(
     );
     render_process_detail(frame, picker, processes, detail, detail_area);
 
-    if matches!(picker.state, ProcessPickerState::ConfirmingStop { .. }) {
-        render_stop_confirmation(frame, area);
+    match &picker.state {
+        ProcessPickerState::ConfirmingStop { .. } => render_stop_confirmation(frame, area),
+        ProcessPickerState::Stopping { process_id } => render_progress(
+            frame,
+            area,
+            "Please wait",
+            &format!("Stopping {process_id}…"),
+        ),
+        ProcessPickerState::Browsing => {}
     }
 }
 
@@ -936,8 +1086,12 @@ fn render_checkpoint_picker(
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("● ").block(
             Block::default()
-                .title("Checkpoints")
-                .title_bottom(Line::from("Tab: transcript · Esc: return").right_aligned())
+                .title(if picker.loading {
+                    "Checkpoints · Loading…"
+                } else {
+                    "Checkpoints"
+                })
+                .title_bottom(Line::from("Tab transcript · Esc return").right_aligned())
                 .borders(Borders::ALL)
                 .border_style(if focused {
                     Style::default().fg(Color::Cyan)
@@ -993,13 +1147,14 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
                     ListItem::new(format!("{} ({count})", sanitize(provider)))
                 })
                 .collect::<Vec<_>>();
-            let mut state = ListState::default().with_selected(Some(picker.provider_index));
+            let mut state = ListState::default()
+                .with_selected((!providers.is_empty()).then_some(picker.provider_index));
             frame.render_stateful_widget(
                 List::new(items).highlight_symbol("● ").block(
                     Block::default()
                         .title("Select provider")
                         .title_bottom(
-                            Line::from("↑/↓ select · Enter models · Esc cancel").right_aligned(),
+                            Line::from("↑/↓ select · Enter choose · Esc close").right_aligned(),
                         )
                         .borders(Borders::ALL),
                 ),
@@ -1047,7 +1202,7 @@ pub(super) fn render_model_picker(frame: &mut Frame<'_>, picker: &ModelPicker) {
                     Block::default()
                         .title(title)
                         .title_bottom(
-                            Line::from("Type to search · ↑/↓ select · Enter effort · Esc back")
+                            Line::from("Type search · ↑/↓ select · Enter continue · Esc back")
                                 .right_aligned(),
                         )
                         .borders(Borders::ALL),
@@ -1113,7 +1268,7 @@ fn render_command_help(frame: &mut Frame<'_>) {
         Paragraph::new(lines).block(
             Block::default()
                 .title("Commands")
-                .title_bottom(Line::from("Esc/Enter closes").right_aligned())
+                .title_bottom(Line::from("Enter/Esc close").right_aligned())
                 .borders(Borders::ALL),
         ),
         area,

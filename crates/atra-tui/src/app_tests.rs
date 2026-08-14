@@ -9,9 +9,13 @@ use crate::ui::{preserve_transcript_viewport, render_model_picker};
 use crate::{
     layout::SelectionPoint,
     runtime::Effect,
-    state::{ModelPicker, ModelPickerStage, Overlay, ThreadPicker, ThreadPickerState},
+    state::{
+        CheckpointPicker, ModelPicker, ModelPickerStage, Overlay, ThreadPicker, ThreadPickerState,
+    },
 };
-use atra_protocol::CommandExecutionArtifact;
+use atra_protocol::{
+    CommandExecutionArtifact, RetryStatus, ThreadOperation, ThreadState, TurnPhase,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, layout::Rect, text::Line};
 
@@ -49,8 +53,9 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         command_input: InputBuffer::new(Vec::new(), false),
         overlay: Overlay::None,
         word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
-        activity: None,
+        error: None,
         login_required: false,
+        login_pending: false,
         view: ViewState::default(),
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
@@ -259,7 +264,7 @@ fn deleting_the_last_thread_closes_the_picker() {
 }
 
 #[test]
-fn empty_thread_picker_closes_before_handling_input() {
+fn empty_thread_picker_stays_open() {
     let mut app = test_app(Vec::new());
     set_threads(&mut app, Vec::new());
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
@@ -271,12 +276,194 @@ fn empty_thread_picker_closes_before_handling_input() {
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
         .unwrap();
 
-    assert!(matches!(app.overlay, Overlay::None));
-    assert!(matches!(
-        app.activity,
-        Some(Activity::Info(ref message)) if message == "No threads are available"
-    ));
+    assert!(matches!(app.overlay, Overlay::ThreadPicker(_)));
+    assert!(app.error.is_none());
     assert!(pending_effects.try_recv().is_err());
+}
+
+#[test]
+fn thread_picker_handles_threads_disappearing_during_delete_confirmation() {
+    let mut app = test_app(Vec::new());
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 1,
+        state: ThreadPickerState::ConfirmingDelete,
+    });
+    set_threads(&mut app, Vec::new());
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &effects,
+    )
+    .unwrap();
+
+    assert!(pending_effects.try_recv().is_err());
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            selected: 0,
+            state: ThreadPickerState::Browsing,
+        })
+    ));
+}
+
+#[test]
+fn thread_picker_clamps_selection_when_threads_shrink() {
+    let mut app = test_app(Vec::new());
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 1,
+        state: ThreadPickerState::Browsing,
+    });
+    let remaining_thread = app.threads()[0].clone();
+    let remaining_thread_id = remaining_thread.id;
+    set_threads(&mut app, vec![remaining_thread]);
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(
+        pending_effects.try_recv().unwrap(),
+        Effect::SelectThread { thread_id, .. } if thread_id == remaining_thread_id
+    ));
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            selected: 0,
+            state: ThreadPickerState::Selecting,
+        })
+    ));
+}
+
+#[test]
+fn stale_checkpoint_error_does_not_change_the_current_load() {
+    let mut app = test_app(Vec::new());
+    let selected = atra_protocol::CheckpointId(2);
+    app.target = Target::Thread {
+        id: atra_protocol::ThreadId(2),
+        view: ThreadView::Checkpoint {
+            picker: CheckpointPicker {
+                selected,
+                loading: true,
+            },
+        },
+    };
+
+    app.update(TurnUpdate::CheckpointLoaded {
+        checkpoint_id: atra_protocol::CheckpointId(1),
+        result: Err(anyhow::anyhow!("stale failure")),
+    })
+    .unwrap();
+
+    assert!(app.error.is_none());
+    assert!(app.target.checkpoint_picker().unwrap().loading);
+}
+
+#[test]
+fn checkpoint_error_is_ignored_after_leaving_the_picker() {
+    let mut app = test_app(Vec::new());
+
+    app.update(TurnUpdate::CheckpointLoaded {
+        checkpoint_id: atra_protocol::CheckpointId(1),
+        result: Err(anyhow::anyhow!("stale failure")),
+    })
+    .unwrap();
+
+    assert!(app.error.is_none());
+    assert!(matches!(
+        app.target,
+        Target::Thread {
+            view: ThreadView::Live,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn current_checkpoint_error_stops_loading_and_is_displayed() {
+    let mut app = test_app(Vec::new());
+    let selected = atra_protocol::CheckpointId(2);
+    app.target = Target::Thread {
+        id: atra_protocol::ThreadId(2),
+        view: ThreadView::Checkpoint {
+            picker: CheckpointPicker {
+                selected,
+                loading: true,
+            },
+        },
+    };
+
+    app.update(TurnUpdate::CheckpointLoaded {
+        checkpoint_id: selected,
+        result: Err(anyhow::anyhow!("current failure")),
+    })
+    .unwrap();
+
+    assert!(!app.target.checkpoint_picker().unwrap().loading);
+    assert_eq!(app.error.unwrap().to_string(), "current failure");
+}
+
+#[test]
+fn operation_errors_use_a_dismissible_modal() {
+    let mut app = test_app(Vec::new());
+    let history = std::env::temp_dir().join(format!(
+        "atra-tui-command-history-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::File::create(&history).unwrap();
+    app.command_history_path = history.clone();
+    app.overlay = Overlay::Command;
+    app.command_input.set("missing".to_owned());
+    let (effects, _) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+    assert!(app.error.is_some());
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &effects,
+    )
+    .unwrap();
+    assert!(app.error.is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &effects)
+        .unwrap();
+    assert!(app.error.is_none());
+    std::fs::remove_file(history).unwrap();
+}
+
+#[test]
+fn retry_state_is_rendered_in_the_status_line() {
+    let mut app = test_app(Vec::new());
+    let mut state =
+        ThreadState::materialize(app.threads()[0].clone(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+    ThreadOperation::ActiveTurnStarted {
+        phase: TurnPhase::Running,
+    }
+    .apply(&mut state)
+    .unwrap();
+    ThreadOperation::RetryScheduled {
+        retry: RetryStatus::new("service overloaded".to_owned(), 2, 5),
+    }
+    .apply(&mut state)
+    .unwrap();
+    app.thread_subscription = Some(crate::sync::ThreadSync::Snapshot(state));
+    let backend = ratatui::backend::TestBackend::new(96, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    assert!(
+        terminal
+            .backend()
+            .to_string()
+            .contains("service overloaded: retrying 2/5 · esc cancel │")
+    );
 }
 
 #[test]

@@ -9,8 +9,8 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
     ActiveItem, ActiveItemData, ActiveItemId, Command, CommandResult, ControllerOperation,
-    ProcessStatus, ProviderLifecycle, ProviderState, ThreadEvent, ThreadEventData, ThreadOperation,
-    ToolCallEvent, ToolResultEvent, TurnOutcome, TurnPhase,
+    ProcessStatus, ProviderLifecycle, ProviderState, RetryStatus, ThreadEvent, ThreadEventData,
+    ThreadOperation, ToolCallEvent, ToolResultEvent, TurnOutcome, TurnPhase,
 };
 
 impl State {
@@ -506,11 +506,15 @@ impl TurnProjector {
     pub(super) async fn apply_update(&self, update: ModelStreamEvent) -> Result<()> {
         let mut projection = self.projection.lock().await;
         let operation = match update {
-            ModelStreamEvent::Retry { current, max } => {
+            ModelStreamEvent::Retry {
+                summary,
+                current,
+                max,
+            } => {
                 tracing::debug!(current, max, "model request retrying");
                 projection.retrying = true;
-                ThreadOperation::PhaseChanged {
-                    phase: TurnPhase::Retrying,
+                ThreadOperation::RetryScheduled {
+                    retry: RetryStatus::new(summary, current, max),
                 }
             }
             ModelStreamEvent::AssistantDelta(content) => {
