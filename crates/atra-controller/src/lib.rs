@@ -49,7 +49,7 @@ use commands::TurnProjector;
 use lifecycle::TurnLifecycle;
 use model::{ModelProvider, ModelResponse, ModelStreamEvent};
 use runner::{CommandOutcome, Runner, RunnerConfig};
-use runner_client::{PrepareTreeResult, RunnerClient, WaitOutcome};
+use runner_client::{PrepareTreeResult, ProcessSubscription, RunnerClient, WaitOutcome};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
 use storage::Store;
 use tools::*;
@@ -268,33 +268,36 @@ async fn provider_state(
 }
 
 async fn watch_process(
-    runners: Weak<RunnerPool>,
     views: Weak<Views>,
     process: atra_protocol::ProcessLocator,
+    mut subscription: ProcessSubscription,
 ) {
-    let key = ProcessKey {
-        thread_id: process.thread_id(),
-        runner: process.runner().to_owned(),
-        process_id: process.process_id().clone(),
-    };
     loop {
-        let Some(runners) = runners.upgrade() else {
-            return;
-        };
-        let Some(record) = runners.process(&key).await else {
-            return;
-        };
-        let detail = runners.inspect_process(key.clone(), record).await;
-        drop(runners);
         let Some(views) = views.upgrade() else {
             return;
+        };
+        let state = match subscription.recv().await {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = views
+                    .synchronize_process(
+                        &process,
+                        String::new(),
+                        0,
+                        atra_protocol::ProcessStatus::Unavailable {
+                            message: format!("{error:#}"),
+                        },
+                    )
+                    .await;
+                return;
+            }
         };
         match views
             .synchronize_process(
                 &process,
-                detail.output_tail,
-                detail.omitted_bytes,
-                detail.process.status,
+                state.output_tail,
+                state.omitted_bytes,
+                state.status,
             )
             .await
         {
@@ -309,8 +312,6 @@ async fn watch_process(
                 return;
             }
         }
-        drop(views);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -453,8 +454,9 @@ impl State {
         let process_handle = runner
             .start_command(command.clone(), thread_id, &process_id)
             .await?;
-        let registered = self
-            .register_managed_process(
+        let registered = async {
+            let subscription = runner.subscribe(process_handle.clone()).await?;
+            self.register_managed_process(
                 ProcessKey {
                     thread_id,
                     runner: runner_name.to_owned(),
@@ -465,8 +467,11 @@ impl State {
                     command,
                     started_at_ms,
                 },
+                subscription,
             )
-            .await;
+            .await
+        }
+        .await;
         if let Err(error) = registered {
             if let Err(stop_error) = runner.stop(process_handle).await {
                 tracing::warn!(
@@ -486,7 +491,11 @@ impl State {
         runner: &str,
         spawned_processes: Vec<SpawnedProcess>,
     ) -> Result<()> {
+        let runner_instance = self.runners.get(runner).await?;
         for process in spawned_processes {
+            let subscription = runner_instance
+                .subscribe(process.process_handle.clone())
+                .await?;
             self.register_managed_process(
                 ProcessKey {
                     thread_id,
@@ -498,22 +507,28 @@ impl State {
                     command: process.command,
                     started_at_ms: checkpoint_time_ms(),
                 },
+                subscription,
             )
             .await?;
         }
         Ok(())
     }
 
-    async fn register_managed_process(&self, key: ProcessKey, record: ProcessRecord) -> Result<()> {
+    async fn register_managed_process(
+        &self,
+        key: ProcessKey,
+        record: ProcessRecord,
+        subscription: ProcessSubscription,
+    ) -> Result<()> {
         if !self.runners.insert_process(key.clone(), record).await {
             return Ok(());
         }
         let process = atra_protocol::ProcessLocator::new(key.thread_id, key.runner, key.process_id);
         self.materialize_process(&process).await?;
         tokio::spawn(watch_process(
-            Arc::downgrade(&self.runners),
             Arc::downgrade(&self.views),
             process,
+            subscription,
         ));
         Ok(())
     }

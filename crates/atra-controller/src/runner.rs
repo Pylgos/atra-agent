@@ -143,6 +143,13 @@ impl Runner {
         self.client.stop(process_handle).await
     }
 
+    pub(super) async fn subscribe(
+        &self,
+        process_handle: ProcessHandle,
+    ) -> Result<runner_client::ProcessSubscription> {
+        self.client.subscribe(process_handle).await
+    }
+
     pub(super) async fn approval(&self) -> ApprovalPolicy {
         self.config.lock().await.approval
     }

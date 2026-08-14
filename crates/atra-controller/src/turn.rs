@@ -1230,6 +1230,7 @@ impl State {
                 patch_results,
                 ..
             } => {
+                let subscription = runner.subscribe(process_handle.clone()).await?;
                 self.register_managed_process(
                     ProcessKey {
                         thread_id,
@@ -1241,6 +1242,7 @@ impl State {
                         command: command.clone(),
                         started_at_ms,
                     },
+                    subscription,
                 )
                 .await?;
                 active.clear_process();

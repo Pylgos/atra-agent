@@ -509,6 +509,9 @@ pub enum RunnerRequest {
         process_handle: ProcessHandle,
         timeout_ms: u64,
     },
+    SubscribeProcess {
+        process_handle: ProcessHandle,
+    },
     StopProcess {
         process_handle: ProcessHandle,
     },

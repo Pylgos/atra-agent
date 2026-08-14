@@ -16,14 +16,48 @@ use atra_store::TreeManifest;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, oneshot, watch},
 };
 
 pub(super) struct RunnerClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RunnerResponse>>>>,
+    subscriptions: Arc<StdMutex<HashMap<u64, watch::Sender<ProcessSubscriptionUpdate>>>>,
     next_request_id: Arc<AtomicU64>,
     name: String,
+}
+
+pub(super) struct ProcessSubscription {
+    receiver: watch::Receiver<ProcessSubscriptionUpdate>,
+}
+
+#[derive(Clone)]
+enum ProcessSubscriptionUpdate {
+    Pending,
+    Inspection(ProcessInspection),
+    Error(String),
+    Invalid,
+}
+
+impl ProcessSubscription {
+    pub(super) async fn recv(&mut self) -> Result<ProcessInspection> {
+        self.receiver
+            .changed()
+            .await
+            .context("runner disconnected during process subscription")?;
+        match self.receiver.borrow_and_update().clone() {
+            ProcessSubscriptionUpdate::Pending => {
+                bail!("runner returned an invalid process subscription response")
+            }
+            ProcessSubscriptionUpdate::Inspection(inspection) => Ok(inspection),
+            ProcessSubscriptionUpdate::Error(message) => {
+                bail!("Runner request failed: {message}")
+            }
+            ProcessSubscriptionUpdate::Invalid => {
+                bail!("runner returned an invalid process subscription response")
+            }
+        }
+    }
 }
 
 pub(super) enum PrepareTreeResult {
@@ -31,6 +65,7 @@ pub(super) enum PrepareTreeResult {
     Ready { digest: String, path: String },
 }
 
+#[derive(Clone)]
 pub(super) struct ProcessInspection {
     pub(super) status: ProcessStatus,
     pub(super) output_tail: String,
@@ -60,6 +95,11 @@ impl RunnerClient {
             HashMap::<u64, oneshot::Sender<RunnerResponse>>::new(),
         ));
         let reader_pending = Arc::clone(&pending);
+        let subscriptions = Arc::new(StdMutex::new(HashMap::<
+            u64,
+            watch::Sender<ProcessSubscriptionUpdate>,
+        >::new()));
+        let reader_subscriptions = Arc::clone(&subscriptions);
         let next_request_id = Arc::new(AtomicU64::new(0));
         let reader_next_request_id = Arc::clone(&next_request_id);
         let runner_name = name.to_owned();
@@ -72,6 +112,50 @@ impl RunnerClient {
                     Ok(0) => break,
                     Ok(_) => match serde_json::from_str::<RunnerResponseEnvelope>(&line) {
                         Ok(envelope) => {
+                            let subscription = reader_subscriptions
+                                .lock()
+                                .unwrap()
+                                .get(&envelope.request_id)
+                                .cloned();
+                            if let Some(subscription) = subscription {
+                                let (update, terminal) = match envelope.response {
+                                    RunnerResponse::ProcessInspected {
+                                        process_status,
+                                        output_tail,
+                                        omitted_bytes,
+                                    } => {
+                                        let terminal =
+                                            matches!(process_status, ProcessStatus::Exited { .. });
+                                        (
+                                            ProcessSubscriptionUpdate::Inspection(
+                                                ProcessInspection {
+                                                    status: process_status,
+                                                    output_tail,
+                                                    omitted_bytes,
+                                                },
+                                            ),
+                                            terminal,
+                                        )
+                                    }
+                                    RunnerResponse::Error { message } => {
+                                        (ProcessSubscriptionUpdate::Error(message), true)
+                                    }
+                                    _ => (ProcessSubscriptionUpdate::Invalid, true),
+                                };
+                                if terminal {
+                                    reader_subscriptions
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&envelope.request_id);
+                                }
+                                if subscription.send(update).is_err() {
+                                    reader_subscriptions
+                                        .lock()
+                                        .unwrap()
+                                        .remove(&envelope.request_id);
+                                }
+                                continue;
+                            }
                             let sender =
                                 reader_pending.lock().unwrap().remove(&envelope.request_id);
                             if let Some(sender) = sender {
@@ -128,11 +212,13 @@ impl RunnerClient {
                     message: format!("runner {runner_name} disconnected"),
                 });
             }
+            reader_subscriptions.lock().unwrap().clear();
         });
 
         Self {
             stdin,
             pending,
+            subscriptions,
             next_request_id,
             name: name.to_owned(),
         }
@@ -165,6 +251,30 @@ impl RunnerClient {
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid start_command response"),
         }
+    }
+
+    pub(super) async fn subscribe(
+        &self,
+        process_handle: ProcessHandle,
+    ) -> Result<ProcessSubscription> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = watch::channel(ProcessSubscriptionUpdate::Pending);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .insert(request_id, sender);
+        let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
+            request_id,
+            request: RunnerRequest::SubscribeProcess { process_handle },
+        })
+        .context("failed to encode runner subscription request")?;
+        request.push(b'\n');
+        if let Err(error) = self.stdin.lock().await.write_all(&request).await {
+            self.subscriptions.lock().unwrap().remove(&request_id);
+            return Err(error)
+                .with_context(|| format!("failed to subscribe to runner {}", self.name));
+        }
+        Ok(ProcessSubscription { receiver })
     }
 
     pub(super) async fn wait(
@@ -301,5 +411,52 @@ impl RunnerClient {
         receiver
             .await
             .with_context(|| format!("runner {} disconnected", self.name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_subscription_keeps_only_the_latest_pending_state() {
+        let (sender, receiver) = watch::channel(ProcessSubscriptionUpdate::Pending);
+        let mut subscription = ProcessSubscription { receiver };
+        sender
+            .send(ProcessSubscriptionUpdate::Inspection(ProcessInspection {
+                status: ProcessStatus::Running,
+                output_tail: "first".to_owned(),
+                omitted_bytes: 0,
+            }))
+            .unwrap();
+        sender
+            .send(ProcessSubscriptionUpdate::Inspection(ProcessInspection {
+                status: ProcessStatus::Running,
+                output_tail: "latest".to_owned(),
+                omitted_bytes: 1,
+            }))
+            .unwrap();
+
+        let latest = subscription.recv().await.unwrap();
+        assert_eq!(latest.output_tail, "latest");
+        assert_eq!(latest.omitted_bytes, 1);
+
+        sender
+            .send(ProcessSubscriptionUpdate::Inspection(ProcessInspection {
+                status: ProcessStatus::Exited { exit_code: Some(0) },
+                output_tail: "final".to_owned(),
+                omitted_bytes: 2,
+            }))
+            .unwrap();
+        drop(sender);
+
+        let terminal = subscription.recv().await.unwrap();
+        assert!(matches!(
+            terminal.status,
+            ProcessStatus::Exited { exit_code: Some(0) }
+        ));
+        assert_eq!(terminal.output_tail, "final");
+        assert_eq!(terminal.omitted_bytes, 2);
+        assert!(subscription.recv().await.is_err());
     }
 }

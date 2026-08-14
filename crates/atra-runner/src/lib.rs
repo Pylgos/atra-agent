@@ -89,7 +89,36 @@ async fn serve(
         let processes = Arc::clone(&processes);
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            let response = match handle_request(&processes, &store, envelope.request).await {
+            let request_id = envelope.request_id;
+            let request = match envelope.request {
+                RunnerRequest::SubscribeProcess { process_handle } => {
+                    if let Err(error) = processes
+                        .subscribe(&process_handle, request_id, &writer)
+                        .await
+                    {
+                        let response = RunnerResponse::Error {
+                            message: format!("{error:#}"),
+                        };
+                        if let Err(error) = write_response(
+                            &writer,
+                            RunnerResponseEnvelope {
+                                request_id,
+                                response,
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "failed to send runner subscription error"
+                            );
+                        }
+                    }
+                    return;
+                }
+                request => request,
+            };
+            let response = match handle_request(&processes, &store, request).await {
                 Ok(response) => response,
                 Err(error) => RunnerResponse::Error {
                     message: format!("{error:#}"),
@@ -98,7 +127,7 @@ async fn serve(
             if let Err(error) = write_response(
                 &writer,
                 RunnerResponseEnvelope {
-                    request_id: envelope.request_id,
+                    request_id,
                     response,
                 },
             )
@@ -194,6 +223,9 @@ async fn handle_request(
                 .wait(&process_handle, Duration::from_millis(timeout_ms))
                 .await
         }
+        RunnerRequest::SubscribeProcess { .. } => {
+            bail!("process subscriptions must be handled by the runner connection")
+        }
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
         RunnerRequest::InspectProcess { process_handle } => {
             processes.inspect(&process_handle).await
@@ -242,6 +274,9 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
             processes
                 .wait(&process_handle, Duration::from_millis(timeout_ms))
                 .await
+        }
+        RunnerRequest::SubscribeProcess { .. } => {
+            bail!("process subscriptions are not supported by the Runner control socket")
         }
         RunnerRequest::StopProcess { process_handle } => processes.stop(&process_handle).await,
         RunnerRequest::SpawnProcess {
@@ -521,6 +556,47 @@ impl ProcessManager {
         Ok(RunnerResponse::ProcessStarted {
             process_handle: process.handle.clone(),
         })
+    }
+
+    async fn subscribe(
+        &self,
+        handle: &ProcessHandle,
+        request_id: u64,
+        writer: &Mutex<impl AsyncWrite + Unpin>,
+    ) -> Result<()> {
+        let process = self.process(handle).await?;
+        let mut previous = None;
+        loop {
+            let process_status = match process.exit_code().await? {
+                Some(exit_code) => {
+                    process.finish_output().await;
+                    ProcessStatus::Exited { exit_code }
+                }
+                None => ProcessStatus::Running,
+            };
+            let (output_tail, omitted_bytes) = process.output_tail.lock().await.snapshot();
+            let state = (process_status, output_tail, omitted_bytes);
+            let finished = matches!(state.0, ProcessStatus::Exited { .. });
+            if previous.as_ref() != Some(&state) {
+                write_response(
+                    writer,
+                    RunnerResponseEnvelope {
+                        request_id,
+                        response: RunnerResponse::ProcessInspected {
+                            process_status: state.0.clone(),
+                            output_tail: state.1.clone(),
+                            omitted_bytes: state.2,
+                        },
+                    },
+                )
+                .await?;
+                previous = Some(state);
+            }
+            if finished {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn wait(&self, handle: &ProcessHandle, timeout: Duration) -> Result<RunnerResponse> {
@@ -832,6 +908,87 @@ impl Drop for ManagedProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn subscription_reports_state_without_consuming_wait_output() {
+        let processes = Arc::new(ProcessManager::new().unwrap());
+        let process = processes
+            .start(
+                "printf subscribed; sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("process".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = process.handle.clone();
+        let (writer, reader) = tokio::io::duplex(64 * 1024);
+        let writer = Arc::new(Mutex::new(writer));
+        let subscription_processes = Arc::clone(&processes);
+        let subscription_writer = Arc::clone(&writer);
+        let subscription_handle = handle.clone();
+        let subscription = tokio::spawn(async move {
+            subscription_processes
+                .subscribe(&subscription_handle, 7, &subscription_writer)
+                .await
+        });
+
+        sleep(Duration::from_millis(50)).await;
+        let wait = processes
+            .wait(&handle, Duration::from_millis(10))
+            .await
+            .unwrap();
+        let RunnerResponse::ProcessRunning { output, .. } = wait else {
+            panic!("process unexpectedly finished");
+        };
+        assert_eq!(output.content, "subscribed");
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let snapshot: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+        let RunnerResponse::ProcessInspected {
+            output_tail,
+            process_status: ProcessStatus::Running,
+            ..
+        } = snapshot.response
+        else {
+            panic!("subscription did not start with a snapshot");
+        };
+        let mut output_tail = output_tail;
+        while output_tail.is_empty() {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+            let RunnerResponse::ProcessInspected {
+                output_tail: current,
+                ..
+            } = envelope.response
+            else {
+                panic!("subscription ended before delivering process output");
+            };
+            output_tail = current;
+        }
+        assert_eq!(output_tail, "subscribed");
+
+        processes.stop(&handle).await.unwrap();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+            if matches!(
+                envelope.response,
+                RunnerResponse::ProcessInspected {
+                    process_status: ProcessStatus::Exited { .. },
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        subscription.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn stop_does_not_wait_for_inherited_output_descriptors() {
