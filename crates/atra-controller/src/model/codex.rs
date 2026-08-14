@@ -1089,7 +1089,13 @@ fn error_message(body: &str) -> String {
 
 fn rate_limit_snapshots(value: &Value) -> Vec<Value> {
     if let Some(array) = value.as_array() {
-        return array.clone();
+        return array
+            .iter()
+            .map(|limit| {
+                let id = limit["limit_id"].as_str().unwrap_or("codex");
+                normalize_rate_limit(limit, id)
+            })
+            .collect();
     }
     let mut snapshots = Vec::new();
     if let Some(primary) = value.get("rate_limit") {
@@ -1105,7 +1111,8 @@ fn rate_limit_snapshots(value: &Value) -> Vec<Value> {
         }));
     }
     if snapshots.is_empty() && value.is_object() {
-        snapshots.push(value.clone());
+        let id = value["limit_id"].as_str().unwrap_or("codex");
+        snapshots.push(normalize_rate_limit(value, id));
     }
     snapshots
 }
@@ -1114,10 +1121,47 @@ fn normalize_rate_limit(value: &Value, id: &str) -> Value {
     json!({
         "limit_id": id,
         "limit_name": value.get("limit_name").cloned().unwrap_or(Value::Null),
-        "primary": value.get("primary_window").or_else(|| value.get("primary")).cloned().unwrap_or(Value::Null),
-        "secondary": value.get("secondary_window").or_else(|| value.get("secondary")).cloned().unwrap_or(Value::Null),
+        "primary": normalize_rate_limit_window(
+            value.get("primary_window").or_else(|| value.get("primary"))
+        ),
+        "secondary": normalize_rate_limit_window(
+            value.get("secondary_window").or_else(|| value.get("secondary"))
+        ),
         "credits": value.get("credits").cloned().unwrap_or(Value::Null),
         "plan_type": value.get("plan_type").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn normalize_rate_limit_window(window: Option<&Value>) -> Value {
+    let Some(window) = window.filter(|window| !window.is_null()) else {
+        return Value::Null;
+    };
+    let Some(used_percent) = window.get("used_percent").filter(|value| !value.is_null()) else {
+        return Value::Null;
+    };
+    let window_minutes = window
+        .get("window_minutes")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| {
+            let seconds = window.get("limit_window_seconds")?;
+            if let Some(seconds) = seconds.as_i64() {
+                Some(Value::from(seconds / 60))
+            } else {
+                seconds.as_f64().map(|seconds| Value::from(seconds / 60.0))
+            }
+        })
+        .unwrap_or(Value::Null);
+    let resets_at = window
+        .get("resets_at")
+        .or_else(|| window.get("reset_at"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "used_percent": used_percent,
+        "window_minutes": window_minutes,
+        "resets_at": resets_at
     })
 }
 
@@ -1209,18 +1253,21 @@ fn rate_limit_headers(headers: &HeaderMap) -> Vec<Value> {
                     "balance": number("x-codex-credits-balance")
                 })
             });
+            let window = |name: &str| {
+                let used_percent = number(&format!("{prefix}-{name}-used-percent"));
+                if used_percent.is_none() {
+                    return Value::Null;
+                }
+                json!({
+                    "used_percent": used_percent,
+                    "window_minutes": number(&format!("{prefix}-{name}-window-minutes")),
+                    "resets_at": number(&format!("{prefix}-{name}-reset-at"))
+                })
+            };
             json!({
                 "limit_id": limit_id,
-                "primary": {
-                    "used_percent": number(&format!("{prefix}-primary-used-percent")),
-                    "window_minutes": number(&format!("{prefix}-primary-window-minutes")),
-                    "resets_at": number(&format!("{prefix}-primary-reset-at"))
-                },
-                "secondary": {
-                    "used_percent": number(&format!("{prefix}-secondary-used-percent")),
-                    "window_minutes": number(&format!("{prefix}-secondary-window-minutes")),
-                    "resets_at": number(&format!("{prefix}-secondary-reset-at"))
-                },
+                "primary": window("primary"),
+                "secondary": window("secondary"),
                 "credits": credits,
                 "plan_type": (prefix == "x-codex")
                     .then(|| text("x-codex-plan-type"))
@@ -1370,6 +1417,31 @@ mod tests {
         ensure_completed_response(true).unwrap();
     }
 
+    #[test]
+    fn raw_usage_windows_are_normalized_and_disabled_windows_stay_null() {
+        let snapshots = rate_limit_snapshots(&json!({
+            "rate_limit": {
+                "primary_window": null,
+                "secondary_window": {
+                    "used_percent": 37.5,
+                    "limit_window_seconds": 7 * 24 * 60 * 60,
+                    "reset_at": 2_000_000_000
+                }
+            }
+        }));
+
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0]["primary"].is_null());
+        assert_eq!(
+            snapshots[0]["secondary"],
+            json!({
+                "used_percent": 37.5,
+                "window_minutes": 7 * 24 * 60,
+                "resets_at": 2_000_000_000
+            })
+        );
+    }
+
     #[tokio::test]
     async fn rate_limits_after_completion_are_still_processed() {
         let (sender, mut receiver) = mpsc::channel(4);
@@ -1505,6 +1577,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-codex-primary-used-percent", "12".parse().unwrap());
         headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert("x-codex-primary-reset-at", "2000000000".parse().unwrap());
         headers.insert("x-codex-credits-balance", "4.5".parse().unwrap());
         headers.insert(
             "x-codex-research-primary-used-percent",
@@ -1526,6 +1599,18 @@ mod tests {
                 .find(|value| value["limit_id"] == "research")
                 .and_then(|value| value.pointer("/primary/used_percent")),
             Some(&json!(34.0))
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|value| value.get("secondary").is_some_and(Value::is_null))
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .find(|value| value["limit_id"] == "codex")
+                .and_then(|value| value.pointer("/primary/resets_at")),
+            Some(&json!(2_000_000_000.0))
         );
 
         let mut cached = vec![json!({

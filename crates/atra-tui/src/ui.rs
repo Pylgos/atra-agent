@@ -33,7 +33,7 @@ fn quota_delta(first: &Value, current: &Value) -> Option<f64> {
 }
 
 fn format_quota_window(window: &Value, delta: Option<f64>) -> (String, Option<(String, f64)>) {
-    let label = window["window_minutes"].as_i64().map_or_else(
+    let label = integer_value(&window["window_minutes"]).map_or_else(
         || "?".to_owned(),
         |minutes| {
             if minutes == 7 * 24 * 60 {
@@ -44,8 +44,7 @@ fn format_quota_window(window: &Value, delta: Option<f64>) -> (String, Option<(S
         },
     );
     let remaining = (100.0 - window["used_percent"].as_f64().unwrap_or_default()).clamp(0.0, 100.0);
-    let reset = window["resets_at"]
-        .as_i64()
+    let reset = integer_value(&window["resets_at"])
         .and_then(|reset| {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
             Some(format_window_duration((reset - now).max(0) / 60))
@@ -56,6 +55,18 @@ fn format_quota_window(window: &Value, delta: Option<f64>) -> (String, Option<(S
         .filter(|delta| *delta > 0.0)
         .map(|delta| (label, delta));
     (content, delta)
+}
+
+fn integer_value(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        let value = value.as_f64()?;
+        (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
+            .then(|| value as i64)
+    })
+}
+
+fn has_quota_window(window: &Value) -> bool {
+    window.get("used_percent").and_then(Value::as_f64).is_some()
 }
 
 fn format_window_duration(minutes: i64) -> String {
@@ -482,11 +493,11 @@ impl App {
             .into_iter()
             .filter_map(|name| {
                 let current = snapshot.get(name)?;
-                (!current.is_null()).then(|| {
+                has_quota_window(current).then(|| {
                     let delta = first_snapshot
                         .and_then(|first| first.get(name))
                         .and_then(|first| quota_delta(first, current));
-                    format_quota_window(current, delta)
+                    (name, format_quota_window(current, delta))
                 })
             })
             .collect::<Vec<_>>();
@@ -500,11 +511,11 @@ impl App {
         let mut spans = vec![Span::raw(" · ")];
         let mut has_detail = false;
         let mut deltas = Vec::new();
-        for (index, (window, delta)) in windows.into_iter().enumerate() {
+        for (index, (name, (window, delta))) in windows.into_iter().enumerate() {
             if index > 0 {
                 spans.push(Span::raw(" · "));
             }
-            let color = if index == 0 {
+            let color = if name == "primary" {
                 Color::Cyan
             } else {
                 Color::Green
@@ -1096,4 +1107,40 @@ fn render_command_help(frame: &mut Frame<'_>) {
         ),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn quota_window_accepts_float_encoded_timing_values() {
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64
+            + 3600.0;
+        let window = json!({
+            "used_percent": 25.0,
+            "window_minutes": 10080.0,
+            "resets_at": reset
+        });
+
+        let (content, _) = format_quota_window(&window, None);
+
+        assert!(content.starts_with("weekly 75.000%/"));
+        assert!(!content.ends_with("/?"));
+    }
+
+    #[test]
+    fn quota_window_requires_usage_data() {
+        assert!(!has_quota_window(&json!(null)));
+        assert!(!has_quota_window(&json!({
+            "used_percent": null,
+            "window_minutes": null,
+            "resets_at": null
+        })));
+        assert!(has_quota_window(&json!({"used_percent": 0.0})));
+    }
 }
