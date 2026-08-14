@@ -3,8 +3,8 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result, bail};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CommandOutput, ProcessHandle,
-    ProcessId, ProcessStatus, Runner as RunnerInfo, ThreadId,
+    ApprovalPolicy, CommandOutput, ProcessHandle, ProcessId, ProcessStatus, Runner as RunnerInfo,
+    ThreadId,
 };
 use atra_store::Store;
 use tokio::sync::Mutex;
@@ -29,6 +29,20 @@ pub(super) struct ProcessRecord {
     pub(super) handle: ProcessHandle,
     pub(super) command: String,
     pub(super) started_at_ms: i64,
+}
+
+pub(super) struct ManagedProcess {
+    pub(super) runner: String,
+    pub(super) process_id: ProcessId,
+    pub(super) command: String,
+    pub(super) started_at_ms: i64,
+    pub(super) status: ProcessStatus,
+}
+
+pub(super) struct ManagedProcessDetail {
+    pub(super) process: ManagedProcess,
+    pub(super) output_tail: String,
+    pub(super) omitted_bytes: usize,
 }
 
 impl RunnerPool {
@@ -139,8 +153,16 @@ impl RunnerPool {
         self.processes.lock().await.get(key).cloned()
     }
 
-    pub(super) async fn insert_process(&self, key: ProcessKey, record: ProcessRecord) {
-        self.processes.lock().await.insert(key, record);
+    pub(super) async fn insert_process(&self, key: ProcessKey, record: ProcessRecord) -> bool {
+        use std::collections::hash_map::Entry;
+
+        match self.processes.lock().await.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(record);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     pub(super) async fn remove_process(&self, key: &ProcessKey) {
@@ -162,7 +184,7 @@ impl RunnerPool {
         }
     }
 
-    pub(super) async fn list_processes(&self, thread_id: ThreadId) -> Vec<BackgroundProcess> {
+    pub(super) async fn list_processes(&self, thread_id: ThreadId) -> Vec<ManagedProcess> {
         let records = self
             .processes
             .lock()
@@ -179,7 +201,7 @@ impl RunnerPool {
                 unavailable.push(key);
                 continue;
             }
-            processes.push(BackgroundProcess {
+            processes.push(ManagedProcess {
                 runner: key.runner,
                 process_id: key.process_id,
                 command: record.command,
@@ -204,7 +226,7 @@ impl RunnerPool {
         &self,
         key: ProcessKey,
         record: ProcessRecord,
-    ) -> BackgroundProcessDetail {
+    ) -> ManagedProcessDetail {
         let response = match self.get(&key.runner).await {
             Ok(runner) => runner.client.inspect(record.handle.clone()).await,
             Err(error) => Err(error),
@@ -223,8 +245,8 @@ impl RunnerPool {
                 0,
             ),
         };
-        BackgroundProcessDetail {
-            process: BackgroundProcess {
+        ManagedProcessDetail {
+            process: ManagedProcess {
                 runner: key.runner,
                 process_id: key.process_id,
                 command: record.command,
@@ -257,5 +279,26 @@ impl RunnerPool {
         let output = self.get(&key.runner).await?.stop(record.handle).await?;
         self.remove_process(key).await;
         Ok(output)
+    }
+
+    pub(super) async fn stop_thread_processes(&self, thread_id: ThreadId) {
+        let keys = self
+            .processes
+            .lock()
+            .await
+            .keys()
+            .filter(|key| key.thread_id == thread_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Err(error) = self.stop_process(&key).await {
+                tracing::warn!(
+                    process_id = %key.process_id,
+                    error = %format!("{error:#}"),
+                    "failed to stop process while deleting its thread"
+                );
+                self.remove_process(&key).await;
+            }
+        }
     }
 }

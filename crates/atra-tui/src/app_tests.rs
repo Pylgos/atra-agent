@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::transcript::{
-    Author, ToolArtifact, TranscriptItem, TranscriptState, layout_transcript, prepare_transcript,
-    sanitize, transcript_lines, transcript_text,
+    Author, ToolArtifact, TranscriptEntry, TranscriptItem, TranscriptState, layout_transcript,
+    prepare_transcript, sanitize, transcript_lines, transcript_text,
 };
 use crate::ui::{preserve_transcript_viewport, render_model_picker};
 use crate::{
@@ -16,32 +16,31 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{Terminal, layout::Rect, text::Line};
 
 fn test_app(items: Vec<TranscriptEntry>) -> App {
+    let threads = vec![
+        Thread {
+            id: atra_protocol::ThreadId(2),
+            display_name: Some("Current work".to_owned()),
+            provider: "codex".to_owned(),
+            model: "gpt-5.6-sol".to_owned(),
+            reasoning_effort: "medium".to_owned(),
+        },
+        Thread {
+            id: atra_protocol::ThreadId(1),
+            display_name: None,
+            provider: "codex".to_owned(),
+            model: "gpt-5.6-sol".to_owned(),
+            reasoning_effort: "medium".to_owned(),
+        },
+    ];
     App {
         endpoint: PathBuf::new(),
         message_history_path: PathBuf::new(),
         command_history_path: PathBuf::new(),
-        threads: vec![
-            Thread {
-                id: atra_protocol::ThreadId(2),
-                display_name: Some("Current work".to_owned()),
-                provider: "codex".to_owned(),
-                model: "gpt-5.6-sol".to_owned(),
-                reasoning_effort: "medium".to_owned(),
-            },
-            Thread {
-                id: atra_protocol::ThreadId(1),
-                display_name: None,
-                provider: "codex".to_owned(),
-                model: "gpt-5.6-sol".to_owned(),
-                reasoning_effort: "medium".to_owned(),
-            },
-        ],
-        models: Vec::new(),
         target: Target::Thread {
             id: atra_protocol::ThreadId(2),
             view: ThreadView::Live,
         },
-        transcript: TranscriptState::new(items, Vec::new()),
+        transcript: TranscriptState::new(items),
         message_input: {
             let mut input = InputBuffer::new(Vec::new(), true);
             input.set("next".to_owned());
@@ -56,11 +55,75 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
         metrics_stale: false,
-        rate_limits: serde_json::Value::Array(Vec::new()),
-        rate_limit_refresh_pending: false,
-        processes: Vec::new(),
-        process_refresh_pending: false,
+        process_selection_pending: false,
+        controller_subscription: crate::sync::ControllerSync::Snapshot(
+            atra_protocol::ControllerState::new(
+                atra_protocol::ControllerLifecycle::Running,
+                threads.clone(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        thread_subscription: Some(crate::sync::ThreadSync::Snapshot(
+            atra_protocol::ThreadState::materialize(
+                threads[0].clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )),
+        checkpoint_subscription: None,
+        process_subscription: None,
     }
+}
+
+fn set_threads(app: &mut App, threads: Vec<Thread>) {
+    app.controller_subscription =
+        crate::sync::ControllerSync::Snapshot(atra_protocol::ControllerState::new(
+            atra_protocol::ControllerLifecycle::Running,
+            threads,
+            Vec::new(),
+            Vec::new(),
+        ));
+}
+
+fn set_active_turn(app: &mut App) {
+    let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
+        panic!("test app must use a snapshot thread");
+    };
+    atra_protocol::ThreadOperation::ActiveTurnStarted {
+        phase: atra_protocol::TurnPhase::Running,
+    }
+    .apply(state)
+    .unwrap();
+}
+
+#[test]
+fn approval_is_derived_from_the_thread_snapshot() {
+    let mut app = test_app(Vec::new());
+    set_active_turn(&mut app);
+    let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
+        panic!("test app must use a snapshot thread");
+    };
+    atra_protocol::ThreadOperation::ApprovalRequested {
+        approval: atra_protocol::PendingApproval::new(
+            atra_protocol::ApprovalId(7),
+            "command".to_owned(),
+            serde_json::json!({"runner": "local"}),
+            Some(2),
+            Some("Run tests".to_owned()),
+        ),
+    }
+    .apply(state)
+    .unwrap();
+
+    assert_eq!(
+        app.pending_approval().unwrap().id(),
+        atra_protocol::ApprovalId(7)
+    );
+    assert!(app.turn_is_running());
+    assert!(matches!(app.turn, TurnState::Idle));
 }
 
 fn model(provider: &str, id: &str, display_name: &str, description: &str) -> Model {
@@ -177,47 +240,21 @@ fn model_picker_keeps_the_last_model_visible_in_a_long_list() {
 }
 
 #[test]
-fn ignores_rate_limits_loaded_for_a_previous_provider() {
-    let mut app = test_app(Vec::new());
-    app.threads[0].provider = "ollama".to_owned();
-    app.rate_limit_refresh_pending = true;
-    let snapshots = serde_json::json!([{"limit_id": "codex"}]);
-    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
-
-    app.update(
-        TurnUpdate::RateLimitsLoaded {
-            provider: "codex".to_owned(),
-            result: Ok(snapshots),
-        },
-        &effects,
-    )
-    .unwrap();
-
-    assert_eq!(app.rate_limits, serde_json::json!([]));
-    assert!(!app.rate_limit_refresh_pending);
-}
-
-#[test]
 fn deleting_the_last_thread_closes_the_picker() {
     let mut app = test_app(Vec::new());
-    app.threads.truncate(1);
+    let only_thread = app.threads()[0].clone();
+    set_threads(&mut app, vec![only_thread]);
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 0,
         state: ThreadPickerState::Deleting,
     });
-    let thread_id = app.threads[0].id;
-    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
-
-    app.update(
-        TurnUpdate::ThreadDeleted {
-            thread_id,
-            result: Ok(()),
-        },
-        &effects,
-    )
+    let thread_id = app.threads()[0].id;
+    app.update(TurnUpdate::ThreadDeleted {
+        thread_id,
+        result: Ok(()),
+    })
     .unwrap();
 
-    assert!(app.threads.is_empty());
     assert!(matches!(app.overlay, Overlay::None));
     assert!(matches!(app.target, Target::New { .. }));
 }
@@ -225,7 +262,7 @@ fn deleting_the_last_thread_closes_the_picker() {
 #[test]
 fn empty_thread_picker_closes_before_handling_input() {
     let mut app = test_app(Vec::new());
-    app.threads.clear();
+    set_threads(&mut app, Vec::new());
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 0,
         state: ThreadPickerState::Browsing,
@@ -250,7 +287,7 @@ fn thread_picker_ignores_input_while_deleting() {
         selected: 0,
         state: ThreadPickerState::ConfirmingDelete,
     });
-    let deleted_thread = app.threads[0].id;
+    let deleted_thread = app.threads()[0].id;
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
 
     app.handle_key(
@@ -397,15 +434,16 @@ fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
     app.message_input.extend_selection(3);
     app.view.selection_start = Some(SelectionPoint { offset: 0 });
     app.view.selection_end = Some(SelectionPoint { offset: 3 });
-    app.turn = TurnState::Running;
+    set_active_turn(&mut app);
     app.handle_key(ctrl_c, &effects).unwrap();
     assert_eq!(app.message_input.value, "message");
-    assert!(matches!(app.turn, TurnState::Running));
+    assert!(app.turn_is_running());
+    assert!(matches!(app.turn, TurnState::Idle));
     assert!(pending_effects.try_recv().is_err());
 
     app.message_input.set("message".to_owned());
     app.handle_key(ctrl_c, &effects).unwrap();
-    assert!(matches!(app.turn, TurnState::Running));
+    assert!(app.turn_is_running());
     assert!(pending_effects.try_recv().is_err());
 
     app.clear_selection();
@@ -422,13 +460,14 @@ fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
     app.command_input.set("checkpoint".to_owned());
     app.command_input.begin_selection(5);
     app.command_input.extend_selection(10);
-    app.turn = TurnState::Running;
+    set_active_turn(&mut app);
     app.handle_key(ctrl_c, &effects).unwrap();
     assert_eq!(app.command_input.value, "checkpoint");
-    assert!(matches!(app.turn, TurnState::Running));
+    assert!(app.turn_is_running());
 
+    let mut app = test_app(Vec::new());
+    app.overlay = Overlay::Command;
     app.command_input.set("checkpoint".to_owned());
-    app.turn = TurnState::Idle;
     app.handle_key(ctrl_c, &effects).unwrap();
     assert!(app.command_input.value.is_empty());
 }

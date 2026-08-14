@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use atra_protocol::{
-    ApprovalId, BackgroundProcessDetail, CheckpointId, EventSequence, Model, ProcessId,
-    ThreadCheckpoint,
-};
+use atra_protocol::{ApprovalId, CheckpointId, EventSequence, Model, ProcessId};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
@@ -19,30 +16,19 @@ pub(crate) enum TurnState {
     #[default]
     Idle,
     Starting,
-    Running,
-    Reloading,
     Cancelling,
-    AwaitingApproval(Approval),
-    ResolvingApproval(Approval),
+    EnteringDenyReason {
+        approval_id: ApprovalId,
+        reason: InputBuffer,
+    },
+    ResolvingApproval {
+        approval_id: ApprovalId,
+    },
 }
 
 impl TurnState {
-    pub(crate) fn is_running(&self) -> bool {
+    pub(crate) fn is_pending(&self) -> bool {
         !matches!(self, Self::Idle)
-    }
-
-    pub(crate) fn approval(&self) -> Option<&Approval> {
-        match self {
-            Self::AwaitingApproval(approval) => Some(approval),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn approval_mut(&mut self) -> Option<&mut Approval> {
-        match self {
-            Self::AwaitingApproval(approval) => Some(approval),
-            _ => None,
-        }
     }
 }
 
@@ -90,19 +76,6 @@ impl Overlay {
             _ => None,
         }
     }
-}
-
-pub(crate) struct Approval {
-    pub(crate) id: ApprovalId,
-    pub(crate) runner: String,
-    pub(crate) label: String,
-    pub(crate) operation_index: Option<usize>,
-    pub(crate) state: ApprovalState,
-}
-
-pub(crate) enum ApprovalState {
-    Pending,
-    EnteringDenyReason(InputBuffer),
 }
 
 pub(crate) struct ModelPicker {
@@ -196,7 +169,6 @@ pub(crate) enum ThreadPickerState {
 
 pub(crate) struct ProcessPicker {
     pub(crate) selected: usize,
-    pub(crate) detail: Option<BackgroundProcessDetail>,
     pub(crate) output_scroll: usize,
     pub(crate) state: ProcessPickerState,
 }
@@ -210,8 +182,7 @@ pub(crate) enum ProcessPickerState {
 }
 
 pub(crate) struct CheckpointPicker {
-    pub(crate) checkpoints: Vec<ThreadCheckpoint>,
-    pub(crate) selected: usize,
+    pub(crate) selected: CheckpointId,
 }
 
 pub(crate) enum HistoryAction {

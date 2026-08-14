@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
-    ApprovalId, ApprovalPolicy, BackgroundProcess, BackgroundProcessDetail, CheckpointId,
-    CommandMode, ControllerRequest, ControllerResponse, EventSequence, HistoryTarget, Model,
-    ProcessId, Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadId,
-    TurnRequest, UnaryRequest,
+    CheckpointId, CheckpointState, CheckpointSubscriptionMessage, Command, CommandResponse,
+    CommandResult, ControllerChange, ControllerState, ControllerSubscriptionMessage, ProcessChange,
+    ProcessLocator, ProcessState, ProcessSubscriptionMessage, StateRequest, Subscribe,
+    SubscriptionTerminal, ThreadChange, ThreadId, ThreadState, ThreadSubscriptionMessage,
 };
-use serde_json::Value;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::{
@@ -17,7 +17,7 @@ use tokio::{
 };
 
 struct Connection {
-    responses: Lines<BufReader<OwnedReadHalf>>,
+    messages: Lines<BufReader<OwnedReadHalf>>,
     _request: OwnedWriteHalf,
 }
 
@@ -25,217 +25,86 @@ pub struct Client {
     endpoint: PathBuf,
 }
 
-pub struct TurnStream {
+pub struct ControllerSubscription {
     connection: Connection,
-    thread_id: ThreadId,
+    state: ControllerState,
+}
+
+pub struct ThreadSubscription {
+    connection: Connection,
+    state: ThreadState,
+}
+
+pub struct CheckpointSubscription {
+    connection: Connection,
+    state: CheckpointState,
+}
+
+pub struct ProcessSubscription {
+    connection: Connection,
+    state: ProcessState,
 }
 
 #[derive(Debug)]
-pub enum ProviderLoginStatus {
-    LoggedIn { account: Option<String> },
-    LoginRequired,
+pub struct SubscriptionError {
+    terminal: SubscriptionTerminal,
 }
 
-#[derive(Debug)]
-pub enum CancelResult {
-    Cancelled,
-    NotActive,
+impl SubscriptionError {
+    pub fn terminal(&self) -> &SubscriptionTerminal {
+        &self.terminal
+    }
 }
 
-#[derive(Debug)]
-pub enum LaunchResult {
-    Launched,
-    AlreadyRunning,
+impl std::fmt::Display for SubscriptionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.terminal {
+            SubscriptionTerminal::Deleted => formatter.write_str("subscribed resource was deleted"),
+            SubscriptionTerminal::ControllerShutdown => {
+                formatter.write_str("controller is shutting down")
+            }
+            SubscriptionTerminal::Error { message } => formatter.write_str(message),
+        }
+    }
 }
 
-#[derive(Clone, Debug)]
-pub enum TurnResult {
-    ApprovalResolved,
-    Cancelled,
-    Compacted,
-    Completed {
-        content: String,
-    },
-    ApprovalRequired {
-        approval_id: ApprovalId,
-        tool: String,
-        arguments: Value,
-    },
-}
-
-#[derive(Debug)]
-pub struct TurnUpdate {
-    pub thread_id: ThreadId,
-    pub event: TurnEvent,
-}
-
-#[derive(Debug)]
-pub enum TurnEvent {
-    Started,
-    Retry {
-        current: u64,
-        max: u64,
-    },
-    Delta {
-        content: String,
-    },
-    ReasoningSummaryDelta {
-        content: String,
-    },
-    ReasoningSummaryPartAdded,
-    WebSearchUpdate {
-        item_id: String,
-        action: Option<Value>,
-    },
-    ToolCallStarted {
-        item_id: String,
-        name: String,
-    },
-    ToolCallDelta {
-        item_id: String,
-        delta: String,
-    },
-    RunnerOperation {
-        call_id: String,
-        operation_index: usize,
-        update: RunnerOperationUpdate,
-    },
-    Event {
-        event: ThreadEvent,
-    },
-    ApprovalRequired {
-        approval_id: ApprovalId,
-        tool: String,
-        arguments: Value,
-        operation_index: Option<usize>,
-        operation_label: Option<String>,
-    },
-    Finished(TurnResult),
-}
-
-#[derive(Debug)]
-pub enum ProcessResult {
-    Started {
-        process_id: ProcessId,
-    },
-    Running {
-        process_id: ProcessId,
-        output: String,
-    },
-    Finished {
-        output: String,
-        exit_code: Option<i32>,
-    },
-    Stopped {
-        output: String,
-    },
-}
+impl std::error::Error for SubscriptionError {}
 
 impl Connection {
-    async fn open(endpoint: &Path, request: &ControllerRequest) -> Result<Self> {
+    async fn open(endpoint: &Path, request: &StateRequest) -> Result<Self> {
         let stream = UnixStream::connect(endpoint).await.with_context(|| {
             format!("failed to connect to controller at {}", endpoint.display())
         })?;
         let (reader, mut writer) = stream.into_split();
-        let mut encoded =
-            serde_json::to_vec(request).context("failed to encode controller request")?;
-        encoded.push(b'\n');
-        writer
-            .write_all(&encoded)
+        write_json_line(&mut writer, request)
             .await
             .context("failed to write controller request")?;
         Ok(Self {
-            responses: BufReader::new(reader).lines(),
+            messages: BufReader::new(reader).lines(),
             _request: writer,
         })
     }
 
-    async fn receive(&mut self) -> Result<ControllerResponse> {
-        let response = self
-            .responses
+    async fn receive<M: DeserializeOwned>(&mut self) -> Result<M> {
+        let message = self
+            .messages
             .next_line()
             .await
-            .context("failed to read controller response")?
-            .context("controller closed the response stream")?;
-        serde_json::from_str(&response).context("failed to decode controller response")
+            .context("failed to read controller message")?
+            .context("controller closed the message stream")?;
+        serde_json::from_str(&message).context("failed to decode controller message")
     }
 }
 
-impl TurnStream {
-    pub async fn receive(&mut self) -> Result<TurnUpdate> {
-        let event = match self.connection.receive().await? {
-            ControllerResponse::TurnStarted { thread_id } => {
-                self.ensure_thread(thread_id)?;
-                TurnEvent::Started
-            }
-            ControllerResponse::TurnRetry { current, max } => TurnEvent::Retry { current, max },
-            ControllerResponse::TurnDelta { content } => TurnEvent::Delta { content },
-            ControllerResponse::ReasoningSummaryDelta { content } => {
-                TurnEvent::ReasoningSummaryDelta { content }
-            }
-            ControllerResponse::ReasoningSummaryPartAdded => TurnEvent::ReasoningSummaryPartAdded,
-            ControllerResponse::WebSearchUpdate { item_id, action } => {
-                TurnEvent::WebSearchUpdate { item_id, action }
-            }
-            ControllerResponse::ToolCallStarted { item_id, name } => {
-                TurnEvent::ToolCallStarted { item_id, name }
-            }
-            ControllerResponse::ToolCallDelta { item_id, delta } => {
-                TurnEvent::ToolCallDelta { item_id, delta }
-            }
-            ControllerResponse::RunnerOperationUpdate {
-                call_id,
-                operation_index,
-                update,
-            } => TurnEvent::RunnerOperation {
-                call_id,
-                operation_index,
-                update,
-            },
-            ControllerResponse::TurnEvent { event } => TurnEvent::Event { event },
-            ControllerResponse::ApprovalRequired {
-                approval_id,
-                thread_id,
-                tool,
-                arguments,
-                operation_index,
-                operation_label,
-            } => {
-                self.ensure_thread(thread_id)?;
-                TurnEvent::ApprovalRequired {
-                    approval_id,
-                    tool,
-                    arguments,
-                    operation_index,
-                    operation_label,
-                }
-            }
-            ControllerResponse::ApprovalResolved => {
-                TurnEvent::Finished(TurnResult::ApprovalResolved)
-            }
-            ControllerResponse::ThreadCancelled => TurnEvent::Finished(TurnResult::Cancelled),
-            ControllerResponse::TurnCompleted { content } => {
-                TurnEvent::Finished(TurnResult::Completed { content })
-            }
-            ControllerResponse::ThreadCompacted => TurnEvent::Finished(TurnResult::Compacted),
-            ControllerResponse::Error { message } => bail!("{message}"),
-            response => return unexpected(response),
-        };
-        Ok(TurnUpdate {
-            thread_id: self.thread_id,
-            event,
-        })
-    }
+async fn write_json_line(writer: &mut OwnedWriteHalf, message: &impl Serialize) -> Result<()> {
+    let mut encoded = serde_json::to_vec(message).context("failed to encode controller request")?;
+    encoded.push(b'\n');
+    writer.write_all(&encoded).await?;
+    Ok(())
+}
 
-    fn ensure_thread(&self, thread_id: ThreadId) -> Result<()> {
-        if thread_id != self.thread_id {
-            bail!(
-                "controller returned update for thread {thread_id} on thread {} stream",
-                self.thread_id
-            );
-        }
-        Ok(())
-    }
+fn terminal_error(terminal: SubscriptionTerminal) -> anyhow::Error {
+    anyhow::Error::new(SubscriptionError { terminal })
 }
 
 impl Client {
@@ -245,490 +114,153 @@ impl Client {
         }
     }
 
-    pub async fn status(&self) -> Result<()> {
-        match self.unary(UnaryRequest::Status).await? {
-            ControllerResponse::Running => Ok(()),
-            response => unexpected(response),
+    pub async fn command(&self, command: Command) -> Result<CommandResult> {
+        let mut connection =
+            Connection::open(&self.endpoint, &StateRequest::Command(command)).await?;
+        match connection.receive().await? {
+            CommandResponse::Success { result } => Ok(result),
+            CommandResponse::Error { message } => bail!(message),
         }
     }
 
-    pub async fn thread_send(&self, thread_id: ThreadId, message: String) -> Result<TurnStream> {
-        self.turn_stream(TurnRequest::ThreadSend { thread_id, message })
-            .await
-    }
-
-    pub async fn thread_continue(&self, thread_id: ThreadId) -> Result<TurnStream> {
-        self.turn_stream(TurnRequest::ThreadContinue { thread_id })
-            .await
-    }
-
-    pub async fn thread_compact(&self, thread_id: ThreadId) -> Result<TurnStream> {
-        self.turn_stream(TurnRequest::ThreadCompact { thread_id })
-            .await
-    }
-
-    pub async fn provider_logout(&self, provider: String) -> Result<()> {
-        match self
-            .unary(UnaryRequest::ProviderLogout {
-                provider: provider.clone(),
-            })
-            .await?
-        {
-            ControllerResponse::ProviderLoggedOut {
-                provider: logged_out,
-            } if logged_out == provider => Ok(()),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn provider_login(
-        &self,
-        provider: String,
-        credential: Option<String>,
-    ) -> Result<ProviderLoginStatus> {
-        match self
-            .unary(UnaryRequest::ProviderLogin {
-                provider: provider.clone(),
-                credential,
-            })
-            .await?
-        {
-            ControllerResponse::ProviderLoggedIn {
-                provider: logged_in,
-                account,
-            } if logged_in == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
-            ControllerResponse::ProviderLoginRequired { provider: required }
-                if required == provider =>
-            {
-                Ok(ProviderLoginStatus::LoginRequired)
+    pub async fn subscribe_controller(&self) -> Result<ControllerSubscription> {
+        let mut connection = Connection::open(
+            &self.endpoint,
+            &StateRequest::Subscribe(Subscribe::Controller {}),
+        )
+        .await?;
+        let state = match connection.receive().await? {
+            ControllerSubscriptionMessage::Snapshot { state } => state,
+            ControllerSubscriptionMessage::Terminal { terminal } => {
+                return Err(terminal_error(terminal));
             }
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn model_list(&self) -> Result<Vec<Model>> {
-        match self.unary(UnaryRequest::ModelList).await? {
-            ControllerResponse::ModelList { models } => Ok(models),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn provider_login_status(&self, provider: String) -> Result<ProviderLoginStatus> {
-        match self
-            .unary(UnaryRequest::ProviderLoginStatus {
-                provider: provider.clone(),
-            })
-            .await?
-        {
-            ControllerResponse::ProviderLoggedIn {
-                provider: logged_in,
-                account,
-            } if logged_in == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
-            ControllerResponse::ProviderLoginRequired { provider: required }
-                if required == provider =>
-            {
-                Ok(ProviderLoginStatus::LoginRequired)
+            ControllerSubscriptionMessage::Operation { .. } => {
+                bail!("controller sent an operation before the subscription snapshot")
             }
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn provider_reload_auth(&self, provider: String) -> Result<ProviderLoginStatus> {
-        match self
-            .unary(UnaryRequest::ProviderReloadAuth {
-                provider: provider.clone(),
-            })
-            .await?
-        {
-            ControllerResponse::ProviderLoggedIn {
-                provider: reloaded,
-                account,
-            } if reloaded == provider => Ok(ProviderLoginStatus::LoggedIn { account }),
-            ControllerResponse::ProviderLoginRequired { provider: required }
-                if required == provider =>
-            {
-                Ok(ProviderLoginStatus::LoginRequired)
-            }
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn provider_rate_limits(&self, provider: String) -> Result<serde_json::Value> {
-        match self
-            .unary(UnaryRequest::ProviderRateLimits {
-                provider: provider.clone(),
-            })
-            .await?
-        {
-            ControllerResponse::ProviderRateLimits {
-                provider: response_provider,
-                snapshots,
-            } if response_provider == provider => Ok(snapshots),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_create(&self, display_name: Option<String>) -> Result<ThreadId> {
-        match self
-            .unary(UnaryRequest::ThreadCreate { display_name })
-            .await?
-        {
-            ControllerResponse::ThreadCreated { thread_id } => Ok(thread_id),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_list(&self) -> Result<Vec<Thread>> {
-        match self.unary(UnaryRequest::ThreadList).await? {
-            ControllerResponse::ThreadList { threads } => Ok(threads),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_rename(&self, thread_id: ThreadId, display_name: String) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::ThreadRename {
-                thread_id,
-                display_name,
-            })
-            .await?,
-            ControllerResponse::ThreadRenamed,
-        )
-    }
-
-    pub async fn thread_delete(&self, thread_id: ThreadId) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::ThreadDelete { thread_id }).await?,
-            ControllerResponse::ThreadDeleted,
-        )
-    }
-
-    pub async fn thread_set_model(
-        &self,
-        thread_id: ThreadId,
-        provider: String,
-        model: String,
-        reasoning_effort: String,
-    ) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::ThreadSetModel {
-                thread_id,
-                provider,
-                model,
-                reasoning_effort,
-            })
-            .await?,
-            ControllerResponse::ThreadModelChanged,
-        )
-    }
-
-    pub async fn thread_events(&self, thread_id: ThreadId) -> Result<Vec<ThreadEvent>> {
-        match self.unary(UnaryRequest::ThreadEvents { thread_id }).await? {
-            ControllerResponse::ThreadEvents { events } => Ok(events),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_cancel(&self, thread_id: ThreadId) -> Result<CancelResult> {
-        match self.unary(UnaryRequest::ThreadCancel { thread_id }).await? {
-            ControllerResponse::ThreadCancelled => Ok(CancelResult::Cancelled),
-            ControllerResponse::ThreadNotActive => Ok(CancelResult::NotActive),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_process_list(&self, thread_id: ThreadId) -> Result<Vec<BackgroundProcess>> {
-        match self
-            .unary(UnaryRequest::ThreadProcessList { thread_id })
-            .await?
-        {
-            ControllerResponse::ThreadProcessList { processes } => Ok(processes),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_process_inspect(
-        &self,
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    ) -> Result<BackgroundProcessDetail> {
-        match self
-            .unary(UnaryRequest::ThreadProcessInspect {
-                thread_id,
-                runner,
-                process_id,
-            })
-            .await?
-        {
-            ControllerResponse::ThreadProcessInspect { process } => Ok(process),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn checkpoint_create(&self, thread_id: ThreadId) -> Result<CheckpointId> {
-        match self
-            .unary(UnaryRequest::ThreadCheckpointCreate { thread_id })
-            .await?
-        {
-            ControllerResponse::ThreadCheckpointCreated { checkpoint_id } => Ok(checkpoint_id),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn checkpoint_list(&self, thread_id: ThreadId) -> Result<Vec<ThreadCheckpoint>> {
-        match self
-            .unary(UnaryRequest::ThreadCheckpointList { thread_id })
-            .await?
-        {
-            ControllerResponse::ThreadCheckpointList { checkpoints } => Ok(checkpoints),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn checkpoint_events(&self, checkpoint_id: CheckpointId) -> Result<Vec<ThreadEvent>> {
-        match self
-            .unary(UnaryRequest::ThreadCheckpointEvents { checkpoint_id })
-            .await?
-        {
-            ControllerResponse::ThreadCheckpointEvents { events } => Ok(events),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn checkpoint_restore(
-        &self,
-        thread_id: ThreadId,
-        checkpoint_id: CheckpointId,
-    ) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::ThreadReplaceHistory {
-                thread_id,
-                target: HistoryTarget::Checkpoint { checkpoint_id },
-            })
-            .await?,
-            ControllerResponse::ThreadHistoryReplaced,
-        )
-    }
-
-    pub async fn thread_fork(
-        &self,
-        thread_id: ThreadId,
-        checkpoint_id: Option<CheckpointId>,
-        sequence: EventSequence,
-        display_name: Option<String>,
-    ) -> Result<ThreadId> {
-        match self
-            .unary(UnaryRequest::ThreadFork {
-                thread_id,
-                checkpoint_id,
-                sequence,
-                display_name,
-            })
-            .await?
-        {
-            ControllerResponse::ThreadForked { thread_id } => Ok(thread_id),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn thread_rewind(
-        &self,
-        thread_id: ThreadId,
-        checkpoint_id: Option<CheckpointId>,
-        sequence: EventSequence,
-    ) -> Result<()> {
-        expect_unit(
-            self.unary(UnaryRequest::ThreadReplaceHistory {
-                thread_id,
-                target: HistoryTarget::Message {
-                    checkpoint_id,
-                    sequence,
-                },
-            })
-            .await?,
-            ControllerResponse::ThreadHistoryReplaced,
-        )
-    }
-
-    pub async fn approval_allow(&self, approval_id: ApprovalId) -> Result<TurnResult> {
-        decode_turn(
-            self.unary(UnaryRequest::ApprovalAllow { approval_id })
-                .await?,
-        )
-    }
-
-    pub async fn approval_deny(
-        &self,
-        approval_id: ApprovalId,
-        reason: Option<String>,
-    ) -> Result<TurnResult> {
-        decode_turn(
-            self.unary(UnaryRequest::ApprovalDeny {
-                approval_id,
-                reason,
-            })
-            .await?,
-        )
-    }
-
-    pub async fn runner_list(&self) -> Result<Vec<Runner>> {
-        match self.unary(UnaryRequest::RunnerList).await? {
-            ControllerResponse::RunnerList { runners } => Ok(runners),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn runner_launch(
-        &self,
-        name: String,
-        description: String,
-        approval: ApprovalPolicy,
-        command: Vec<String>,
-    ) -> Result<LaunchResult> {
-        match self
-            .unary(UnaryRequest::RunnerLaunch {
-                name,
-                description,
-                approval,
-                command,
-            })
-            .await?
-        {
-            ControllerResponse::Launched => Ok(LaunchResult::Launched),
-            ControllerResponse::AlreadyRunning => Ok(LaunchResult::AlreadyRunning),
-            response => unexpected(response),
-        }
-    }
-
-    pub async fn exec_command(
-        &self,
-        thread_id: ThreadId,
-        runner: String,
-        command: String,
-        mode: CommandMode,
-    ) -> Result<ProcessResult> {
-        decode_process(
-            self.unary(UnaryRequest::ExecCommand {
-                thread_id,
-                runner,
-                command,
-                mode,
-            })
-            .await?,
-        )
-    }
-
-    pub async fn wait_process(
-        &self,
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-        timeout_ms: u64,
-    ) -> Result<ProcessResult> {
-        decode_process(
-            self.unary(UnaryRequest::WaitProcess {
-                thread_id,
-                runner,
-                process_id,
-                timeout_ms,
-            })
-            .await?,
-        )
-    }
-
-    pub async fn stop_process(
-        &self,
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    ) -> Result<ProcessResult> {
-        decode_process(
-            self.unary(UnaryRequest::StopProcess {
-                thread_id,
-                runner,
-                process_id,
-            })
-            .await?,
-        )
-    }
-
-    async fn unary(&self, request: UnaryRequest) -> Result<ControllerResponse> {
-        let request = ControllerRequest::Unary(request);
-        let mut connection = Connection::open(&self.endpoint, &request).await?;
-        loop {
-            match connection.receive().await? {
-                ControllerResponse::TurnDelta { .. }
-                | ControllerResponse::ReasoningSummaryDelta { .. }
-                | ControllerResponse::ReasoningSummaryPartAdded
-                | ControllerResponse::ToolCallStarted { .. }
-                | ControllerResponse::ToolCallDelta { .. }
-                | ControllerResponse::RunnerOperationUpdate { .. }
-                | ControllerResponse::TurnEvent { .. } => {}
-                ControllerResponse::Error { message } => bail!("{message}"),
-                response => return Ok(response),
-            }
-        }
-    }
-
-    async fn turn_stream(&self, request: TurnRequest) -> Result<TurnStream> {
-        let thread_id = match &request {
-            TurnRequest::ThreadSend { thread_id, .. }
-            | TurnRequest::ThreadContinue { thread_id }
-            | TurnRequest::ThreadCompact { thread_id } => *thread_id,
         };
-        let request = ControllerRequest::Turn(request);
-        Ok(TurnStream {
-            connection: Connection::open(&self.endpoint, &request).await?,
-            thread_id,
-        })
+        Ok(ControllerSubscription { connection, state })
+    }
+
+    pub async fn subscribe_thread(&self, thread_id: ThreadId) -> Result<ThreadSubscription> {
+        let mut connection = Connection::open(
+            &self.endpoint,
+            &StateRequest::Subscribe(Subscribe::Thread { thread_id }),
+        )
+        .await?;
+        let state = match connection.receive().await? {
+            ThreadSubscriptionMessage::Snapshot { state } => state,
+            ThreadSubscriptionMessage::Terminal { terminal } => {
+                return Err(terminal_error(terminal));
+            }
+            ThreadSubscriptionMessage::Operation { .. } => {
+                bail!("controller sent an operation before the subscription snapshot")
+            }
+        };
+        Ok(ThreadSubscription { connection, state })
+    }
+
+    pub async fn subscribe_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> Result<CheckpointSubscription> {
+        let mut connection = Connection::open(
+            &self.endpoint,
+            &StateRequest::Subscribe(Subscribe::Checkpoint { checkpoint_id }),
+        )
+        .await?;
+        let state = match connection.receive().await? {
+            CheckpointSubscriptionMessage::Snapshot { state } => state,
+            CheckpointSubscriptionMessage::Terminal { terminal } => {
+                return Err(terminal_error(terminal));
+            }
+        };
+        Ok(CheckpointSubscription { connection, state })
+    }
+
+    pub async fn subscribe_process(&self, process: ProcessLocator) -> Result<ProcessSubscription> {
+        let mut connection = Connection::open(
+            &self.endpoint,
+            &StateRequest::Subscribe(Subscribe::Process { process }),
+        )
+        .await?;
+        let state = match connection.receive().await? {
+            ProcessSubscriptionMessage::Snapshot { state } => state,
+            ProcessSubscriptionMessage::Terminal { terminal } => {
+                return Err(terminal_error(terminal));
+            }
+            ProcessSubscriptionMessage::Operation { .. } => {
+                bail!("controller sent an operation before the subscription snapshot")
+            }
+        };
+        Ok(ProcessSubscription { connection, state })
     }
 }
 
-fn expect_unit(response: ControllerResponse, expected: ControllerResponse) -> Result<()> {
-    if response == expected {
-        Ok(())
-    } else {
-        unexpected(response)
+impl ControllerSubscription {
+    pub fn state(&self) -> &ControllerState {
+        &self.state
     }
-}
 
-fn decode_turn(response: ControllerResponse) -> Result<TurnResult> {
-    match response {
-        ControllerResponse::ApprovalResolved => Ok(TurnResult::ApprovalResolved),
-        ControllerResponse::ThreadCancelled => Ok(TurnResult::Cancelled),
-        ControllerResponse::ThreadCompacted => Ok(TurnResult::Compacted),
-        ControllerResponse::TurnCompleted { content } => Ok(TurnResult::Completed { content }),
-        ControllerResponse::ApprovalRequired {
-            approval_id,
-            tool,
-            arguments,
-            ..
-        } => Ok(TurnResult::ApprovalRequired {
-            approval_id,
-            tool,
-            arguments,
-        }),
-        response => unexpected(response),
-    }
-}
-
-fn decode_process(response: ControllerResponse) -> Result<ProcessResult> {
-    match response {
-        ControllerResponse::ProcessStarted { process_id } => {
-            Ok(ProcessResult::Started { process_id })
+    pub async fn receive(&mut self) -> Result<ControllerChange> {
+        match self.connection.receive().await? {
+            ControllerSubscriptionMessage::Operation { operation } => operation
+                .apply(&mut self.state)
+                .context("controller operation could not be applied"),
+            ControllerSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
+            ControllerSubscriptionMessage::Snapshot { .. } => {
+                bail!("controller sent a second subscription snapshot")
+            }
         }
-        ControllerResponse::ProcessRunning { process_id, output } => {
-            Ok(ProcessResult::Running { process_id, output })
-        }
-        ControllerResponse::ProcessFinished { output, exit_code } => {
-            Ok(ProcessResult::Finished { output, exit_code })
-        }
-        ControllerResponse::ProcessStopped { output } => Ok(ProcessResult::Stopped { output }),
-        response => unexpected(response),
     }
 }
 
-fn unexpected<T>(response: ControllerResponse) -> Result<T> {
-    bail!("controller returned an unexpected response: {response:?}")
+impl ThreadSubscription {
+    pub fn state(&self) -> &ThreadState {
+        &self.state
+    }
+
+    pub async fn receive(&mut self) -> Result<ThreadChange> {
+        match self.connection.receive().await? {
+            ThreadSubscriptionMessage::Operation { operation } => operation
+                .apply(&mut self.state)
+                .context("thread operation could not be applied"),
+            ThreadSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
+            ThreadSubscriptionMessage::Snapshot { .. } => {
+                bail!("controller sent a second subscription snapshot")
+            }
+        }
+    }
+}
+
+impl CheckpointSubscription {
+    pub fn state(&self) -> &CheckpointState {
+        &self.state
+    }
+
+    pub async fn receive_terminal(&mut self) -> Result<()> {
+        match self.connection.receive().await? {
+            CheckpointSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
+            CheckpointSubscriptionMessage::Snapshot { .. } => {
+                bail!("controller sent a second subscription snapshot")
+            }
+        }
+    }
+}
+
+impl ProcessSubscription {
+    pub fn state(&self) -> &ProcessState {
+        &self.state
+    }
+
+    pub async fn receive(&mut self) -> Result<ProcessChange> {
+        match self.connection.receive().await? {
+            ProcessSubscriptionMessage::Operation { operation } => operation
+                .apply(&mut self.state)
+                .context("process operation could not be applied"),
+            ProcessSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
+            ProcessSubscriptionMessage::Snapshot { .. } => {
+                bail!("controller sent a second subscription snapshot")
+            }
+        }
+    }
 }

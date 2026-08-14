@@ -13,8 +13,8 @@ use crate::{
     layout::SelectionPoint,
     runtime::{ApprovalDecision, Effect, HistoryOperation},
     state::{
-        ApprovalState, FocusPane, HistoryAction, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
+        FocusPane, HistoryAction, ModelPicker, ModelPickerStage, Overlay, ProcessPicker,
+        ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
     },
     text::offset_at_position,
     transcript::{sanitize, transcript_text},
@@ -42,10 +42,9 @@ impl App {
         key: KeyEvent,
         effects: &mpsc::UnboundedSender<Effect>,
     ) -> Result<bool> {
-        if matches!(
-            self.turn,
-            TurnState::Starting | TurnState::Running | TurnState::ResolvingApproval(_)
-        ) && self.overlay.is_none()
+        if self.turn_is_running()
+            && self.pending_approval().is_none()
+            && self.overlay.is_none()
             && key.code == KeyCode::Esc
         {
             self.cancel_turn(effects);
@@ -85,44 +84,62 @@ impl App {
             return Ok(false);
         }
 
-        if self.turn.approval().is_some() && is_ctrl_c(key) {
+        if (self.pending_approval().is_some()
+            || matches!(self.turn, TurnState::EnteringDenyReason { .. }))
+            && is_ctrl_c(key)
+        {
             self.handle_ctrl_c(effects)?;
             return Ok(false);
         }
 
-        if let Some(approval) = self.turn.approval_mut() {
-            if key.code == KeyCode::Esc && matches!(approval.state, ApprovalState::Pending) {
-                self.cancel_turn(effects);
-                return Ok(false);
-            }
-            match &mut approval.state {
-                ApprovalState::EnteringDenyReason(reason) => match key.code {
-                    KeyCode::Enter => {
-                        let id = approval.id;
-                        let reason = reason.take();
-                        let reason = (!reason.trim().is_empty()).then_some(reason);
-                        self.resolve_approval(id, false, reason, effects);
-                    }
-                    KeyCode::Esc => approval.state = ApprovalState::Pending,
-                    _ => {
-                        reason.handle_key(key, &self.word_segmenter);
-                    }
-                },
-                ApprovalState::Pending => match key.code {
-                    KeyCode::Char('y') => {
-                        let id = approval.id;
-                        self.resolve_approval(id, true, None, effects);
-                    }
-                    KeyCode::Char('n') => {
-                        approval.state =
-                            ApprovalState::EnteringDenyReason(InputBuffer::new(Vec::new(), false));
-                    }
-                    _ => {}
-                },
+        if let TurnState::EnteringDenyReason {
+            approval_id,
+            reason,
+        } = &mut self.turn
+        {
+            match key.code {
+                KeyCode::Enter => {
+                    let approval_id = *approval_id;
+                    let reason = reason.take();
+                    let reason = (!reason.trim().is_empty()).then_some(reason);
+                    self.resolve_approval(approval_id, false, reason, effects);
+                }
+                KeyCode::Esc => self.reset_turn_interaction(),
+                _ => {
+                    reason.handle_key(key, &self.word_segmenter);
+                }
             }
             return Ok(false);
         }
 
+        if let Some(approval_id) = self.pending_approval().map(|approval| approval.id()) {
+            match key.code {
+                KeyCode::Esc => self.cancel_turn(effects),
+                KeyCode::Char('y') => {
+                    self.resolve_approval(approval_id, true, None, effects);
+                }
+                KeyCode::Char('n') => {
+                    self.turn = TurnState::EnteringDenyReason {
+                        approval_id,
+                        reason: InputBuffer::new(Vec::new(), false),
+                    };
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        let processes = self
+            .processes()
+            .iter()
+            .map(|process| {
+                (
+                    process.locator().runner().to_owned(),
+                    process.locator().process_id().clone(),
+                    process.status().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         if let Overlay::Processes(picker) = &mut self.overlay {
             if let ProcessPickerState::ConfirmingStop { runner, process_id } = &picker.state {
                 match key.code {
@@ -153,22 +170,21 @@ impl App {
                     picker.selected = selected;
                 }
                 KeyCode::Down => {
-                    let selected =
-                        (picker.selected + 1).min(self.processes.len().saturating_sub(1));
+                    let selected = (picker.selected + 1).min(processes.len().saturating_sub(1));
                     refresh_detail = selected != picker.selected;
                     picker.selected = selected;
                 }
                 KeyCode::PageUp => picker.output_scroll = picker.output_scroll.saturating_add(10),
                 KeyCode::PageDown => picker.output_scroll = picker.output_scroll.saturating_sub(10),
                 KeyCode::Char('x')
-                    if self.processes.get(picker.selected).is_some_and(|process| {
-                        matches!(process.status, ProcessStatus::Running)
-                    }) =>
+                    if processes
+                        .get(picker.selected)
+                        .is_some_and(|process| matches!(process.2, ProcessStatus::Running)) =>
                 {
-                    let process = &self.processes[picker.selected];
+                    let process = &processes[picker.selected];
                     picker.state = ProcessPickerState::ConfirmingStop {
-                        runner: process.runner.clone(),
-                        process_id: process.process_id.clone(),
+                        runner: process.0.clone(),
+                        process_id: process.1.clone(),
                     };
                 }
                 KeyCode::Esc => {
@@ -178,11 +194,11 @@ impl App {
                 _ => {}
             }
             if refresh_detail {
+                self.process_subscription = None;
                 if let Overlay::Processes(picker) = &mut self.overlay {
-                    picker.detail = None;
                     picker.output_scroll = 0;
                 }
-                self.poll_processes(effects);
+                self.select_process(effects);
             }
             return Ok(false);
         }
@@ -212,7 +228,7 @@ impl App {
                 if self.message_input.value.starts_with('/') {
                     let command = self.message_input.take();
                     return self.execute_command(&command, effects);
-                } else if !self.turn.is_running() {
+                } else if !self.turn_is_running() {
                     self.send(effects)?;
                 }
                 return Ok(false);
@@ -222,7 +238,7 @@ impl App {
                     self.overlay = Overlay::Rename;
                     self.view.focus = FocusPane::Input;
                     let display_name = self
-                        .threads
+                        .threads()
                         .iter()
                         .find(|thread| Some(thread.id) == self.target.thread_id())
                         .and_then(|thread| thread.display_name.clone())
@@ -387,7 +403,12 @@ impl App {
             return Ok(false);
         }
 
-        if matches!(self.overlay, Overlay::ThreadPicker(_)) && self.threads.is_empty() {
+        let thread_ids = self
+            .threads()
+            .iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        if matches!(self.overlay, Overlay::ThreadPicker(_)) && thread_ids.is_empty() {
             self.overlay = Overlay::None;
             self.activity = Some(Activity::Info("No threads are available".to_owned()));
             return Ok(false);
@@ -400,7 +421,7 @@ impl App {
             if matches!(picker.state, ThreadPickerState::ConfirmingDelete) {
                 match key.code {
                     KeyCode::Char('y') => {
-                        let thread_id = self.threads[picker.selected].id;
+                        let thread_id = thread_ids[picker.selected];
                         self.activity = Some(Activity::Info("Deleting thread…".to_owned()));
                         effects
                             .send(Effect::DeleteThread {
@@ -420,14 +441,13 @@ impl App {
             match key.code {
                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
                 KeyCode::Down => {
-                    picker.selected =
-                        (picker.selected + 1).min(self.threads.len().saturating_sub(1));
+                    picker.selected = (picker.selected + 1).min(thread_ids.len().saturating_sub(1));
                 }
                 KeyCode::Char('x') => {
                     picker.state = ThreadPickerState::ConfirmingDelete;
                 }
                 KeyCode::Enter => {
-                    let thread_id = self.threads[picker.selected].id;
+                    let thread_id = thread_ids[picker.selected];
                     self.overlay = Overlay::None;
                     self.select_thread(thread_id, effects);
                 }
@@ -443,38 +463,43 @@ impl App {
         if self.view.focus == FocusPane::Checkpoints
             && let Some(picker) = self.target.checkpoint_picker_mut()
         {
+            let mut selected = None;
             match key.code {
                 KeyCode::Up => {
-                    let selected = picker.selected.saturating_sub(1);
-                    if selected != picker.selected {
-                        picker.selected = selected;
-                        let checkpoint = picker.checkpoints[selected].clone();
-                        self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
-                        effects
-                            .send(Effect::LoadCheckpoint {
-                                endpoint: self.endpoint.clone(),
-                                checkpoint,
-                            })
-                            .ok();
-                    }
+                    selected = Some(-1_isize);
                 }
                 KeyCode::Down => {
-                    let selected =
-                        (picker.selected + 1).min(picker.checkpoints.len().saturating_sub(1));
-                    if selected != picker.selected {
-                        picker.selected = selected;
-                        let checkpoint = picker.checkpoints[selected].clone();
-                        self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
-                        effects
-                            .send(Effect::LoadCheckpoint {
-                                endpoint: self.endpoint.clone(),
-                                checkpoint,
-                            })
-                            .ok();
-                    }
+                    selected = Some(1);
                 }
                 KeyCode::Esc => {}
                 _ => return Ok(false),
+            }
+            let current = picker.selected;
+            if let Some(offset) = selected {
+                let checkpoints = self.checkpoints();
+                let current_index = checkpoints
+                    .iter()
+                    .position(|checkpoint| checkpoint.id == current)
+                    .unwrap_or_default();
+                let selected_index = current_index
+                    .saturating_add_signed(offset)
+                    .min(checkpoints.len().saturating_sub(1));
+                if let Some(checkpoint) = checkpoints.get(selected_index)
+                    && checkpoint.id != current
+                {
+                    let checkpoint_id = checkpoint.id;
+                    self.target
+                        .checkpoint_picker_mut()
+                        .expect("checkpoint picker was present")
+                        .selected = checkpoint_id;
+                    self.activity = Some(Activity::Info("Loading checkpoint…".to_owned()));
+                    effects
+                        .send(Effect::LoadCheckpoint {
+                            endpoint: self.endpoint.clone(),
+                            checkpoint_id,
+                        })
+                        .ok();
+                }
             }
             if key.code != KeyCode::Esc {
                 return Ok(false);
@@ -592,35 +617,36 @@ impl App {
         self.target.thread_id().context("no thread is selected")?;
         self.overlay = Overlay::Processes(ProcessPicker {
             selected: 0,
-            detail: None,
             output_scroll: 0,
             state: ProcessPickerState::Browsing,
         });
         self.activity = Some(Activity::Info(
             "↑/↓ select · PageUp/PageDown output · x stop · Esc close".to_owned(),
         ));
-        self.poll_processes(effects);
+        self.select_process(effects);
         Ok(())
     }
 
-    pub(crate) fn poll_processes(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
+    pub(crate) fn select_process(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
         let Some(thread_id) = self.target.thread_id() else {
-            self.processes.clear();
+            self.process_subscription = None;
             return;
         };
-        if self.process_refresh_pending {
+        if self.process_selection_pending {
             return;
         }
         let selected = match &self.overlay {
-            Overlay::Processes(picker) => self
-                .processes
-                .get(picker.selected)
-                .map(|process| (process.runner.clone(), process.process_id.clone())),
+            Overlay::Processes(picker) => self.processes().get(picker.selected).map(|process| {
+                (
+                    process.locator().runner().to_owned(),
+                    process.locator().process_id().clone(),
+                )
+            }),
             _ => None,
         };
-        self.process_refresh_pending = true;
+        self.process_selection_pending = true;
         effects
-            .send(Effect::PollProcesses {
+            .send(Effect::SelectProcess {
                 endpoint: self.endpoint.clone(),
                 thread_id,
                 selected,
@@ -633,34 +659,33 @@ impl App {
         self.overlay = Overlay::None;
     }
 
-    pub(super) fn reset_to_new_thread(&mut self) {
-        self.target = Target::New {
-            model: self.models.first().map(|model| {
-                (
-                    model.provider.clone(),
-                    model.id.clone(),
-                    model.default_reasoning_effort.clone(),
-                )
-            }),
-        };
-        self.processes.clear();
+    pub(crate) fn reset_to_new_thread(&mut self) {
+        let model = self.models().first().map(|model| {
+            (
+                model.provider.clone(),
+                model.id.clone(),
+                model.default_reasoning_effort.clone(),
+            )
+        });
+        self.target = Target::New { model };
+        self.process_subscription = None;
         self.transcript.clear();
         self.message_input.clear();
         self.clear_selection();
         self.reset_view();
         self.metrics_stale = false;
-        self.rate_limits = serde_json::Value::Array(Vec::new());
         self.activity = Some(Activity::Info("New thread".to_owned()));
     }
 
     fn open_model_picker(&mut self) -> Result<()> {
         self.overlay = Overlay::None;
-        if self.models.is_empty() {
+        let models = self.models();
+        if models.is_empty() {
             self.activity = Some(Activity::Info("No models are available".to_owned()));
             return Ok(());
         }
         let selected = self
-            .threads
+            .threads()
             .iter()
             .find(|thread| Some(thread.id) == self.target.thread_id())
             .map(|thread| {
@@ -677,8 +702,7 @@ impl App {
                         (provider.as_str(), model.as_str(), effort.as_str())
                     })
             });
-        let model_index = self
-            .models
+        let model_index = models
             .iter()
             .position(|model| {
                 selected.is_some_and(|(provider, selected, _)| {
@@ -686,13 +710,13 @@ impl App {
                 })
             })
             .unwrap_or(0);
-        let effort_index = self.models[model_index]
+        let effort_index = models[model_index]
             .supported_reasoning_efforts
             .iter()
             .position(|effort| selected.is_some_and(|(_, _, selected)| effort == selected))
             .unwrap_or(0);
         let mut picker = ModelPicker {
-            models: self.models.clone(),
+            models,
             provider_index: 0,
             model_index,
             effort_index,
@@ -713,12 +737,12 @@ impl App {
 
     fn open_thread_picker(&mut self) {
         self.overlay = Overlay::None;
-        if self.threads.is_empty() {
+        if self.threads().is_empty() {
             self.activity = Some(Activity::Info("No threads are available".to_owned()));
             return;
         }
         let selected = self
-            .threads
+            .threads()
             .iter()
             .position(|thread| Some(thread.id) == self.target.thread_id())
             .unwrap_or(0);
@@ -743,10 +767,10 @@ impl App {
 
     fn create_checkpoint(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
         let thread_id = self.target.thread_id().context("no thread is selected")?;
-        if self.target.checkpoint().is_some() {
+        if self.checkpoint().is_some() {
             bail!("cannot checkpoint a checkpoint view");
         }
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("cannot checkpoint while a turn is running");
         }
         self.activity = Some(Activity::Info("Creating checkpoint…".to_owned()));
@@ -763,14 +787,16 @@ impl App {
 
     fn open_checkpoints(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
         let thread_id = self.target.thread_id().context("no thread is selected")?;
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("cannot browse checkpoints while a turn is running");
         }
+        let checkpoint_id = self.checkpoints().first().map(|checkpoint| checkpoint.id);
         self.activity = Some(Activity::Info("Loading checkpoints…".to_owned()));
         effects
             .send(Effect::LoadCheckpoints {
                 endpoint: self.endpoint.clone(),
                 thread_id,
+                checkpoint_id,
             })
             .ok();
         Ok(())
@@ -793,7 +819,7 @@ impl App {
 
     fn fork_selected(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
         let thread_id = self.target.thread_id().context("no thread is selected")?;
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("cannot fork while a turn is running");
         }
         let (sequence, draft) = self.selected_history_point()?;
@@ -804,11 +830,7 @@ impl App {
                 thread_id,
                 draft,
                 operation: HistoryOperation::Fork {
-                    checkpoint_id: self
-                        .target
-                        .checkpoint()
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.id),
+                    checkpoint_id: self.checkpoint().map(|checkpoint| checkpoint.id),
                     sequence,
                 },
             })
@@ -817,16 +839,12 @@ impl App {
     }
 
     fn confirm_rewind(&mut self) -> Result<()> {
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("cannot rewind while a turn is running");
         }
         let (sequence, draft) = self.selected_history_point()?;
         self.overlay = Overlay::HistoryConfirmation(HistoryAction::Rewind {
-            checkpoint_id: self
-                .target
-                .checkpoint()
-                .as_ref()
-                .map(|checkpoint| checkpoint.id),
+            checkpoint_id: self.checkpoint().map(|checkpoint| checkpoint.id),
             sequence,
             draft,
         });
@@ -837,11 +855,10 @@ impl App {
     }
 
     fn confirm_restore(&mut self) -> Result<()> {
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("cannot restore while a turn is running");
         }
         let checkpoint_id = self
-            .target
             .checkpoint()
             .context("open a checkpoint with /checkpoints first")?
             .id;
@@ -888,10 +905,10 @@ impl App {
 
     fn continue_thread(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
         let thread_id = self.target.thread_id().context("no thread is selected")?;
-        if self.target.checkpoint().is_some() {
+        if self.checkpoint().is_some() {
             bail!("cannot continue a checkpoint view");
         }
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("a turn is already running");
         }
         self.turn = TurnState::Starting;
@@ -907,10 +924,10 @@ impl App {
 
     fn compact_thread(&mut self, effects: &mpsc::UnboundedSender<Effect>) -> Result<()> {
         let thread_id = self.target.thread_id().context("no thread is selected")?;
-        if self.target.checkpoint().is_some() {
+        if self.checkpoint().is_some() {
             bail!("cannot compact a checkpoint view");
         }
-        if self.turn.is_running() {
+        if self.turn_is_running() {
             bail!("a turn is already running");
         }
         self.turn = TurnState::Starting;
@@ -1169,10 +1186,7 @@ impl App {
 
     fn cancel_turn(&mut self, effects: &mpsc::UnboundedSender<Effect>) {
         self.overlay = Overlay::None;
-        let started = matches!(
-            self.turn,
-            TurnState::Running | TurnState::AwaitingApproval(_) | TurnState::ResolvingApproval(_)
-        );
+        let started = self.active_turn().is_some();
         self.turn = TurnState::Cancelling;
         self.activity = Some(Activity::Info("Cancelling…".to_owned()));
         if started {
@@ -1220,7 +1234,6 @@ impl App {
             self.target = Target::New {
                 model: Some((provider, model, reasoning_effort)),
             };
-            self.rate_limits = serde_json::Value::Array(Vec::new());
             self.overlay = Overlay::None;
             self.metrics_stale = true;
             self.activity = Some(Activity::Info("Model selected for new thread".to_owned()));
@@ -1252,15 +1265,13 @@ impl App {
         } else {
             ApprovalDecision::Deny { reason }
         };
-        self.transcript.set_pending_approval(None);
-        let approval = match std::mem::replace(&mut self.turn, TurnState::Running) {
-            TurnState::AwaitingApproval(approval) => approval,
-            state => {
-                self.turn = state;
-                return;
-            }
-        };
-        self.turn = TurnState::ResolvingApproval(approval);
+        if self
+            .pending_approval()
+            .is_none_or(|approval| approval.id() != approval_id)
+        {
+            return;
+        }
+        self.turn = TurnState::ResolvingApproval { approval_id };
         self.overlay = Overlay::None;
         self.activity = Some(Activity::Info(
             "Waiting for Atra Controller… · Esc cancels".to_owned(),
@@ -1275,16 +1286,15 @@ impl App {
     }
 
     pub(super) fn restore_failed_approval(&mut self, approval_id: ApprovalId) {
-        let approval = match std::mem::replace(&mut self.turn, TurnState::Running) {
-            TurnState::ResolvingApproval(approval) if approval.id == approval_id => approval,
-            state => {
-                self.turn = state;
-                return;
-            }
-        };
-        self.transcript
-            .set_pending_approval(approval.operation_index);
-        self.turn = TurnState::AwaitingApproval(approval);
+        if matches!(
+            self.turn,
+            TurnState::ResolvingApproval {
+                approval_id: current,
+                ..
+            } if current == approval_id
+        ) {
+            self.reset_turn_interaction();
+        }
     }
 
     fn point_at(&self, column: u16, row: u16) -> Option<SelectionPoint> {
@@ -1301,21 +1311,15 @@ impl App {
     }
 
     fn composer_input(&self) -> Option<&InputBuffer> {
-        if let Some(approval) = self.turn.approval() {
-            return match &approval.state {
-                ApprovalState::EnteringDenyReason(reason) => Some(reason),
-                ApprovalState::Pending => None,
-            };
+        if let TurnState::EnteringDenyReason { reason, .. } = &self.turn {
+            return Some(reason);
         }
         matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&self.message_input)
     }
 
     fn composer_input_mut(&mut self) -> Option<&mut InputBuffer> {
-        if let Some(approval) = self.turn.approval_mut() {
-            return match &mut approval.state {
-                ApprovalState::EnteringDenyReason(reason) => Some(reason),
-                ApprovalState::Pending => None,
-            };
+        if let TurnState::EnteringDenyReason { reason, .. } = &mut self.turn {
+            return Some(reason);
         }
         matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&mut self.message_input)
     }
@@ -1360,22 +1364,14 @@ impl App {
         {
             return self.copy_selection();
         }
-        if matches!(
-            self.turn,
-            TurnState::Starting
-                | TurnState::Running
-                | TurnState::AwaitingApproval(_)
-                | TurnState::ResolvingApproval(_)
-        ) {
+        if self.turn_is_running() {
             self.cancel_turn(effects);
             return Ok(());
         }
 
         if matches!(self.overlay, Overlay::Command) {
             self.command_input.clear();
-        } else if let Some(approval) = self.turn.approval_mut()
-            && let ApprovalState::EnteringDenyReason(reason) = &mut approval.state
-        {
+        } else if let TurnState::EnteringDenyReason { reason, .. } = &mut self.turn {
             reason.clear();
         } else if !self.message_input.value.is_empty() {
             let input = self.message_input.take();
@@ -1387,11 +1383,8 @@ impl App {
     fn input_selection_text(&self) -> Option<String> {
         let input = if matches!(self.overlay, Overlay::Command) {
             &self.command_input
-        } else if let Some(approval) = self.turn.approval() {
-            match &approval.state {
-                ApprovalState::EnteringDenyReason(reason) => reason,
-                ApprovalState::Pending => return None,
-            }
+        } else if let TurnState::EnteringDenyReason { reason, .. } = &self.turn {
+            reason
         } else {
             &self.message_input
         };

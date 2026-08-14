@@ -8,13 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::ControllerRequest;
+use atra_protocol::{Command as StateCommand, CommandResult};
 use rustix::process::getuid;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::AsyncWriteExt,
-    net::UnixStream,
     process::Command,
     time::{Instant, sleep},
 };
@@ -306,8 +304,8 @@ pub(crate) async fn stop_controller(endpoint: &Path) -> Result<()> {
 }
 
 pub(crate) async fn controller_status(endpoint: &Path) -> Result<()> {
-    match client(endpoint).status().await {
-        Ok(()) => println!("running"),
+    match client(endpoint).subscribe_controller().await {
+        Ok(_) => println!("running"),
         Err(error) if controller_not_running(&error) => println!("stopped"),
         Err(error) => return Err(error),
     }
@@ -315,25 +313,15 @@ pub(crate) async fn controller_status(endpoint: &Path) -> Result<()> {
 }
 
 async fn send_shutdown(endpoint: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(endpoint)
-        .await
-        .with_context(|| format!("failed to connect to controller at {}", endpoint.display()))?;
-    let mut request = serde_json::to_vec(&ControllerRequest::Shutdown)
-        .context("failed to encode controller shutdown request")?;
-    request.push(b'\n');
-    stream
-        .write_all(&request)
-        .await
-        .context("failed to write controller shutdown request")?;
-    stream
-        .shutdown()
-        .await
-        .context("failed to close controller shutdown request")
+    match client(endpoint).command(StateCommand::Shutdown).await? {
+        CommandResult::Accepted => Ok(()),
+        result => bail!("unexpected shutdown result: {result:?}"),
+    }
 }
 
 async fn controller_is_running(endpoint: &Path) -> Result<bool> {
-    match client(endpoint).status().await {
-        Ok(()) => Ok(true),
+    match client(endpoint).subscribe_controller().await {
+        Ok(_) => Ok(true),
         Err(error) if controller_not_running(&error) => Ok(false),
         Err(error) => Err(error),
     }

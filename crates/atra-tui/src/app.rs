@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
-use atra_client::{CancelResult, ProviderLoginStatus, TurnResult};
+use atra_client::{CheckpointSubscription, ProcessSubscription, ThreadSubscription};
 use atra_protocol::{
-    ApprovalId, BackgroundProcess, BackgroundProcessDetail, Model, ProcessId, Thread,
-    ThreadCheckpoint, ThreadEvent, ThreadId,
+    ActiveTurn, ApprovalId, Model, PendingApproval, ProcessId, Thread, ThreadCheckpoint,
+    ThreadEvent, ThreadId,
 };
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
 
@@ -13,7 +13,8 @@ use crate::{
     input::InputBuffer,
     layout::ViewLayout,
     state::{CheckpointPicker, Overlay, TurnState, ViewState},
-    transcript::{TranscriptEntry, TranscriptState, transcript_from_events},
+    sync::{CheckpointSync, ControllerSync, ProcessSync, ThreadSync},
+    transcript::{TranscriptState, transcript_from_events},
 };
 
 mod interaction;
@@ -38,9 +39,7 @@ pub(crate) const COMMAND_HELP: &[(&str, &str)] = &[
 pub(crate) struct HistoryChange {
     pub(super) message: String,
     pub(super) thread_id: ThreadId,
-    pub(super) threads: Vec<Thread>,
-    pub(super) transcript: Vec<TranscriptEntry>,
-    pub(super) events: Vec<ThreadEvent>,
+    pub(super) subscription: ThreadSubscription,
 }
 
 pub(crate) enum Activity {
@@ -60,10 +59,7 @@ pub(crate) enum Target {
 
 pub(crate) enum ThreadView {
     Live,
-    Checkpoint {
-        checkpoint: ThreadCheckpoint,
-        picker: CheckpointPicker,
-    },
+    Checkpoint { picker: CheckpointPicker },
 }
 
 impl Target {
@@ -74,18 +70,14 @@ impl Target {
         }
     }
 
-    pub(crate) fn checkpoint(&self) -> Option<&ThreadCheckpoint> {
-        match self {
+    pub(crate) fn is_checkpoint(&self) -> bool {
+        matches!(
+            self,
             Self::Thread {
-                view: ThreadView::Checkpoint { checkpoint, .. },
+                view: ThreadView::Checkpoint { .. },
                 ..
-            } => Some(checkpoint),
-            Self::New { .. }
-            | Self::Thread {
-                view: ThreadView::Live,
-                ..
-            } => None,
-        }
+            }
+        )
     }
 
     pub(crate) fn checkpoint_picker(&self) -> Option<&CheckpointPicker> {
@@ -126,36 +118,24 @@ impl Target {
 
 pub(crate) enum TurnUpdate {
     Started {
-        message: String,
         thread_id: ThreadId,
-        threads: Vec<Thread>,
+        subscription: ThreadSubscription,
     },
-    Stream(atra_client::TurnUpdate),
     StreamFailed(anyhow::Error),
-    Compacted {
-        thread_id: ThreadId,
-        result: Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)>,
-    },
     ApprovalResolved {
         approval_id: ApprovalId,
-        result: Result<TurnResult>,
+        result: Result<()>,
     },
     CancelCompleted {
         thread_id: ThreadId,
-        result: Result<CancelResult>,
+        result: Result<()>,
     },
-    LoginCompleted(Result<ProviderLoginStatus>),
-    RateLimitsLoaded {
-        provider: String,
-        result: Result<serde_json::Value>,
-    },
+    LoginCompleted(Result<()>),
     ThreadSelected {
         thread_id: ThreadId,
-        result: Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)>,
+        result: Result<ThreadSubscription>,
     },
     ThreadRenamed {
-        thread_id: ThreadId,
-        display_name: String,
         result: Result<()>,
     },
     ThreadDeleted {
@@ -163,17 +143,13 @@ pub(crate) enum TurnUpdate {
         result: Result<()>,
     },
     ModelChanged {
-        thread_id: ThreadId,
-        provider: String,
-        model: String,
-        reasoning_effort: String,
         result: Result<()>,
     },
     CheckpointsLoaded {
         thread_id: ThreadId,
-        result: Result<(Vec<ThreadCheckpoint>, Vec<ThreadEvent>)>,
+        result: Result<Option<CheckpointSubscription>>,
     },
-    CheckpointLoaded(Result<(ThreadCheckpoint, Vec<ThreadEvent>)>),
+    CheckpointLoaded(Result<CheckpointSubscription>),
     HistoryChanged {
         source_thread_id: ThreadId,
         draft: Option<String>,
@@ -181,11 +157,10 @@ pub(crate) enum TurnUpdate {
     },
     ProcessesLoaded {
         thread_id: ThreadId,
-        result: Result<(Vec<BackgroundProcess>, Option<BackgroundProcessDetail>)>,
+        result: Result<Option<ProcessSubscription>>,
     },
     ProcessStopped {
         thread_id: ThreadId,
-        runner: String,
         process_id: ProcessId,
         result: Result<()>,
     },
@@ -195,8 +170,6 @@ pub(crate) struct App {
     pub(crate) endpoint: PathBuf,
     pub(crate) message_history_path: PathBuf,
     pub(crate) command_history_path: PathBuf,
-    pub(crate) threads: Vec<Thread>,
-    pub(crate) models: Vec<Model>,
     pub(crate) target: Target,
     pub(crate) transcript: TranscriptState,
     pub(crate) message_input: InputBuffer,
@@ -209,15 +182,75 @@ pub(crate) struct App {
     pub(crate) layout: ViewLayout,
     pub(crate) turn: TurnState,
     pub(crate) metrics_stale: bool,
-    pub(crate) rate_limits: serde_json::Value,
-    pub(crate) rate_limit_refresh_pending: bool,
-    pub(crate) processes: Vec<BackgroundProcess>,
-    pub(crate) process_refresh_pending: bool,
+    pub(crate) process_selection_pending: bool,
+    pub(crate) controller_subscription: ControllerSync,
+    pub(crate) thread_subscription: Option<ThreadSync>,
+    pub(crate) checkpoint_subscription: Option<CheckpointSync>,
+    pub(crate) process_subscription: Option<ProcessSync>,
 }
 
 impl App {
+    pub(crate) fn active_turn(&self) -> Option<&ActiveTurn> {
+        self.thread_subscription
+            .as_ref()
+            .and_then(|subscription| subscription.state().active_turn())
+    }
+
+    pub(crate) fn pending_approval(&self) -> Option<&PendingApproval> {
+        let approval = self
+            .active_turn()
+            .and_then(|turn| turn.pending_approval())?;
+        if matches!(
+            self.turn,
+            TurnState::ResolvingApproval { approval_id, .. } if approval_id == approval.id()
+        ) {
+            return None;
+        }
+        Some(approval)
+    }
+
+    pub(crate) fn turn_is_running(&self) -> bool {
+        self.turn.is_pending() || self.active_turn().is_some()
+    }
+
+    pub(crate) fn reset_turn_interaction(&mut self) {
+        self.turn = TurnState::Idle;
+    }
+
+    pub(crate) fn checkpoints(&self) -> &[ThreadCheckpoint] {
+        self.thread_subscription
+            .as_ref()
+            .map(|subscription| subscription.state().checkpoints())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn checkpoint(&self) -> Option<&ThreadCheckpoint> {
+        if !self.target.is_checkpoint() {
+            return None;
+        }
+        self.checkpoint_subscription
+            .as_ref()
+            .map(|subscription| subscription.state().metadata())
+    }
+
+    pub(crate) fn displayed_events(&self) -> &[ThreadEvent] {
+        if self.target.is_checkpoint() {
+            return self
+                .checkpoint_subscription
+                .as_ref()
+                .map(|subscription| subscription.state().events())
+                .unwrap_or_default();
+        }
+        self.thread_subscription
+            .as_ref()
+            .map(|subscription| subscription.state().events())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn selected_provider(&self) -> Option<&str> {
-        self.threads
+        self.controller_subscription
+            .state()
+            .threads()
             .iter()
             .find(|thread| Some(thread.id) == self.target.thread_id())
             .map(|thread| thread.provider.as_str())
@@ -228,23 +261,75 @@ impl App {
             })
     }
 
+    pub(crate) fn threads(&self) -> &[Thread] {
+        self.controller_subscription.state().threads()
+    }
+
+    pub(crate) fn models(&self) -> Vec<Model> {
+        self.controller_subscription
+            .state()
+            .providers()
+            .iter()
+            .flat_map(|provider| provider.models().iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn selected_rate_limits(&self) -> Option<&serde_json::Value> {
+        let provider = self.selected_provider()?;
+        self.controller_subscription
+            .state()
+            .providers()
+            .iter()
+            .find(|current| current.id() == provider)
+            .and_then(|current| current.rate_limits())
+    }
+
+    pub(crate) fn processes(&self) -> &[atra_protocol::ProcessSummary] {
+        self.thread_subscription
+            .as_ref()
+            .map(|subscription| subscription.state().processes())
+            .unwrap_or_default()
+    }
+
     pub(super) async fn load(
         endpoint: PathBuf,
         message_history_path: PathBuf,
         command_history_path: PathBuf,
     ) -> Result<Self> {
         let client = atra_client::Client::new(&endpoint);
-        let threads = client.thread_list().await?;
+        let controller_subscription = client.subscribe_controller().await?;
+        let threads = controller_subscription.state().threads().to_vec();
         let thread_id = threads.first().map(|thread| thread.id);
-        let (transcript, events) = match thread_id {
-            Some(thread_id) => load_transcript(&endpoint, thread_id).await?,
-            None => (Vec::new(), Vec::new()),
+        let thread_subscription = match thread_id {
+            Some(thread_id) => Some(client.subscribe_thread(thread_id).await?),
+            None => None,
         };
-        let login_required = match client.provider_login_status("codex".to_owned()).await? {
-            ProviderLoginStatus::LoginRequired => true,
-            ProviderLoginStatus::LoggedIn { .. } => false,
-        };
-        let models = client.model_list().await.unwrap_or_default();
+        let events = thread_subscription
+            .as_ref()
+            .map(|subscription| subscription.state().events().to_vec())
+            .unwrap_or_default();
+        let transcript = transcript_from_events(&events);
+        let mut transcript = TranscriptState::new(transcript);
+        if let Some(subscription) = &thread_subscription {
+            transcript.rebuild(subscription.state());
+        }
+        let codex = controller_subscription
+            .state()
+            .providers()
+            .iter()
+            .find(|provider| provider.id() == "codex");
+        let login_required = codex.is_none_or(|provider| {
+            !matches!(
+                provider.lifecycle(),
+                atra_protocol::ProviderLifecycle::LoggedIn { .. }
+            )
+        });
+        let models = controller_subscription
+            .state()
+            .providers()
+            .iter()
+            .flat_map(|provider| provider.models().iter().cloned())
+            .collect::<Vec<_>>();
         let target = match thread_id {
             Some(id) => Target::Thread {
                 id,
@@ -266,10 +351,8 @@ impl App {
             endpoint,
             message_history_path,
             command_history_path,
-            threads,
-            models,
             target,
-            transcript: TranscriptState::new(transcript, events),
+            transcript,
             message_input: InputBuffer::new(message_history, true),
             command_input: InputBuffer::new(command_history, false),
             overlay: Overlay::None,
@@ -285,24 +368,14 @@ impl App {
             layout: ViewLayout::default(),
             turn: TurnState::Idle,
             metrics_stale: false,
-            rate_limits: serde_json::Value::Array(Vec::new()),
-            rate_limit_refresh_pending: false,
-            processes: Vec::new(),
-            process_refresh_pending: false,
+            process_selection_pending: false,
+            controller_subscription: controller_subscription.into(),
+            thread_subscription: thread_subscription.map(Into::into),
+            checkpoint_subscription: None,
+            process_subscription: None,
         })
     }
 }
-pub(super) async fn load_transcript(
-    endpoint: &Path,
-    thread_id: ThreadId,
-) -> Result<(Vec<TranscriptEntry>, Vec<ThreadEvent>)> {
-    let events = atra_client::Client::new(endpoint)
-        .thread_events(thread_id)
-        .await?;
-    let transcript = transcript_from_events(&events);
-    Ok((transcript, events))
-}
-
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;

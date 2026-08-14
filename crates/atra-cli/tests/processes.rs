@@ -63,7 +63,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         .await
         .unwrap();
     assert!(relaunched.status.success(), "{relaunched:?}");
-    assert_eq!(relaunched.stdout, b"already running\n");
+    assert_eq!(relaunched.stdout, b"launched\n");
 
     let thread = system.create_thread().await;
     let turn = system

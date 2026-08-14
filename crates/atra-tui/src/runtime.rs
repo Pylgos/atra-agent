@@ -1,17 +1,17 @@
 use std::{io, time::Duration};
 
-use anyhow::Result;
-use atra_client::{Client, TurnResult};
-use atra_protocol::{ApprovalId, CheckpointId, EventSequence, ProcessId, ThreadId};
+use anyhow::{Result, bail};
+use atra_client::{Client, SubscriptionError};
+use atra_protocol::{
+    ApprovalId, CheckpointId, Command as StateCommand, CommandResult, EventSequence, HistoryTarget,
+    ProcessId, ProcessLocator, ThreadId,
+};
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
-use crate::{
-    app::{App, HistoryChange, TurnUpdate, load_transcript},
-    controller::forward_turn,
-};
+use crate::app::{App, HistoryChange, TurnUpdate};
 
 pub(crate) enum ApprovalDecision {
     Allow,
@@ -36,10 +36,6 @@ pub(crate) enum HistoryOperation {
 pub(crate) enum Effect {
     Login {
         endpoint: std::path::PathBuf,
-    },
-    PollRateLimits {
-        endpoint: std::path::PathBuf,
-        provider: String,
     },
     SelectThread {
         endpoint: std::path::PathBuf,
@@ -87,10 +83,11 @@ pub(crate) enum Effect {
     LoadCheckpoints {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
+        checkpoint_id: Option<CheckpointId>,
     },
     LoadCheckpoint {
         endpoint: std::path::PathBuf,
-        checkpoint: atra_protocol::ThreadCheckpoint,
+        checkpoint_id: CheckpointId,
     },
     HistoryRequest {
         endpoint: std::path::PathBuf,
@@ -98,7 +95,7 @@ pub(crate) enum Effect {
         draft: Option<String>,
         operation: HistoryOperation,
     },
-    PollProcesses {
+    SelectProcess {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
         selected: Option<(String, ProcessId)>,
@@ -120,15 +117,47 @@ pub(super) async fn run(
     let (updates, mut pending_updates) = mpsc::unbounded_channel();
     let mut redraw = tokio::time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut process_poll = tokio::time::interval(Duration::from_secs(1));
-    process_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut rate_limit_poll = tokio::time::interval(Duration::from_secs(60));
-    rate_limit_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     terminal.draw(|frame| app.render(frame))?;
     redraw.tick().await;
     let mut dirty = false;
     loop {
         tokio::select! {
+            result = app.controller_subscription.receive() => {
+                let change = match result {
+                    Ok(change) => change,
+                    Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::ControllerShutdown) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                app.apply_controller_change(change);
+                dirty = true;
+            }
+            result = receive_thread(&mut app.thread_subscription) => {
+                let change = match result {
+                    Ok(change) => change,
+                    Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::Deleted) => {
+                        app.thread_subscription = None;
+                        app.reset_to_new_thread();
+                        app.activity = Some(crate::app::Activity::Info("Thread deleted".to_owned()));
+                        dirty = true;
+                        continue;
+                    }
+                    Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::ControllerShutdown) => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                app.apply_thread_change(change);
+                dirty = true;
+            }
+            result = receive_process(&mut app.process_subscription) => {
+                match result {
+                    Ok(_) => {}
+                    Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::Deleted) => {
+                        app.process_subscription = None;
+                    }
+                    Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::ControllerShutdown) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                dirty = true;
+            }
             event = events.next() => {
                 let Some(event) = event.transpose()? else {
                     return Ok(());
@@ -142,25 +171,11 @@ pub(super) async fn run(
                 dirty = true;
             }
             Some(update) = pending_updates.recv() => {
-                app.update(update, &effects)?;
+                app.update(update)?;
                 dirty = true;
             }
             Some(effect) = pending_effects.recv() => {
                 effect.start(updates.clone());
-            }
-            _ = process_poll.tick() => {
-                app.poll_processes(&effects);
-            }
-            _ = rate_limit_poll.tick() => {
-                if !app.rate_limit_refresh_pending
-                    && let Some(provider) = app.selected_provider().map(str::to_owned)
-                {
-                    app.rate_limit_refresh_pending = true;
-                    effects.send(Effect::PollRateLimits {
-                        endpoint: app.endpoint.clone(),
-                        provider,
-                    }).ok();
-                }
             }
             _ = redraw.tick() => {
                 if dirty {
@@ -172,27 +187,49 @@ pub(super) async fn run(
     }
 }
 
+fn is_terminal(error: &anyhow::Error, terminal: atra_protocol::SubscriptionTerminal) -> bool {
+    error
+        .downcast_ref::<SubscriptionError>()
+        .is_some_and(|error| error.terminal() == &terminal)
+}
+
+async fn receive_thread(
+    subscription: &mut Option<crate::sync::ThreadSync>,
+) -> Result<atra_protocol::ThreadChange> {
+    match subscription {
+        Some(subscription) => subscription.receive().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn receive_process(
+    subscription: &mut Option<crate::sync::ProcessSync>,
+) -> Result<atra_protocol::ProcessChange> {
+    match subscription {
+        Some(subscription) => subscription.receive().await,
+        None => std::future::pending().await,
+    }
+}
+
 impl Effect {
     fn start(self, updates: mpsc::UnboundedSender<TurnUpdate>) {
         tokio::spawn(async move {
             match self {
                 Self::Login { endpoint } => {
                     let result = Client::new(&endpoint)
-                        .provider_login("codex".to_owned(), None)
-                        .await;
+                        .command(StateCommand::ProviderLogin {
+                            provider: "codex".to_owned(),
+                            credential: None,
+                        })
+                        .await
+                        .and_then(accepted);
                     let _ = updates.send(TurnUpdate::LoginCompleted(result));
-                }
-                Self::PollRateLimits { endpoint, provider } => {
-                    let result = Client::new(&endpoint)
-                        .provider_rate_limits(provider.clone())
-                        .await;
-                    let _ = updates.send(TurnUpdate::RateLimitsLoaded { provider, result });
                 }
                 Self::SelectThread {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = load_transcript(&endpoint, thread_id).await;
+                    let result = Client::new(&endpoint).subscribe_thread(thread_id).await;
                     let _ = updates.send(TurnUpdate::ThreadSelected { thread_id, result });
                 }
                 Self::RenameThread {
@@ -201,19 +238,22 @@ impl Effect {
                     display_name,
                 } => {
                     let result = Client::new(&endpoint)
-                        .thread_rename(thread_id, display_name.clone())
-                        .await;
-                    let _ = updates.send(TurnUpdate::ThreadRenamed {
-                        thread_id,
-                        display_name,
-                        result,
-                    });
+                        .command(StateCommand::ThreadRename {
+                            thread_id,
+                            display_name: display_name.clone(),
+                        })
+                        .await
+                        .and_then(accepted);
+                    let _ = updates.send(TurnUpdate::ThreadRenamed { result });
                 }
                 Self::DeleteThread {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = Client::new(&endpoint).thread_delete(thread_id).await;
+                    let result = Client::new(&endpoint)
+                        .command(StateCommand::ThreadDelete { thread_id })
+                        .await
+                        .and_then(accepted);
                     let _ = updates.send(TurnUpdate::ThreadDeleted { thread_id, result });
                 }
                 Self::ChangeModel {
@@ -224,20 +264,15 @@ impl Effect {
                     reasoning_effort,
                 } => {
                     let result = Client::new(&endpoint)
-                        .thread_set_model(
+                        .command(StateCommand::ThreadSetModel {
                             thread_id,
-                            provider.clone(),
-                            model.clone(),
-                            reasoning_effort.clone(),
-                        )
-                        .await;
-                    let _ = updates.send(TurnUpdate::ModelChanged {
-                        thread_id,
-                        provider,
-                        model,
-                        reasoning_effort,
-                        result,
-                    });
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reasoning_effort: reasoning_effort.clone(),
+                        })
+                        .await
+                        .and_then(accepted);
+                    let _ = updates.send(TurnUpdate::ModelChanged { result });
                 }
                 Self::SendTurn {
                     endpoint,
@@ -255,11 +290,10 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = async {
-                        let stream = Client::new(&endpoint).thread_continue(thread_id).await?;
-                        forward_turn(stream, &updates).await
-                    }
-                    .await;
+                    let result = Client::new(&endpoint)
+                        .command(StateCommand::ThreadContinue { thread_id })
+                        .await
+                        .and_then(accepted);
                     if let Err(error) = result {
                         let _ = updates.send(TurnUpdate::StreamFailed(error));
                     }
@@ -268,20 +302,12 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = async {
-                        let stream = Client::new(&endpoint).thread_compact(thread_id).await?;
-                        forward_turn(stream, &updates).await
-                    }
-                    .await;
-                    match result {
-                        Ok(TurnResult::Compacted) => {
-                            let result = load_transcript(&endpoint, thread_id).await;
-                            let _ = updates.send(TurnUpdate::Compacted { thread_id, result });
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let _ = updates.send(TurnUpdate::StreamFailed(error));
-                        }
+                    let result = Client::new(&endpoint)
+                        .command(StateCommand::ThreadCompact { thread_id })
+                        .await
+                        .and_then(accepted);
+                    if let Err(error) = result {
+                        let _ = updates.send(TurnUpdate::StreamFailed(error));
                     }
                 }
                 Self::ResolveApproval {
@@ -291,11 +317,21 @@ impl Effect {
                 } => {
                     let client = Client::new(&endpoint);
                     let result = match decision {
-                        ApprovalDecision::Allow => client.approval_allow(approval_id).await,
-                        ApprovalDecision::Deny { reason } => {
-                            client.approval_deny(approval_id, reason).await
+                        ApprovalDecision::Allow => {
+                            client
+                                .command(StateCommand::ApprovalAllow { approval_id })
+                                .await
                         }
-                    };
+                        ApprovalDecision::Deny { reason } => {
+                            client
+                                .command(StateCommand::ApprovalDeny {
+                                    approval_id,
+                                    reason,
+                                })
+                                .await
+                        }
+                    }
+                    .and_then(accepted);
                     let _ = updates.send(TurnUpdate::ApprovalResolved {
                         approval_id,
                         result,
@@ -305,33 +341,38 @@ impl Effect {
                     endpoint,
                     thread_id,
                 } => {
-                    let result = Client::new(&endpoint).thread_cancel(thread_id).await;
+                    let result = Client::new(&endpoint)
+                        .command(StateCommand::ThreadCancel { thread_id })
+                        .await
+                        .and_then(accepted);
                     let _ = updates.send(TurnUpdate::CancelCompleted { thread_id, result });
                 }
                 Self::LoadCheckpoints {
                     endpoint,
                     thread_id,
+                    checkpoint_id,
                 } => {
                     let result = async {
-                        let client = Client::new(&endpoint);
-                        let checkpoints = client.checkpoint_list(thread_id).await?;
-                        let events = match checkpoints.first() {
-                            Some(checkpoint) => client.checkpoint_events(checkpoint.id).await?,
-                            None => Vec::new(),
+                        let checkpoint = match checkpoint_id {
+                            Some(checkpoint_id) => Some(
+                                Client::new(&endpoint)
+                                    .subscribe_checkpoint(checkpoint_id)
+                                    .await?,
+                            ),
+                            None => None,
                         };
-                        Ok((checkpoints, events))
+                        Ok(checkpoint)
                     }
                     .await;
                     let _ = updates.send(TurnUpdate::CheckpointsLoaded { thread_id, result });
                 }
                 Self::LoadCheckpoint {
                     endpoint,
-                    checkpoint,
+                    checkpoint_id,
                 } => {
                     let result = Client::new(&endpoint)
-                        .checkpoint_events(checkpoint.id)
-                        .await
-                        .map(|events| (checkpoint, events));
+                        .subscribe_checkpoint(checkpoint_id)
+                        .await;
                     let _ = updates.send(TurnUpdate::CheckpointLoaded(result));
                 }
                 Self::HistoryRequest {
@@ -344,41 +385,73 @@ impl Effect {
                         let client = Client::new(&endpoint);
                         let (selected_thread_id, message) = match operation {
                             HistoryOperation::CreateCheckpoint => {
-                                let checkpoint_id = client.checkpoint_create(thread_id).await?;
+                                let mut subscription = client.subscribe_thread(thread_id).await?;
+                                accepted(
+                                    client
+                                        .command(StateCommand::ThreadCheckpointCreate { thread_id })
+                                        .await?,
+                                )?;
+                                let checkpoint_id = loop {
+                                    if let atra_protocol::ThreadChange::Checkpoint(id) =
+                                        subscription.receive().await?
+                                    {
+                                        break id;
+                                    }
+                                };
                                 (thread_id, format!("Checkpoint {checkpoint_id} created"))
                             }
                             HistoryOperation::Fork {
                                 checkpoint_id,
                                 sequence,
                             } => (
-                                client
-                                    .thread_fork(thread_id, checkpoint_id, sequence, None)
-                                    .await?,
+                                match client
+                                    .command(StateCommand::ThreadFork {
+                                        thread_id,
+                                        checkpoint_id,
+                                        sequence,
+                                        display_name: None,
+                                    })
+                                    .await?
+                                {
+                                    CommandResult::ThreadForked { thread_id } => thread_id,
+                                    result => bail!("unexpected command result: {result:?}"),
+                                },
                                 "Thread forked".to_owned(),
                             ),
                             HistoryOperation::Rewind {
                                 checkpoint_id,
                                 sequence,
                             } => {
-                                client
-                                    .thread_rewind(thread_id, checkpoint_id, sequence)
-                                    .await?;
+                                accepted(
+                                    client
+                                        .command(StateCommand::ThreadReplaceHistory {
+                                            thread_id,
+                                            target: HistoryTarget::Message {
+                                                checkpoint_id,
+                                                sequence,
+                                            },
+                                        })
+                                        .await?,
+                                )?;
                                 (thread_id, "Thread rewound".to_owned())
                             }
                             HistoryOperation::Restore { checkpoint_id } => {
-                                client.checkpoint_restore(thread_id, checkpoint_id).await?;
+                                accepted(
+                                    client
+                                        .command(StateCommand::ThreadReplaceHistory {
+                                            thread_id,
+                                            target: HistoryTarget::Checkpoint { checkpoint_id },
+                                        })
+                                        .await?,
+                                )?;
                                 (thread_id, "Checkpoint restored".to_owned())
                             }
                         };
-                        let threads = client.thread_list().await?;
-                        let transcript = load_transcript(&endpoint, selected_thread_id).await?;
-                        let (transcript, events) = transcript;
+                        let subscription = client.subscribe_thread(selected_thread_id).await?;
                         Ok(HistoryChange {
                             message,
                             thread_id: selected_thread_id,
-                            threads,
-                            transcript,
-                            events,
+                            subscription,
                         })
                     }
                     .await;
@@ -388,26 +461,22 @@ impl Effect {
                         result,
                     });
                 }
-                Self::PollProcesses {
+                Self::SelectProcess {
                     endpoint,
                     thread_id,
                     selected,
                 } => {
                     let result = async {
                         let client = Client::new(&endpoint);
-                        let processes = client.thread_process_list(thread_id).await?;
-                        let detail = match selected.filter(|(runner, process_id)| {
-                            processes.iter().any(|process| {
-                                process.runner == *runner && process.process_id == *process_id
-                            })
-                        }) {
+                        match selected {
                             Some((runner, process_id)) => client
-                                .thread_process_inspect(thread_id, runner, process_id)
+                                .subscribe_process(ProcessLocator::new(
+                                    thread_id, runner, process_id,
+                                ))
                                 .await
-                                .ok(),
-                            None => None,
-                        };
-                        Ok((processes, detail))
+                                .map(Some),
+                            None => Ok(None),
+                        }
                     }
                     .await;
                     let _ = updates.send(TurnUpdate::ProcessesLoaded { thread_id, result });
@@ -419,12 +488,17 @@ impl Effect {
                     process_id,
                 } => {
                     let result = Client::new(&endpoint)
-                        .stop_process(thread_id, runner.clone(), process_id.clone())
+                        .command(StateCommand::StopProcess {
+                            process: ProcessLocator::new(
+                                thread_id,
+                                runner.clone(),
+                                process_id.clone(),
+                            ),
+                        })
                         .await
-                        .map(|_| ());
+                        .and_then(accepted);
                     let _ = updates.send(TurnUpdate::ProcessStopped {
                         thread_id,
-                        runner,
                         process_id,
                         result,
                     });
@@ -445,24 +519,46 @@ async fn send_turn(
     let thread_id = match existing_thread_id {
         Some(thread_id) => thread_id,
         None => {
-            let thread_id = client.thread_create(None).await?;
+            let thread_id = match client
+                .command(StateCommand::ThreadCreate { display_name: None })
+                .await?
+            {
+                CommandResult::ThreadCreated { thread_id } => thread_id,
+                result => bail!("unexpected command result: {result:?}"),
+            };
             if let Some((provider, model, reasoning_effort)) = new_thread_model {
-                client
-                    .thread_set_model(thread_id, provider, model, reasoning_effort)
-                    .await?;
+                accepted(
+                    client
+                        .command(StateCommand::ThreadSetModel {
+                            thread_id,
+                            provider,
+                            model,
+                            reasoning_effort,
+                        })
+                        .await?,
+                )?;
             }
-            let threads = client.thread_list().await?;
+            let subscription = client.subscribe_thread(thread_id).await?;
             updates
                 .send(TurnUpdate::Started {
-                    message: message.clone(),
                     thread_id,
-                    threads,
+                    subscription,
                 })
                 .ok();
             thread_id
         }
     };
-    let stream = client.thread_send(thread_id, message).await?;
-    forward_turn(stream, updates).await?;
+    accepted(
+        client
+            .command(StateCommand::ThreadSend { thread_id, message })
+            .await?,
+    )?;
     Ok(())
+}
+
+fn accepted(result: CommandResult) -> Result<()> {
+    match result {
+        CommandResult::Accepted => Ok(()),
+        result => bail!("unexpected command result: {result:?}"),
+    }
 }

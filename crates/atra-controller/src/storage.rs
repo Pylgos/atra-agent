@@ -87,18 +87,6 @@ impl Store {
                     );
                     ",
                 )?;
-                let transaction = connection.transaction()?;
-                if !has_column(&transaction, "threads", "provider")? {
-                    transaction.execute_batch(
-                        "ALTER TABLE threads ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';",
-                    )?;
-                }
-                if !has_column(&transaction, "checkpoints", "provider")? {
-                    transaction.execute_batch(
-                        "ALTER TABLE checkpoints ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex';",
-                    )?;
-                }
-                transaction.commit()?;
                 Ok(())
             })
             .await?;
@@ -139,6 +127,26 @@ impl Store {
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+    }
+
+    pub async fn thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<Thread> {
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT id, display_name, provider, model, reasoning_effort FROM threads WHERE id = ?1",
+                    [thread_id.0],
+                    |row| {
+                        Ok(Thread {
+                            id: ThreadId(row.get(0)?),
+                            display_name: row.get(1)?,
+                            provider: row.get(2)?,
+                            model: row.get(3)?,
+                            reasoning_effort: row.get(4)?,
+                        })
+                    },
+                )
             })
             .await
     }
@@ -514,6 +522,28 @@ impl Store {
             .await
     }
 
+    pub async fn checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+    ) -> tokio_rusqlite::Result<ThreadCheckpoint> {
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT id, thread_id, created_at_ms, reason FROM checkpoints WHERE id = ?1",
+                    [checkpoint_id.0],
+                    |row| {
+                        Ok(ThreadCheckpoint {
+                            id: CheckpointId(row.get(0)?),
+                            thread_id: ThreadId(row.get(1)?),
+                            created_at_ms: row.get(2)?,
+                            reason: row.get(3)?,
+                        })
+                    },
+                )
+            })
+            .await
+    }
+
     pub async fn fork_thread(
         &self,
         thread_id: ThreadId,
@@ -727,18 +757,6 @@ impl Store {
             })
             .await
     }
-}
-
-fn has_column(
-    transaction: &rusqlite::Transaction<'_>,
-    table: &str,
-    column: &str,
-) -> rusqlite::Result<bool> {
-    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns.iter().any(|candidate| candidate == column))
 }
 
 fn to_sql_error(error: serde_json::Error) -> tokio_rusqlite::Error {
@@ -1022,71 +1040,6 @@ mod tests {
                     content: "saved".to_owned()
                 }),
             }]
-        );
-    }
-
-    #[tokio::test]
-    async fn adds_codex_provider_to_existing_threads_and_checkpoints() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("controller.sqlite3");
-        let legacy = rusqlite::Connection::open(&database).unwrap();
-        legacy
-            .execute_batch(
-                "
-                CREATE TABLE threads (
-                    id INTEGER PRIMARY KEY,
-                    display_name TEXT,
-                    model TEXT NOT NULL,
-                    reasoning_effort TEXT NOT NULL
-                );
-                CREATE TABLE checkpoints (
-                    id INTEGER PRIMARY KEY,
-                    thread_id INTEGER NOT NULL REFERENCES threads(id),
-                    created_at_ms INTEGER NOT NULL,
-                    reason TEXT NOT NULL,
-                    display_name TEXT,
-                    model TEXT NOT NULL,
-                    reasoning_effort TEXT NOT NULL
-                );
-                INSERT INTO threads (id, display_name, model, reasoning_effort)
-                VALUES (1, 'Legacy', 'gpt-5.6-sol', 'medium');
-                INSERT INTO checkpoints (
-                    id, thread_id, created_at_ms, reason, display_name, model, reasoning_effort
-                )
-                VALUES (1, 1, 1, 'legacy', 'Legacy', 'gpt-5.6-sol', 'medium');
-                ",
-            )
-            .unwrap();
-        drop(legacy);
-
-        let store = Store::open(&database).await.unwrap();
-
-        assert_eq!(store.threads().await.unwrap()[0].provider, "codex");
-        assert_eq!(
-            store
-                .connection
-                .call(|connection| {
-                    connection.query_row(
-                        "SELECT provider FROM checkpoints WHERE id = 1",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                })
-                .await
-                .unwrap(),
-            "codex"
-        );
-        drop(store);
-
-        assert_eq!(
-            Store::open(&database)
-                .await
-                .unwrap()
-                .threads()
-                .await
-                .unwrap()[0]
-                .provider,
-            "codex"
         );
     }
 

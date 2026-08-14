@@ -16,8 +16,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{Activity, App, COMMAND_HELP},
     state::{
-        ApprovalState, CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState,
+        CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, Overlay, ProcessPicker,
+        ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
     },
     text::{expand_line_tabs, expand_tabs},
     transcript::{
@@ -61,7 +61,7 @@ fn integer_value(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         let value = value.as_f64()?;
         (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
-            .then(|| value as i64)
+            .then_some(value as i64)
     })
 }
 
@@ -123,7 +123,9 @@ pub(crate) fn preserve_transcript_viewport(
 
 impl App {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = if self.turn.approval().is_some() {
+        let input_height = if self.pending_approval().is_some()
+            || matches!(self.turn, TurnState::EnteringDenyReason { .. })
+        {
             3
         } else {
             (self
@@ -163,36 +165,38 @@ impl App {
 
     fn render_composer(&mut self, frame: &mut Frame<'_>, input: Rect) {
         let (input_title, input_hint, input_value, input_cursor, input_selection, show_cursor) =
-            if let Some(approval) = self.turn.approval() {
-                match &approval.state {
-                    ApprovalState::EnteringDenyReason(reason) => (
-                        "Deny reason (optional)".to_owned(),
-                        Some(Line::from("Enter: deny · Esc: back").right_aligned()),
-                        reason.value.as_str(),
-                        reason.cursor,
-                        reason.selection_range(),
-                        true,
-                    ),
-                    ApprovalState::Pending => {
-                        let operation = approval
-                            .operation_index
-                            .map(|index| format!("Operation {index} · "))
-                            .unwrap_or_default();
-                        let runner = if approval.runner.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{} · ", approval.runner)
-                        };
-                        (
-                            format!("Approval required · {operation}{runner}{}", approval.label),
-                            None,
-                            "[y] Allow  [n] Deny",
-                            0,
-                            None,
-                            false,
-                        )
-                    }
-                }
+            if let TurnState::EnteringDenyReason { reason, .. } = &self.turn {
+                (
+                    "Deny reason (optional)".to_owned(),
+                    Some(Line::from("Enter: deny · Esc: back").right_aligned()),
+                    reason.value.as_str(),
+                    reason.cursor,
+                    reason.selection_range(),
+                    true,
+                )
+            } else if let Some(approval) = self.pending_approval() {
+                let operation = approval
+                    .operation_index()
+                    .map(|index| format!("Operation {index} · "))
+                    .unwrap_or_default();
+                let runner = approval
+                    .arguments()
+                    .get("runner")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|runner| !runner.is_empty())
+                    .map(|runner| format!("{runner} · "))
+                    .unwrap_or_default();
+                let label = approval
+                    .operation_label()
+                    .unwrap_or_else(|| approval.tool());
+                (
+                    format!("Approval required · {operation}{runner}{label}"),
+                    None,
+                    "[y] Allow  [n] Deny",
+                    0,
+                    None,
+                    false,
+                )
             } else {
                 match &self.overlay {
                     Overlay::Rename => (
@@ -321,10 +325,17 @@ impl App {
             render_model_picker(frame, picker);
         }
         if let Overlay::ThreadPicker(picker) = &self.overlay {
-            render_thread_picker(frame, picker, &self.threads);
+            render_thread_picker(frame, picker, self.threads());
         }
         if let Overlay::Processes(picker) = &self.overlay {
-            render_process_picker(frame, picker, &self.processes);
+            render_process_picker(
+                frame,
+                picker,
+                self.processes(),
+                self.process_subscription
+                    .as_ref()
+                    .map(|subscription| subscription.state()),
+            );
         }
         if let Some(picker) = self.target.checkpoint_picker() {
             let [list, _] = Layout::default()
@@ -335,6 +346,7 @@ impl App {
                 frame,
                 list,
                 picker,
+                self.checkpoints(),
                 self.view.focus == FocusPane::Checkpoints,
             );
         }
@@ -353,7 +365,8 @@ impl App {
                 | Overlay::ThreadPicker(_)
                 | Overlay::Processes(_)
                 | Overlay::HistoryConfirmation(_)
-        ) && self.turn.approval().is_none()
+        ) && self.pending_approval().is_none()
+            && !matches!(self.turn, TurnState::EnteringDenyReason { .. })
             && self.view.focus == pane
         {
             Style::default().fg(Color::Cyan)
@@ -364,7 +377,7 @@ impl App {
 
     fn status_line(&self) -> Line<'static> {
         let selected = self
-            .threads
+            .threads()
             .iter()
             .find(|thread| Some(thread.id) == self.target.thread_id())
             .map(|thread| {
@@ -386,7 +399,7 @@ impl App {
         };
         let usage = (!self.metrics_stale)
             .then(|| {
-                self.transcript.events.iter().rev().find_map(|event| {
+                self.displayed_events().iter().rev().find_map(|event| {
                     if let ThreadEventData::ModelRequest(request) = &event.data
                         && request.kind == ModelRequestKind::Response
                     {
@@ -443,9 +456,9 @@ impl App {
         ];
         spans.extend(self.quota_status());
         let running_processes = self
-            .processes
+            .processes()
             .iter()
-            .filter(|process| matches!(process.status, ProcessStatus::Running))
+            .filter(|process| matches!(process.status(), ProcessStatus::Running))
             .count();
         if running_processes != 0 {
             spans.push(Span::raw(" · "));
@@ -454,7 +467,7 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
-        if let Some(checkpoint) = self.target.checkpoint() {
+        if let Some(checkpoint) = self.checkpoint() {
             spans.push(Span::raw(" · "));
             spans.push(Span::styled(
                 format!("checkpoint {} ({})", checkpoint.id, checkpoint.reason),
@@ -465,7 +478,9 @@ impl App {
     }
 
     fn quota_status(&self) -> Vec<Span<'static>> {
-        let snapshots = self.rate_limits.as_array();
+        let snapshots = self
+            .selected_rate_limits()
+            .and_then(serde_json::Value::as_array);
         let Some(snapshot) = snapshots.and_then(|snapshots| {
             snapshots
                 .iter()
@@ -476,8 +491,7 @@ impl App {
             return Vec::new();
         };
         let first_snapshot = self
-            .transcript
-            .events
+            .displayed_events()
             .iter()
             .find_map(|event| match &event.data {
                 ThreadEventData::RateLimits(event) => event.snapshots.as_array(),
@@ -637,8 +651,7 @@ impl App {
         &self,
         request_sequence: atra_protocol::EventSequence,
     ) -> Option<&serde_json::Value> {
-        self.transcript
-            .events
+        self.displayed_events()
             .iter()
             .find_map(|event| match &event.data {
                 ThreadEventData::TokenUsage(event)
@@ -739,7 +752,8 @@ fn render_delete_progress(frame: &mut Frame<'_>, area: Rect) {
 fn render_process_picker(
     frame: &mut Frame<'_>,
     picker: &ProcessPicker,
-    processes: &[atra_protocol::BackgroundProcess],
+    processes: &[atra_protocol::ProcessSummary],
+    detail: Option<&atra_protocol::ProcessState>,
 ) {
     let width = frame.area().width.saturating_sub(4).min(120);
     let height = frame
@@ -775,21 +789,21 @@ fn render_process_picker(
         list_area,
         &mut state,
     );
-    render_process_detail(frame, picker, processes, detail_area);
+    render_process_detail(frame, picker, processes, detail, detail_area);
 
     if matches!(picker.state, ProcessPickerState::ConfirmingStop { .. }) {
         render_stop_confirmation(frame, area);
     }
 }
 
-fn process_list_items(processes: &[atra_protocol::BackgroundProcess]) -> Vec<ListItem<'static>> {
+fn process_list_items(processes: &[atra_protocol::ProcessSummary]) -> Vec<ListItem<'static>> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64);
     processes
         .iter()
         .map(|process| {
-            let (status, color) = match &process.status {
+            let (status, color) = match process.status() {
                 ProcessStatus::Running => ("running".to_owned(), Color::Green),
                 ProcessStatus::Exited { exit_code } => (
                     format!(
@@ -800,15 +814,15 @@ fn process_list_items(processes: &[atra_protocol::BackgroundProcess]) -> Vec<Lis
                 ),
                 ProcessStatus::Unavailable { .. } => ("unavailable".to_owned(), Color::Red),
             };
-            let elapsed = format_elapsed_ms(now_ms.saturating_sub(process.started_at_ms));
-            let command = expand_tabs(&sanitize(&process.command)).replace('\n', " ");
+            let elapsed = format_elapsed_ms(now_ms.saturating_sub(process.started_at_ms()));
+            let command = expand_tabs(&sanitize(process.command())).replace('\n', " ");
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(status, Style::default().fg(color)),
-                    Span::raw(format!(" · {elapsed} · {}", process.process_id)),
+                    Span::raw(format!(" · {elapsed} · {}", process.locator().process_id())),
                 ]),
                 Line::styled(
-                    format!("  {} · {command}", process.runner),
+                    format!("  {} · {command}", process.locator().runner()),
                     Style::default().fg(Color::DarkGray),
                 ),
             ])
@@ -819,7 +833,8 @@ fn process_list_items(processes: &[atra_protocol::BackgroundProcess]) -> Vec<Lis
 fn render_process_detail(
     frame: &mut Frame<'_>,
     picker: &ProcessPicker,
-    processes: &[atra_protocol::BackgroundProcess],
+    processes: &[atra_protocol::ProcessSummary],
+    detail: Option<&atra_protocol::ProcessState>,
     area: Rect,
 ) {
     let [command_area, output_area] = Layout::default()
@@ -828,28 +843,25 @@ fn render_process_detail(
         .areas(area);
     let selected = processes.get(picker.selected);
     let command = selected
-        .map(|process| expand_tabs(&sanitize(&process.command)))
+        .map(|process| expand_tabs(&sanitize(process.command())))
         .unwrap_or_else(|| "No background processes".to_owned());
     frame.render_widget(
         Paragraph::new(command).block(Block::default().title("Command").borders(Borders::ALL)),
         command_area,
     );
 
-    let detail = picker.detail.as_ref().filter(|detail| {
-        selected.is_some_and(|selected| {
-            detail.process.runner == selected.runner
-                && detail.process.process_id == selected.process_id
-        })
+    let detail = detail.filter(|detail| {
+        selected.is_some_and(|selected| detail.process().locator() == selected.locator())
     });
     let output = detail
-        .map(|detail| expand_tabs(&sanitize(&detail.output_tail)))
+        .map(|detail| expand_tabs(&sanitize(detail.output_tail())))
         .unwrap_or_default();
     let mut lines = output
         .lines()
         .map(|line| Line::from(line.to_owned()))
         .collect::<Vec<_>>();
     if lines.is_empty() {
-        let message = match selected.map(|process| &process.status) {
+        let message = match selected.map(|process| process.status()) {
             Some(ProcessStatus::Unavailable { message }) => expand_tabs(&sanitize(message)),
             Some(_) => "(no output)".to_owned(),
             None => String::new(),
@@ -860,7 +872,7 @@ fn render_process_detail(
     let bottom = lines.len().saturating_sub(visible_height);
     let start = bottom.saturating_sub(picker.output_scroll);
     let end = (start + visible_height).min(lines.len());
-    let omitted_bytes = detail.map_or(0, |detail| detail.omitted_bytes);
+    let omitted_bytes = detail.map_or(0, atra_protocol::ProcessState::omitted_bytes);
     frame.render_widget(
         Paragraph::new(lines[start..end].to_vec()).block(
             Block::default()
@@ -909,10 +921,10 @@ fn render_checkpoint_picker(
     frame: &mut Frame<'_>,
     area: Rect,
     picker: &CheckpointPicker,
+    checkpoints: &[atra_protocol::ThreadCheckpoint],
     focused: bool,
 ) {
-    let items = picker
-        .checkpoints
+    let items = checkpoints
         .iter()
         .map(|checkpoint| {
             ListItem::new(format!(
@@ -921,7 +933,10 @@ fn render_checkpoint_picker(
             ))
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(picker.selected));
+    let selected = checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.id == picker.selected);
+    let mut state = ListState::default().with_selected(selected);
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("● ").block(
             Block::default()

@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use atra_protocol::{
-    ApprovalId, AssistantMessagePhase, Model, RunnerOperationUpdate, ThreadEvent, ThreadId,
-};
+use atra_protocol::{AssistantMessagePhase, Model, RunnerOperationUpdate};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
@@ -59,42 +57,30 @@ pub(crate) enum ModelResponse {
 }
 
 pub(crate) enum ModelStreamEvent {
-    TurnStarted {
-        thread_id: ThreadId,
-    },
     Retry {
         current: u64,
         max: u64,
     },
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
-    ReasoningSummaryPartAdded,
     WebSearchUpdate {
         item_id: String,
         action: Option<serde_json::Value>,
     },
     ToolCallStarted {
         item_id: String,
+        call_id: Option<String>,
         name: String,
     },
     ToolCallDelta {
         item_id: String,
         delta: String,
     },
-    ApprovalRequired {
-        approval_id: ApprovalId,
-        thread_id: ThreadId,
-        tool: String,
-        arguments: serde_json::Value,
-        operation_index: Option<usize>,
-        operation_label: Option<String>,
-    },
     RunnerOperationUpdate {
         call_id: String,
         operation_index: usize,
         update: RunnerOperationUpdate,
     },
-    ThreadEvent(ThreadEvent),
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -35,6 +35,10 @@ pub(super) struct ApprovalDecision {
     pub(super) reason: Option<String>,
 }
 
+pub(super) struct ClaimedApproval {
+    decision: oneshot::Sender<ApprovalDecision>,
+}
+
 struct PendingApproval {
     thread_id: ThreadId,
     decision: oneshot::Sender<ApprovalDecision>,
@@ -127,21 +131,16 @@ impl TurnLifecycle {
         Ok((approval_id, receiver))
     }
 
-    pub(super) async fn resolve_approval(
-        &self,
-        approval_id: ApprovalId,
-        decision: ApprovalDecision,
-    ) -> Result<()> {
+    pub(super) async fn claim_approval(&self, approval_id: ApprovalId) -> Result<ClaimedApproval> {
         let pending = self
             .approvals
             .lock()
             .await
             .remove(&approval_id)
             .with_context(|| format!("approval {approval_id} is not pending"))?;
-        pending
-            .decision
-            .send(decision)
-            .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))
+        Ok(ClaimedApproval {
+            decision: pending.decision,
+        })
     }
 
     pub(super) async fn clear_approvals(&self, thread_id: ThreadId) {
@@ -162,6 +161,19 @@ impl TurnLifecycle {
             bail!("thread has a pending approval");
         }
         Ok(())
+    }
+}
+
+impl ClaimedApproval {
+    pub(super) fn resolve(
+        self,
+        approval_id: ApprovalId,
+        allowed: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
+        self.decision
+            .send(ApprovalDecision { allowed, reason })
+            .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))
     }
 }
 
@@ -229,5 +241,19 @@ mod tests {
 
         lifecycle.finish_delete(thread_id).await;
         assert!(lifecycle.start(thread_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_claimed_approval_releases_the_waiting_turn() {
+        let lifecycle = TurnLifecycle::new();
+        let thread_id = ThreadId(1);
+        lifecycle.start(thread_id).await.unwrap();
+        let (approval_id, waiting) = lifecycle.register_approval(thread_id).await.unwrap();
+
+        let claimed = lifecycle.claim_approval(approval_id).await.unwrap();
+        drop(claimed);
+
+        assert!(waiting.await.is_err());
+        assert!(lifecycle.claim_approval(approval_id).await.is_err());
     }
 }

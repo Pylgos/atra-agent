@@ -1,6 +1,26 @@
 use super::*;
 use futures_util::StreamExt;
 
+pub(super) enum TurnRequest {
+    Send {
+        thread_id: ThreadId,
+        message: String,
+    },
+    Continue {
+        thread_id: ThreadId,
+    },
+    Compact {
+        thread_id: ThreadId,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TurnCompletion {
+    Completed,
+    Cancelled,
+    Compacted,
+}
+
 fn response_event(response: &mut ModelResponse) -> ThreadEventData {
     match response {
         ModelResponse::AssistantMessage { content, phase } => {
@@ -61,31 +81,23 @@ fn tool_result_matches_call(result: &ToolResultEvent, call: &ToolCallEvent) -> b
 }
 
 impl State {
-    pub(super) async fn handle_streaming(
+    pub(super) async fn handle_started_streaming(
         &self,
         request: TurnRequest,
-        updates: &mpsc::UnboundedSender<ModelStreamEvent>,
-    ) -> Result<ControllerResponse> {
-        let thread_id = match &request {
-            TurnRequest::ThreadSend { thread_id, .. }
-            | TurnRequest::ThreadContinue { thread_id }
-            | TurnRequest::ThreadCompact { thread_id } => *thread_id,
-        };
-        let active = self.turns.start(thread_id).await?;
-        updates
-            .send(ModelStreamEvent::TurnStarted { thread_id })
-            .context("turn stream closed before turn started")?;
+        active: Arc<lifecycle::ActiveTurn>,
+        updates: &TurnProjector,
+    ) -> Result<TurnCompletion> {
         let mut cancel_requested = active.cancel_requested();
         let mut cancellation = active.cancellation();
         let mut turn = Box::pin(async {
             match request {
-                TurnRequest::ThreadSend { thread_id, message } => {
+                TurnRequest::Send { thread_id, message } => {
                     self.run_turn(thread_id, message, Some(updates)).await
                 }
-                TurnRequest::ThreadContinue { thread_id } => {
+                TurnRequest::Continue { thread_id } => {
                     self.continue_thread(thread_id, Some(updates)).await
                 }
-                TurnRequest::ThreadCompact { thread_id } => {
+                TurnRequest::Compact { thread_id } => {
                     self.compact_thread(thread_id, Some(updates)).await
                 }
             }
@@ -111,11 +123,11 @@ impl State {
                 .clone()
                 .expect("cancellation completed")
             {
-                Ok(()) => Ok(ControllerResponse::ThreadCancelled),
+                Ok(()) => Ok(TurnCompletion::Cancelled),
                 Err(message) => Err(anyhow!(message)),
             }
         };
-        if active.is_cancelling() && !matches!(response, Ok(ControllerResponse::ThreadCancelled)) {
+        if active.is_cancelling() && !matches!(response, Ok(TurnCompletion::Cancelled)) {
             if !*cancel_requested.borrow() {
                 cancel_requested
                     .changed()
@@ -133,12 +145,9 @@ impl State {
                 .clone()
                 .expect("cancellation completed")
             {
-                Ok(()) => Ok(ControllerResponse::ThreadCancelled),
+                Ok(()) => Ok(TurnCompletion::Cancelled),
                 Err(message) => Err(anyhow!(message)),
             };
-        }
-        if !active.is_cancelling() {
-            self.turns.finish(thread_id, &active).await;
         }
         response
     }
@@ -146,17 +155,24 @@ impl State {
         &self,
         thread_id: ThreadId,
         message: String,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ControllerResponse> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
-        self.store
-            .name_thread_if_unnamed(thread_id, message.clone())
-            .await
-            .context("failed to name thread")?;
-        self.sync_workspace_instructions(thread_id).await?;
+        {
+            let _mutation = self.lock_mutation().await?;
+            self.store
+                .name_thread_if_unnamed(thread_id, message.clone())
+                .await
+                .context("failed to name thread")?;
+            let metadata = self.store.thread(thread_id).await?;
+            self.views
+                .update_thread_metadata(thread_id, metadata)
+                .await?;
+        }
+        self.sync_workspace_instructions(thread_id, updates).await?;
         self.append_event(
             thread_id,
             ThreadEventData::UserMessage(MessageEvent { content: message }),
@@ -170,8 +186,8 @@ impl State {
     pub(super) async fn continue_thread(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ControllerResponse> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
@@ -204,14 +220,14 @@ impl State {
             None => bail!("thread has no resumable history"),
             _ => unreachable!(),
         }
-        self.sync_workspace_instructions(thread_id).await?;
+        self.sync_workspace_instructions(thread_id, updates).await?;
         self.continue_turn(thread_id, updates).await
     }
 
     pub(super) async fn prepare_thread_for_turn(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<()> {
         let events = self
             .store
@@ -260,9 +276,9 @@ impl State {
         Ok(())
     }
 
-    pub(super) async fn cancel_thread(&self, thread_id: ThreadId) -> Result<ControllerResponse> {
+    pub(super) async fn cancel_thread(&self, thread_id: ThreadId) -> Result<bool> {
         let Some(active) = self.turns.begin_cancellation(thread_id).await else {
-            return Ok(ControllerResponse::ThreadNotActive);
+            return Ok(false);
         };
         let stop = active.request_cancellation().await;
         let cleanup = async {
@@ -279,12 +295,9 @@ impl State {
                 Err(stop.context(format!("turn cleanup also failed: {cleanup:#}")))
             }
         };
-        self.turns.finish(thread_id, &active).await;
         let outcome = result.map_err(|error| format!("{error:#}"));
         active.complete_cancellation(outcome.clone());
-        outcome
-            .map(|()| ControllerResponse::ThreadCancelled)
-            .map_err(anyhow::Error::msg)
+        outcome.map(|()| true).map_err(anyhow::Error::msg)
     }
 
     pub(super) fn thread_lock(&self, thread_id: ThreadId) -> Arc<Mutex<()>> {
@@ -304,13 +317,13 @@ impl State {
     pub(super) async fn compact_thread(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ControllerResponse> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
-        self.sync_workspace_instructions(thread_id).await?;
+        self.sync_workspace_instructions(thread_id, updates).await?;
         let prompt_cache_key = format!(
             "{:x}",
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
@@ -358,7 +371,7 @@ impl State {
         {
             bail!("model returned an empty compaction");
         }
-        Ok(ControllerResponse::ThreadCompacted)
+        Ok(TurnCompletion::Compacted)
     }
 
     async fn compact_history(
@@ -367,7 +380,7 @@ impl State {
         model_session: &dyn model::ModelSession,
         model_request: &model::ModelRequest<'_>,
         context_window: Option<i64>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<bool> {
         self.append_event(
             thread_id,
@@ -379,10 +392,18 @@ impl State {
         )
         .await
         .context("failed to save compaction request")?;
-        self.store
-            .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
-            .await
-            .context("failed to checkpoint history before compaction")?;
+        {
+            let _mutation = self.lock_mutation().await?;
+            let checkpoint_id = self
+                .store
+                .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
+                .await
+                .context("failed to checkpoint history before compaction")?;
+            if let Some(updates) = updates {
+                let checkpoint = self.store.checkpoint(checkpoint_id).await?;
+                updates.checkpoint_added(checkpoint).await?;
+            }
+        }
         let Some(items) = model_session.compact(model_request).await? else {
             return Ok(false);
         };
@@ -391,26 +412,33 @@ impl State {
             WorkspaceInstructions::Present(content) => Some(InstructionEvent::Initial(content)),
             WorkspaceInstructions::Removed => Some(InstructionEvent::Removal),
         };
-        self.store
-            .replace_with_compaction(
-                thread_id,
-                CompactionEvent {
-                    items: serde_json::to_value(items).map_err(|error| anyhow!(error))?,
-                },
-                workspace_event,
-                skill_event(model_request.events),
-                runner_event(model_request.events),
-            )
-            .await
-            .context("failed to replace history after compaction")?;
+        {
+            let _mutation = self.lock_mutation().await?;
+            self.store
+                .replace_with_compaction(
+                    thread_id,
+                    CompactionEvent {
+                        items: serde_json::to_value(items).map_err(|error| anyhow!(error))?,
+                    },
+                    workspace_event,
+                    skill_event(model_request.events),
+                    runner_event(model_request.events),
+                )
+                .await
+                .context("failed to replace history after compaction")?;
+            if let Some(updates) = updates {
+                let events = protocol_events(self.store.events(thread_id).await?);
+                updates.history_replaced(events).await?;
+            }
+        }
         Ok(true)
     }
 
     pub(super) async fn continue_turn(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<ControllerResponse> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<TurnCompletion> {
         let prompt_cache_key = format!(
             "{:x}",
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
@@ -520,7 +548,7 @@ impl State {
                 match event {
                     model::ModelEvent::Update(event) => {
                         if let Some(updates) = updates {
-                            let _ = updates.send(event);
+                            updates.apply_update(event).await?;
                         }
                     }
                     model::ModelEvent::OutputItemDone {
@@ -535,20 +563,19 @@ impl State {
                         if let Some(response) = &mut response {
                             events.push(response_event(response));
                         }
-                        let saved = self
-                            .store
-                            .append_all(thread_id, events.clone())
-                            .await
-                            .context("failed to save completed model output item")?;
-                        if events.len() == 2
-                            && !matches!(events[1], ThreadEventData::Reasoning(_))
-                            && let Some(updates) = updates
                         {
-                            let _ =
-                                updates.send(model::ModelStreamEvent::ThreadEvent(ThreadEvent {
-                                    sequence: saved[1],
-                                    data: events.pop().unwrap(),
-                                }));
+                            let _mutation = self.lock_mutation().await?;
+                            let saved = self
+                                .store
+                                .append_all(thread_id, events.clone())
+                                .await
+                                .context("failed to save completed model output item")?;
+                            if let Some(updates) = updates {
+                                for (sequence, data) in saved.into_iter().zip(events) {
+                                    send_thread_event(updates, ThreadEvent { sequence, data })
+                                        .await?;
+                                }
+                            }
                         }
                         if let Some(
                             response @ (ModelResponse::AssistantMessage { .. }
@@ -565,21 +592,21 @@ impl State {
                         rate_limits,
                     } => {
                         if let Some(metadata) = metadata {
-                            self.store
-                                .append(
-                                    thread_id,
-                                    ThreadEventData::ModelOutput(ModelOutputEvent {
-                                        request_sequence,
-                                        output: serde_json::to_value(model::ProviderOutput {
-                                            provider: metadata.provider,
-                                            data: serde_json::Value::Array(Vec::new()),
-                                        })
-                                        .map_err(|error| anyhow!(error))?,
-                                        response_id: Some(metadata.response_id),
-                                    }),
-                                )
-                                .await
-                                .context("failed to save model response metadata")?;
+                            self.append_event(
+                                thread_id,
+                                ThreadEventData::ModelOutput(ModelOutputEvent {
+                                    request_sequence,
+                                    output: serde_json::to_value(model::ProviderOutput {
+                                        provider: metadata.provider,
+                                        data: serde_json::Value::Array(Vec::new()),
+                                    })
+                                    .map_err(|error| anyhow!(error))?,
+                                    response_id: Some(metadata.response_id),
+                                }),
+                                updates,
+                            )
+                            .await
+                            .context("failed to save model response metadata")?;
                         }
                         if let Some(usage) = token_usage {
                             self.append_event(
@@ -613,14 +640,14 @@ impl State {
             if !completed && stream_error.is_none() {
                 stream_error = Some(anyhow!("model stream ended before completion"));
             }
-            let response = self
+            let completed_response = self
                 .execute_model_responses(provider.as_ref(), thread_id, responses, updates)
                 .await?;
             if let Some(error) = stream_error {
                 return Err(error);
             }
-            if let Some(response) = response {
-                return Ok(response);
+            if completed_response {
+                return Ok(TurnCompletion::Completed);
             }
         }
     }
@@ -630,7 +657,7 @@ impl State {
         provider: &dyn model::ModelProvider,
         thread_id: ThreadId,
         events: &mut Vec<storage::Event>,
-        stream_updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        stream_updates: Option<&TurnProjector>,
     ) -> Result<usize> {
         let previous_boundary = storage::latest_frozen_boundary(events);
         let active_through = previous_boundary
@@ -728,6 +755,7 @@ impl State {
         if masked_tokens == 0 {
             return Ok(0);
         }
+        let _mutation = self.lock_mutation().await?;
         let sequence = self
             .store
             .freeze_event_payloads(
@@ -749,16 +777,18 @@ impl State {
         };
         events.push(boundary.clone());
         if let Some(stream_updates) = stream_updates {
-            let _ = stream_updates.send(ModelStreamEvent::ThreadEvent(protocol_event(boundary)));
-            for (_, event) in &masked_events {
-                let _ = stream_updates
-                    .send(ModelStreamEvent::ThreadEvent(protocol_event(event.clone())));
-            }
+            stream_updates
+                .history_replaced(protocol_events(events.clone()))
+                .await?;
         }
         Ok(masked_tokens)
     }
 
-    pub(super) async fn sync_workspace_instructions(&self, thread_id: ThreadId) -> Result<()> {
+    pub(super) async fn sync_workspace_instructions(
+        &self,
+        thread_id: ThreadId,
+        updates: Option<&TurnProjector>,
+    ) -> Result<()> {
         let content = self.read_workspace_instructions().await?;
         let events = self
             .store
@@ -792,17 +822,20 @@ impl State {
                 InstructionEvent::Initial(content)
             }
         };
-        self.store
-            .append(thread_id, ThreadEventData::WorkspaceInstructions(event))
-            .await
-            .context("failed to save workspace instructions")?;
+        self.append_event(
+            thread_id,
+            ThreadEventData::WorkspaceInstructions(event),
+            updates,
+        )
+        .await
+        .context("failed to save workspace instructions")?;
         Ok(())
     }
 
     pub(super) async fn sync_skills(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<()> {
         let generation = self.collect_skill_generation().await?;
 
@@ -862,7 +895,7 @@ impl State {
     pub(super) async fn sync_runners(
         &self,
         thread_id: ThreadId,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<()> {
         let runners = self.runners.list().await?;
         let events = self
@@ -927,8 +960,8 @@ impl State {
         provider: &dyn model::ModelProvider,
         thread_id: ThreadId,
         mut responses: VecDeque<ModelResponse>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> Result<Option<ControllerResponse>> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<bool> {
         let mut final_answer = None;
         let mut needs_follow_up = false;
         while let Some(response) = responses.pop_front() {
@@ -1031,7 +1064,8 @@ impl State {
                             RunnerOperationUpdate::Completed {
                                 artifact: artifact.clone(),
                             },
-                        )?;
+                        )
+                        .await?;
                         artifacts.push(artifact);
                     }
                     self.save_tool_result(
@@ -1050,10 +1084,7 @@ impl State {
                 ModelResponse::Reasoning { .. } => {}
             }
         }
-        Ok((!needs_follow_up)
-            .then_some(final_answer)
-            .flatten()
-            .map(|content| ControllerResponse::TurnCompleted { content }))
+        Ok(!needs_follow_up && final_answer.is_some())
     }
 
     pub(super) async fn approve_and_execute(
@@ -1062,7 +1093,7 @@ impl State {
         name: &str,
         arguments: CommandArguments,
         operation: Option<&OperationContext>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
         let runner = self.runners.get(arguments.runner()).await?;
         let decision = if runner.approval().await == ApprovalPolicy::Ask {
@@ -1071,15 +1102,14 @@ impl State {
             let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
             updates
                 .context("approval requires a streaming turn")?
-                .send(ModelStreamEvent::ApprovalRequired {
+                .approval_requested(atra_protocol::PendingApproval::new(
                     approval_id,
-                    thread_id,
-                    tool: name.to_owned(),
-                    arguments: arguments_json,
-                    operation_index: operation.map(|operation| operation.index),
-                    operation_label: operation.map(|operation| operation.label.clone()),
-                })
-                .context("turn stream closed while waiting for approval")?;
+                    name.to_owned(),
+                    arguments_json,
+                    operation.map(|operation| operation.index),
+                    operation.map(|operation| operation.label.clone()),
+                ))
+                .await?;
             Some(
                 approval
                     .await
@@ -1103,16 +1133,11 @@ impl State {
         Ok(result)
     }
 
-    pub(super) async fn resolve_approval(
+    pub(super) async fn claim_approval(
         &self,
         approval_id: ApprovalId,
-        allowed: bool,
-        reason: Option<String>,
-    ) -> Result<ControllerResponse> {
-        self.turns
-            .resolve_approval(approval_id, ApprovalDecision { allowed, reason })
-            .await?;
-        Ok(ControllerResponse::ApprovalResolved)
+    ) -> Result<lifecycle::ClaimedApproval> {
+        self.turns.claim_approval(approval_id).await
     }
 
     pub(super) async fn execute(
@@ -1120,7 +1145,7 @@ impl State {
         thread_id: ThreadId,
         arguments: CommandArguments,
         operation: Option<&OperationContext>,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
         let runner_name = arguments.runner.clone();
         let command = arguments.command.clone();
@@ -1139,7 +1164,7 @@ impl State {
             .start_command(arguments.command, thread_id, &process_id)
             .await?;
         active.set_process(Arc::clone(&runner), process_handle.clone());
-        send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted)?;
+        send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted).await?;
         let deadline = Instant::now() + std::time::Duration::from_millis(FOREGROUND_TIMEOUT_MS);
         let mut collected = None;
         let mut patch_results = Vec::new();
@@ -1158,7 +1183,7 @@ impl State {
                     ..
                 } => {
                     self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
-                        .await;
+                        .await?;
                     send_operation_update(
                         operation,
                         updates,
@@ -1166,7 +1191,8 @@ impl State {
                             content: output.content.clone(),
                             omitted_bytes: output.omitted_bytes,
                         },
-                    )?;
+                    )
+                    .await?;
                     append_command_output(&mut collected, output);
                     patch_results.extend(result_patch_results);
                     if Instant::now() >= deadline {
@@ -1185,7 +1211,7 @@ impl State {
                     spawned_processes,
                 } => {
                     self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
-                        .await;
+                        .await?;
                     append_command_output(&mut collected, output);
                     patch_results.extend(result_patch_results);
                     break WaitOutcome::Finished {
@@ -1204,20 +1230,19 @@ impl State {
                 patch_results,
                 ..
             } => {
-                self.runners
-                    .insert_process(
-                        ProcessKey {
-                            thread_id,
-                            runner: runner_name.clone(),
-                            process_id: process_id.clone(),
-                        },
-                        ProcessRecord {
-                            handle: process_handle,
-                            command: command.clone(),
-                            started_at_ms,
-                        },
-                    )
-                    .await;
+                self.register_managed_process(
+                    ProcessKey {
+                        thread_id,
+                        runner: runner_name.clone(),
+                        process_id: process_id.clone(),
+                    },
+                    ProcessRecord {
+                        handle: process_handle,
+                        command: command.clone(),
+                        started_at_ms,
+                    },
+                )
+                .await?;
                 active.clear_process();
                 CommandOutcome::Running {
                     process_id,
@@ -1263,7 +1288,7 @@ impl State {
         call_id: Option<&str>,
         outcome: ToolOutcome,
         custom: bool,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+        updates: Option<&TurnProjector>,
     ) -> Result<()> {
         let data = if custom {
             ThreadEventData::ToolResult(ToolResultEvent::Custom {
@@ -1294,17 +1319,17 @@ impl State {
         &self,
         thread_id: ThreadId,
         data: ThreadEventData,
-        updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
-    ) -> tokio_rusqlite::Result<EventSequence> {
+        updates: Option<&TurnProjector>,
+    ) -> Result<EventSequence> {
+        let _mutation = self.lock_mutation().await?;
         let sequence = self.store.append(thread_id, data.clone()).await?;
         if let Some(updates) = updates {
-            updates
-                .send(ModelStreamEvent::ThreadEvent(ThreadEvent {
-                    sequence,
-                    data,
-                }))
-                .ok();
+            send_thread_event(updates, ThreadEvent { sequence, data }).await?;
         }
         Ok(sequence)
     }
+}
+
+async fn send_thread_event(updates: &TurnProjector, event: ThreadEvent) -> Result<()> {
+    updates.event_finalized(event).await
 }

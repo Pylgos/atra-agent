@@ -586,9 +586,6 @@ async fn handle_sse_event(
         "response.reasoning_summary_text.delta" => event["delta"]
             .as_str()
             .map(|value| ModelStreamEvent::ReasoningSummaryDelta(value.to_owned())),
-        "response.reasoning_summary_part.added" => {
-            Some(ModelStreamEvent::ReasoningSummaryPartAdded)
-        }
         "response.custom_tool_call_input.delta" => Some(ModelStreamEvent::ToolCallDelta {
             item_id: event["item_id"].as_str().unwrap_or_default().to_owned(),
             delta: event["delta"].as_str().unwrap_or_default().to_owned(),
@@ -599,6 +596,7 @@ async fn handle_sse_event(
                 Some("custom_tool_call") | Some("function_call") => {
                     Some(ModelStreamEvent::ToolCallStarted {
                         item_id: item["id"].as_str().unwrap_or_default().to_owned(),
+                        call_id: item["call_id"].as_str().map(str::to_owned),
                         name: item["name"].as_str().unwrap_or_default().to_owned(),
                     })
                 }

@@ -1,265 +1,201 @@
 use std::{path::PathBuf, time::Duration};
 
 use atra_protocol::{
-    ControllerRequest, ControllerResponse, Thread, ThreadEventData, ThreadId, TurnRequest,
-    UnaryRequest,
+    Command, CommandResult, ControllerChange, ControllerLifecycle, SubscriptionTerminal,
+    ThreadChange, ThreadEventData, ThreadId,
 };
 use tempfile::TempDir;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-    task::JoinHandle,
-};
+use tokio::{io::AsyncWriteExt, net::UnixStream, task::JoinHandle};
 
 #[tokio::test]
-async fn status_reports_running() {
+async fn subscriptions_receive_snapshot_then_shared_operations() {
     let controller = TestController::start().await;
+    let client = atra_client::Client::new(&controller.endpoint);
+    let mut controller_subscription = client.subscribe_controller().await.unwrap();
+    assert_eq!(
+        controller_subscription.state().lifecycle(),
+        ControllerLifecycle::Running
+    );
+    assert!(controller_subscription.state().threads().is_empty());
 
-    assert_eq!(
-        status(&controller.endpoint).await,
-        ControllerResponse::Running
-    );
-}
-
-#[tokio::test]
-async fn lists_threads_newest_first() {
-    let controller = TestController::start().await;
-    let first = request(
-        &controller.endpoint,
-        unary(UnaryRequest::ThreadCreate {
-            display_name: Some("Named".to_owned()),
-        }),
-    )
-    .await;
-    let second = request(
-        &controller.endpoint,
-        unary(UnaryRequest::ThreadCreate { display_name: None }),
-    )
-    .await;
-
-    assert_eq!(
-        (first, second),
-        (
-            ControllerResponse::ThreadCreated {
-                thread_id: ThreadId(1),
-            },
-            ControllerResponse::ThreadCreated {
-                thread_id: ThreadId(2),
-            },
-        )
-    );
-    assert_eq!(
-        request(&controller.endpoint, unary(UnaryRequest::ThreadList)).await,
-        ControllerResponse::ThreadList {
-            threads: vec![
-                Thread {
-                    id: ThreadId(2),
-                    display_name: None,
-                    provider: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
-                    reasoning_effort: "medium".to_owned(),
-                },
-                Thread {
-                    id: ThreadId(1),
-                    display_name: Some("Named".to_owned()),
-                    provider: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
-                    reasoning_effort: "medium".to_owned(),
-                }
-            ]
-        }
-    );
-
-    assert_eq!(
-        request(
-            &controller.endpoint,
-            unary(UnaryRequest::ThreadRename {
-                thread_id: ThreadId(1),
-                display_name: "Renamed".to_owned(),
-            }),
-        )
-        .await,
-        ControllerResponse::ThreadRenamed
-    );
-    let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
-    let mut encoded_request = serde_json::to_vec(&turn(TurnRequest::ThreadSend {
-        thread_id: ThreadId(2),
-        message: "First prompt".to_owned(),
-    }))
-    .unwrap();
-    encoded_request.push(b'\n');
-    stream.write_all(&encoded_request).await.unwrap();
-    let mut responses = BufReader::new(stream).lines();
-    assert_eq!(
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap(),
-        ControllerResponse::TurnStarted {
-            thread_id: ThreadId(2),
-        }
-    );
-    let skills =
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap();
-    assert!(matches!(
-        skills,
-        ControllerResponse::TurnEvent { event } if matches!(event.data, ThreadEventData::Skills(_))
-    ));
-    let runners =
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap();
-    assert!(matches!(
-        runners,
-        ControllerResponse::TurnEvent { event } if matches!(event.data, ThreadEventData::Runners(_))
-    ));
-    let event =
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap();
-    assert!(matches!(
-        event,
-        ControllerResponse::TurnEvent { event }
-            if matches!(&event.data, ThreadEventData::UserMessage(message) if message.content == "First prompt")
-    ));
-    let response =
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap();
-    assert!(matches!(response, ControllerResponse::Error { .. }));
-    assert_eq!(
-        request(&controller.endpoint, unary(UnaryRequest::ThreadList)).await,
-        ControllerResponse::ThreadList {
-            threads: vec![
-                Thread {
-                    id: ThreadId(2),
-                    display_name: Some("First prompt".to_owned()),
-                    provider: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
-                    reasoning_effort: "medium".to_owned(),
-                },
-                Thread {
-                    id: ThreadId(1),
-                    display_name: Some("Renamed".to_owned()),
-                    provider: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
-                    reasoning_effort: "medium".to_owned(),
-                }
-            ]
-        }
-    );
-}
-
-#[tokio::test]
-async fn active_turn_can_be_cancelled_after_starting() {
-    let controller = TestController::start().await;
-    assert_eq!(
-        request(
-            &controller.endpoint,
-            unary(UnaryRequest::ThreadCreate { display_name: None }),
-        )
-        .await,
-        ControllerResponse::ThreadCreated {
-            thread_id: ThreadId(1),
-        }
-    );
-    let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
-    let mut encoded_request = serde_json::to_vec(&turn(TurnRequest::ThreadSend {
-        thread_id: ThreadId(1),
-        message: "Cancel this".to_owned(),
-    }))
-    .unwrap();
-    encoded_request.push(b'\n');
-    stream.write_all(&encoded_request).await.unwrap();
-    let mut responses = BufReader::new(stream).lines();
-    assert_eq!(
-        serde_json::from_str::<ControllerResponse>(&responses.next_line().await.unwrap().unwrap())
-            .unwrap(),
-        ControllerResponse::TurnStarted {
-            thread_id: ThreadId(1),
-        }
-    );
-
-    assert_eq!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            request(
-                &controller.endpoint,
-                unary(UnaryRequest::ThreadCancel {
-                    thread_id: ThreadId(1),
-                }),
-            ),
-        )
+    let thread_id = match client
+        .command(Command::ThreadCreate {
+            display_name: Some("Initial".to_owned()),
+        })
         .await
-        .expect("cancellation did not complete"),
-        ControllerResponse::ThreadCancelled
+        .unwrap()
+    {
+        CommandResult::ThreadCreated { thread_id } => thread_id,
+        result => panic!("unexpected command result: {result:?}"),
+    };
+    assert_eq!(
+        controller_subscription.receive().await.unwrap(),
+        ControllerChange::Thread(thread_id)
     );
-    let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+
+    let mut thread_subscription = client.subscribe_thread(thread_id).await.unwrap();
+    client
+        .command(Command::ThreadRename {
+            thread_id,
+            display_name: "Renamed".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        controller_subscription.receive().await.unwrap(),
+        ControllerChange::Thread(thread_id)
+    );
+    assert_eq!(
+        thread_subscription.receive().await.unwrap(),
+        ThreadChange::Metadata
+    );
+    assert_eq!(
+        thread_subscription
+            .state()
+            .metadata()
+            .display_name
+            .as_deref(),
+        Some("Renamed")
+    );
+}
+
+#[tokio::test]
+async fn accepted_turn_progresses_through_thread_operations() {
+    let controller = TestController::start().await;
+    let client = atra_client::Client::new(&controller.endpoint);
+    let thread_id = match client
+        .command(Command::ThreadCreate { display_name: None })
+        .await
+        .unwrap()
+    {
+        CommandResult::ThreadCreated { thread_id } => thread_id,
+        result => panic!("unexpected command result: {result:?}"),
+    };
+    let mut subscription = client.subscribe_thread(thread_id).await.unwrap();
+    assert_eq!(
+        client
+            .command(Command::ThreadSend {
+                thread_id,
+                message: "State-synchronized prompt".to_owned(),
+            })
+            .await
+            .unwrap(),
+        CommandResult::Accepted
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let response = serde_json::from_str::<ControllerResponse>(
-                &responses.next_line().await.unwrap().unwrap(),
-            )
-            .unwrap();
-            if matches!(
-                response,
-                ControllerResponse::ThreadCancelled | ControllerResponse::Error { .. }
-            ) {
-                break response;
+            if subscription.receive().await.unwrap() == ThreadChange::TurnFinished {
+                break;
             }
         }
     })
     .await
-    .expect("turn stream did not complete");
-    assert_eq!(terminal, ControllerResponse::ThreadCancelled);
+    .expect("turn state did not reach an outcome");
+    assert!(subscription.state().active_turn().is_none());
+    assert!(subscription.state().last_outcome().is_some());
+    assert!(subscription.state().events().iter().any(|event| {
+        matches!(
+            &event.data,
+            ThreadEventData::UserMessage(message)
+                if message.content == "State-synchronized prompt"
+        )
+    }));
 }
 
 #[tokio::test]
-async fn stalled_client_does_not_block_another_client() {
+async fn unsupported_and_unknown_requests_are_rejected_without_stopping_controller() {
     let controller = TestController::start().await;
-    let _stalled_client = UnixStream::connect(&controller.endpoint).await.unwrap();
+    for request in [
+        br#"{"kind":"unary","request":{"method":"status"}}\n"#.as_slice(),
+        br#"{"kind":"subscribe","request":{"resource":"controller","extra":true}}\n"#.as_slice(),
+    ] {
+        let mut stream = UnixStream::connect(&controller.endpoint).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        drop(stream);
+    }
 
+    let subscription = atra_client::Client::new(&controller.endpoint)
+        .subscribe_controller()
+        .await
+        .unwrap();
     assert_eq!(
-        status(&controller.endpoint).await,
-        ControllerResponse::Running
+        subscription.state().lifecycle(),
+        ControllerLifecycle::Running
     );
 }
 
 #[tokio::test]
-async fn invalid_message_does_not_stop_controller() {
+async fn deleting_a_thread_terminates_its_subscription() {
     let controller = TestController::start().await;
-    let mut client = UnixStream::connect(&controller.endpoint).await.unwrap();
+    let client = atra_client::Client::new(&controller.endpoint);
+    let thread_id = match client
+        .command(Command::ThreadCreate { display_name: None })
+        .await
+        .unwrap()
+    {
+        CommandResult::ThreadCreated { thread_id } => thread_id,
+        result => panic!("unexpected command result: {result:?}"),
+    };
+    let mut subscription = client.subscribe_thread(thread_id).await.unwrap();
+
     client
-        .write_all(b"{\"method\":\"unknown\"}\n")
+        .command(Command::ThreadDelete { thread_id })
         .await
         .unwrap();
-    drop(client);
-
+    let error = subscription.receive().await.unwrap_err();
     assert_eq!(
-        status(&controller.endpoint).await,
-        ControllerResponse::Running
+        error
+            .downcast_ref::<atra_client::SubscriptionError>()
+            .unwrap()
+            .terminal(),
+        &SubscriptionTerminal::Deleted
     );
 }
 
-async fn status(endpoint: &PathBuf) -> ControllerResponse {
-    request(endpoint, unary(UnaryRequest::Status)).await
+#[tokio::test]
+async fn shutdown_sends_stopping_operation_before_terminal() {
+    let controller = TestController::start().await;
+    let client = atra_client::Client::new(&controller.endpoint);
+    let mut subscription = client.subscribe_controller().await.unwrap();
+
+    assert_eq!(
+        client.command(Command::Shutdown).await.unwrap(),
+        CommandResult::Accepted
+    );
+    assert_eq!(
+        subscription.receive().await.unwrap(),
+        ControllerChange::Lifecycle
+    );
+    assert_eq!(
+        subscription.state().lifecycle(),
+        ControllerLifecycle::Stopping
+    );
+    let error = subscription.receive().await.unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<atra_client::SubscriptionError>()
+            .unwrap()
+            .terminal(),
+        &SubscriptionTerminal::ControllerShutdown
+    );
 }
 
-fn unary(request: UnaryRequest) -> ControllerRequest {
-    ControllerRequest::Unary(request)
-}
-
-fn turn(request: TurnRequest) -> ControllerRequest {
-    ControllerRequest::Turn(request)
-}
-
-async fn request(endpoint: &PathBuf, request: ControllerRequest) -> ControllerResponse {
-    let mut stream = UnixStream::connect(endpoint).await.unwrap();
-    let mut request = serde_json::to_vec(&request).unwrap();
-    request.push(b'\n');
-    stream.write_all(&request).await.unwrap();
-
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
+#[tokio::test]
+async fn missing_subscription_resource_returns_an_error_terminal() {
+    let controller = TestController::start().await;
+    let error = atra_client::Client::new(&controller.endpoint)
+        .subscribe_thread(ThreadId(999))
         .await
-        .unwrap();
-    serde_json::from_str(&response).unwrap()
+        .err()
+        .expect("missing thread subscription unexpectedly succeeded");
+    assert!(matches!(
+        error
+            .downcast_ref::<atra_client::SubscriptionError>()
+            .unwrap()
+            .terminal(),
+        SubscriptionTerminal::Error { .. }
+    ));
 }
 
 struct TestController {

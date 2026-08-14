@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use atra_protocol::{
-    EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, TodoItem, ToolCallEvent,
-    ToolResultEvent,
+    ActiveItemData, ActiveItemId, EventSequence, RunnerOperationUpdate, ThreadChange, ThreadEvent,
+    ThreadEventData, ThreadState, TodoItem, ToolCallEvent, ToolResultEvent,
 };
 use ratatui::text::Line;
 
@@ -15,114 +15,210 @@ pub(crate) use render::{
 
 pub(crate) struct TranscriptState {
     pub(crate) entries: Vec<TranscriptEntry>,
-    pub(crate) events: Vec<ThreadEvent>,
-    live_previews: HashMap<String, usize>,
+    active_entries: HashMap<ActiveItemId, ActiveEntry>,
+}
+
+enum ActiveEntry {
+    Transcript(usize),
+    RunnerCall(String),
 }
 
 impl TranscriptState {
-    pub(crate) fn new(entries: Vec<TranscriptEntry>, events: Vec<ThreadEvent>) -> Self {
+    pub(crate) fn new(entries: Vec<TranscriptEntry>) -> Self {
         Self {
             entries,
-            events,
-            live_previews: HashMap::new(),
+            active_entries: HashMap::new(),
         }
     }
 
-    pub(crate) fn replace(&mut self, entries: Vec<TranscriptEntry>, events: Vec<ThreadEvent>) {
+    pub(crate) fn replace(&mut self, entries: Vec<TranscriptEntry>) {
         self.entries = entries;
-        self.events = events;
-        self.live_previews.clear();
+        self.active_entries.clear();
     }
 
-    pub(crate) fn replace_events(&mut self, events: Vec<ThreadEvent>) {
-        self.replace(transcript_from_events(&events), events);
+    pub(crate) fn rebuild(&mut self, state: &ThreadState) {
+        self.replace(transcript_from_events(state.events()));
+        if let Some(turn) = state.active_turn() {
+            for item in turn.items() {
+                self.synchronize_active(item.id(), item.data());
+            }
+            if let Some(approval) = turn.pending_approval() {
+                self.set_pending_approval(approval.operation_index());
+            }
+        }
+    }
+
+    pub(crate) fn replace_events(&mut self, events: &[ThreadEvent]) {
+        self.replace(transcript_from_events(events));
     }
 
     pub(crate) fn clear(&mut self) {
-        self.replace(Vec::new(), Vec::new());
+        self.replace(Vec::new());
     }
 
-    pub(crate) fn append_assistant_delta(&mut self, content: &str) {
-        let content = sanitize(content);
-        if self
-            .entries
-            .last()
-            .is_some_and(TranscriptEntry::is_assistant_message)
-        {
-            self.entries.last_mut().unwrap().append_message(&content);
-        } else {
-            self.entries
-                .push(TranscriptEntry::message(Author::Assistant, content));
+    pub(crate) fn apply_change(&mut self, state: &ThreadState, change: &ThreadChange) {
+        match change {
+            ThreadChange::Event(sequence) => {
+                if let Some(event) = state
+                    .events()
+                    .iter()
+                    .find(|event| event.sequence == *sequence)
+                {
+                    self.append_event(event);
+                }
+            }
+            ThreadChange::ActiveItem(id) => match state
+                .active_turn()
+                .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))
+            {
+                Some(item) => self.synchronize_active(*id, item.data()),
+                None => self.remove_active(*id, state),
+            },
+            ThreadChange::ActiveItemFinalized {
+                active_id,
+                sequence,
+            } => {
+                self.remove_active(*active_id, state);
+                if let Some(event) = state
+                    .events()
+                    .iter()
+                    .find(|event| event.sequence == *sequence)
+                {
+                    self.append_event(event);
+                }
+            }
+            ThreadChange::HistoryReplaced => self.rebuild(state),
+            ThreadChange::Approval => {
+                if let Some(approval) = state.active_turn().and_then(|turn| turn.pending_approval())
+                {
+                    self.set_pending_approval(approval.operation_index());
+                } else {
+                    self.set_pending_approval(None);
+                }
+            }
+            ThreadChange::TurnFinished => {
+                let active_ids = self.active_entries.keys().copied().collect::<Vec<_>>();
+                for id in active_ids {
+                    self.remove_active(id, state);
+                }
+                self.set_pending_approval(None);
+            }
+            ThreadChange::Metadata
+            | ThreadChange::Phase
+            | ThreadChange::Checkpoint(_)
+            | ThreadChange::Process(_) => {}
         }
     }
 
-    pub(crate) fn append_reasoning_delta(&mut self, content: &str) {
-        let content = sanitize(content);
-        if self
-            .entries
-            .last()
-            .is_some_and(TranscriptEntry::is_reasoning_summary)
+    fn synchronize_active(&mut self, id: ActiveItemId, data: &ActiveItemData) {
+        if let ActiveItemData::RunnerTool {
+            call_id,
+            operation_index,
+            update,
+        } = data
         {
-            self.entries.last_mut().unwrap().append_message(&content);
-        } else {
-            self.entries
-                .push(TranscriptEntry::new(TranscriptItem::ReasoningSummary {
-                    text: content,
-                }));
-        }
-    }
-
-    pub(crate) fn finish_reasoning_part(&mut self) {
-        if let Some(entry) = self.entries.last_mut()
-            && entry.is_reasoning_summary()
-            && !entry.is_empty_reasoning_summary()
-        {
-            entry.append_message("\n\n");
-        }
-    }
-
-    pub(crate) fn start_tool_preview(&mut self, item_id: String, name: &str) {
-        let index = self.entries.len();
-        self.entries
-            .push(TranscriptEntry::new(TranscriptItem::ToolCall {
-                name: sanitize(name),
-                arguments: None,
-            }));
-        self.live_previews.insert(item_id, index);
-    }
-
-    pub(crate) fn update_web_search_preview(
-        &mut self,
-        item_id: String,
-        action: Option<serde_json::Value>,
-    ) {
-        let item = TranscriptItem::WebSearch {
-            action: sanitize_value(action.unwrap_or(serde_json::Value::Null)),
-        };
-        if let Some(index) = self.live_previews.get(&item_id) {
-            self.entries[*index].replace(item);
+            self.active_entries
+                .insert(id, ActiveEntry::RunnerCall(call_id.clone()));
+            self.update_runner_operation(call_id, *operation_index, update.clone());
             return;
         }
-        let index = self.entries.len();
-        self.entries.push(TranscriptEntry::new(item));
-        self.live_previews.insert(item_id, index);
-    }
-
-    pub(crate) fn append_tool_preview(&mut self, item_id: &str, content: &str) {
-        if let Some(index) = self.live_previews.get(item_id) {
-            self.entries[*index].append_tool_input(&sanitize(content));
+        let item = match data {
+            ActiveItemData::Assistant { content } => TranscriptItem::Message {
+                author: Author::Assistant,
+                text: sanitize(content),
+                todos: Vec::new(),
+            },
+            ActiveItemData::Reasoning { content } => TranscriptItem::ReasoningSummary {
+                text: sanitize(content),
+            },
+            ActiveItemData::WebSearch { action, .. } => TranscriptItem::WebSearch {
+                action: sanitize_value(action.clone().unwrap_or(serde_json::Value::Null)),
+            },
+            ActiveItemData::ToolCall { name, input, .. } => TranscriptItem::ToolCall {
+                name: sanitize(name),
+                arguments: (!input.is_empty()).then(|| {
+                    sanitize_value(
+                        serde_json::from_str(input)
+                            .unwrap_or_else(|_| serde_json::Value::String(input.clone())),
+                    )
+                }),
+            },
+            ActiveItemData::RunnerTool { .. } => unreachable!(),
+        };
+        match self.active_entries.get(&id) {
+            Some(ActiveEntry::Transcript(index)) => self.entries[*index].replace(item),
+            Some(ActiveEntry::RunnerCall(_)) => unreachable!("active item kind changed"),
+            None => {
+                let index = self.entries.len();
+                self.entries.push(TranscriptEntry::new(item));
+                self.active_entries
+                    .insert(id, ActiveEntry::Transcript(index));
+            }
         }
     }
 
-    pub(crate) fn discard_live_previews(&mut self) {
-        let mut indices = self
-            .live_previews
-            .drain()
-            .map(|(_, index)| index)
-            .collect::<Vec<_>>();
-        indices.sort_unstable_by(|left, right| right.cmp(left));
-        for index in indices {
-            self.entries.remove(index);
+    fn remove_active(&mut self, id: ActiveItemId, state: &ThreadState) {
+        let Some(active) = self.active_entries.remove(&id) else {
+            return;
+        };
+        let index = match active {
+            ActiveEntry::Transcript(index) => index,
+            ActiveEntry::RunnerCall(call_id) => {
+                self.restore_runner_call(state, &call_id);
+                return;
+            }
+        };
+        self.entries.remove(index);
+        for current in self.active_entries.values_mut() {
+            if let ActiveEntry::Transcript(current) = current
+                && *current > index
+            {
+                *current -= 1;
+            }
+        }
+    }
+
+    fn restore_runner_call(&mut self, state: &ThreadState, call_id: &str) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.runner_call_id() == Some(call_id))
+        else {
+            return;
+        };
+        let Some(event) = state.events().iter().find(|event| {
+            matches!(
+                &event.data,
+                ThreadEventData::ToolCall(ToolCallEvent::Custom {
+                    call_id: current,
+                    ..
+                } | ToolCallEvent::Function {
+                    call_id: Some(current),
+                    ..
+                }) if current == call_id
+            )
+        }) else {
+            return;
+        };
+        let Some(mut entry) = TranscriptEntry::from_event(event.clone()) else {
+            return;
+        };
+        for event in state.events() {
+            merge_runner_tool_result(std::slice::from_mut(&mut entry), event);
+        }
+        self.entries[index] = entry;
+        if let Some(turn) = state.active_turn() {
+            for item in turn.items() {
+                if let ActiveItemData::RunnerTool {
+                    call_id: current,
+                    operation_index,
+                    update,
+                } = item.data()
+                    && current == call_id
+                {
+                    self.update_runner_operation(current, *operation_index, update.clone());
+                }
+            }
         }
     }
 
@@ -153,71 +249,16 @@ impl TranscriptState {
         }
     }
 
-    pub(crate) fn apply_event(&mut self, event: ThreadEvent) {
-        if let Some(existing) = self
-            .events
-            .iter_mut()
-            .find(|existing| existing.sequence == event.sequence)
-        {
-            *existing = event.clone();
-            if merge_runner_tool_result(&mut self.entries, &event) {
-                return;
-            }
-            if let Some(item) = item_from_event(event)
-                && let Some(entry) = self
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.sequence == Some(existing.sequence))
-            {
-                entry.replace(item);
-            }
+    fn append_event(&mut self, event: &ThreadEvent) {
+        if merge_runner_tool_result(&mut self.entries, event) {
             return;
         }
-        self.events.push(event.clone());
-        let item_id = match &event.data {
-            ThreadEventData::ToolCall(ToolCallEvent::Custom { item_id, .. }) => item_id.clone(),
-            ThreadEventData::WebSearch(search) => search
-                .item
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        };
-        let sequence = event.sequence;
-        if merge_runner_tool_result(&mut self.entries, &event) {
-            return;
-        }
-        let Some(item) = item_from_event(event) else {
+        let Some(item) = item_from_event(event.clone()) else {
             return;
         };
-        if matches!(
-            item,
-            TranscriptItem::WebSearch { .. }
-                | TranscriptItem::ToolCall { .. }
-                | TranscriptItem::RunnerTool { .. }
-        ) && let Some(item_id) = item_id
-            && let Some(index) = self.live_previews.remove(&item_id)
-        {
-            self.entries[index].replace_event(sequence, item);
-            return;
-        }
-        if matches!(
-            item,
-            TranscriptItem::Message {
-                author: Author::Assistant,
-                ..
-            }
-        ) && let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.is_assistant_message() && entry.sequence.is_none())
-        {
-            entry.replace_event(sequence, item);
-            return;
-        }
         self.entries.push(TranscriptEntry {
             item,
-            sequence: Some(sequence),
+            sequence: Some(event.sequence),
             rendered: None,
         });
     }
@@ -286,15 +327,6 @@ impl TranscriptItem {
         }
     }
 
-    pub(crate) fn append_message(&mut self, content: &str) {
-        match self {
-            Self::Message { text, .. } | Self::ReasoningSummary { text } => {
-                text.push_str(content);
-            }
-            _ => unreachable!(),
-        };
-    }
-
     pub(crate) fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
             || matches!(self, Self::RunnerTool { results, .. } if !results.is_empty())
@@ -318,14 +350,6 @@ impl TranscriptItem {
                 ..
             }
         )
-    }
-
-    pub(crate) fn is_reasoning_summary(&self) -> bool {
-        matches!(self, Self::ReasoningSummary { .. })
-    }
-
-    pub(crate) fn is_empty_reasoning_summary(&self) -> bool {
-        matches!(self, Self::ReasoningSummary { text } if text.is_empty())
     }
 }
 
@@ -353,26 +377,9 @@ impl TranscriptEntry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn message(author: Author, text: String) -> Self {
         Self::new(TranscriptItem::message(author, text))
-    }
-
-    pub(crate) fn append_message(&mut self, content: &str) {
-        self.item.append_message(content);
-        self.rendered = None;
-    }
-
-    pub(crate) fn append_tool_input(&mut self, content: &str) {
-        match &mut self.item {
-            TranscriptItem::RunnerTool { input, .. } => input.push_str(content),
-            TranscriptItem::ToolCall { arguments, .. } => match arguments {
-                Some(serde_json::Value::String(input)) => input.push_str(content),
-                None => *arguments = Some(serde_json::Value::String(content.to_owned())),
-                Some(_) => unreachable!(),
-            },
-            _ => unreachable!(),
-        }
-        self.rendered = None;
     }
 
     pub(crate) fn update_runner_operation(
@@ -459,11 +466,6 @@ impl TranscriptEntry {
         self.rendered = None;
     }
 
-    pub(crate) fn replace_event(&mut self, sequence: EventSequence, item: TranscriptItem) {
-        self.sequence = Some(sequence);
-        self.replace(item);
-    }
-
     pub(crate) fn is_tool_result(&self) -> bool {
         self.item.is_tool_result()
     }
@@ -481,14 +483,6 @@ impl TranscriptEntry {
             } => Some(text),
             _ => None,
         }
-    }
-
-    pub(crate) fn is_reasoning_summary(&self) -> bool {
-        self.item.is_reasoning_summary()
-    }
-
-    pub(crate) fn is_empty_reasoning_summary(&self) -> bool {
-        self.item.is_empty_reasoning_summary()
     }
 }
 
@@ -787,5 +781,48 @@ mod tests {
             panic!("assistant message event was not converted");
         };
         assert_eq!(todos[0].step, "safe");
+    }
+
+    #[test]
+    fn finishing_a_turn_removes_uncommitted_active_entries() {
+        let metadata = atra_protocol::Thread {
+            id: atra_protocol::ThreadId(1),
+            display_name: None,
+            provider: "fake".to_owned(),
+            model: "test".to_owned(),
+            reasoning_effort: "medium".to_owned(),
+        };
+        let mut state =
+            ThreadState::materialize(metadata, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        atra_protocol::ThreadOperation::ActiveTurnStarted {
+            phase: atra_protocol::TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        atra_protocol::ThreadOperation::ActiveItemAdded {
+            item: atra_protocol::ActiveItem::new(
+                ActiveItemId(1),
+                ActiveItemData::Assistant {
+                    content: "partial".to_owned(),
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let mut transcript = TranscriptState::new(Vec::new());
+        transcript.rebuild(&state);
+        assert_eq!(transcript.entries.len(), 1);
+
+        let change = atra_protocol::ThreadOperation::TurnFinished {
+            outcome: atra_protocol::TurnOutcome::Failed {
+                message: "failed".to_owned(),
+            },
+        }
+        .apply(&mut state)
+        .unwrap();
+        transcript.apply_change(&state, &change);
+
+        assert!(transcript.entries.is_empty());
+        assert!(transcript.active_entries.is_empty());
     }
 }

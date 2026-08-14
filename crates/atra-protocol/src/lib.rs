@@ -5,6 +5,10 @@ use atra_store::TreeManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod state;
+
+pub use state::*;
+
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ThreadId(pub i64);
@@ -96,268 +100,8 @@ pub enum ApprovalPolicy {
     Allow,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum CommandMode {
-    Foreground { timeout_ms: Option<u64> },
-    Background,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
-pub enum ControllerRequest {
-    Shutdown,
-    Turn(TurnRequest),
-    Unary(UnaryRequest),
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum TurnRequest {
-    ThreadSend {
-        thread_id: ThreadId,
-        message: String,
-    },
-    ThreadContinue {
-        thread_id: ThreadId,
-    },
-    ThreadCompact {
-        thread_id: ThreadId,
-    },
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum UnaryRequest {
-    Status,
-    ThreadCreate {
-        display_name: Option<String>,
-    },
-    ThreadList,
-    ModelList,
-    ThreadRename {
-        thread_id: ThreadId,
-        display_name: String,
-    },
-    ThreadDelete {
-        thread_id: ThreadId,
-    },
-    ThreadSetModel {
-        thread_id: ThreadId,
-        provider: String,
-        model: String,
-        reasoning_effort: String,
-    },
-    ThreadEvents {
-        thread_id: ThreadId,
-    },
-    ThreadCheckpointCreate {
-        thread_id: ThreadId,
-    },
-    ThreadCheckpointList {
-        thread_id: ThreadId,
-    },
-    ThreadCheckpointEvents {
-        checkpoint_id: CheckpointId,
-    },
-    ThreadFork {
-        thread_id: ThreadId,
-        checkpoint_id: Option<CheckpointId>,
-        sequence: EventSequence,
-        display_name: Option<String>,
-    },
-    ThreadReplaceHistory {
-        thread_id: ThreadId,
-        target: HistoryTarget,
-    },
-    ThreadCancel {
-        thread_id: ThreadId,
-    },
-    ThreadProcessList {
-        thread_id: ThreadId,
-    },
-    ThreadProcessInspect {
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    },
-    ProviderLogin {
-        provider: String,
-        credential: Option<String>,
-    },
-    ProviderReloadAuth {
-        provider: String,
-    },
-    ProviderLogout {
-        provider: String,
-    },
-    ProviderLoginStatus {
-        provider: String,
-    },
-    ProviderRateLimits {
-        provider: String,
-    },
-    ApprovalAllow {
-        approval_id: ApprovalId,
-    },
-    ApprovalDeny {
-        approval_id: ApprovalId,
-        reason: Option<String>,
-    },
-    RunnerList,
-    RunnerLaunch {
-        name: String,
-        description: String,
-        approval: ApprovalPolicy,
-        command: Vec<String>,
-    },
-    ExecCommand {
-        thread_id: ThreadId,
-        runner: String,
-        command: String,
-        mode: CommandMode,
-    },
-    WaitProcess {
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-        timeout_ms: u64,
-    },
-    StopProcess {
-        thread_id: ThreadId,
-        runner: String,
-        process_id: ProcessId,
-    },
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ControllerResponse {
-    Running,
-    Stopping,
-    ThreadCreated {
-        thread_id: ThreadId,
-    },
-    ThreadList {
-        threads: Vec<Thread>,
-    },
-    ModelList {
-        models: Vec<Model>,
-    },
-    ThreadRenamed,
-    ThreadDeleted,
-    ThreadModelChanged,
-    TurnStarted {
-        thread_id: ThreadId,
-    },
-    TurnDelta {
-        content: String,
-    },
-    TurnRetry {
-        current: u64,
-        max: u64,
-    },
-    ReasoningSummaryDelta {
-        content: String,
-    },
-    ReasoningSummaryPartAdded,
-    WebSearchUpdate {
-        item_id: String,
-        action: Option<Value>,
-    },
-    ToolCallStarted {
-        item_id: String,
-        name: String,
-    },
-    ToolCallDelta {
-        item_id: String,
-        delta: String,
-    },
-    TurnEvent {
-        event: ThreadEvent,
-    },
-    TurnCompleted {
-        content: String,
-    },
-    ThreadCompacted,
-    ThreadCancelled,
-    ThreadNotActive,
-    ThreadProcessList {
-        processes: Vec<BackgroundProcess>,
-    },
-    ThreadProcessInspect {
-        process: BackgroundProcessDetail,
-    },
-    ApprovalResolved,
-    ApprovalRequired {
-        approval_id: ApprovalId,
-        thread_id: ThreadId,
-        tool: String,
-        arguments: Value,
-        operation_index: Option<usize>,
-        operation_label: Option<String>,
-    },
-    RunnerOperationUpdate {
-        call_id: String,
-        operation_index: usize,
-        update: RunnerOperationUpdate,
-    },
-    ThreadEvents {
-        events: Vec<ThreadEvent>,
-    },
-    ThreadCheckpointCreated {
-        checkpoint_id: CheckpointId,
-    },
-    ThreadCheckpointList {
-        checkpoints: Vec<ThreadCheckpoint>,
-    },
-    ThreadCheckpointEvents {
-        events: Vec<ThreadEvent>,
-    },
-    ThreadForked {
-        thread_id: ThreadId,
-    },
-    ThreadHistoryReplaced,
-    RunnerList {
-        runners: Vec<Runner>,
-    },
-    Launched,
-    AlreadyRunning,
-    ProcessStarted {
-        process_id: ProcessId,
-    },
-    ProcessRunning {
-        process_id: ProcessId,
-        output: String,
-    },
-    ProcessFinished {
-        output: String,
-        exit_code: Option<i32>,
-    },
-    ProcessStopped {
-        output: String,
-    },
-    Error {
-        message: String,
-    },
-    ProviderLoginRequired {
-        provider: String,
-    },
-    ProviderLoggedIn {
-        provider: String,
-        account: Option<String>,
-    },
-    ProviderLoggedOut {
-        provider: String,
-    },
-    ProviderRateLimits {
-        provider: String,
-        snapshots: Value,
-    },
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunnerOperationUpdate {
     CommandStarted,
     CommandOutput {
@@ -370,7 +114,12 @@ pub enum RunnerOperationUpdate {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ToolArtifact {
     CommandExecution(CommandExecutionArtifact),
     PatchOperations(ApplyPatchResult),
@@ -378,7 +127,7 @@ pub enum ToolArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommandExecutionArtifact {
     Started {
         runner: String,
@@ -397,6 +146,7 @@ pub enum CommandExecutionArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerOperationArtifact {
     pub operation: usize,
     pub runner: String,
@@ -406,6 +156,7 @@ pub struct RunnerOperationArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadEvent {
     pub sequence: EventSequence,
     #[serde(flatten)]
@@ -413,7 +164,12 @@ pub struct ThreadEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ThreadEventData {
     WorkspaceInstructions(InstructionEvent),
     Skills(InstructionEvent),
@@ -480,11 +236,13 @@ pub enum RunnersEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageEvent {
     pub content: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssistantMessageEvent {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -494,6 +252,7 @@ pub struct AssistantMessageEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TodoItem {
     pub step: String,
     pub status: TodoStatus,
@@ -515,11 +274,13 @@ pub enum AssistantMessagePhase {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ItemEvent {
     pub item: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelOutputEvent {
     pub request_sequence: EventSequence,
     pub output: Value,
@@ -528,7 +289,7 @@ pub struct ModelOutputEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum ToolCallEvent {
     Custom {
         #[serde(rename = "type")]
@@ -552,7 +313,7 @@ pub enum CustomToolType {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum ToolResultEvent {
     Custom {
         #[serde(rename = "type")]
@@ -577,17 +338,20 @@ pub enum ToolResultEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrozenBoundaryEvent {
     pub through_sequence: EventSequence,
     pub masked_sequences: Vec<EventSequence>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionEvent {
     pub items: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRequestEvent {
     pub kind: ModelRequestKind,
     pub context_window: Option<i64>,
@@ -601,18 +365,21 @@ pub enum ModelRequestKind {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenUsageEvent {
     pub request_sequence: EventSequence,
     pub usage: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitsEvent {
     pub request_sequence: EventSequence,
     pub snapshots: Value,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Thread {
     pub id: ThreadId,
     pub display_name: Option<String>,
@@ -622,6 +389,7 @@ pub struct Thread {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadCheckpoint {
     pub id: CheckpointId,
     pub thread_id: ThreadId,
@@ -630,7 +398,7 @@ pub struct ThreadCheckpoint {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HistoryTarget {
     Message {
         checkpoint_id: Option<CheckpointId>,
@@ -642,12 +410,14 @@ pub enum HistoryTarget {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Runner {
     pub name: String,
     pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub provider: String,
     pub id: String,
@@ -662,23 +432,7 @@ pub struct Model {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct BackgroundProcess {
-    pub runner: String,
-    pub process_id: ProcessId,
-    pub command: String,
-    pub started_at_ms: i64,
-    pub status: ProcessStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct BackgroundProcessDetail {
-    pub process: BackgroundProcess,
-    pub output_tail: String,
-    pub omitted_bytes: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessStatus {
     Running,
     Exited { exit_code: Option<i32> },

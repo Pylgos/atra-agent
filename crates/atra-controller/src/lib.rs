@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,12 +13,12 @@ use atra_patch::ApplyPatchResult;
 use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalId, ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
-    CommandExecutionArtifact, CommandMode, CommandOutput, CompactionEvent, ControllerResponse,
-    CustomToolType, EventSequence, FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent,
-    Model, ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
-    RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
-    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
-    TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent, TurnRequest, UnaryRequest,
+    CommandExecutionArtifact, CommandOutput, CompactionEvent, CustomToolType, EventSequence,
+    FrozenBoundaryEvent, InstructionEvent, ItemEvent, MessageEvent, ModelOutputEvent,
+    ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, RateLimitsEvent,
+    Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent,
+    SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus, TokenUsageEvent,
+    ToolArtifact, ToolCallEvent, ToolResultEvent,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -28,10 +28,11 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, watch},
     time::Instant,
 };
 
+mod commands;
 mod connection;
 mod lifecycle;
 mod model;
@@ -42,14 +43,17 @@ mod skills;
 mod storage;
 mod tools;
 mod turn;
+mod views;
 
-use lifecycle::{ApprovalDecision, TurnLifecycle};
-use model::{DEFAULT_MODEL, ModelProvider, ModelResponse, ModelStreamEvent};
+use commands::TurnProjector;
+use lifecycle::TurnLifecycle;
+use model::{ModelProvider, ModelResponse, ModelStreamEvent};
 use runner::{CommandOutcome, Runner, RunnerConfig};
 use runner_client::{PrepareTreeResult, RunnerClient, WaitOutcome};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
 use storage::Store;
 use tools::*;
+use views::Views;
 
 const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
 const ACTIVE_CONTEXT_HIGH_TOKENS: usize = 96_000;
@@ -141,8 +145,19 @@ pub async fn run(
         )
     })?;
     let _socket = SocketGuard(endpoint);
+    let controller_threads = store
+        .threads()
+        .await
+        .context("failed to materialize controller threads")?;
+    let controller_providers = provider_states(&providers).await;
+    let public_state = atra_protocol::ControllerState::new(
+        atra_protocol::ControllerLifecycle::Running,
+        controller_threads,
+        controller_providers,
+        Vec::new(),
+    );
     let state = Arc::new(State {
-        runners: RunnerPool::new(platform),
+        runners: Arc::new(RunnerPool::new(platform)),
         store,
         providers,
         default_provider,
@@ -153,6 +168,8 @@ pub async fn run(
         data_home: data_home.to_owned(),
         prompt_cache_namespace,
         workspace,
+        mutation: Mutex::new(()),
+        views: Arc::new(Views::new(public_state)),
     });
 
     let (shutdown, mut shutdown_requested) = watch::channel(false);
@@ -163,7 +180,7 @@ pub async fn run(
                     let state = Arc::clone(&state);
                     let shutdown = shutdown.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = connection::handle_client(stream, &state, &shutdown).await {
+                        if let Err(error) = connection::handle_client(stream, state, &shutdown).await {
                             tracing::warn!(error = %format!("{error:#}"), "client request failed");
                         }
                     });
@@ -181,7 +198,7 @@ pub async fn run(
 }
 
 pub(crate) struct State {
-    runners: RunnerPool,
+    runners: Arc<RunnerPool>,
     store: Store,
     providers: HashMap<String, Arc<dyn ModelProvider>>,
     default_provider: String,
@@ -192,6 +209,8 @@ pub(crate) struct State {
     data_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
+    mutation: Mutex<()>,
+    views: Arc<Views>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -201,383 +220,231 @@ enum WorkspaceInstructions {
     Removed,
 }
 
+async fn provider_states(
+    providers: &HashMap<String, Arc<dyn ModelProvider>>,
+) -> Vec<atra_protocol::ProviderState> {
+    let mut ids = providers.keys().cloned().collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut states = Vec::with_capacity(ids.len());
+    for id in ids {
+        states.push(provider_state(&id, &providers[&id]).await);
+    }
+    states
+}
+
+async fn provider_state(
+    id: &str,
+    provider: &Arc<dyn ModelProvider>,
+) -> atra_protocol::ProviderState {
+    let (lifecycle, models, rate_limits) = match provider.login_status().await {
+        Ok(model::ProviderLoginStatus::LoginRequired) => (
+            atra_protocol::ProviderLifecycle::LoginRequired,
+            Vec::new(),
+            None,
+        ),
+        Ok(model::ProviderLoginStatus::LoggedIn(account)) => match provider.models().await {
+            Ok(models) => (
+                atra_protocol::ProviderLifecycle::LoggedIn { account },
+                models,
+                provider.rate_limits().await.ok(),
+            ),
+            Err(error) => (
+                atra_protocol::ProviderLifecycle::Failed {
+                    message: format!("{error:#}"),
+                },
+                Vec::new(),
+                None,
+            ),
+        },
+        Err(error) => (
+            atra_protocol::ProviderLifecycle::Failed {
+                message: format!("{error:#}"),
+            },
+            Vec::new(),
+            None,
+        ),
+    };
+    atra_protocol::ProviderState::new(id.to_owned(), lifecycle, models, rate_limits)
+}
+
+async fn watch_process(
+    runners: Weak<RunnerPool>,
+    views: Weak<Views>,
+    process: atra_protocol::ProcessLocator,
+) {
+    let key = ProcessKey {
+        thread_id: process.thread_id(),
+        runner: process.runner().to_owned(),
+        process_id: process.process_id().clone(),
+    };
+    loop {
+        let Some(runners) = runners.upgrade() else {
+            return;
+        };
+        let Some(record) = runners.process(&key).await else {
+            return;
+        };
+        let detail = runners.inspect_process(key.clone(), record).await;
+        drop(runners);
+        let Some(views) = views.upgrade() else {
+            return;
+        };
+        match views
+            .synchronize_process(
+                &process,
+                detail.output_tail,
+                detail.omitted_bytes,
+                detail.process.status,
+            )
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    process_id = %process.process_id(),
+                    error = %format!("{error:#}"),
+                    "managed process watcher failed"
+                );
+                return;
+            }
+        }
+        drop(views);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 impl State {
+    async fn lock_mutation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.mutation.lock().await;
+        self.views.ensure_running().await?;
+        Ok(guard)
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let _mutation = self.mutation.lock().await;
+        self.views.shutdown().await
+    }
+
+    pub(crate) async fn materialize_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let _mutation = self.lock_mutation().await?;
+        if self.views.has_thread(thread_id).await {
+            return Ok(());
+        }
+        let metadata = self
+            .store
+            .thread(thread_id)
+            .await
+            .context("failed to load thread metadata")?;
+        let events = protocol_events(
+            self.store
+                .events(thread_id)
+                .await
+                .context("failed to load thread events")?,
+        );
+        let checkpoints = self
+            .store
+            .checkpoints(thread_id)
+            .await
+            .context("failed to load thread checkpoints")?;
+        let processes = self
+            .runners
+            .list_processes(thread_id)
+            .await
+            .into_iter()
+            .map(|process| {
+                atra_protocol::ProcessSummary::new(
+                    atra_protocol::ProcessLocator::new(
+                        thread_id,
+                        process.runner,
+                        process.process_id,
+                    ),
+                    process.command,
+                    process.started_at_ms,
+                    process.status,
+                )
+            })
+            .collect();
+        let state =
+            atra_protocol::ThreadState::materialize(metadata, events, checkpoints, processes)
+                .context("failed to materialize thread state")?;
+        self.views.insert_thread(state).await;
+        Ok(())
+    }
+
+    pub(crate) async fn materialize_checkpoint(
+        &self,
+        checkpoint_id: atra_protocol::CheckpointId,
+    ) -> Result<()> {
+        let _mutation = self.lock_mutation().await?;
+        if self.views.has_checkpoint(checkpoint_id).await {
+            return Ok(());
+        }
+        let metadata = self
+            .store
+            .checkpoint(checkpoint_id)
+            .await
+            .context("failed to load checkpoint metadata")?;
+        let events = protocol_events(
+            self.store
+                .checkpoint_events(checkpoint_id)
+                .await
+                .context("failed to load checkpoint events")?,
+        );
+        let state = atra_protocol::CheckpointState::materialize(metadata, events)
+            .context("failed to materialize checkpoint state")?;
+        self.views.insert_checkpoint(state).await;
+        Ok(())
+    }
+
+    pub(crate) async fn materialize_process(
+        &self,
+        process: &atra_protocol::ProcessLocator,
+    ) -> Result<()> {
+        let _mutation = self.lock_mutation().await?;
+        if self.views.has_process(process).await {
+            return Ok(());
+        }
+        let key = ProcessKey {
+            thread_id: process.thread_id(),
+            runner: process.runner().to_owned(),
+            process_id: process.process_id().clone(),
+        };
+        let record = self
+            .runners
+            .process(&key)
+            .await
+            .context("managed process does not exist")?;
+        let detail = self.runners.inspect_process(key, record).await;
+        let summary = atra_protocol::ProcessSummary::new(
+            process.clone(),
+            detail.process.command,
+            detail.process.started_at_ms,
+            detail.process.status,
+        );
+        self.views
+            .insert_process(atra_protocol::ProcessState::new(
+                summary,
+                detail.output_tail,
+                detail.omitted_bytes,
+            ))
+            .await?;
+        Ok(())
+    }
+
     pub(crate) fn provider(&self, id: &str) -> Result<&Arc<dyn ModelProvider>> {
         self.providers
             .get(id)
             .with_context(|| format!("unknown model provider {id}"))
     }
 
-    async fn models(&self) -> Result<Vec<Model>> {
-        let mut models = Vec::new();
-        let mut first_error = None;
-        let mut providers = self.providers.values().collect::<Vec<_>>();
-        providers.sort_by_key(|provider| provider.id() != self.default_provider);
-        for provider in providers {
-            if matches!(
-                provider.login_status().await?,
-                model::ProviderLoginStatus::LoggedIn(_)
-            ) {
-                match provider.models().await {
-                    Ok(provider_models) => models.extend(provider_models),
-                    Err(error) => {
-                        tracing::warn!(
-                            provider = provider.id(),
-                            error = %format!("{error:#}"),
-                            "failed to list provider models"
-                        );
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-        }
-        if models.is_empty()
-            && let Some(error) = first_error
-        {
-            return Err(error);
-        }
-        Ok(models)
-    }
-
-    async fn handle(&self, request: UnaryRequest) -> Result<ControllerResponse> {
-        match request {
-            UnaryRequest::Status => Ok(ControllerResponse::Running),
-            UnaryRequest::ThreadCreate { display_name } => {
-                let thread_id = self
-                    .store
-                    .create_thread(
-                        display_name,
-                        self.default_provider.clone(),
-                        DEFAULT_MODEL.to_owned(),
-                        "medium".to_owned(),
-                    )
-                    .await
-                    .context("failed to create thread")?;
-                Ok(ControllerResponse::ThreadCreated { thread_id })
-            }
-            UnaryRequest::ThreadList => {
-                let threads = self
-                    .store
-                    .threads()
-                    .await
-                    .context("failed to list threads")?;
-                Ok(ControllerResponse::ThreadList { threads })
-            }
-            UnaryRequest::ModelList => Ok(ControllerResponse::ModelList {
-                models: self.models().await?,
-            }),
-            UnaryRequest::ThreadRename {
-                thread_id,
-                display_name,
-            } => {
-                if display_name.trim().is_empty() {
-                    bail!("thread display name must not be empty");
-                }
-                self.store
-                    .rename_thread(thread_id, display_name)
-                    .await
-                    .context("failed to rename thread")?;
-                Ok(ControllerResponse::ThreadRenamed)
-            }
-            UnaryRequest::ThreadDelete { thread_id } => {
-                self.turns.begin_delete(thread_id).await?;
-                let result = async {
-                    let _guard = self.thread_lock(thread_id).lock_owned().await;
-                    self.store
-                        .delete_thread(thread_id)
-                        .await
-                        .context("failed to delete thread")
-                }
-                .await;
-                self.turns.finish_delete(thread_id).await;
-                result?;
-                Ok(ControllerResponse::ThreadDeleted)
-            }
-            UnaryRequest::ThreadSetModel {
-                thread_id,
-                provider,
-                model,
-                reasoning_effort,
-            } => {
-                if model.trim().is_empty() {
-                    bail!("thread model must not be empty");
-                }
-                if reasoning_effort.trim().is_empty() {
-                    bail!("reasoning effort must not be empty");
-                }
-                let models = self.provider(&provider)?.models().await?;
-                let selected = models
-                    .iter()
-                    .find(|candidate| candidate.provider == provider && candidate.id == model)
-                    .with_context(|| format!("unknown model {provider}/{model}"))?;
-                if !selected
-                    .supported_reasoning_efforts
-                    .iter()
-                    .any(|candidate| candidate == &reasoning_effort)
-                {
-                    bail!(
-                        "reasoning effort {reasoning_effort} is not supported by model {provider}/{model}"
-                    );
-                }
-                let (current_provider, _, _) = self
-                    .store
-                    .thread_model(thread_id)
-                    .await
-                    .context("failed to load thread model")?;
-                if current_provider != provider && !self.store.events(thread_id).await?.is_empty() {
-                    bail!("cannot change provider after the thread history has started");
-                }
-                self.store
-                    .set_thread_model(thread_id, provider, model, reasoning_effort)
-                    .await
-                    .context("failed to change thread model")?;
-                Ok(ControllerResponse::ThreadModelChanged)
-            }
-            UnaryRequest::ThreadEvents { thread_id } => {
-                let events = protocol_events(
-                    self.store
-                        .events(thread_id)
-                        .await
-                        .context("failed to load thread events")?,
-                );
-                Ok(ControllerResponse::ThreadEvents { events })
-            }
-            UnaryRequest::ThreadCheckpointCreate { thread_id } => {
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                self.ensure_no_pending_approval(thread_id).await?;
-                let checkpoint_id = self
-                    .store
-                    .create_checkpoint(thread_id, checkpoint_time_ms(), "manual".to_owned())
-                    .await
-                    .context("failed to create checkpoint")?;
-                Ok(ControllerResponse::ThreadCheckpointCreated { checkpoint_id })
-            }
-            UnaryRequest::ThreadCheckpointList { thread_id } => {
-                let checkpoints = self
-                    .store
-                    .checkpoints(thread_id)
-                    .await
-                    .context("failed to list checkpoints")?;
-                Ok(ControllerResponse::ThreadCheckpointList { checkpoints })
-            }
-            UnaryRequest::ThreadCheckpointEvents { checkpoint_id } => {
-                let events = protocol_events(
-                    self.store
-                        .checkpoint_events(checkpoint_id)
-                        .await
-                        .context("failed to load checkpoint events")?,
-                );
-                Ok(ControllerResponse::ThreadCheckpointEvents { events })
-            }
-            UnaryRequest::ThreadFork {
-                thread_id,
-                checkpoint_id,
-                sequence,
-                display_name,
-            } => {
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                self.ensure_no_pending_approval(thread_id).await?;
-                let thread_id = self
-                    .store
-                    .fork_thread(thread_id, checkpoint_id, sequence, display_name)
-                    .await
-                    .context("failed to fork thread")?;
-                Ok(ControllerResponse::ThreadForked { thread_id })
-            }
-            UnaryRequest::ThreadReplaceHistory { thread_id, target } => {
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                self.ensure_no_pending_approval(thread_id).await?;
-                self.store
-                    .replace_history(thread_id, target, checkpoint_time_ms())
-                    .await
-                    .context("failed to replace thread history")?;
-                Ok(ControllerResponse::ThreadHistoryReplaced)
-            }
-            UnaryRequest::ThreadCancel { thread_id } => self.cancel_thread(thread_id).await,
-            UnaryRequest::ThreadProcessList { thread_id } => {
-                let processes = self.runners.list_processes(thread_id).await;
-                Ok(ControllerResponse::ThreadProcessList { processes })
-            }
-            UnaryRequest::ThreadProcessInspect {
-                thread_id,
-                runner,
-                process_id,
-            } => {
-                let key = ProcessKey {
-                    thread_id,
-                    runner,
-                    process_id,
-                };
-                let record = self
-                    .runners
-                    .process(&key)
-                    .await
-                    .context("background process is no longer available")?;
-                Ok(ControllerResponse::ThreadProcessInspect {
-                    process: self.runners.inspect_process(key, record).await,
-                })
-            }
-            UnaryRequest::ProviderLogin {
-                provider,
-                credential,
-            } => match self.provider(&provider)?.login(credential).await? {
-                model::ProviderLoginStatus::LoggedIn(account) => {
-                    Ok(ControllerResponse::ProviderLoggedIn { provider, account })
-                }
-                model::ProviderLoginStatus::LoginRequired => {
-                    Ok(ControllerResponse::ProviderLoginRequired { provider })
-                }
-            },
-            UnaryRequest::ProviderLogout { provider } => {
-                self.provider(&provider)?.logout().await?;
-                Ok(ControllerResponse::ProviderLoggedOut { provider })
-            }
-            UnaryRequest::ProviderReloadAuth { provider } => {
-                self.provider(&provider)?.reload_auth().await?;
-                match self.provider(&provider)?.login_status().await? {
-                    model::ProviderLoginStatus::LoggedIn(account) => {
-                        Ok(ControllerResponse::ProviderLoggedIn { provider, account })
-                    }
-                    model::ProviderLoginStatus::LoginRequired => {
-                        Ok(ControllerResponse::ProviderLoginRequired { provider })
-                    }
-                }
-            }
-            UnaryRequest::ProviderLoginStatus { provider } => {
-                match self.provider(&provider)?.login_status().await? {
-                    model::ProviderLoginStatus::LoggedIn(account) => {
-                        Ok(ControllerResponse::ProviderLoggedIn { provider, account })
-                    }
-                    model::ProviderLoginStatus::LoginRequired => {
-                        Ok(ControllerResponse::ProviderLoginRequired { provider })
-                    }
-                }
-            }
-            UnaryRequest::ProviderRateLimits { provider } => {
-                let snapshots = self.provider(&provider)?.rate_limits().await?;
-                Ok(ControllerResponse::ProviderRateLimits {
-                    provider,
-                    snapshots,
-                })
-            }
-            UnaryRequest::ApprovalAllow { approval_id } => {
-                self.resolve_approval(approval_id, true, None).await
-            }
-            UnaryRequest::ApprovalDeny {
-                approval_id,
-                reason,
-            } => self.resolve_approval(approval_id, false, reason).await,
-            UnaryRequest::RunnerList => Ok(ControllerResponse::RunnerList {
-                runners: self.runners.list().await?,
-            }),
-            UnaryRequest::RunnerLaunch {
-                name,
-                description,
-                approval,
-                command,
-            } => {
-                self.launch_runner(name, description, approval, command)
-                    .await
-            }
-            UnaryRequest::ExecCommand {
-                thread_id,
-                runner,
-                command,
-                mode,
-            } => {
-                self.store
-                    .thread_model(thread_id)
-                    .await
-                    .context("thread does not exist")?;
-                tracing::debug!(
-                    runner,
-                    %command,
-                    ?mode,
-                    "executing command"
-                );
-                let active_runner = self.runners.get(&runner).await?;
-                self.execute_controller_command(thread_id, &runner, &active_runner, command, mode)
-                    .await
-            }
-            UnaryRequest::WaitProcess {
-                thread_id,
-                runner,
-                process_id,
-                timeout_ms,
-            } => {
-                let key = ProcessKey {
-                    thread_id,
-                    runner: runner.clone(),
-                    process_id: process_id.clone(),
-                };
-                let record = self
-                    .runners
-                    .process(&key)
-                    .await
-                    .context("background process is no longer available")?;
-                match self
-                    .runners
-                    .get(&runner)
-                    .await?
-                    .wait(record.handle, timeout_ms)
-                    .await?
-                {
-                    WaitOutcome::Running {
-                        output,
-                        spawned_processes,
-                        ..
-                    } => {
-                        self.register_spawned_processes(thread_id, &runner, spawned_processes)
-                            .await;
-                        Ok(ControllerResponse::ProcessRunning {
-                            process_id,
-                            output: format_command_output(&output),
-                        })
-                    }
-                    WaitOutcome::Finished {
-                        output,
-                        exit_code,
-                        spawned_processes,
-                        ..
-                    } => {
-                        self.register_spawned_processes(thread_id, &runner, spawned_processes)
-                            .await;
-                        self.runners.remove_process(&key).await;
-                        Ok(ControllerResponse::ProcessFinished {
-                            output: format_command_output(&output),
-                            exit_code,
-                        })
-                    }
-                }
-            }
-            UnaryRequest::StopProcess {
-                thread_id,
-                runner,
-                process_id,
-            } => {
-                let output = self
-                    .runners
-                    .stop_process(&ProcessKey {
-                        thread_id,
-                        runner,
-                        process_id,
-                    })
-                    .await?;
-                Ok(ControllerResponse::ProcessStopped {
-                    output: format_command_output(&output),
-                })
-            }
-        }
-    }
-
-    async fn execute_controller_command(
+    async fn start_managed_process(
         &self,
         thread_id: ThreadId,
         runner_name: &str,
         runner: &Runner,
         command: String,
-        mode: CommandMode,
-    ) -> Result<ControllerResponse> {
+    ) -> Result<ProcessId> {
         let started_at_ms = checkpoint_time_ms();
         let process_id = self
             .runners
@@ -586,91 +453,31 @@ impl State {
         let process_handle = runner
             .start_command(command.clone(), thread_id, &process_id)
             .await?;
-        if mode == CommandMode::Background {
-            self.runners
-                .insert_process(
-                    ProcessKey {
-                        thread_id,
-                        runner: runner_name.to_owned(),
-                        process_id: process_id.clone(),
-                    },
-                    ProcessRecord {
-                        handle: process_handle,
-                        command,
-                        started_at_ms,
-                    },
-                )
-                .await;
-            return Ok(ControllerResponse::ProcessStarted { process_id });
-        }
-
-        let deadline = match mode {
-            CommandMode::Foreground { timeout_ms } => timeout_ms
-                .map(|timeout_ms| Instant::now() + std::time::Duration::from_millis(timeout_ms)),
-            CommandMode::Background => unreachable!(),
-        };
-        let mut collected = None;
-        loop {
-            let timeout_ms = deadline.map_or(1000, |deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis()
-                    .min(1000)
-                    .try_into()
-                    .unwrap_or(1000)
-            });
-            match runner.wait(process_handle.clone(), timeout_ms).await? {
-                WaitOutcome::Running {
-                    output,
-                    spawned_processes,
-                    ..
-                } => {
-                    self.register_spawned_processes(thread_id, runner_name, spawned_processes)
-                        .await;
-                    append_command_output(&mut collected, output);
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        self.runners
-                            .insert_process(
-                                ProcessKey {
-                                    thread_id,
-                                    runner: runner_name.to_owned(),
-                                    process_id: process_id.clone(),
-                                },
-                                ProcessRecord {
-                                    handle: process_handle,
-                                    command,
-                                    started_at_ms,
-                                },
-                            )
-                            .await;
-                        return Ok(ControllerResponse::ProcessRunning {
-                            process_id,
-                            output: format_command_output(&collected.take().unwrap()),
-                        });
-                    }
-                }
-                WaitOutcome::Finished {
-                    output,
-                    exit_code,
-                    spawned_processes,
-                    ..
-                } => {
-                    self.register_spawned_processes(thread_id, runner_name, spawned_processes)
-                        .await;
-                    append_command_output(&mut collected, output);
-                    let output = collected.take().unwrap();
-                    tracing::info!(
-                        ?exit_code,
-                        output_bytes = output.content.len(),
-                        "process finished"
-                    );
-                    return Ok(ControllerResponse::ProcessFinished {
-                        output: format_command_output(&output),
-                        exit_code,
-                    });
-                }
+        let registered = self
+            .register_managed_process(
+                ProcessKey {
+                    thread_id,
+                    runner: runner_name.to_owned(),
+                    process_id: process_id.clone(),
+                },
+                ProcessRecord {
+                    handle: process_handle.clone(),
+                    command,
+                    started_at_ms,
+                },
+            )
+            .await;
+        if let Err(error) = registered {
+            if let Err(stop_error) = runner.stop(process_handle).await {
+                tracing::warn!(
+                    process_id = %process_id,
+                    error = %format!("{stop_error:#}"),
+                    "failed to stop a process after registration failed"
+                );
             }
+            return Err(error);
         }
+        Ok(process_id)
     }
 
     async fn register_spawned_processes(
@@ -678,23 +485,37 @@ impl State {
         thread_id: ThreadId,
         runner: &str,
         spawned_processes: Vec<SpawnedProcess>,
-    ) {
+    ) -> Result<()> {
         for process in spawned_processes {
-            self.runners
-                .insert_process(
-                    ProcessKey {
-                        thread_id,
-                        runner: runner.to_owned(),
-                        process_id: process.process_id,
-                    },
-                    ProcessRecord {
-                        handle: process.process_handle,
-                        command: process.command,
-                        started_at_ms: checkpoint_time_ms(),
-                    },
-                )
-                .await;
+            self.register_managed_process(
+                ProcessKey {
+                    thread_id,
+                    runner: runner.to_owned(),
+                    process_id: process.process_id,
+                },
+                ProcessRecord {
+                    handle: process.process_handle,
+                    command: process.command,
+                    started_at_ms: checkpoint_time_ms(),
+                },
+            )
+            .await?;
         }
+        Ok(())
+    }
+
+    async fn register_managed_process(&self, key: ProcessKey, record: ProcessRecord) -> Result<()> {
+        if !self.runners.insert_process(key.clone(), record).await {
+            return Ok(());
+        }
+        let process = atra_protocol::ProcessLocator::new(key.thread_id, key.runner, key.process_id);
+        self.materialize_process(&process).await?;
+        tokio::spawn(watch_process(
+            Arc::downgrade(&self.runners),
+            Arc::downgrade(&self.views),
+            process,
+        ));
+        Ok(())
     }
 
     async fn launch_runner(
@@ -703,7 +524,7 @@ impl State {
         description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
-    ) -> Result<ControllerResponse> {
+    ) -> Result<bool> {
         let cached_generation = self.skill_generation.lock().await.clone();
         let generation = match cached_generation {
             Some(generation) => generation,
@@ -713,8 +534,7 @@ impl State {
                 generation
             }
         };
-        if self
-            .runners
+        self.runners
             .launch(
                 name,
                 description,
@@ -723,12 +543,7 @@ impl State {
                 &self.skill_store,
                 &generation,
             )
-            .await?
-        {
-            Ok(ControllerResponse::Launched)
-        } else {
-            Ok(ControllerResponse::AlreadyRunning)
-        }
+            .await
     }
 }
 

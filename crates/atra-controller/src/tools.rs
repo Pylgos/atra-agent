@@ -237,20 +237,20 @@ pub(super) struct OperationContext {
     pub(super) label: String,
 }
 
-pub(super) fn send_operation_update(
+pub(super) async fn send_operation_update(
     operation: Option<&OperationContext>,
-    updates: Option<&mpsc::UnboundedSender<ModelStreamEvent>>,
+    updates: Option<&TurnProjector>,
     update: RunnerOperationUpdate,
 ) -> Result<()> {
     if let Some(operation) = operation {
         updates
             .context("runner operation update requires a streaming turn")?
-            .send(ModelStreamEvent::RunnerOperationUpdate {
+            .apply_update(ModelStreamEvent::RunnerOperationUpdate {
                 call_id: operation.call_id.clone(),
                 operation_index: operation.index,
                 update,
             })
-            .context("turn stream closed during runner operation")?;
+            .await?;
     }
     Ok(())
 }
