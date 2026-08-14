@@ -594,6 +594,11 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
                     }),
                 ));
             }
+            ModelTool::Function {
+                name,
+                description,
+                parameters,
+            } => definitions.push(function_tool(name, description, parameters.clone())),
             ModelTool::Custom {
                 name,
                 description,
@@ -774,15 +779,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn ollama_tools_include_command_search_and_fetch() {
-        let tools = crate::tools::model_tools();
+    fn ollama_tools_include_question_command_search_and_fetch() {
+        let tools = crate::tools::model_tools(true);
         let definitions = tool_definitions(&tools);
         let names = definitions
             .iter()
             .filter_map(|tool| tool.pointer("/function/name")?.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["web_search", "web_fetch", "command"]);
-        let command_description = definitions[2]["function"]["description"].as_str().unwrap();
+        assert_eq!(names, ["web_search", "web_fetch", "question", "command"]);
+        let command_description = definitions[3]["function"]["description"].as_str().unwrap();
         assert!(command_description.contains("lark grammar"));
         assert!(command_description.contains("add_line: \"+\""));
     }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use atra_client::{CheckpointSubscription, ProcessSubscription, ThreadSubscription};
 use atra_protocol::{
-    ActiveTurn, ApprovalId, CheckpointId, Model, PendingApproval, Thread, ThreadCheckpoint,
+    ActiveTurn, CheckpointId, InteractionId, Model, PendingApproval, Thread, ThreadCheckpoint,
     ThreadEvent, ThreadId,
 };
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed, options::WordBreakInvariantOptions};
@@ -117,7 +117,11 @@ pub(crate) enum TurnUpdate {
     },
     StreamFailed(anyhow::Error),
     ApprovalResolved {
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
+        result: Result<()>,
+    },
+    QuestionResolved {
+        request_id: InteractionId,
         result: Result<()>,
     },
     CancelCompleted {
@@ -209,8 +213,20 @@ impl App {
         self.turn.is_pending() || self.active_turn().is_some()
     }
 
-    pub(crate) fn reset_turn_interaction(&mut self) {
-        self.turn = TurnState::Idle;
+    pub(crate) fn sync_turn_interaction(&mut self) {
+        let pending_question = self
+            .active_turn()
+            .and_then(|turn| turn.pending_question())
+            .cloned();
+        self.turn = match (std::mem::take(&mut self.turn), pending_question) {
+            (TurnState::AnsweringQuestions(form), Some(request)) if form.id() == request.id => {
+                TurnState::AnsweringQuestions(form)
+            }
+            (_, Some(request)) => {
+                TurnState::AnsweringQuestions(crate::state::QuestionForm::new(request))
+            }
+            (_, None) => TurnState::Idle,
+        };
     }
 
     pub(crate) fn checkpoints(&self) -> &[ThreadCheckpoint] {
@@ -343,7 +359,7 @@ impl App {
         };
         let message_history = history::load(&message_history_path)?;
         let command_history = history::load(&command_history_path)?;
-        Ok(Self {
+        let mut app = Self {
             endpoint,
             message_history_path,
             command_history_path,
@@ -364,7 +380,9 @@ impl App {
             thread_subscription: thread_subscription.map(Into::into),
             checkpoint_subscription: None,
             process_subscription: None,
-        })
+        };
+        app.sync_turn_interaction();
+        Ok(app)
     }
 }
 #[cfg(test)]

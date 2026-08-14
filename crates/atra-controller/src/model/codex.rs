@@ -914,6 +914,17 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
         .iter()
         .map(|tool| match tool {
             ModelTool::WebSearch => json!({"type": "web_search", "external_web_access": true}),
+            ModelTool::Function {
+                name,
+                description,
+                parameters,
+            } => json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+                "strict": true,
+            }),
             ModelTool::Custom { name, description, format } => json!({
                 "type": "custom",
                 "name": name,
@@ -1422,7 +1433,7 @@ mod tests {
                 }),
             },
         ];
-        let tools = crate::tools::model_tools();
+        let tools = crate::tools::model_tools(true);
         let request = completion_request(&ModelRequest {
             model: "model",
             reasoning_effort: "medium",
@@ -1448,7 +1459,7 @@ mod tests {
                 content: "hello".to_owned(),
             }),
         }];
-        let tools = crate::tools::model_tools();
+        let tools = crate::tools::model_tools(true);
         let request = compaction_request(&ModelRequest {
             model: "model",
             reasoning_effort: "medium",

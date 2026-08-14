@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{ApprovalId, EventSequence, ProcessStatus, ThreadId, TurnPhase};
+use atra_protocol::{EventSequence, InteractionId, ProcessStatus, ThreadId, TurnPhase};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
@@ -14,7 +14,8 @@ use crate::{
     runtime::{ApprovalDecision, Effect, HistoryOperation},
     state::{
         FocusPane, HistoryAction, ModelPicker, ModelPickerStage, OperationOverlay, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
+        ProcessPicker, ProcessPickerState, QuestionFormMode, ThreadPicker, ThreadPickerState,
+        TurnState,
     },
     text::offset_at_position,
     transcript::transcript_text,
@@ -46,6 +47,9 @@ impl App {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 self.error = None;
             }
+            return Ok(false);
+        }
+        if self.handle_question_key(key, effects)? {
             return Ok(false);
         }
         if self.turn_is_running()
@@ -119,7 +123,7 @@ impl App {
                     let reason = (!reason.trim().is_empty()).then_some(reason);
                     self.resolve_approval(approval_id, false, reason, effects);
                 }
-                KeyCode::Esc => self.reset_turn_interaction(),
+                KeyCode::Esc => self.sync_turn_interaction(),
                 _ => {
                     reason.handle_key(key, &self.word_segmenter);
                 }
@@ -548,6 +552,99 @@ impl App {
             self.message_input.handle_key(key, &self.word_segmenter);
         }
         Ok(false)
+    }
+
+    fn handle_question_key(
+        &mut self,
+        key: KeyEvent,
+        effects: &mpsc::UnboundedSender<Effect>,
+    ) -> Result<bool> {
+        let TurnState::AnsweringQuestions(form) = &mut self.turn else {
+            return Ok(false);
+        };
+        if form.mode == QuestionFormMode::Submitting {
+            return Ok(true);
+        }
+        let mut submit = false;
+        let mut cancel = false;
+        let question_count = form.request.questions.len();
+        match form.mode {
+            QuestionFormMode::Note => {
+                let confirm = key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Enter | KeyCode::Char('g'));
+                if confirm {
+                    form.mode = QuestionFormMode::Normal;
+                    if form.current + 1 == question_count {
+                        form.mode = QuestionFormMode::Confirm;
+                        form.scroll = 0;
+                    } else {
+                        form.current += 1;
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {
+                            form.mode = QuestionFormMode::Normal;
+                        }
+                        _ => {
+                            form.drafts[form.current]
+                                .note
+                                .handle_key(key, &self.word_segmenter);
+                        }
+                    }
+                }
+            }
+            QuestionFormMode::Normal => match key.code {
+                KeyCode::Up => {
+                    form.drafts[form.current].selected =
+                        form.drafts[form.current].selected.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let last = form.request.questions[form.current].options.len();
+                    form.drafts[form.current].selected =
+                        (form.drafts[form.current].selected + 1).min(last);
+                }
+                KeyCode::Tab | KeyCode::BackTab => form.mode = QuestionFormMode::Note,
+                KeyCode::Left => {
+                    form.current = form.current.saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    if form.current + 1 == question_count {
+                        form.mode = QuestionFormMode::Confirm;
+                        form.scroll = 0;
+                    } else {
+                        form.current += 1;
+                    }
+                }
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            },
+            QuestionFormMode::Confirm => match key.code {
+                KeyCode::Enter | KeyCode::Right => submit = true,
+                KeyCode::Left | KeyCode::Esc => {
+                    form.current = question_count.saturating_sub(1);
+                    form.mode = QuestionFormMode::Normal;
+                }
+                KeyCode::Up => form.scroll = form.scroll.saturating_sub(1),
+                KeyCode::Down => form.scroll = form.scroll.saturating_add(1),
+                _ => {}
+            },
+            QuestionFormMode::Submitting => unreachable!(),
+        }
+        if cancel {
+            self.cancel_turn(effects);
+        } else if submit {
+            let request_id = form.id();
+            let answers = form.answers();
+            form.mode = QuestionFormMode::Submitting;
+            effects
+                .send(Effect::ResolveQuestion {
+                    endpoint: self.endpoint.clone(),
+                    request_id,
+                    answers,
+                })
+                .ok();
+        }
+        Ok(true)
     }
 
     fn execute_command(
@@ -1237,7 +1334,7 @@ impl App {
 
     fn resolve_approval(
         &mut self,
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
         allowed: bool,
         reason: Option<String>,
         effects: &mpsc::UnboundedSender<Effect>,
@@ -1264,7 +1361,7 @@ impl App {
             .ok();
     }
 
-    pub(super) fn restore_failed_approval(&mut self, approval_id: ApprovalId) {
+    pub(super) fn restore_failed_approval(&mut self, approval_id: InteractionId) {
         if matches!(
             self.turn,
             TurnState::ResolvingApproval {
@@ -1272,7 +1369,7 @@ impl App {
                 ..
             } if current == approval_id
         ) {
-            self.reset_turn_interaction();
+            self.sync_turn_interaction();
         }
     }
 

@@ -88,7 +88,7 @@ impl TranscriptState {
                 }
             }
             ThreadChange::HistoryReplaced => self.rebuild(state),
-            ThreadChange::Approval => {
+            ThreadChange::Interaction => {
                 if let Some(approval) = state.active_turn().and_then(|turn| turn.pending_approval())
                 {
                     self.set_pending_approval(approval.operation_index());

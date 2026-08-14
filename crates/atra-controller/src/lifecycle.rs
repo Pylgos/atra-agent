@@ -7,15 +7,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use atra_protocol::{ApprovalId, ProcessHandle, ThreadId};
+use atra_protocol::{InteractionId, ProcessHandle, QuestionAnswer, ThreadId};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::Runner;
 
 pub(super) struct TurnLifecycle {
     threads: Mutex<ThreadActivity>,
-    approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
-    next_approval_id: AtomicU64,
+    interactions: Mutex<HashMap<InteractionId, PendingInteraction>>,
+    next_interaction_id: AtomicU64,
 }
 
 struct ThreadActivity {
@@ -35,13 +35,14 @@ pub(super) struct ApprovalDecision {
     pub(super) reason: Option<String>,
 }
 
-pub(super) struct ClaimedApproval {
-    decision: oneshot::Sender<ApprovalDecision>,
+struct PendingInteraction {
+    thread_id: ThreadId,
+    waiter: InteractionWaiter,
 }
 
-struct PendingApproval {
-    thread_id: ThreadId,
-    decision: oneshot::Sender<ApprovalDecision>,
+pub(super) enum InteractionWaiter {
+    Approval(oneshot::Sender<ApprovalDecision>),
+    Questions(oneshot::Sender<Vec<QuestionAnswer>>),
 }
 
 impl TurnLifecycle {
@@ -51,8 +52,8 @@ impl TurnLifecycle {
                 active: HashMap::new(),
                 deleting: HashSet::new(),
             }),
-            approvals: Mutex::new(HashMap::new()),
-            next_approval_id: AtomicU64::new(0),
+            interactions: Mutex::new(HashMap::new()),
+            next_interaction_id: AtomicU64::new(0),
         }
     }
 
@@ -89,7 +90,7 @@ impl TurnLifecycle {
             threads.active.remove(&thread_id);
         }
         drop(threads);
-        self.clear_approvals(thread_id).await;
+        self.clear_interactions(thread_id).await;
     }
 
     pub(super) async fn begin_delete(&self, thread_id: ThreadId) -> Result<()> {
@@ -110,7 +111,36 @@ impl TurnLifecycle {
     pub(super) async fn register_approval(
         &self,
         thread_id: ThreadId,
-    ) -> Result<(ApprovalId, oneshot::Receiver<ApprovalDecision>)> {
+    ) -> Result<(InteractionId, oneshot::Receiver<ApprovalDecision>)> {
+        let id = self.next_interaction(thread_id).await?;
+        let (decision, receiver) = oneshot::channel();
+        self.interactions.lock().await.insert(
+            id,
+            PendingInteraction {
+                thread_id,
+                waiter: InteractionWaiter::Approval(decision),
+            },
+        );
+        Ok((id, receiver))
+    }
+
+    pub(super) async fn register_question(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(InteractionId, oneshot::Receiver<Vec<QuestionAnswer>>)> {
+        let id = self.next_interaction(thread_id).await?;
+        let (answers, receiver) = oneshot::channel();
+        self.interactions.lock().await.insert(
+            id,
+            PendingInteraction {
+                thread_id,
+                waiter: InteractionWaiter::Questions(answers),
+            },
+        );
+        Ok((id, receiver))
+    }
+
+    async fn next_interaction(&self, thread_id: ThreadId) -> Result<InteractionId> {
         let threads = self.threads.lock().await;
         let turn = threads
             .active
@@ -119,61 +149,92 @@ impl TurnLifecycle {
         if turn.is_cancelling() {
             bail!("thread cancellation is in progress");
         }
-        let approval_id = ApprovalId(self.next_approval_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let (decision, receiver) = oneshot::channel();
-        self.approvals.lock().await.insert(
-            approval_id,
-            PendingApproval {
-                thread_id,
-                decision,
-            },
-        );
-        Ok((approval_id, receiver))
+        Ok(InteractionId(
+            self.next_interaction_id.fetch_add(1, Ordering::Relaxed) + 1,
+        ))
     }
 
-    pub(super) async fn claim_approval(&self, approval_id: ApprovalId) -> Result<ClaimedApproval> {
-        let pending = self
-            .approvals
+    pub(super) async fn claim_approval(&self, id: InteractionId) -> Result<InteractionWaiter> {
+        self.claim(
+            id,
+            |waiter| matches!(waiter, InteractionWaiter::Approval(_)),
+            "approval",
+        )
+        .await
+    }
+
+    pub(super) async fn claim_questions(&self, id: InteractionId) -> Result<InteractionWaiter> {
+        self.claim(
+            id,
+            |waiter| matches!(waiter, InteractionWaiter::Questions(_)),
+            "question request",
+        )
+        .await
+    }
+
+    async fn claim(
+        &self,
+        id: InteractionId,
+        expected: impl FnOnce(&InteractionWaiter) -> bool,
+        kind: &str,
+    ) -> Result<InteractionWaiter> {
+        let mut interactions = self.interactions.lock().await;
+        let pending = interactions
+            .get(&id)
+            .with_context(|| format!("interaction {id} is not pending"))?;
+        if !expected(&pending.waiter) {
+            bail!("interaction {id} is not a pending {kind}");
+        }
+        Ok(interactions.remove(&id).unwrap().waiter)
+    }
+
+    pub(super) async fn clear_interactions(&self, thread_id: ThreadId) {
+        self.interactions
             .lock()
             .await
-            .remove(&approval_id)
-            .with_context(|| format!("approval {approval_id} is not pending"))?;
-        Ok(ClaimedApproval {
-            decision: pending.decision,
-        })
+            .retain(|_, interaction| interaction.thread_id != thread_id);
     }
 
-    pub(super) async fn clear_approvals(&self, thread_id: ThreadId) {
-        self.approvals
-            .lock()
-            .await
-            .retain(|_, approval| approval.thread_id != thread_id);
-    }
-
-    pub(super) async fn ensure_no_pending_approval(&self, thread_id: ThreadId) -> Result<()> {
+    pub(super) async fn ensure_no_pending_interaction(&self, thread_id: ThreadId) -> Result<()> {
         if self
-            .approvals
+            .interactions
             .lock()
             .await
             .values()
-            .any(|approval| approval.thread_id == thread_id)
+            .any(|interaction| interaction.thread_id == thread_id)
         {
-            bail!("thread has a pending approval");
+            bail!("thread has a pending interaction");
         }
         Ok(())
     }
 }
 
-impl ClaimedApproval {
-    pub(super) fn resolve(
+impl InteractionWaiter {
+    pub(super) fn resolve_approval(
         self,
-        approval_id: ApprovalId,
+        id: InteractionId,
         allowed: bool,
         reason: Option<String>,
     ) -> Result<()> {
-        self.decision
+        let Self::Approval(decision) = self else {
+            bail!("interaction {id} is not an approval");
+        };
+        decision
             .send(ApprovalDecision { allowed, reason })
-            .map_err(|_| anyhow!("turn ended before approval {approval_id} was resolved"))
+            .map_err(|_| anyhow!("turn ended before approval {id} was resolved"))
+    }
+
+    pub(super) fn resolve_questions(
+        self,
+        id: InteractionId,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<()> {
+        let Self::Questions(sender) = self else {
+            bail!("interaction {id} is not a question request");
+        };
+        sender
+            .send(answers)
+            .map_err(|_| anyhow!("turn ended before question request {id} was resolved"))
     }
 }
 
@@ -255,5 +316,25 @@ mod tests {
 
         assert!(waiting.await.is_err());
         assert!(lifecycle.claim_approval(approval_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolving_a_question_returns_answers_to_the_waiting_turn() {
+        let lifecycle = TurnLifecycle::new();
+        let thread_id = ThreadId(1);
+        lifecycle.start(thread_id).await.unwrap();
+        let (request_id, waiting) = lifecycle.register_question(thread_id).await.unwrap();
+        let claimed = lifecycle.claim_questions(request_id).await.unwrap();
+        let answers = vec![QuestionAnswer {
+            selected_option: Some("A".to_owned()),
+            note: "because".to_owned(),
+        }];
+
+        claimed
+            .resolve_questions(request_id, answers.clone())
+            .expect("question should resolve");
+
+        assert_eq!(waiting.await.unwrap(), answers);
+        assert!(lifecycle.claim_questions(request_id).await.is_err());
     }
 }

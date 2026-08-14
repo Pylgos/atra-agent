@@ -5,12 +5,15 @@ pub(super) enum TurnRequest {
     Send {
         thread_id: ThreadId,
         message: String,
+        allow_questions: bool,
     },
     Continue {
         thread_id: ThreadId,
+        allow_questions: bool,
     },
     Compact {
         thread_id: ThreadId,
+        allow_questions: bool,
     },
 }
 
@@ -91,14 +94,27 @@ impl State {
         let mut cancellation = active.cancellation();
         let mut turn = Box::pin(async {
             match request {
-                TurnRequest::Send { thread_id, message } => {
-                    self.run_turn(thread_id, message, Some(updates)).await
+                TurnRequest::Send {
+                    thread_id,
+                    message,
+                    allow_questions,
+                } => {
+                    self.run_turn(thread_id, message, allow_questions, Some(updates))
+                        .await
                 }
-                TurnRequest::Continue { thread_id } => {
-                    self.continue_thread(thread_id, Some(updates)).await
+                TurnRequest::Continue {
+                    thread_id,
+                    allow_questions,
+                } => {
+                    self.continue_thread(thread_id, allow_questions, Some(updates))
+                        .await
                 }
-                TurnRequest::Compact { thread_id } => {
-                    self.compact_thread(thread_id, Some(updates)).await
+                TurnRequest::Compact {
+                    thread_id,
+                    allow_questions,
+                } => {
+                    self.compact_thread(thread_id, allow_questions, Some(updates))
+                        .await
                 }
             }
         });
@@ -155,6 +171,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         message: String,
+        allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
@@ -180,12 +197,14 @@ impl State {
         )
         .await
         .context("failed to save user message")?;
-        self.continue_turn(thread_id, updates).await
+        self.continue_turn(thread_id, allow_questions, updates)
+            .await
     }
 
     pub(super) async fn continue_thread(
         &self,
         thread_id: ThreadId,
+        allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
@@ -221,7 +240,8 @@ impl State {
             _ => unreachable!(),
         }
         self.sync_workspace_instructions(thread_id, updates).await?;
-        self.continue_turn(thread_id, updates).await
+        self.continue_turn(thread_id, allow_questions, updates)
+            .await
     }
 
     pub(super) async fn prepare_thread_for_turn(
@@ -252,7 +272,7 @@ impl State {
         if pending.is_empty() {
             return Ok(());
         }
-        self.turns.clear_approvals(thread_id).await;
+        self.turns.clear_interactions(thread_id).await;
         for call in pending {
             let (name, call_id, custom) = match &call {
                 ToolCallEvent::Custom { name, call_id, .. } => {
@@ -283,7 +303,7 @@ impl State {
         let stop = active.request_cancellation().await;
         let cleanup = async {
             let _guard = self.thread_lock(thread_id).lock_owned().await;
-            self.turns.clear_approvals(thread_id).await;
+            self.turns.clear_interactions(thread_id).await;
             self.prepare_thread_for_turn(thread_id, None).await
         }
         .await;
@@ -310,13 +330,14 @@ impl State {
         )
     }
 
-    pub(super) async fn ensure_no_pending_approval(&self, thread_id: ThreadId) -> Result<()> {
-        self.turns.ensure_no_pending_approval(thread_id).await
+    pub(super) async fn ensure_no_pending_interaction(&self, thread_id: ThreadId) -> Result<()> {
+        self.turns.ensure_no_pending_interaction(thread_id).await
     }
 
     pub(super) async fn compact_thread(
         &self,
         thread_id: ThreadId,
+        allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
         let _guard = self.thread_lock(thread_id).lock_owned().await;
@@ -328,7 +349,7 @@ impl State {
             "{:x}",
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
-        let model_tools = model_tools();
+        let model_tools = model_tools(allow_questions);
         let mut events = self
             .store
             .events(thread_id)
@@ -437,6 +458,7 @@ impl State {
     pub(super) async fn continue_turn(
         &self,
         thread_id: ThreadId,
+        allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
         let prompt_cache_key = format!(
@@ -450,7 +472,7 @@ impl State {
             .context("failed to load thread model")?;
         let provider = self.provider(&provider_id)?;
         let model_session = provider.start_turn(&prompt_cache_key).await?;
-        let model_tools = model_tools();
+        let model_tools = model_tools(allow_questions);
         loop {
             self.sync_runners(thread_id, updates).await?;
             let mut events = self
@@ -641,7 +663,13 @@ impl State {
                 stream_error = Some(anyhow!("model stream ended before completion"));
             }
             let completed_response = self
-                .execute_model_responses(provider.as_ref(), thread_id, responses, updates)
+                .execute_model_responses(
+                    provider.as_ref(),
+                    thread_id,
+                    responses,
+                    allow_questions,
+                    updates,
+                )
                 .await?;
             if let Some(error) = stream_error {
                 return Err(error);
@@ -960,6 +988,7 @@ impl State {
         provider: &dyn model::ModelProvider,
         thread_id: ThreadId,
         mut responses: VecDeque<ModelResponse>,
+        allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<bool> {
         let mut final_answer = None;
@@ -977,6 +1006,37 @@ impl State {
                     arguments,
                     call_id,
                 } => {
+                    if name == "question" && allow_questions {
+                        let questions = parse_questions(arguments)?;
+                        let (request_id, answer) = self.turns.register_question(thread_id).await?;
+                        updates
+                            .context("question requires a streaming turn")?
+                            .interaction_requested(atra_protocol::PendingInteraction::Questions(
+                                atra_protocol::PendingQuestionRequest {
+                                    id: request_id,
+                                    questions,
+                                },
+                            ))
+                            .await?;
+                        let answers = answer
+                            .await
+                            .context("question was removed before it was answered")?;
+                        needs_follow_up = true;
+                        self.save_tool_result(
+                            thread_id,
+                            &name,
+                            call_id.as_deref(),
+                            ToolOutcome {
+                                result: serde_json::to_value(&answers)
+                                    .context("failed to encode question answers")?,
+                                artifacts: Vec::new(),
+                            },
+                            false,
+                            updates,
+                        )
+                        .await?;
+                        continue;
+                    }
                     let result = provider
                         .execute_tool(&name, &arguments)
                         .await?
@@ -1102,12 +1162,14 @@ impl State {
             let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
             updates
                 .context("approval requires a streaming turn")?
-                .approval_requested(atra_protocol::PendingApproval::new(
-                    approval_id,
-                    name.to_owned(),
-                    arguments_json,
-                    operation.map(|operation| operation.index),
-                    operation.map(|operation| operation.label.clone()),
+                .interaction_requested(atra_protocol::PendingInteraction::Approval(
+                    atra_protocol::PendingApproval::new(
+                        approval_id,
+                        name.to_owned(),
+                        arguments_json,
+                        operation.map(|operation| operation.index),
+                        operation.map(|operation| operation.label.clone()),
+                    ),
                 ))
                 .await?;
             Some(
@@ -1135,9 +1197,16 @@ impl State {
 
     pub(super) async fn claim_approval(
         &self,
-        approval_id: ApprovalId,
-    ) -> Result<lifecycle::ClaimedApproval> {
+        approval_id: InteractionId,
+    ) -> Result<lifecycle::InteractionWaiter> {
         self.turns.claim_approval(approval_id).await
+    }
+
+    pub(super) async fn claim_questions(
+        &self,
+        request_id: InteractionId,
+    ) -> Result<lifecycle::InteractionWaiter> {
+        self.turns.claim_questions(request_id).await
     }
 
     pub(super) async fn execute(

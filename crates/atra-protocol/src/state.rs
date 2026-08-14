@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ApprovalId, ApprovalPolicy, CheckpointId, EventSequence, HistoryTarget, Model, ProcessId,
+    ApprovalPolicy, CheckpointId, EventSequence, HistoryTarget, InteractionId, Model, ProcessId,
     ProcessStatus, Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadId,
 };
 
@@ -231,7 +231,7 @@ impl fmt::Display for ActiveItemId {
 pub enum TurnPhase {
     Running,
     Retrying,
-    AwaitingApproval,
+    AwaitingInput,
     Cancelling,
     Compacting,
 }
@@ -331,7 +331,7 @@ impl ActiveItem {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingApproval {
-    id: ApprovalId,
+    id: InteractionId,
     tool: String,
     arguments: Value,
     operation_index: Option<usize>,
@@ -340,7 +340,7 @@ pub struct PendingApproval {
 
 impl PendingApproval {
     pub fn new(
-        id: ApprovalId,
+        id: InteractionId,
         tool: String,
         arguments: Value,
         operation_index: Option<usize>,
@@ -355,7 +355,7 @@ impl PendingApproval {
         }
     }
 
-    pub fn id(&self) -> ApprovalId {
+    pub fn id(&self) -> InteractionId {
         self.id
     }
 
@@ -378,10 +378,55 @@ impl PendingApproval {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Question {
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub recommended_options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingQuestionRequest {
+    pub id: InteractionId,
+    pub questions: Vec<Question>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PendingInteraction {
+    Approval(PendingApproval),
+    Questions(PendingQuestionRequest),
+}
+
+impl PendingInteraction {
+    pub fn id(&self) -> InteractionId {
+        match self {
+            Self::Approval(approval) => approval.id(),
+            Self::Questions(request) => request.id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionAnswer {
+    pub selected_option: Option<String>,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveTurn {
     phase: TurnPhase,
     items: Vec<ActiveItem>,
-    pending_approval: Option<PendingApproval>,
+    pending_interaction: Option<PendingInteraction>,
     retry: Option<Box<RetryStatus>>,
 }
 
@@ -390,7 +435,7 @@ impl ActiveTurn {
         Self {
             phase,
             items: Vec::new(),
-            pending_approval: None,
+            pending_interaction: None,
             retry: None,
         }
     }
@@ -404,7 +449,21 @@ impl ActiveTurn {
     }
 
     pub fn pending_approval(&self) -> Option<&PendingApproval> {
-        self.pending_approval.as_ref()
+        match self.pending_interaction.as_ref() {
+            Some(PendingInteraction::Approval(approval)) => Some(approval),
+            _ => None,
+        }
+    }
+
+    pub fn pending_question(&self) -> Option<&PendingQuestionRequest> {
+        match self.pending_interaction.as_ref() {
+            Some(PendingInteraction::Questions(request)) => Some(request),
+            _ => None,
+        }
+    }
+
+    pub fn pending_interaction(&self) -> Option<&PendingInteraction> {
+        self.pending_interaction.as_ref()
     }
 
     pub fn retry(&self) -> Option<&RetryStatus> {
@@ -597,11 +656,11 @@ pub enum ThreadOperation {
     RetryScheduled {
         retry: RetryStatus,
     },
-    ApprovalRequested {
-        approval: PendingApproval,
+    InteractionRequested {
+        interaction: PendingInteraction,
     },
-    ApprovalResolved {
-        approval_id: ApprovalId,
+    InteractionResolved {
+        interaction_id: InteractionId,
     },
     TurnFinished {
         outcome: TurnOutcome,
@@ -627,7 +686,7 @@ pub enum ThreadChange {
         sequence: EventSequence,
     },
     Phase,
-    Approval,
+    Interaction,
     TurnFinished,
     HistoryReplaced,
     Checkpoint(CheckpointId),
@@ -746,32 +805,32 @@ impl ThreadOperation {
                 turn.retry = Some(Box::new(retry));
                 Ok(ThreadChange::Phase)
             }
-            Self::ApprovalRequested { approval } => {
+            Self::InteractionRequested { interaction } => {
                 let turn = active_turn_mut(state)?;
-                if turn.pending_approval.is_some() {
-                    return Err(ApplyError::new("thread already has a pending approval"));
+                if turn.pending_interaction.is_some() {
+                    return Err(ApplyError::new("thread already has a pending interaction"));
                 }
-                turn.phase = TurnPhase::AwaitingApproval;
+                turn.phase = TurnPhase::AwaitingInput;
                 turn.retry = None;
-                turn.pending_approval = Some(approval);
-                Ok(ThreadChange::Approval)
+                turn.pending_interaction = Some(interaction);
+                Ok(ThreadChange::Interaction)
             }
-            Self::ApprovalResolved { approval_id } => {
+            Self::InteractionResolved { interaction_id } => {
                 let turn = active_turn_mut(state)?;
-                if turn.phase != TurnPhase::AwaitingApproval {
-                    return Err(ApplyError::new("thread is not awaiting approval"));
+                if turn.phase != TurnPhase::AwaitingInput {
+                    return Err(ApplyError::new("thread is not awaiting input"));
                 }
                 let pending = turn
-                    .pending_approval
+                    .pending_interaction
                     .as_ref()
-                    .ok_or_else(|| ApplyError::new("thread has no pending approval"))?;
-                if pending.id != approval_id {
-                    return Err(ApplyError::new("approval id does not match"));
+                    .ok_or_else(|| ApplyError::new("thread has no pending interaction"))?;
+                if pending.id() != interaction_id {
+                    return Err(ApplyError::new("interaction id does not match"));
                 }
-                turn.pending_approval = None;
+                turn.pending_interaction = None;
                 turn.phase = TurnPhase::Running;
                 turn.retry = None;
-                Ok(ThreadChange::Approval)
+                Ok(ThreadChange::Interaction)
             }
             Self::TurnFinished { outcome } => {
                 if state.active_turn.take().is_none() {
@@ -1001,12 +1060,15 @@ pub enum Command {
     ThreadSend {
         thread_id: ThreadId,
         message: String,
+        allow_questions: bool,
     },
     ThreadContinue {
         thread_id: ThreadId,
+        allow_questions: bool,
     },
     ThreadCompact {
         thread_id: ThreadId,
+        allow_questions: bool,
     },
     ThreadCheckpointCreate {
         thread_id: ThreadId,
@@ -1035,11 +1097,15 @@ pub enum Command {
         provider: String,
     },
     ApprovalAllow {
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
     },
     ApprovalDeny {
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
         reason: Option<String>,
+    },
+    QuestionAnswer {
+        request_id: InteractionId,
+        answers: Vec<QuestionAnswer>,
     },
     RunnerLaunch {
         name: String,
@@ -1215,14 +1281,14 @@ mod tests {
         }
         .apply(&mut state)
         .unwrap();
-        ThreadOperation::ApprovalRequested {
-            approval: PendingApproval::new(
-                ApprovalId(1),
+        ThreadOperation::InteractionRequested {
+            interaction: PendingInteraction::Approval(PendingApproval::new(
+                InteractionId(1),
                 "shell".to_owned(),
                 Value::Null,
                 None,
                 None,
-            ),
+            )),
         }
         .apply(&mut state)
         .unwrap();
@@ -1233,15 +1299,55 @@ mod tests {
         .unwrap();
 
         assert!(
-            ThreadOperation::ApprovalResolved {
-                approval_id: ApprovalId(1),
+            ThreadOperation::InteractionResolved {
+                interaction_id: InteractionId(1),
             }
             .apply(&mut state)
             .is_err()
         );
         let turn = state.active_turn().unwrap();
         assert_eq!(turn.phase(), TurnPhase::Cancelling);
-        assert_eq!(turn.pending_approval().unwrap().id(), ApprovalId(1));
+        assert_eq!(turn.pending_approval().unwrap().id(), InteractionId(1));
+    }
+
+    #[test]
+    fn question_request_moves_turn_through_awaiting_answer() {
+        let mut state =
+            ThreadState::materialize(thread(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        let request_id = InteractionId(7);
+        ThreadOperation::InteractionRequested {
+            interaction: PendingInteraction::Questions(PendingQuestionRequest {
+                id: request_id,
+                questions: vec![Question {
+                    question: "Choose".to_owned(),
+                    options: vec![QuestionOption {
+                        label: "A".to_owned(),
+                        description: "First".to_owned(),
+                    }],
+                    recommended_options: vec!["A".to_owned()],
+                }],
+            }),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let turn = state.active_turn().unwrap();
+        assert_eq!(turn.phase(), TurnPhase::AwaitingInput);
+        assert_eq!(turn.pending_question().unwrap().id, request_id);
+
+        ThreadOperation::InteractionResolved {
+            interaction_id: request_id,
+        }
+        .apply(&mut state)
+        .unwrap();
+        let turn = state.active_turn().unwrap();
+        assert_eq!(turn.phase(), TurnPhase::Running);
+        assert!(turn.pending_question().is_none());
     }
 
     #[test]

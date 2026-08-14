@@ -33,8 +33,13 @@ impl App {
             .active_turn()
             .and_then(|turn| turn.pending_approval())
             .map(|approval| approval.id());
+        let pending_question_request = state
+            .active_turn()
+            .and_then(|turn| turn.pending_question())
+            .cloned();
+        let pending_question = pending_question_request.as_ref().map(|request| request.id);
         self.turn = match std::mem::take(&mut self.turn) {
-            TurnState::Starting { .. } if active => TurnState::Idle,
+            TurnState::Starting { .. } if active && pending_question.is_none() => TurnState::Idle,
             TurnState::Cancelling if cancelling || !active => TurnState::Idle,
             TurnState::EnteringDenyReason {
                 approval_id,
@@ -51,6 +56,13 @@ impl App {
             TurnState::EnteringDenyReason { .. } | TurnState::ResolvingApproval { .. } => {
                 TurnState::Idle
             }
+            TurnState::AnsweringQuestions(form) if pending_question == Some(form.id()) => {
+                TurnState::AnsweringQuestions(form)
+            }
+            TurnState::AnsweringQuestions(_) if pending_question.is_none() => TurnState::Idle,
+            _ if pending_question.is_some() => TurnState::AnsweringQuestions(
+                crate::state::QuestionForm::new(pending_question_request.unwrap()),
+            ),
             _state if !active => TurnState::Idle,
             state => state,
         };
@@ -76,7 +88,7 @@ impl App {
                 if let Some(subscription) = &self.thread_subscription {
                     self.transcript.rebuild(subscription.state());
                 }
-                self.reset_turn_interaction();
+                self.sync_turn_interaction();
                 self.error = Some(error);
                 Ok(())
             }
@@ -93,12 +105,23 @@ impl App {
                 }
                 Ok(())
             }
+            TurnUpdate::QuestionResolved { request_id, result } => {
+                if let Err(error) = result {
+                    if let TurnState::AnsweringQuestions(form) = &mut self.turn
+                        && form.id() == request_id
+                    {
+                        form.mode = crate::state::QuestionFormMode::Confirm;
+                    }
+                    self.error = Some(error);
+                }
+                Ok(())
+            }
             TurnUpdate::CancelCompleted { thread_id, result } => {
                 if self.target.thread_id() == Some(thread_id) {
                     match result {
                         Ok(()) => {}
                         Err(error) => {
-                            self.reset_turn_interaction();
+                            self.sync_turn_interaction();
                             self.error = Some(error);
                         }
                     }
@@ -130,7 +153,7 @@ impl App {
                 };
                 self.transcript.rebuild(subscription.state());
                 self.thread_subscription = Some(subscription.into());
-                self.reset_turn_interaction();
+                self.sync_turn_interaction();
                 self.target = Target::Thread {
                     id: thread_id,
                     view: ThreadView::Live,
@@ -339,7 +362,7 @@ impl App {
                 self.transcript.rebuild(subscription.state());
                 self.overlay = Overlay::None;
                 self.thread_subscription = Some(subscription.into());
-                self.reset_turn_interaction();
+                self.sync_turn_interaction();
                 self.target = Target::Thread {
                     id: thread_id,
                     view: ThreadView::Live,

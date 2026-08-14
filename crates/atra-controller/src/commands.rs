@@ -136,7 +136,7 @@ impl State {
                     bail!("cannot create a checkpoint while a turn is active");
                 }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_approval(thread_id).await?;
+                self.ensure_no_pending_interaction(thread_id).await?;
                 let checkpoint_id = self
                     .store
                     .create_checkpoint(thread_id, checkpoint_time_ms(), "manual".to_owned())
@@ -163,7 +163,7 @@ impl State {
                     bail!("cannot fork a thread while a turn is active");
                 }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_approval(thread_id).await?;
+                self.ensure_no_pending_interaction(thread_id).await?;
                 let forked_id = self
                     .store
                     .fork_thread(thread_id, checkpoint_id, sequence, display_name)
@@ -185,7 +185,7 @@ impl State {
                     bail!("cannot replace history while a turn is active");
                 }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_approval(thread_id).await?;
+                self.ensure_no_pending_interaction(thread_id).await?;
                 let checkpoint_id = self
                     .store
                     .replace_history(thread_id, target, checkpoint_time_ms())
@@ -216,8 +216,8 @@ impl State {
             }
             Command::ApprovalAllow { approval_id } => {
                 let approval = self.claim_approval(approval_id).await?;
-                self.views.resolve_approval(approval_id).await?;
-                approval.resolve(approval_id, true, None)?;
+                self.views.resolve_interaction(approval_id).await?;
+                approval.resolve_approval(approval_id, true, None)?;
                 Ok(CommandResult::Accepted)
             }
             Command::ApprovalDeny {
@@ -225,31 +225,63 @@ impl State {
                 reason,
             } => {
                 let approval = self.claim_approval(approval_id).await?;
-                self.views.resolve_approval(approval_id).await?;
-                approval.resolve(approval_id, false, reason)?;
+                self.views.resolve_interaction(approval_id).await?;
+                approval.resolve_approval(approval_id, false, reason)?;
                 Ok(CommandResult::Accepted)
             }
-            Command::ThreadSend { thread_id, message } => {
+            Command::QuestionAnswer {
+                request_id,
+                answers,
+            } => {
+                self.views
+                    .validate_question_answers(request_id, &answers)
+                    .await?;
+                let question = self.claim_questions(request_id).await?;
+                self.views.resolve_interaction(request_id).await?;
+                question.resolve_questions(request_id, answers)?;
+                Ok(CommandResult::Accepted)
+            }
+            Command::ThreadSend {
+                thread_id,
+                message,
+                allow_questions,
+            } => {
                 self.start_turn(
                     thread_id,
                     TurnPhase::Running,
-                    TurnRequest::Send { thread_id, message },
+                    TurnRequest::Send {
+                        thread_id,
+                        message,
+                        allow_questions,
+                    },
                 )
                 .await
             }
-            Command::ThreadContinue { thread_id } => {
+            Command::ThreadContinue {
+                thread_id,
+                allow_questions,
+            } => {
                 self.start_turn(
                     thread_id,
                     TurnPhase::Running,
-                    TurnRequest::Continue { thread_id },
+                    TurnRequest::Continue {
+                        thread_id,
+                        allow_questions,
+                    },
                 )
                 .await
             }
-            Command::ThreadCompact { thread_id } => {
+            Command::ThreadCompact {
+                thread_id,
+                allow_questions,
+            } => {
                 self.start_turn(
                     thread_id,
                     TurnPhase::Compacting,
-                    TurnRequest::Compact { thread_id },
+                    TurnRequest::Compact {
+                        thread_id,
+                        allow_questions,
+                    },
                 )
                 .await
             }
@@ -620,15 +652,15 @@ impl TurnProjector {
             .await
     }
 
-    pub(super) async fn approval_requested(
+    pub(super) async fn interaction_requested(
         &self,
-        approval: atra_protocol::PendingApproval,
+        interaction: atra_protocol::PendingInteraction,
     ) -> Result<()> {
         self.state
             .views
             .apply_thread(
                 self.thread_id,
-                ThreadOperation::ApprovalRequested { approval },
+                ThreadOperation::InteractionRequested { interaction },
             )
             .await
     }

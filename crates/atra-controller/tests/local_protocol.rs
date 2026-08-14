@@ -77,6 +77,7 @@ async fn accepted_turn_progresses_through_thread_operations() {
             .command(Command::ThreadSend {
                 thread_id,
                 message: "State-synchronized prompt".to_owned(),
+                allow_questions: false,
             })
             .await
             .unwrap(),

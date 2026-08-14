@@ -1,9 +1,51 @@
 use super::*;
 use indoc::indoc;
 
-pub(super) fn model_tools() -> Vec<model::ModelTool> {
-    vec![
-        model::ModelTool::WebSearch,
+pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
+    let mut tools = vec![model::ModelTool::WebSearch];
+    if allow_questions {
+        tools.push(model::ModelTool::Function {
+            name: "question",
+            description: "Ask the user one or more questions. Each question is answered with one option and an optional free-form note. recommended_options must contain option labels. The UI adds a final \"どれでもない\" option automatically, so do not provide it; that answer is returned with selected_option null. Use this when user input is required before continuing.",
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "minLength": 1},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "minLength": 1},
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "recommended_options": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "required": ["question", "options", "recommended_options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    tools.extend([
         model::ModelTool::Custom {
             name: "command",
             description: indoc! {"
@@ -98,7 +140,57 @@ pub(super) fn model_tools() -> Vec<model::ModelTool> {
                 "#},
             },
         },
-    ]
+    ]);
+    tools
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionArguments {
+    questions: Vec<atra_protocol::Question>,
+}
+
+pub(super) fn parse_questions(
+    arguments: serde_json::Value,
+) -> Result<Vec<atra_protocol::Question>> {
+    let mut arguments: QuestionArguments =
+        serde_json::from_value(arguments).context("invalid question arguments")?;
+    if arguments.questions.is_empty() {
+        bail!("question tool requires at least one question");
+    }
+    for question in &mut arguments.questions {
+        if question.question.trim().is_empty() {
+            bail!("question text must not be empty");
+        }
+        if question.options.is_empty() {
+            bail!("each question requires at least one option");
+        }
+        let mut labels = HashSet::new();
+        for option in &question.options {
+            if option.label.trim().is_empty() {
+                bail!("option labels must not be empty");
+            }
+            if option.label == "どれでもない" {
+                bail!("the reserved option label どれでもない must not be provided");
+            }
+            if !labels.insert(option.label.as_str()) {
+                bail!("option labels must be unique within a question");
+            }
+        }
+        let mut recommended = HashSet::new();
+        for label in &question.recommended_options {
+            if !labels.contains(label.as_str()) {
+                bail!("recommended_options contains an unknown option");
+            }
+            if !recommended.insert(label) {
+                bail!("recommended_options must not contain duplicates");
+            }
+        }
+        question
+            .options
+            .sort_by_key(|option| !question.recommended_options.contains(&option.label));
+    }
+    Ok(arguments.questions)
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -536,6 +628,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn question_tool_is_only_available_for_interactive_turns() {
+        assert!(model_tools(true).iter().any(|tool| matches!(
+            tool,
+            model::ModelTool::Function {
+                name: "question",
+                ..
+            }
+        )));
+        assert!(model_tools(false).iter().all(|tool| !matches!(
+            tool,
+            model::ModelTool::Function {
+                name: "question",
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn parses_todo_annotation() {
         let (content, todos) = parse_todo_annotation(
             "<todo>\n- [x]: task a\n- [-]: task b\n- [ ]: task c\n</todo>\n\nBody".to_owned(),
@@ -585,5 +695,46 @@ mod tests {
                 .iter()
                 .all(|todo| todo.status == TodoStatus::InProgress)
         );
+    }
+
+    #[test]
+    fn parses_valid_questions() {
+        let questions = parse_questions(serde_json::json!({
+            "questions": [{
+                "question": "Choose",
+                "options": [
+                    {"label": "A", "description": "First"},
+                    {"label": "B", "description": "Second"}
+                ],
+                "recommended_options": ["B"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].recommended_options, ["B"]);
+        assert_eq!(questions[0].options[0].label, "B");
+    }
+
+    #[test]
+    fn rejects_invalid_recommended_options_and_reserved_label() {
+        for arguments in [
+            serde_json::json!({
+                "questions": [{
+                    "question": "Choose",
+                    "options": [{"label": "A", "description": "First"}],
+                    "recommended_options": ["B"]
+                }]
+            }),
+            serde_json::json!({
+                "questions": [{
+                    "question": "Choose",
+                    "options": [{"label": "どれでもない", "description": "Reserved"}],
+                    "recommended_options": []
+                }]
+            }),
+        ] {
+            assert!(parse_questions(arguments).is_err());
+        }
     }
 }

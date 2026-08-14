@@ -432,9 +432,45 @@ impl Views {
         Ok(())
     }
 
-    pub(super) async fn resolve_approval(
+    pub(super) async fn validate_question_answers(
         &self,
-        approval_id: atra_protocol::ApprovalId,
+        id: atra_protocol::InteractionId,
+        answers: &[atra_protocol::QuestionAnswer],
+    ) -> Result<()> {
+        let inner = self.inner.lock().await;
+        ensure_inner_running(&inner)?;
+        let request = inner
+            .threads
+            .values()
+            .find_map(|view| {
+                view.state
+                    .active_turn()
+                    .and_then(|turn| turn.pending_question())
+                    .filter(|request| request.id == id)
+            })
+            .context("question request is not pending in public state")?;
+        if answers.len() != request.questions.len()
+            || request
+                .questions
+                .iter()
+                .zip(answers)
+                .any(|(question, answer)| {
+                    answer.selected_option.as_ref().is_some_and(|selected| {
+                        !question
+                            .options
+                            .iter()
+                            .any(|option| option.label == *selected)
+                    })
+                })
+        {
+            anyhow::bail!("answers do not match the pending questions");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn resolve_interaction(
+        &self,
+        interaction_id: atra_protocol::InteractionId,
     ) -> Result<ThreadId> {
         let mut inner = self.inner.lock().await;
         ensure_inner_running(&inner)?;
@@ -444,20 +480,17 @@ impl Views {
             .find_map(|(thread_id, view)| {
                 view.state
                     .active_turn()
-                    .and_then(|turn| turn.pending_approval())
-                    .is_some_and(|approval| approval.id() == approval_id)
+                    .and_then(|turn| turn.pending_interaction())
+                    .is_some_and(|interaction| interaction.id() == interaction_id)
                     .then_some(*thread_id)
             })
-            .context("approval is not pending in public state")?;
-        let view = inner
-            .threads
-            .get_mut(&thread_id)
-            .expect("approval thread was found in the same map");
-        let operation = ThreadOperation::ApprovalResolved { approval_id };
+            .context("interaction is not pending in public state")?;
+        let view = inner.threads.get_mut(&thread_id).unwrap();
+        let operation = ThreadOperation::InteractionResolved { interaction_id };
         operation
             .clone()
             .apply(&mut view.state)
-            .context("failed to resolve approval in public state")?;
+            .context("failed to resolve interaction in public state")?;
         let message = ThreadSubscriptionMessage::Operation { operation };
         view.subscribers
             .retain(|subscriber| subscriber.send(message.clone()).is_ok());

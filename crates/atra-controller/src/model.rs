@@ -126,6 +126,11 @@ pub(crate) struct ModelRequest<'a> {
 
 pub(crate) enum ModelTool {
     WebSearch,
+    Function {
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    },
     Custom {
         name: &'static str,
         description: &'static str,

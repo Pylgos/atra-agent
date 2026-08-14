@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 
-use atra_protocol::{ApprovalId, CheckpointId, EventSequence, Model, ProcessId, TurnPhase};
+use atra_protocol::{
+    CheckpointId, EventSequence, InteractionId, Model, PendingQuestionRequest, ProcessId,
+    QuestionAnswer, TurnPhase,
+};
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FocusPane {
     Input,
     Checkpoints,
@@ -20,17 +23,78 @@ pub(crate) enum TurnState {
     },
     Cancelling,
     EnteringDenyReason {
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
         reason: InputBuffer,
     },
     ResolvingApproval {
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
     },
+    AnsweringQuestions(QuestionForm),
 }
 
 impl TurnState {
     pub(crate) fn is_pending(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+}
+
+pub(crate) struct QuestionForm {
+    pub(crate) request: PendingQuestionRequest,
+    pub(crate) drafts: Vec<QuestionDraft>,
+    pub(crate) current: usize,
+    pub(crate) mode: QuestionFormMode,
+    pub(crate) scroll: usize,
+}
+
+pub(crate) struct QuestionDraft {
+    pub(crate) selected: usize,
+    pub(crate) note: InputBuffer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuestionFormMode {
+    Normal,
+    Note,
+    Confirm,
+    Submitting,
+}
+
+impl QuestionForm {
+    pub(crate) fn new(request: PendingQuestionRequest) -> Self {
+        let drafts = request
+            .questions
+            .iter()
+            .map(|_| QuestionDraft {
+                selected: 0,
+                note: InputBuffer::new(Vec::new(), true),
+            })
+            .collect();
+        Self {
+            request,
+            drafts,
+            current: 0,
+            mode: QuestionFormMode::Normal,
+            scroll: 0,
+        }
+    }
+
+    pub(crate) fn id(&self) -> InteractionId {
+        self.request.id
+    }
+
+    pub(crate) fn answers(&self) -> Vec<QuestionAnswer> {
+        self.request
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| QuestionAnswer {
+                selected_option: question
+                    .options
+                    .get(self.drafts[index].selected)
+                    .map(|option| option.label.clone()),
+                note: self.drafts[index].note.value.clone(),
+            })
+            .collect()
     }
 }
 

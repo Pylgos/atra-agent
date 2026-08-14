@@ -3,8 +3,8 @@ use std::{io, time::Duration};
 use anyhow::{Result, bail};
 use atra_client::{Client, SubscriptionError};
 use atra_protocol::{
-    ApprovalId, CheckpointId, Command as StateCommand, CommandResult, EventSequence, HistoryTarget,
-    ProcessId, ProcessLocator, ThreadId,
+    CheckpointId, Command as StateCommand, CommandResult, EventSequence, HistoryTarget,
+    InteractionId, ProcessId, ProcessLocator, QuestionAnswer, ThreadId,
 };
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
@@ -73,8 +73,13 @@ pub(crate) enum Effect {
     },
     ResolveApproval {
         endpoint: std::path::PathBuf,
-        approval_id: ApprovalId,
+        approval_id: InteractionId,
         decision: ApprovalDecision,
+    },
+    ResolveQuestion {
+        endpoint: std::path::PathBuf,
+        request_id: InteractionId,
+        answers: Vec<QuestionAnswer>,
     },
     CancelTurn {
         endpoint: std::path::PathBuf,
@@ -298,7 +303,10 @@ impl Effect {
                     thread_id,
                 } => {
                     let result = Client::new(&endpoint)
-                        .command(StateCommand::ThreadContinue { thread_id })
+                        .command(StateCommand::ThreadContinue {
+                            thread_id,
+                            allow_questions: true,
+                        })
                         .await
                         .and_then(accepted);
                     if let Err(error) = result {
@@ -310,7 +318,10 @@ impl Effect {
                     thread_id,
                 } => {
                     let result = Client::new(&endpoint)
-                        .command(StateCommand::ThreadCompact { thread_id })
+                        .command(StateCommand::ThreadCompact {
+                            thread_id,
+                            allow_questions: true,
+                        })
                         .await
                         .and_then(accepted);
                     if let Err(error) = result {
@@ -343,6 +354,20 @@ impl Effect {
                         approval_id,
                         result,
                     });
+                }
+                Self::ResolveQuestion {
+                    endpoint,
+                    request_id,
+                    answers,
+                } => {
+                    let result = Client::new(&endpoint)
+                        .command(StateCommand::QuestionAnswer {
+                            request_id,
+                            answers,
+                        })
+                        .await
+                        .and_then(accepted);
+                    let _ = updates.send(TurnUpdate::QuestionResolved { request_id, result });
                 }
                 Self::CancelTurn {
                     endpoint,
@@ -552,7 +577,11 @@ async fn send_turn(
     };
     accepted(
         client
-            .command(StateCommand::ThreadSend { thread_id, message })
+            .command(StateCommand::ThreadSend {
+                thread_id,
+                message,
+                allow_questions: true,
+            })
             .await?,
     )?;
     Ok(())

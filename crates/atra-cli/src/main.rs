@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_client::{Client, ProcessSubscription, ThreadSubscription};
 use atra_protocol::{
-    ApprovalId, ApprovalPolicy, AssistantMessagePhase, CheckpointId, Command as StateCommand,
-    CommandResult, EventSequence, HistoryTarget, ProcessId, ProcessLocator, ProcessStatus,
+    ApprovalPolicy, AssistantMessagePhase, CheckpointId, Command as StateCommand, CommandResult,
+    EventSequence, HistoryTarget, InteractionId, ProcessId, ProcessLocator, ProcessStatus,
     ProviderLifecycle, RunnerLifecycle, ThreadEventData, ThreadId, TurnOutcome,
 };
 use clap::{Parser, Subcommand, ValueEnum};
@@ -496,7 +496,7 @@ async fn run(command: Command) -> Result<()> {
             expect_accepted(
                 client(&endpoint)
                     .command(StateCommand::ApprovalAllow {
-                        approval_id: ApprovalId(approval),
+                        approval_id: InteractionId(approval),
                     })
                     .await?,
             )?;
@@ -508,7 +508,7 @@ async fn run(command: Command) -> Result<()> {
             expect_accepted(
                 client(&endpoint)
                     .command(StateCommand::ApprovalDeny {
-                        approval_id: ApprovalId(approval),
+                        approval_id: InteractionId(approval),
                         reason,
                     })
                     .await?,
@@ -728,7 +728,11 @@ async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
             display_turn(
                 client(endpoint),
                 subscription,
-                StateCommand::ThreadSend { thread_id, message },
+                StateCommand::ThreadSend {
+                    thread_id,
+                    message,
+                    allow_questions: false,
+                },
                 false,
             )
             .await
@@ -792,7 +796,10 @@ async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
             display_turn(
                 client(endpoint),
                 subscription,
-                StateCommand::ThreadContinue { thread_id },
+                StateCommand::ThreadContinue {
+                    thread_id,
+                    allow_questions: false,
+                },
                 false,
             )
             .await
@@ -803,7 +810,10 @@ async fn run_thread(endpoint: &Path, command: ThreadCommand) -> Result<()> {
             display_turn(
                 client(endpoint),
                 subscription,
-                StateCommand::ThreadCompact { thread_id },
+                StateCommand::ThreadCompact {
+                    thread_id,
+                    allow_questions: false,
+                },
                 true,
             )
             .await

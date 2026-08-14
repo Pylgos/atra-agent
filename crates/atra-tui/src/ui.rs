@@ -17,7 +17,8 @@ use crate::{
     app::{App, COMMAND_HELP},
     state::{
         CheckpointPicker, FocusPane, ModelPicker, ModelPickerStage, OperationOverlay, Overlay,
-        ProcessPicker, ProcessPickerState, ThreadPicker, ThreadPickerState, TurnState,
+        ProcessPicker, ProcessPickerState, QuestionForm, QuestionFormMode, ThreadPicker,
+        ThreadPickerState, TurnState,
     },
     text::{expand_line_tabs, expand_tabs},
     transcript::{
@@ -160,6 +161,12 @@ impl App {
         self.render_composer(frame, input);
         frame.render_widget(Paragraph::new(self.status_line()), status);
         self.render_overlays(frame, main);
+        if let TurnState::AnsweringQuestions(form) = &self.turn {
+            render_question_form(frame, form);
+        }
+        if let Some(error) = &self.error {
+            render_error(frame, error);
+        }
     }
 
     fn render_composer(&mut self, frame: &mut Frame<'_>, input: Rect) {
@@ -325,9 +332,6 @@ impl App {
         }
         if matches!(self.overlay, Overlay::Help) {
             render_command_help(frame);
-        }
-        if let Some(error) = &self.error {
-            render_error(frame, error);
         }
     }
 
@@ -501,13 +505,21 @@ impl App {
                 Style::default().fg(Color::Yellow),
             )];
         }
-        let (message, color) = match self.turn {
+        let (message, color) = match &self.turn {
             TurnState::Starting {
                 phase: TurnPhase::Compacting,
             } => ("Compacting".to_owned(), Color::Yellow),
             TurnState::Starting { .. } => ("Starting".to_owned(), Color::Yellow),
             TurnState::Cancelling => ("Cancelling".to_owned(), Color::Yellow),
             TurnState::ResolvingApproval { .. } => ("Resuming".to_owned(), Color::Yellow),
+            TurnState::AnsweringQuestions(form) => {
+                let message = if form.mode == QuestionFormMode::Submitting {
+                    "Sending answers"
+                } else {
+                    "Answer required"
+                };
+                (message.to_owned(), Color::Yellow)
+            }
             TurnState::EnteringDenyReason { .. } => ("Approval required".to_owned(), Color::Yellow),
             TurnState::Idle => {
                 let Some(turn) = self.active_turn() else {
@@ -531,7 +543,7 @@ impl App {
                         );
                         (message, Color::Red)
                     }
-                    TurnPhase::AwaitingApproval => ("Approval required".to_owned(), Color::Yellow),
+                    TurnPhase::AwaitingInput => ("Input required".to_owned(), Color::Yellow),
                     TurnPhase::Cancelling => ("Cancelling".to_owned(), Color::Yellow),
                     TurnPhase::Compacting => ("Compacting".to_owned(), Color::Yellow),
                     TurnPhase::Running => {
@@ -551,7 +563,12 @@ impl App {
             }
         };
         let mut spans = vec![Span::styled(message, Style::default().fg(color))];
-        if self.turn_is_running() && !matches!(self.turn, TurnState::Cancelling) {
+        if self.turn_is_running()
+            && !matches!(
+                self.turn,
+                TurnState::Cancelling | TurnState::AnsweringQuestions(_)
+            )
+        {
             spans.push(Span::styled(
                 " · esc cancel",
                 Style::default().fg(Color::DarkGray),
@@ -745,6 +762,215 @@ impl App {
                 _ => None,
             })
     }
+}
+
+fn render_question_form(frame: &mut Frame<'_>, form: &QuestionForm) {
+    let area = frame.area().inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    frame.render_widget(Clear, area);
+    let submitting = form.mode == QuestionFormMode::Submitting;
+    let title = if submitting {
+        " Sending answers "
+    } else if form.mode == QuestionFormMode::Confirm {
+        " Confirm answers "
+    } else {
+        " Questions "
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(area).inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    frame.render_widget(block, area);
+    let questions = &form.request.questions;
+
+    if matches!(
+        form.mode,
+        QuestionFormMode::Confirm | QuestionFormMode::Submitting
+    ) {
+        let mut lines = Vec::new();
+        for (index, question) in questions.iter().enumerate() {
+            let option = question.options.get(form.drafts[index].selected);
+            lines.push(Line::styled(
+                format!("{}. {}", index + 1, sanitize(&question.question)),
+                Style::default().fg(Color::Cyan),
+            ));
+            let label = option.map_or_else(
+                || "どれでもない".to_owned(),
+                |option| sanitize(&option.label),
+            );
+            let recommended = if option
+                .is_some_and(|option| question.recommended_options.contains(&option.label))
+            {
+                " ★ recommended"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!("   {label}{recommended}")));
+            let description = option.map_or_else(
+                || "上記の選択肢を選ばない".to_owned(),
+                |option| sanitize(&option.description),
+            );
+            if !description.is_empty() {
+                lines.push(Line::styled(
+                    format!("   {description}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if !form.drafts[index].note.value.is_empty() {
+                lines.push(Line::from("   Note:"));
+                lines.extend(
+                    form.drafts[index]
+                        .note
+                        .value
+                        .lines()
+                        .map(|line| Line::from(format!("     {line}"))),
+                );
+            }
+            lines.push(Line::default());
+        }
+        let [content, hint] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .areas(inner);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((form.scroll.min(u16::MAX as usize) as u16, 0)),
+            content,
+        );
+        frame.render_widget(
+            Paragraph::new(if submitting {
+                "Sending…"
+            } else {
+                "Enter / →: send · ← / Esc: back · ↑ / ↓: scroll"
+            })
+            .style(Style::default().fg(Color::DarkGray))
+            .right_aligned(),
+            hint,
+        );
+        return;
+    }
+
+    let question = &questions[form.current];
+    let note_input = &form.drafts[form.current].note;
+    let note_value = &note_input.value;
+    let note_height = (note_value.lines().count() as u16 + 2).clamp(3, 8);
+    let [heading, options, note, hint] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(note_height),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}/{}  {}",
+            form.current + 1,
+            questions.len(),
+            sanitize(&question.question)
+        ))
+        .style(Style::default().fg(Color::Cyan))
+        .wrap(Wrap { trim: false }),
+        heading,
+    );
+    let mut items = question
+        .options
+        .iter()
+        .map(|option| {
+            let recommended = question.recommended_options.contains(&option.label);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::raw(sanitize(&option.label)),
+                    Span::styled(
+                        if recommended {
+                            "  ★ recommended".to_owned()
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(Color::Green),
+                    ),
+                ]),
+                Line::styled(
+                    format!("  {}", sanitize(&option.description)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    items.push(ListItem::new(vec![
+        Line::from("どれでもない"),
+        Line::styled(
+            "  上記の選択肢を選ばない",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let mut state = ListState::default().with_selected(Some(form.drafts[form.current].selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().fg(Color::Yellow)),
+        options,
+        &mut state,
+    );
+
+    let note_block = Block::default()
+        .title(if form.mode == QuestionFormMode::Note {
+            " Note (editing) "
+        } else {
+            " Note "
+        })
+        .borders(Borders::ALL);
+    let note_inner = note_block.inner(note);
+    frame.render_widget(note_block, note);
+    let cursor = note_input.cursor;
+    let before = expand_tabs(&note_value[..cursor]);
+    let cursor_row = before.bytes().filter(|byte| *byte == b'\n').count();
+    let cursor_column = before
+        .rsplit_once('\n')
+        .map_or(before.as_str(), |(_, line)| line)
+        .width();
+    let visible_note_width = usize::from(note_inner.width);
+    let visible_note_height = usize::from(note_inner.height);
+    let horizontal_scroll =
+        cursor_column.saturating_sub(visible_note_width.saturating_sub(1)) as u16;
+    let vertical_scroll = cursor_row.saturating_sub(visible_note_height.saturating_sub(1)) as u16;
+    frame.render_widget(
+        Paragraph::new(selected_input_text(
+            note_value,
+            (form.mode == QuestionFormMode::Note)
+                .then(|| note_input.selection_range())
+                .flatten(),
+        ))
+        .scroll((vertical_scroll, horizontal_scroll)),
+        note_inner,
+    );
+    if form.mode == QuestionFormMode::Note {
+        frame.set_cursor_position((
+            note_inner
+                .x
+                .saturating_add(cursor_column as u16)
+                .saturating_sub(horizontal_scroll),
+            note_inner
+                .y
+                .saturating_add(cursor_row as u16)
+                .saturating_sub(vertical_scroll),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(if form.mode == QuestionFormMode::Note {
+            "Enter: newline · Ctrl-Enter / Ctrl-G: next · Tab / Esc: options"
+        } else {
+            "↑ / ↓: select · Enter / →: next · ←: previous · Tab: edit note · Esc: cancel"
+        })
+        .style(Style::default().fg(Color::DarkGray))
+        .right_aligned(),
+        hint,
+    );
 }
 
 fn rounded_divide(numerator: usize, denominator: usize) -> usize {

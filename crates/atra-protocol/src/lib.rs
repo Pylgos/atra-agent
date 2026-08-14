@@ -23,7 +23,7 @@ pub struct EventSequence(pub i64);
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
-pub struct ApprovalId(pub u64);
+pub struct InteractionId(pub u64);
 
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -51,7 +51,7 @@ impl fmt::Display for EventSequence {
     }
 }
 
-impl fmt::Display for ApprovalId {
+impl fmt::Display for InteractionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }

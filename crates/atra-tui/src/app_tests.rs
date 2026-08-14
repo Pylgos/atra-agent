@@ -103,6 +103,18 @@ fn set_active_turn(app: &mut App) {
     .unwrap();
 }
 
+fn set_pending_question(app: &mut App, request: atra_protocol::PendingQuestionRequest) {
+    set_active_turn(app);
+    let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
+        panic!("test app must use a snapshot thread");
+    };
+    ThreadOperation::InteractionRequested {
+        interaction: atra_protocol::PendingInteraction::Questions(request),
+    }
+    .apply(state)
+    .unwrap();
+}
+
 #[test]
 fn approval_is_derived_from_the_thread_snapshot() {
     let mut app = test_app(Vec::new());
@@ -110,13 +122,15 @@ fn approval_is_derived_from_the_thread_snapshot() {
     let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
         panic!("test app must use a snapshot thread");
     };
-    atra_protocol::ThreadOperation::ApprovalRequested {
-        approval: atra_protocol::PendingApproval::new(
-            atra_protocol::ApprovalId(7),
-            "command".to_owned(),
-            serde_json::json!({"runner": "local"}),
-            Some(2),
-            Some("Run tests".to_owned()),
+    atra_protocol::ThreadOperation::InteractionRequested {
+        interaction: atra_protocol::PendingInteraction::Approval(
+            atra_protocol::PendingApproval::new(
+                atra_protocol::InteractionId(7),
+                "command".to_owned(),
+                serde_json::json!({"runner": "local"}),
+                Some(2),
+                Some("Run tests".to_owned()),
+            ),
         ),
     }
     .apply(state)
@@ -124,7 +138,7 @@ fn approval_is_derived_from_the_thread_snapshot() {
 
     assert_eq!(
         app.pending_approval().unwrap().id(),
-        atra_protocol::ApprovalId(7)
+        atra_protocol::InteractionId(7)
     );
     assert!(app.turn_is_running());
     assert!(matches!(app.turn, TurnState::Idle));
@@ -712,4 +726,243 @@ fn markdown_and_patch_command_render_before_completion() {
     assert!(rendered.contains("fn main() {}"));
     assert!(rendered.contains("*** Update File: src/main.rs"));
     assert!(rendered.contains("+new"));
+}
+
+#[test]
+fn question_form_navigation_note_and_confirmation_keys() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![
+            Question {
+                question: "First?".to_owned(),
+                options: vec![QuestionOption {
+                    label: "A".to_owned(),
+                    description: "First option".to_owned(),
+                }],
+                recommended_options: vec![],
+            },
+            Question {
+                question: "Second?".to_owned(),
+                options: vec![QuestionOption {
+                    label: "B".to_owned(),
+                    description: "Second option".to_owned(),
+                }],
+                recommended_options: vec![],
+            },
+        ],
+    };
+    let mut app = test_app(Vec::new());
+    app.turn = TurnState::AnsweringQuestions(QuestionForm::new(request));
+    let (effects, mut received) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &effects)
+        .unwrap();
+    let TurnState::AnsweringQuestions(form) = &app.turn else {
+        panic!("question form should remain active");
+    };
+    assert_eq!(form.current, 1);
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+    let TurnState::AnsweringQuestions(form) = &app.turn else {
+        panic!("question form should remain active");
+    };
+    assert_eq!(form.mode, QuestionFormMode::Note);
+    assert_eq!(form.drafts[1].note.value, "\n");
+
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &effects)
+        .unwrap();
+    let TurnState::AnsweringQuestions(form) = &app.turn else {
+        panic!("question form should remain active");
+    };
+    assert_eq!(form.mode, QuestionFormMode::Normal);
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        &effects,
+    )
+    .unwrap();
+    let TurnState::AnsweringQuestions(form) = &app.turn else {
+        panic!("question form should remain active");
+    };
+    assert_eq!(form.mode, QuestionFormMode::Confirm);
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(
+        app.turn,
+        TurnState::AnsweringQuestions(ref form)
+            if form.id() == InteractionId(9)
+                && form.mode == QuestionFormMode::Submitting
+    ));
+    let Effect::ResolveQuestion {
+        request_id,
+        answers,
+        ..
+    } = received.try_recv().unwrap()
+    else {
+        panic!("question answer effect should be emitted");
+    };
+    assert_eq!(request_id, InteractionId(9));
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0].selected_option.as_deref(), Some("A"));
+    assert_eq!(answers[1].selected_option, None);
+}
+
+#[test]
+fn interaction_sync_restores_a_pending_question_from_the_thread_snapshot() {
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let mut app = test_app(Vec::new());
+    set_pending_question(
+        &mut app,
+        PendingQuestionRequest {
+            id: InteractionId(9),
+            questions: vec![Question {
+                question: "Choose".to_owned(),
+                options: vec![QuestionOption {
+                    label: "A".to_owned(),
+                    description: "First option".to_owned(),
+                }],
+                recommended_options: vec![],
+            }],
+        },
+    );
+    app.turn = TurnState::Cancelling;
+
+    app.update(TurnUpdate::CancelCompleted {
+        thread_id: atra_protocol::ThreadId(2),
+        result: Err(anyhow::anyhow!("cancel failed")),
+    })
+    .unwrap();
+
+    assert!(matches!(
+        app.turn,
+        TurnState::AnsweringQuestions(ref form) if form.id() == InteractionId(9)
+    ));
+}
+
+#[test]
+fn question_form_sanitizes_model_text_when_rendering() {
+    use crate::state::QuestionForm;
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Safe question\x1b]52;c;bad-question\x07".to_owned(),
+            options: vec![QuestionOption {
+                label: "Visible label\x1b]52;c;bad-label\x07".to_owned(),
+                description: "\x1b[31mred description\x1b[0m".to_owned(),
+            }],
+            recommended_options: vec![],
+        }],
+    };
+    for mode in [
+        crate::state::QuestionFormMode::Normal,
+        crate::state::QuestionFormMode::Confirm,
+    ] {
+        let mut form = QuestionForm::new(request.clone());
+        form.mode = mode;
+        let mut app = test_app(Vec::new());
+        app.turn = TurnState::AnsweringQuestions(form);
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal.backend().to_string();
+
+        assert!(rendered.contains("Safe question"));
+        assert!(rendered.contains("Visible label"));
+        assert!(rendered.contains("red description"));
+        assert!(!rendered.contains("bad-question"));
+        assert!(!rendered.contains("bad-label"));
+        assert!(!rendered.contains('\x1b'));
+    }
+}
+
+#[test]
+fn question_note_scrolls_horizontally_to_keep_the_cursor_visible() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Add details".to_owned(),
+            options: vec![QuestionOption {
+                label: "A".to_owned(),
+                description: "First option".to_owned(),
+            }],
+            recommended_options: vec![],
+        }],
+    };
+    let mut form = QuestionForm::new(request);
+    form.mode = QuestionFormMode::Note;
+    form.drafts[0]
+        .note
+        .set(format!("{}VISIBLE-TAIL", "x".repeat(80)));
+    let mut app = test_app(Vec::new());
+    app.turn = TurnState::AnsweringQuestions(form);
+    let backend = ratatui::backend::TestBackend::new(40, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let cursor = terminal.backend().cursor_position();
+    assert!(cursor.x < 40);
+    assert!(cursor.y < 20);
+    assert!(terminal.backend().to_string().contains("VISIBLE-TAIL"));
+}
+
+#[test]
+fn escape_closes_question_error_without_reaching_the_form() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "First?".to_owned(),
+            options: vec![QuestionOption {
+                label: "A".to_owned(),
+                description: "First option".to_owned(),
+            }],
+            recommended_options: vec![],
+        }],
+    };
+    let mut form = QuestionForm::new(request);
+    form.mode = QuestionFormMode::Confirm;
+    let mut app = test_app(Vec::new());
+    app.turn = TurnState::AnsweringQuestions(form);
+    app.error = Some(anyhow::anyhow!("answer failed"));
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(terminal.backend().to_string().contains("answer failed"));
+
+    let (effects, mut received) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(app.error.is_none());
+    assert!(matches!(
+        app.turn,
+        TurnState::AnsweringQuestions(ref form) if form.mode == QuestionFormMode::Confirm
+    ));
+    assert!(received.try_recv().is_err());
 }
