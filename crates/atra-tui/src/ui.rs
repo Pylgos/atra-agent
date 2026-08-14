@@ -128,6 +128,15 @@ impl App {
             || matches!(self.turn, TurnState::EnteringDenyReason { .. })
         {
             3
+        } else if let TurnState::AnsweringQuestions(form) = &self.turn {
+            (form.drafts[form.current]
+                .note
+                .value
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u16
+                + 3)
+            .min(8)
         } else {
             (self
                 .message_input
@@ -147,23 +156,34 @@ impl App {
             ])
             .areas(frame.area());
         self.layout.input_area = input;
+        let (transcript_main, question_area) =
+            if let TurnState::AnsweringQuestions(form) = &self.turn {
+                let question_height = question_form_height(form, main.height.saturating_sub(4));
+                let [transcript, question] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(4), Constraint::Length(question_height)])
+                    .areas(main);
+                (transcript, Some(question))
+            } else {
+                (main, None)
+            };
         let transcript_area = if self.target.checkpoint_picker().is_some() {
             let [_, transcript] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(30), Constraint::Min(20)])
-                .areas(main);
+                .areas(transcript_main);
             transcript
         } else {
-            main
+            transcript_main
         };
         self.layout.transcript_area = transcript_area;
         self.render_coding_transcript(frame, transcript_area);
+        if let (Some(area), TurnState::AnsweringQuestions(form)) = (question_area, &self.turn) {
+            render_question_form(frame, area, form);
+        }
         self.render_composer(frame, input);
         frame.render_widget(Paragraph::new(self.status_line()), status);
         self.render_overlays(frame, main);
-        if let TurnState::AnsweringQuestions(form) = &self.turn {
-            render_question_form(frame, form);
-        }
         if let Some(error) = &self.error {
             render_error(frame, error);
         }
@@ -202,6 +222,27 @@ impl App {
                     0,
                     None,
                     false,
+                )
+            } else if let TurnState::AnsweringQuestions(form) = &self.turn {
+                let note = &form.drafts[form.current].note;
+                (
+                    format!(
+                        "Note (optional) · {}/{}",
+                        form.current + 1,
+                        form.request.questions.len()
+                    ),
+                    (form.mode == QuestionFormMode::Note).then(|| {
+                        Line::from(
+                            "Enter: newline · Ctrl-Enter / Ctrl-G: next · Tab / Esc: options",
+                        )
+                        .right_aligned()
+                    }),
+                    note.value.as_str(),
+                    note.cursor,
+                    (form.mode == QuestionFormMode::Note)
+                        .then(|| note.selection_range())
+                        .flatten(),
+                    form.mode == QuestionFormMode::Note,
                 )
             } else {
                 match &self.overlay {
@@ -764,12 +805,27 @@ impl App {
     }
 }
 
-fn render_question_form(frame: &mut Frame<'_>, form: &QuestionForm) {
-    let area = frame.area().inner(Margin {
-        vertical: 1,
-        horizontal: 2,
-    });
-    frame.render_widget(Clear, area);
+fn question_form_height(form: &QuestionForm, available: u16) -> u16 {
+    let desired = if matches!(
+        form.mode,
+        QuestionFormMode::Confirm | QuestionFormMode::Submitting
+    ) {
+        form.request.questions.len().saturating_mul(4) + 4
+    } else {
+        form.request.questions[form.current]
+            .options
+            .len()
+            .saturating_add(1)
+            .saturating_mul(2)
+            + 5
+    };
+    (desired as u16).min(14).min(available)
+}
+
+fn render_question_form(frame: &mut Frame<'_>, area: Rect, form: &QuestionForm) {
+    if area.is_empty() {
+        return;
+    }
     let submitting = form.mode == QuestionFormMode::Submitting;
     let title = if submitting {
         " Sending answers "
@@ -780,7 +836,7 @@ fn render_question_form(frame: &mut Frame<'_>, form: &QuestionForm) {
     };
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(area).inner(Margin {
-        vertical: 1,
+        vertical: 0,
         horizontal: 1,
     });
     frame.render_widget(block, area);
@@ -855,15 +911,11 @@ fn render_question_form(frame: &mut Frame<'_>, form: &QuestionForm) {
     }
 
     let question = &questions[form.current];
-    let note_input = &form.drafts[form.current].note;
-    let note_value = &note_input.value;
-    let note_height = (note_value.lines().count() as u16 + 2).clamp(3, 8);
-    let [heading, options, note, hint] = Layout::default()
+    let [heading, options, hint] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(note_height),
+            Constraint::Min(1),
             Constraint::Length(1),
         ])
         .areas(inner);
@@ -917,53 +969,9 @@ fn render_question_form(frame: &mut Frame<'_>, form: &QuestionForm) {
         options,
         &mut state,
     );
-
-    let note_block = Block::default()
-        .title(if form.mode == QuestionFormMode::Note {
-            " Note (editing) "
-        } else {
-            " Note "
-        })
-        .borders(Borders::ALL);
-    let note_inner = note_block.inner(note);
-    frame.render_widget(note_block, note);
-    let cursor = note_input.cursor;
-    let before = expand_tabs(&note_value[..cursor]);
-    let cursor_row = before.bytes().filter(|byte| *byte == b'\n').count();
-    let cursor_column = before
-        .rsplit_once('\n')
-        .map_or(before.as_str(), |(_, line)| line)
-        .width();
-    let visible_note_width = usize::from(note_inner.width);
-    let visible_note_height = usize::from(note_inner.height);
-    let horizontal_scroll =
-        cursor_column.saturating_sub(visible_note_width.saturating_sub(1)) as u16;
-    let vertical_scroll = cursor_row.saturating_sub(visible_note_height.saturating_sub(1)) as u16;
-    frame.render_widget(
-        Paragraph::new(selected_input_text(
-            note_value,
-            (form.mode == QuestionFormMode::Note)
-                .then(|| note_input.selection_range())
-                .flatten(),
-        ))
-        .scroll((vertical_scroll, horizontal_scroll)),
-        note_inner,
-    );
-    if form.mode == QuestionFormMode::Note {
-        frame.set_cursor_position((
-            note_inner
-                .x
-                .saturating_add(cursor_column as u16)
-                .saturating_sub(horizontal_scroll),
-            note_inner
-                .y
-                .saturating_add(cursor_row as u16)
-                .saturating_sub(vertical_scroll),
-        ));
-    }
     frame.render_widget(
         Paragraph::new(if form.mode == QuestionFormMode::Note {
-            "Enter: newline · Ctrl-Enter / Ctrl-G: next · Tab / Esc: options"
+            "Editing note below · Tab / Esc: return to options"
         } else {
             "↑ / ↓: select · Enter / →: next · ←: previous · Tab: edit note · Esc: cancel"
         })

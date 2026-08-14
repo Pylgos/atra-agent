@@ -447,6 +447,7 @@ fn tool_call_lines(
             false,
         ),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
+        "question" => question_tool_lines(arguments),
         _ => {
             let mut lines = vec![(
                 Some('◆'),
@@ -467,6 +468,72 @@ fn tool_call_lines(
             lines
         }
     }
+}
+
+fn question_tool_lines(
+    arguments: Option<&serde_json::Value>,
+) -> Vec<(Option<char>, Line<'static>)> {
+    let Some(questions) = arguments
+        .and_then(|arguments| arguments.get("questions"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return vec![(Some('◆'), Line::from("question…"))];
+    };
+    let mut lines = vec![(Some('◆'), Line::from("question"))];
+    for (index, question) in questions.iter().enumerate() {
+        let prompt = question
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        lines.push((None, Line::from(format!("{}. {prompt}", index + 1))));
+        let recommended = question
+            .get("recommended_options")
+            .and_then(serde_json::Value::as_array);
+        if let Some(options) = question
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+        {
+            for option in options {
+                let label = option
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let is_recommended = recommended.is_some_and(|recommended| {
+                    recommended
+                        .iter()
+                        .any(|value| value.as_str() == Some(label))
+                });
+                lines.push((
+                    None,
+                    Line::from(vec![
+                        Span::raw(format!("   ○ {label}")),
+                        Span::styled(
+                            if is_recommended {
+                                "  ★ recommended"
+                            } else {
+                                ""
+                            },
+                            Style::default().fg(Color::Green),
+                        ),
+                    ]),
+                ));
+                if let Some(description) = option
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|description| !description.is_empty())
+                {
+                    lines.push((
+                        None,
+                        Line::styled(
+                            format!("     {description}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn todo_lines(todos: &[TodoItem]) -> Vec<Line<'static>> {

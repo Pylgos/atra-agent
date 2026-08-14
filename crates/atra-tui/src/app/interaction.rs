@@ -1387,17 +1387,25 @@ impl App {
     }
 
     fn composer_input(&self) -> Option<&InputBuffer> {
-        if let TurnState::EnteringDenyReason { reason, .. } = &self.turn {
-            return Some(reason);
+        match &self.turn {
+            TurnState::EnteringDenyReason { reason, .. } => Some(reason),
+            TurnState::AnsweringQuestions(form) if form.mode == QuestionFormMode::Note => {
+                Some(&form.drafts[form.current].note)
+            }
+            _ => matches!(self.overlay, Overlay::None | Overlay::Rename)
+                .then_some(&self.message_input),
         }
-        matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&self.message_input)
     }
 
     fn composer_input_mut(&mut self) -> Option<&mut InputBuffer> {
-        if let TurnState::EnteringDenyReason { reason, .. } = &mut self.turn {
-            return Some(reason);
+        match &mut self.turn {
+            TurnState::EnteringDenyReason { reason, .. } => Some(reason),
+            TurnState::AnsweringQuestions(form) if form.mode == QuestionFormMode::Note => {
+                Some(&mut form.drafts[form.current].note)
+            }
+            _ => matches!(self.overlay, Overlay::None | Overlay::Rename)
+                .then_some(&mut self.message_input),
         }
-        matches!(self.overlay, Overlay::None | Overlay::Rename).then_some(&mut self.message_input)
     }
 
     pub(crate) fn selection_range(&self) -> Option<(usize, usize)> {

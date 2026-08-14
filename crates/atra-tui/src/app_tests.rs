@@ -619,6 +619,57 @@ fn mouse_selection_can_be_deleted_in_message_and_command_inputs() {
 }
 
 #[test]
+fn mouse_selection_edits_the_question_note_in_the_composer() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Add details".to_owned(),
+            options: vec![QuestionOption {
+                label: "A".to_owned(),
+                description: "First option".to_owned(),
+            }],
+            recommended_options: vec![],
+        }],
+    };
+    let mut form = QuestionForm::new(request);
+    form.mode = QuestionFormMode::Note;
+    form.drafts[0].note.set("abcdef".to_owned());
+    let mut app = test_app(Vec::new());
+    app.turn = TurnState::AnsweringQuestions(form);
+    let backend = ratatui::backend::TestBackend::new(42, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let (effects, _pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let note_area = app.layout.input_text_area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: note_area.x + 1,
+        row: note_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: note_area.x + 4,
+        row: note_area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    let TurnState::AnsweringQuestions(form) = &app.turn else {
+        panic!("question form should remain active");
+    };
+    assert_eq!(form.drafts[0].note.value, "aef");
+    assert_eq!(app.message_input.value, "next");
+}
+
+#[test]
 fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
@@ -729,6 +780,32 @@ fn markdown_and_patch_command_render_before_completion() {
 }
 
 #[test]
+fn question_tool_call_has_a_structured_transcript_rendering() {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolCall {
+        name: "question".to_owned(),
+        arguments: Some(serde_json::json!({
+            "questions": [{
+                "question": "Which layout?",
+                "options": [
+                    {"label": "Stacked", "description": "Keep the transcript visible"},
+                    {"label": "Overlay", "description": "Cover the transcript"}
+                ],
+                "recommended_options": ["Stacked"]
+            }]
+        })),
+    })];
+
+    prepare_transcript(&mut items, &HashSet::new(), 80);
+    let rendered = transcript_text(&items);
+
+    assert!(rendered.contains("question"));
+    assert!(rendered.contains("1. Which layout?"));
+    assert!(rendered.contains("○ Stacked  ★ recommended"));
+    assert!(rendered.contains("Keep the transcript visible"));
+    assert!(!rendered.contains("recommended_options:"));
+}
+
+#[test]
 fn question_form_navigation_note_and_confirmation_keys() {
     use crate::state::{QuestionForm, QuestionFormMode};
     use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
@@ -820,6 +897,44 @@ fn question_form_navigation_note_and_confirmation_keys() {
     assert_eq!(answers.len(), 2);
     assert_eq!(answers[0].selected_option.as_deref(), Some("A"));
     assert_eq!(answers[1].selected_option, None);
+}
+
+#[test]
+fn question_form_keeps_the_transcript_visible_and_reuses_the_composer_for_notes() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Choose a layout".to_owned(),
+            options: vec![QuestionOption {
+                label: "Stacked".to_owned(),
+                description: "Keep context visible".to_owned(),
+            }],
+            recommended_options: vec!["Stacked".to_owned()],
+        }],
+    };
+    let mut form = QuestionForm::new(request);
+    form.mode = QuestionFormMode::Note;
+    form.drafts[0].note.set("Useful context".to_owned());
+    let mut app = test_app(vec![TranscriptEntry::message(
+        Author::Assistant,
+        "Transcript remains visible".to_owned(),
+    )]);
+    app.turn = TurnState::AnsweringQuestions(form);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let rendered = terminal.backend().to_string();
+
+    assert!(rendered.contains("Transcript remains visible"));
+    assert!(rendered.contains("Choose a layout"));
+    assert!(rendered.contains("Stacked"));
+    assert!(rendered.contains("Note (optional) · 1/1"));
+    assert!(rendered.contains("Useful context"));
+    assert!(!rendered.contains("Message"));
 }
 
 #[test]
