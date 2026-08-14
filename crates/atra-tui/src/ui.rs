@@ -397,19 +397,15 @@ impl App {
         let Some((_, model, effort)) = selected else {
             return Line::from("model — · context — · cache —");
         };
-        let usage = (!self.metrics_stale)
-            .then(|| {
-                self.displayed_events().iter().rev().find_map(|event| {
-                    if let ThreadEventData::ModelRequest(request) = &event.data
-                        && request.kind == ModelRequestKind::Response
-                    {
-                        self.usage_for(event.sequence).map(|usage| (event, usage))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .flatten();
+        let usage = self.displayed_events().iter().rev().find_map(|event| {
+            if let ThreadEventData::ModelRequest(request) = &event.data
+                && request.kind == ModelRequestKind::Response
+            {
+                self.usage_for(event.sequence).map(|usage| (event, usage))
+            } else {
+                None
+            }
+        });
         let (context, cache) = usage.map_or_else(
             || ("—".to_owned(), "—".to_owned()),
             |(request, usage)| {

@@ -54,7 +54,6 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         view: ViewState::default(),
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
-        metrics_stale: false,
         process_selection_pending: false,
         controller_subscription: crate::sync::ControllerSync::Snapshot(
             atra_protocol::ControllerState::new(

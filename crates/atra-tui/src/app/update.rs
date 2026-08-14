@@ -133,7 +133,6 @@ impl App {
                 self.overlay = Overlay::None;
                 self.clear_selection();
                 self.reset_view();
-                self.metrics_stale = false;
                 self.activity = Some(Activity::Info("Thread selected".to_owned()));
                 Ok(())
             }
@@ -222,7 +221,6 @@ impl App {
             TurnUpdate::ModelChanged { result } => {
                 match result {
                     Ok(()) => {
-                        self.metrics_stale = true;
                         self.activity = Some(Activity::Info("Thread model changed".to_owned()));
                     }
                     Err(error) => {
@@ -315,7 +313,6 @@ impl App {
                     self.message_input.set(draft);
                     self.view.focus = FocusPane::Input;
                 }
-                self.metrics_stale = false;
                 self.activity = Some(Activity::Info(message));
                 Ok(())
             }

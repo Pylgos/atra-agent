@@ -673,7 +673,6 @@ impl App {
         self.message_input.clear();
         self.clear_selection();
         self.reset_view();
-        self.metrics_stale = false;
         self.activity = Some(Activity::Info("New thread".to_owned()));
     }
 
@@ -1235,7 +1234,6 @@ impl App {
                 model: Some((provider, model, reasoning_effort)),
             };
             self.overlay = Overlay::None;
-            self.metrics_stale = true;
             self.activity = Some(Activity::Info("Model selected for new thread".to_owned()));
             return Ok(());
         };
