@@ -116,6 +116,7 @@
               "$out/cargo" \
               "$out/dev/shm" \
               "$out/etc/ssl/certs" \
+              "$out/home" \
               "$out/nix/store" \
               "$out/proc" \
               "$out/run" \
@@ -167,6 +168,7 @@
               clang
               clippy
               git
+              mold
               openssl
               pkg-config
               rust-analyzer

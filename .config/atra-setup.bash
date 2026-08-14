@@ -22,6 +22,7 @@ container=(
   --rm
   --interactive
   --read-only
+  --tmpfs /home:rw,nosuid,nodev,exec,mode=755
   --tmpfs /run:rw,nosuid,nodev,noexec,mode=755
   --tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777
   --tmpfs /var/tmp:rw,nosuid,nodev,exec,mode=1777
@@ -30,13 +31,13 @@ container=(
   --security-opt no-new-privileges
   --volume /nix/store:/nix/store:ro
   --volume "$activation:/activation/dev-env.bash:ro"
-  --volume "$workspace:/workspace:rw"
+  --volume "$workspace:$workspace:rw"
   --volume atra-agent-cargo:/cargo:U
   --volume atra-agent-runner:/atra:U
   --env HOME=/tmp/home
   --env CARGO_HOME=/cargo
-  --env CARGO_TARGET_DIR=/workspace/target
-  --workdir /workspace
+  --env CARGO_TARGET_DIR="$workspace/target"
+  --workdir "$workspace"
 )
 
 runner="$(
@@ -60,7 +61,7 @@ runner="$(
   --rootfs "$rootfs" \
   /bin/bash -c \
   'source /activation/dev-env.bash
-   export HOME=/tmp/home CARGO_HOME=/cargo CARGO_TARGET_DIR=/workspace/target
+   export HOME=/tmp/home CARGO_HOME=/cargo
    mkdir -p "$HOME"
    exec "$@"' \
   atra-runner \
