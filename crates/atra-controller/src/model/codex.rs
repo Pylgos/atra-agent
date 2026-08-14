@@ -667,7 +667,7 @@ async fn handle_sse_event(
             *token_usage = response
                 .get("usage")
                 .filter(|value| !value.is_null())
-                .cloned();
+                .map(normalize_token_usage);
             if let Some(limits) = event.get("rate_limits") {
                 *rate_limits = rate_limit_snapshots(limits);
             }
@@ -683,6 +683,26 @@ async fn handle_sse_event(
         _ => {}
     }
     Ok(false)
+}
+
+fn normalize_token_usage(usage: &Value) -> Value {
+    json!({
+        "input_tokens": usage.get("input_tokens").cloned().unwrap_or(Value::Null),
+        "cached_input_tokens": usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "cache_write_input_tokens": usage
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "output_tokens": usage.get("output_tokens").cloned().unwrap_or(Value::Null),
+        "reasoning_output_tokens": usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "total_tokens": usage.get("total_tokens").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn completion_request(request: &ModelRequest<'_>) -> Result<Value> {
@@ -1506,6 +1526,56 @@ mod tests {
         .unwrap();
         assert!(!completed);
         assert_eq!(rate_limits[0]["primary"]["used_percent"], 42);
+    }
+
+    #[tokio::test]
+    async fn completed_response_usage_is_normalized() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let mut response_id = None;
+        let mut token_usage = None;
+        let mut rate_limits = Vec::new();
+        let mut emitted = false;
+        let mut has_response = false;
+
+        let completed = handle_sse_event(
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "response-1",
+                    "usage": {
+                        "input_tokens": 6567,
+                        "input_tokens_details": {
+                            "cached_tokens": 3456,
+                            "cache_write_tokens": 12
+                        },
+                        "output_tokens": 17,
+                        "output_tokens_details": {"reasoning_tokens": 4},
+                        "total_tokens": 6584
+                    }
+                }
+            }),
+            &sender,
+            &mut response_id,
+            &mut token_usage,
+            &mut rate_limits,
+            &mut emitted,
+            &mut has_response,
+        )
+        .await
+        .unwrap();
+
+        assert!(completed);
+        assert_eq!(
+            token_usage,
+            Some(json!({
+                "input_tokens": 6567,
+                "cached_input_tokens": 3456,
+                "cache_write_input_tokens": 12,
+                "output_tokens": 17,
+                "reasoning_output_tokens": 4,
+                "total_tokens": 6584
+            }))
+        );
     }
 
     #[tokio::test]
