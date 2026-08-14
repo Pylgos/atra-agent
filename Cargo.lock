@@ -191,7 +191,6 @@ dependencies = [
  "tokio-rusqlite",
  "tracing",
  "webbrowser",
- "xdg",
  "yaml-rust",
  "zstd",
 ]

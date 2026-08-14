@@ -16,6 +16,24 @@ use tokio::{
 
 const ATRA: &str = env!("CARGO_BIN_EXE_atra");
 
+fn process_has_exited(pid: Pid) -> bool {
+    if test_kill_process(pid).is_err() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, status)| status.starts_with('Z'))
+        })
+        == Some(true)
+    {
+        return true;
+    }
+    false
+}
+
 fn tool_result(event: &ThreadEvent) -> serde_json::Value {
     match &event.data {
         ThreadEventData::ToolResult(ToolResultEvent::Custom { result, .. })
@@ -219,10 +237,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
 
     timeout(Duration::from_secs(1), async {
         loop {
-            if process_pids
-                .iter()
-                .all(|pid| test_kill_process(*pid).is_err())
-            {
+            if process_pids.iter().all(|pid| process_has_exited(*pid)) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -432,6 +447,7 @@ impl TestSystem {
             .env("ATRA_CONTROLLER_ENDPOINT", &self.endpoint)
             .env("ATRA_CONTROLLER_STATE", &self.database)
             .env("ATRA_FAKE_MODEL_SCRIPT", &self.model_script)
+            .env("XDG_DATA_HOME", self.workspace.path().join("data"))
             .current_dir(self.workspace.path())
             .stderr(Stdio::from(log))
             .kill_on_drop(true)
@@ -641,7 +657,7 @@ impl TestSystem {
     }
 
     async fn runner_pid(&self, runner: &str) -> Pid {
-        let output = self.exec(runner, "ps -o ppid= -p $$").await.unwrap();
+        let output = self.exec(runner, "printf '%s\n' \"$PPID\"").await.unwrap();
         assert!(output.status.success(), "{output:?}");
         let pid = String::from_utf8(output.stdout)
             .unwrap()

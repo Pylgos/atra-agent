@@ -442,10 +442,12 @@ async fn run(command: Command) -> Result<()> {
             command: ControllerCommand::Run,
         } => {
             let database = workspace::database(&workspace_id)?;
+            let data_home = data_home()?;
             atra_controller::run(
                 &endpoint,
                 &database,
-                &provider_auth_home()?,
+                &data_home.join("atra/providers"),
+                &data_home,
                 platform::current_platform()?,
             )
             .await
@@ -819,8 +821,11 @@ fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
 }
 
 fn provider_auth_home() -> Result<PathBuf> {
-    Ok(xdg::BaseDirectories::new()
+    Ok(data_home()?.join("atra/providers"))
+}
+
+fn data_home() -> Result<PathBuf> {
+    xdg::BaseDirectories::new()
         .get_data_home()
-        .context("cannot determine the XDG data directory")?
-        .join("atra/providers"))
+        .context("cannot determine the XDG data directory")
 }

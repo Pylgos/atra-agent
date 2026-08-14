@@ -81,6 +81,7 @@ pub async fn run(
     endpoint: &Path,
     database: &Path,
     provider_auth_home: &Path,
+    data_home: &Path,
     platform: Option<PlatformStore>,
 ) -> Result<()> {
     let workspace = env::current_dir().context("failed to determine controller workspace")?;
@@ -115,9 +116,6 @@ pub async fn run(
             }
         };
     let platform = platform.map(Arc::new);
-    let data_home = xdg::BaseDirectories::new()
-        .get_data_home()
-        .context("cannot determine the XDG data directory")?;
     let skill_store =
         AtraStore::open(data_home.join("atra")).context("failed to open skill object store")?;
 
@@ -152,7 +150,7 @@ pub async fn run(
         thread_locks: StdMutex::new(HashMap::new()),
         skill_store,
         skill_generation: Mutex::new(None),
-        data_home,
+        data_home: data_home.to_owned(),
         prompt_cache_namespace,
         workspace,
     });

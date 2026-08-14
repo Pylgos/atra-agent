@@ -274,9 +274,10 @@ impl TestController {
         let endpoint = directory.path().join("controller.sock");
         let database = directory.path().join("controller.sqlite3");
         let auth_home = directory.path().join("auth");
+        let data_home = directory.path().join("data");
         let server_endpoint = endpoint.clone();
         let task = tokio::spawn(async move {
-            atra_controller::run(&server_endpoint, &database, &auth_home, None)
+            atra_controller::run(&server_endpoint, &database, &auth_home, &data_home, None)
                 .await
                 .unwrap();
         });

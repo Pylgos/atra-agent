@@ -29,7 +29,6 @@ tokio-rusqlite.workspace = true
 tracing.workspace = true
 webbrowser.workspace = true
 tiktoken-rs.workspace = true
-xdg.workspace = true
 yaml-rust.workspace = true
 zstd.workspace = true
 
