@@ -9,7 +9,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use rand::Rng;
-use reqwest::{Client, Response, StatusCode, header::HeaderMap};
+use reqwest::{
+    Client, Response, StatusCode,
+    header::{HeaderMap, HeaderValue},
+};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -296,22 +299,17 @@ impl ModelSession for CodexTurn {
             REQUEST_TIMEOUT,
             self.session.send(
                 reqwest::Method::POST,
-                &format!("{BASE_URL}/responses/compact"),
+                &format!("{BASE_URL}/responses"),
                 Some(body),
                 &self.turn_state,
             ),
         )
         .await
         .context("Codex compaction request timed out")??;
-        let value = decode_json(response, "Codex compaction").await?;
-        let items = value
-            .get("output")
-            .and_then(Value::as_array)
-            .cloned()
-            .context("Codex compaction response has no output array")?;
-        Ok((!items.is_empty()).then_some(ProviderOutput {
+        let item = decode_compaction_stream(response).await?;
+        Ok(Some(ProviderOutput {
             provider: PROVIDER_ID.to_owned(),
-            data: Value::Array(items),
+            data: Value::Array(vec![item]),
         }))
     }
 }
@@ -352,6 +350,10 @@ impl CodexSession {
                 turn_state.parse().context("invalid Codex turn state")?,
             );
         }
+        headers.insert(
+            "x-codex-beta-features",
+            HeaderValue::from_static("remote_compaction_v2"),
+        );
         let response =
             send_authenticated(&self.client, &self.auth, auth, method, url, body, headers).await?;
         if let Some(next_turn_state) = response
@@ -727,16 +729,12 @@ fn completion_request(request: &ModelRequest<'_>) -> Result<Value> {
 }
 
 fn compaction_request(request: &ModelRequest<'_>) -> Result<Value> {
-    Ok(json!({
-        "model": request.model,
-        "instructions": request.instructions,
-        "input": model_input(request.events)?,
-        "tools": tool_definitions(request.tools),
-        "parallel_tool_calls": false,
-        "reasoning": {"effort": request.reasoning_effort, "summary": "detailed"},
-        "prompt_cache_key": request.prompt_cache_key,
-        "text": {"verbosity": "low"}
-    }))
+    let mut body = completion_request(request)?;
+    body["input"]
+        .as_array_mut()
+        .context("Codex compaction input is not an array")?
+        .push(json!({"type": "compaction_trigger"}));
+    Ok(body)
 }
 
 fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
@@ -1026,6 +1024,69 @@ async fn decode_json(response: Response, label: &str) -> Result<Value> {
         .json()
         .await
         .with_context(|| format!("failed to decode {label}"))
+}
+
+async fn decode_compaction_stream(response: Response) -> Result<Value> {
+    if !response.status().is_success() {
+        return Err(response_error(response, "Codex compaction").await);
+    }
+    let mut bytes = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut compaction = None;
+    let mut compaction_count = 0;
+    let mut output_count = 0;
+    let mut completed = false;
+    'stream: loop {
+        let chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next())
+            .await
+            .context("Codex compaction response timed out")?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        buffer.extend_from_slice(&chunk.context("failed to read Codex compaction stream")?);
+        while let Some(frame) = next_sse_frame(&mut buffer)? {
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                break 'stream;
+            }
+            let event: Value =
+                serde_json::from_str(&data).context("invalid Codex compaction SSE event")?;
+            match event["type"].as_str() {
+                Some("response.output_item.done") => {
+                    output_count += 1;
+                    if event["item"]["type"] == "compaction" {
+                        compaction_count += 1;
+                        if compaction.is_none() {
+                            compaction = Some(event["item"].clone());
+                        }
+                    }
+                }
+                Some("response.completed") => {
+                    completed = true;
+                    break 'stream;
+                }
+                Some("error" | "response.failed") => return Err(sse_failure(&event)),
+                _ => {}
+            }
+        }
+    }
+    anyhow::ensure!(
+        completed,
+        "Codex compaction stream ended before response.completed"
+    );
+    anyhow::ensure!(
+        compaction_count == 1,
+        "Codex compaction expected exactly one compaction item, got {compaction_count} from {output_count} output items"
+    );
+    compaction.context("Codex compaction response has no compaction item")
 }
 
 async fn response_error(response: Response, label: &str) -> anyhow::Error {
@@ -1378,6 +1439,34 @@ mod tests {
             request.pointer("/input/0/content/0/text"),
             Some(&json!("hello"))
         );
+    }
+
+    #[test]
+    fn compaction_request_uses_responses_v2_trigger() {
+        let events = vec![Event {
+            sequence: atra_protocol::EventSequence(0),
+            data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                content: "hello".to_owned(),
+            }),
+        }];
+        let tools = crate::tools::model_tools();
+        let request = compaction_request(&ModelRequest {
+            model: "model",
+            reasoning_effort: "medium",
+            instructions: super::super::BASE_INSTRUCTIONS,
+            tools: &tools,
+            events: &events,
+            prompt_cache_key: "cache",
+        })
+        .unwrap();
+
+        assert_eq!(
+            request["input"].as_array().unwrap().last(),
+            Some(&json!({"type": "compaction_trigger"}))
+        );
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["store"], false);
+        assert_eq!(request["parallel_tool_calls"], true);
     }
 
     #[test]
