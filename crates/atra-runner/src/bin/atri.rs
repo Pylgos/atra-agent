@@ -20,8 +20,7 @@ use tokio::{
     time::Instant,
 };
 
-const DEFAULT_WAIT_SECONDS: u64 = 10;
-const MAX_WAIT_SECONDS: u64 = 60;
+const DEFAULT_WAIT_SECONDS: u64 = 120;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
@@ -56,7 +55,7 @@ enum ProcCommand {
     Wait {
         #[arg(required = true, value_parser = process_id)]
         processes: Vec<String>,
-        #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_parser = timeout_seconds)]
+        #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
         timeout: u64,
     },
     Stop {
@@ -178,6 +177,10 @@ async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
 
     let prefix = env::var("ATRI_PROCESS_PREFIX")
         .context("ATRI_PROCESS_PREFIX is not set; atri must run on an Atra Runner")?;
+    let waiting_process_handle = ProcessHandle(
+        env::var("ATRI_PROCESS_HANDLE")
+            .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
+    );
     let processes = match &command {
         ProcCommand::Wait { processes, .. } | ProcCommand::Stop { processes } => processes,
         ProcCommand::Spawn { .. } => unreachable!(),
@@ -192,13 +195,22 @@ async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
 
     let results = match command {
         ProcCommand::Wait { processes, timeout } => {
-            let deadline = Instant::now() + Duration::from_secs(timeout);
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(timeout))
+                .context("timeout is too large")?;
             let tasks = processes
                 .into_iter()
                 .map(|process| {
                     let endpoint = endpoint.clone();
                     let handle = ProcessHandle(format!("{prefix}{process}"));
-                    tokio::spawn(wait_process(endpoint, process, handle, deadline))
+                    let waiting_process_handle = waiting_process_handle.clone();
+                    tokio::spawn(wait_process(
+                        endpoint,
+                        process,
+                        waiting_process_handle,
+                        handle,
+                        deadline,
+                    ))
                 })
                 .collect::<Vec<_>>();
             collect_results(tasks).await
@@ -324,6 +336,7 @@ async fn collect_results(tasks: Vec<JoinHandle<ProcessResult>>) -> Vec<ProcessRe
 async fn wait_process(
     endpoint: PathBuf,
     process: String,
+    waiting_process_handle: ProcessHandle,
     handle: ProcessHandle,
     deadline: Instant,
 ) -> ProcessResult {
@@ -336,7 +349,8 @@ async fn wait_process(
             .unwrap_or(u64::MAX);
         match request(
             &endpoint,
-            RunnerRequest::WaitProcess {
+            RunnerRequest::WaitChildProcess {
+                waiting_process_handle: waiting_process_handle.clone(),
                 process_handle: handle.clone(),
                 timeout_ms,
             },
@@ -472,9 +486,11 @@ fn display_results(results: Vec<ProcessResult>) {
             ProcessState::Stopped => "stopped".to_owned(),
             ProcessState::Error(_) => "error".to_owned(),
         };
-        let omitted = (result.output.omitted_bytes != 0)
-            .then(|| format!(", {} bytes omitted", result.output.omitted_bytes))
-            .unwrap_or_default();
+        let omitted = if result.output.omitted_bytes != 0 {
+            format!(", {} bytes omitted", result.output.omitted_bytes)
+        } else {
+            Default::default()
+        };
         println!("==> {} [{status}{omitted}] <==", result.process);
         let content = String::from_utf8_lossy(&result.output.bytes);
         if !content.is_empty() {
@@ -537,13 +553,34 @@ fn process_id(value: &str) -> Result<String, String> {
     }
 }
 
-fn timeout_seconds(value: &str) -> Result<u64, String> {
-    let timeout = value
-        .parse()
-        .map_err(|_| "must be an integer number of seconds".to_owned())?;
-    if timeout <= MAX_WAIT_SECONDS {
-        Ok(timeout)
-    } else {
-        Err(format!("must not exceed {MAX_WAIT_SECONDS} seconds"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_defaults_to_120_seconds() {
+        let cli = Cli::try_parse_from(["atri", "proc", "wait", "process"]).unwrap();
+        let Command::Proc {
+            command: ProcCommand::Wait { timeout, .. },
+        } = cli.command
+        else {
+            panic!("expected proc wait");
+        };
+
+        assert_eq!(timeout, 120);
+    }
+
+    #[test]
+    fn wait_timeout_has_no_configured_maximum() {
+        let cli =
+            Cli::try_parse_from(["atri", "proc", "wait", "process", "--timeout", "86400"]).unwrap();
+        let Command::Proc {
+            command: ProcCommand::Wait { timeout, .. },
+        } = cli.command
+        else {
+            panic!("expected proc wait");
+        };
+
+        assert_eq!(timeout, 86_400);
     }
 }

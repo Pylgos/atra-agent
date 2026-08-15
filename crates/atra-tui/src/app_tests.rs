@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::transcript::{
-    Author, ToolArtifact, TranscriptEntry, TranscriptItem, TranscriptState, layout_transcript,
-    prepare_transcript, sanitize, transcript_lines, transcript_text,
+    Author, RunnerResult, ToolArtifact, TranscriptEntry, TranscriptItem, TranscriptState,
+    layout_transcript, prepare_transcript, sanitize, transcript_lines, transcript_text,
 };
 use crate::ui::{preserve_transcript_viewport, render_model_picker};
 use crate::{
@@ -711,7 +711,7 @@ fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
         Author::User,
         "transcript".to_owned(),
     )];
-    prepare_transcript(&mut items, &HashSet::new(), 42);
+    prepare_transcript(&mut items, &HashSet::new(), 42, 0);
     let mut app = test_app(items);
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
     app.message_input.set("message".to_owned());
@@ -771,7 +771,7 @@ fn layout_mapping_does_not_insert_soft_wraps() {
         masked: false,
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 4);
+    prepare_transcript(&mut items, &HashSet::new(), 4, 0);
     let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0);
 
     let text = transcript_text(&items);
@@ -779,6 +779,78 @@ fn layout_mapping_does_not_insert_soft_wraps() {
     assert_eq!(layout.rows[0].cells, vec![0, 1]);
     let output_start = text.find("abcdefgh").unwrap();
     assert_eq!(&text[output_start..output_start + 8], "abcdefgh");
+}
+
+#[test]
+fn running_command_timer_uses_the_runner_snapshot() {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::RunnerTool {
+        call_id: "call-1".to_owned(),
+        input: "*** Runner sandbox\nsleep 200".to_owned(),
+        results: std::collections::BTreeMap::from([(
+            1,
+            RunnerResult::Running {
+                output: String::new(),
+                omitted_bytes: 0,
+                timer: atra_protocol::CommandTimerState {
+                    elapsed_ms: 37_000,
+                    remaining_ms: 83_000,
+                    paused: false,
+                },
+            },
+        )]),
+        pending_approval: None,
+        masked: false,
+    })];
+
+    prepare_transcript(&mut items, &HashSet::new(), 80, 38_000);
+    assert!(transcript_text(&items).contains("running · elapsed 37s · detach in 1m23s"));
+
+    prepare_transcript(&mut items, &HashSet::new(), 80, 39_000);
+    assert!(transcript_text(&items).contains("running · elapsed 37s · detach in 1m23s"));
+}
+
+#[test]
+fn paused_command_timer_uses_the_runner_snapshot() {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::RunnerTool {
+        call_id: "call-1".to_owned(),
+        input: "*** Runner sandbox\natri proc wait child".to_owned(),
+        results: std::collections::BTreeMap::from([(
+            1,
+            RunnerResult::Running {
+                output: String::new(),
+                omitted_bytes: 0,
+                timer: atra_protocol::CommandTimerState {
+                    elapsed_ms: 110_000,
+                    remaining_ms: 10_000,
+                    paused: true,
+                },
+            },
+        )]),
+        pending_approval: None,
+        masked: false,
+    })];
+
+    prepare_transcript(&mut items, &HashSet::new(), 80, 61_000);
+    assert!(transcript_text(&items).contains("running · elapsed 1m50s · detach in 10s · paused"));
+}
+
+#[test]
+fn detached_command_is_not_rendered_as_running() {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
+        artifacts: vec![ToolArtifact::CommandExecution(
+            CommandExecutionArtifact::Running {
+                output: String::new(),
+                runner: "sandbox".to_owned(),
+                full_output_path: "/tmp/output".into(),
+            },
+        )],
+        masked: false,
+    })];
+
+    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
+    let rendered = transcript_text(&items);
+    assert!(rendered.contains("detached"));
+    assert!(!rendered.contains("running"));
 }
 
 #[test]
@@ -798,7 +870,7 @@ fn markdown_and_patch_command_render_before_completion() {
         }),
     ];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80);
+    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
     let lines = transcript_lines(&items, None, None, 80, 0..usize::MAX);
     let rendered = lines
         .iter()
@@ -829,7 +901,7 @@ fn question_tool_call_has_a_structured_transcript_rendering() {
         })),
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80);
+    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
     let rendered = transcript_text(&items);
 
     assert!(rendered.contains("question"));
@@ -871,7 +943,7 @@ fn answered_question_marks_the_selection_and_shows_the_note() {
         ]),
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80);
+    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
     let rendered = transcript_text(&items);
 
     assert!(rendered.contains("○ Stacked  ★ recommended"));

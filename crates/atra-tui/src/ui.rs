@@ -709,10 +709,14 @@ impl App {
             .borders(Borders::ALL)
             .border_style(self.focus_border_style(FocusPane::Transcript));
         let inner = block.inner(area);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as i64);
         prepare_transcript(
             &mut self.transcript.entries,
             &self.view.expanded_tools,
             inner.width,
+            now_ms,
         );
         let (content_length, item_ranges) = transcript_ranges(&self.transcript.entries);
         let max_scroll = content_length.saturating_sub(usize::from(inner.height));

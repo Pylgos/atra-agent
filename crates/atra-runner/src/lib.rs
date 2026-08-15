@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -17,7 +17,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    CommandEnvironment, CommandOutput, ProcessHandle, ProcessStatus, RunnerRequest,
+    CommandEnvironment, CommandOutput, ProcessHandle, ProcessStatus, ProcessTiming, RunnerRequest,
     RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
 };
 use atra_store::{PreparedTree, Store};
@@ -193,6 +193,7 @@ async fn handle_request(
                 .await?;
             Ok(RunnerResponse::ProcessStarted {
                 process_handle: process.handle.clone(),
+                timing: process.timing(),
             })
         }
         RunnerRequest::SpawnProcess { .. } => {
@@ -217,11 +218,18 @@ async fn handle_request(
         }
         RunnerRequest::WaitProcess {
             process_handle,
-            timeout_ms,
+            active_timeout_ms,
         } => {
             processes
-                .wait(&process_handle, Duration::from_millis(timeout_ms))
+                .wait(
+                    &process_handle,
+                    Duration::from_millis(active_timeout_ms),
+                    Duration::from_secs(1),
+                )
                 .await
+        }
+        RunnerRequest::WaitChildProcess { .. } => {
+            bail!("child processes can only be waited through the Runner control socket")
         }
         RunnerRequest::SubscribeProcess { .. } => {
             bail!("process subscriptions must be handled by the runner connection")
@@ -267,13 +275,28 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
     let envelope: RunnerRequestEnvelope =
         serde_json::from_str(&line).context("failed to decode Runner control request")?;
     let response = match envelope.request {
-        RunnerRequest::WaitProcess {
+        RunnerRequest::WaitChildProcess {
+            waiting_process_handle,
             process_handle,
             timeout_ms,
         } => {
-            processes
-                .wait(&process_handle, Duration::from_millis(timeout_ms))
-                .await
+            let mut disconnected = [0];
+            tokio::select! {
+                response = processes.wait_for_child(
+                    &waiting_process_handle,
+                    &process_handle,
+                    Duration::from_millis(timeout_ms),
+                ) => response,
+                read = reader.read(&mut disconnected) => {
+                    match read.context("failed to monitor Runner control client")? {
+                        0 => return Ok(()),
+                        _ => bail!("Runner control client sent data after its request"),
+                    }
+                }
+            }
+        }
+        RunnerRequest::WaitProcess { .. } => {
+            bail!("controller process waits are not supported by the Runner control socket")
         }
         RunnerRequest::SubscribeProcess { .. } => {
             bail!("process subscriptions are not supported by the Runner control socket")
@@ -447,6 +470,7 @@ impl ProcessManager {
         let child = child
             .spawn()
             .context("failed to execute command with bash")?;
+        let started_at = Instant::now();
         let os_pid = Pid::from_raw(
             child
                 .id()
@@ -471,6 +495,7 @@ impl ProcessManager {
             patching: Mutex::new(()),
             full_output_path,
             output_closed: AtomicBool::new(false),
+            timing: StdMutex::new(ProcessClock::new(started_at)),
             output_shutdown,
             changed: Notify::new(),
         });
@@ -555,6 +580,7 @@ impl ProcessManager {
         });
         Ok(RunnerResponse::ProcessStarted {
             process_handle: process.handle.clone(),
+            timing: process.timing(),
         })
     }
 
@@ -599,29 +625,50 @@ impl ProcessManager {
         }
     }
 
-    async fn wait(&self, handle: &ProcessHandle, timeout: Duration) -> Result<RunnerResponse> {
+    async fn wait(
+        &self,
+        handle: &ProcessHandle,
+        active_timeout: Duration,
+        poll_timeout: Duration,
+    ) -> Result<RunnerResponse> {
+        self.wait_inner(handle, poll_timeout, Some(active_timeout), true)
+            .await
+    }
+
+    async fn wait_inner(
+        &self,
+        handle: &ProcessHandle,
+        poll_timeout: Duration,
+        active_timeout: Option<Duration>,
+        return_on_progress: bool,
+    ) -> Result<RunnerResponse> {
         let process = self.process(handle).await?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + poll_timeout;
+        let mut collected = OutputBuffer::default();
         loop {
-            let output = process.take_output().await;
+            collected.append_output(process.take_output().await);
             if let Some(exit_code) = process.exit_code().await? {
                 process.finish_output().await;
-                let mut output = output;
-                output.append_output(process.take_output().await);
+                collected.append_output(process.take_output().await);
                 self.processes.lock().await.remove(handle);
                 return Ok(RunnerResponse::ProcessFinished {
-                    output: output.finish(process.full_output_path.clone()),
+                    output: collected.finish(process.full_output_path.clone()),
                     exit_code,
                     patch_results: process.take_patch_results().await,
                     spawned_processes: process.take_spawned_processes().await,
                 });
             }
-            if !output.bytes.is_empty() || output.omitted_bytes != 0 || Instant::now() >= deadline {
+            let (active_elapsed, timing) = process.timing_snapshot();
+            if return_on_progress && (!collected.bytes.is_empty() || collected.omitted_bytes != 0)
+                || active_timeout.is_some_and(|timeout| active_elapsed >= timeout)
+                || Instant::now() >= deadline
+            {
                 return Ok(RunnerResponse::ProcessRunning {
                     process_handle: handle.clone(),
-                    output: output.finish(process.full_output_path.clone()),
+                    output: collected.finish(process.full_output_path.clone()),
                     patch_results: process.take_patch_results().await,
                     spawned_processes: process.take_spawned_processes().await,
+                    timing,
                 });
             }
             tokio::select! {
@@ -630,6 +677,20 @@ impl ProcessManager {
                 () = sleep(Duration::from_millis(10)) => {}
             }
         }
+    }
+
+    async fn wait_for_child(
+        &self,
+        waiting_handle: &ProcessHandle,
+        handle: &ProcessHandle,
+        timeout: Duration,
+    ) -> Result<RunnerResponse> {
+        if waiting_handle == handle {
+            bail!("process {waiting_handle} cannot wait for itself");
+        }
+        let waiting_process = self.process(waiting_handle).await?;
+        let _active_wait = waiting_process.begin_wait();
+        self.wait_inner(handle, timeout, None, false).await
     }
 
     async fn stop(&self, handle: &ProcessHandle) -> Result<RunnerResponse> {
@@ -750,11 +811,41 @@ struct ManagedProcess {
     patching: Mutex<()>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
+    timing: StdMutex<ProcessClock>,
     output_shutdown: watch::Sender<bool>,
     changed: Notify,
 }
 
 impl ManagedProcess {
+    fn begin_wait(self: &Arc<Self>) -> ActiveWait {
+        if self.timing.lock().unwrap().begin_wait() {
+            self.changed.notify_waiters();
+        }
+        ActiveWait {
+            process: Arc::clone(self),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_active_wait(&self) -> bool {
+        self.timing.lock().unwrap().paused()
+    }
+
+    fn timing(&self) -> ProcessTiming {
+        self.timing_snapshot().1
+    }
+
+    fn timing_snapshot(&self) -> (Duration, ProcessTiming) {
+        let (active_elapsed, paused) = self.timing.lock().unwrap().snapshot();
+        (
+            active_elapsed,
+            ProcessTiming {
+                active_elapsed_ms: active_elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+                paused,
+            },
+        )
+    }
+
     async fn take_output(&self) -> OutputBuffer {
         std::mem::take(&mut *self.output.lock().await)
     }
@@ -810,6 +901,71 @@ impl ManagedProcess {
                 );
             }
         }
+    }
+}
+
+struct ActiveWait {
+    process: Arc<ManagedProcess>,
+}
+
+impl Drop for ActiveWait {
+    fn drop(&mut self) {
+        if self.process.timing.lock().unwrap().end_wait() {
+            self.process.changed.notify_waiters();
+        }
+    }
+}
+
+struct ProcessClock {
+    active_elapsed: Duration,
+    running_since: Option<Instant>,
+    active_waits: usize,
+}
+
+impl ProcessClock {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            active_elapsed: Duration::ZERO,
+            running_since: Some(started_at),
+            active_waits: 0,
+        }
+    }
+
+    fn begin_wait(&mut self) -> bool {
+        let first = self.active_waits == 0;
+        if first {
+            let running_since = self
+                .running_since
+                .take()
+                .expect("running process clock must have a start time");
+            self.active_elapsed = self
+                .active_elapsed
+                .saturating_add(Instant::now().duration_since(running_since));
+        }
+        self.active_waits += 1;
+        first
+    }
+
+    fn end_wait(&mut self) -> bool {
+        assert!(self.active_waits > 0, "process wait count underflow");
+        self.active_waits -= 1;
+        let resumed = self.active_waits == 0;
+        if resumed {
+            self.running_since = Some(Instant::now());
+        }
+        resumed
+    }
+
+    fn paused(&self) -> bool {
+        self.active_waits != 0
+    }
+
+    fn snapshot(&self) -> (Duration, bool) {
+        let elapsed = self.running_since.map_or(self.active_elapsed, |started| {
+            self.active_elapsed
+                .saturating_add(Instant::now().duration_since(started))
+        });
+        (elapsed, self.paused())
     }
 }
 
@@ -910,6 +1066,61 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn process_clock_excludes_active_wait_time() {
+        let mut clock = ProcessClock::new(Instant::now());
+        sleep(Duration::from_millis(20)).await;
+        assert!(clock.begin_wait());
+        let paused_elapsed = clock.snapshot().0;
+
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(clock.snapshot().0, paused_elapsed);
+
+        assert!(clock.end_wait());
+        sleep(Duration::from_millis(20)).await;
+        assert!(clock.snapshot().0 > paused_elapsed);
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_uses_runner_active_time() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("process".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let active_timeout = process.timing_snapshot().0 + Duration::from_millis(30);
+        let active_wait = process.begin_wait();
+
+        let response = processes
+            .wait(&process.handle, active_timeout, Duration::from_millis(50))
+            .await
+            .unwrap();
+        let RunnerResponse::ProcessRunning { timing, .. } = response else {
+            panic!("process unexpectedly finished");
+        };
+        assert!(timing.paused);
+        assert!(process.timing_snapshot().0 < active_timeout);
+
+        drop(active_wait);
+        let response = timeout(
+            Duration::from_millis(200),
+            processes.wait(&process.handle, active_timeout, Duration::from_secs(1)),
+        )
+        .await
+        .expect("active timeout did not expire")
+        .unwrap();
+        assert!(matches!(response, RunnerResponse::ProcessRunning { .. }));
+        assert!(process.timing_snapshot().0 >= active_timeout);
+
+        processes.stop(&process.handle).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn subscription_reports_state_without_consuming_wait_output() {
         let processes = Arc::new(ProcessManager::new().unwrap());
         let process = processes
@@ -936,7 +1147,7 @@ mod tests {
 
         sleep(Duration::from_millis(50)).await;
         let wait = processes
-            .wait(&handle, Duration::from_millis(10))
+            .wait(&handle, Duration::from_secs(120), Duration::from_millis(10))
             .await
             .unwrap();
         let RunnerResponse::ProcessRunning { output, .. } = wait else {
@@ -1011,5 +1222,206 @@ mod tests {
             .unwrap();
 
         assert!(matches!(response, RunnerResponse::ProcessStopped { .. }));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_child_ignores_intermediate_output_and_marks_the_parent() {
+        let processes = Arc::new(ProcessManager::new().unwrap());
+        let parent = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("parent".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let child = processes
+            .start(
+                "printf first; sleep 0.05; printf second; sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("child".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let wait_processes = Arc::clone(&processes);
+        let parent_handle = parent.handle.clone();
+        let child_handle = child.handle.clone();
+        let wait = tokio::spawn(async move {
+            wait_processes
+                .wait_for_child(&parent_handle, &child_handle, Duration::from_millis(200))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            while !parent.has_active_wait() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("child wait did not mark its parent");
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !wait.is_finished(),
+            "child output ended the wait before its timeout"
+        );
+        let response = processes
+            .wait(&parent.handle, Duration::from_secs(120), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            RunnerResponse::ProcessRunning {
+                timing: ProcessTiming { paused: true, .. },
+                ..
+            }
+        ));
+
+        let response = wait.await.unwrap().unwrap();
+        let RunnerResponse::ProcessRunning { output, .. } = response else {
+            panic!("child unexpectedly finished");
+        };
+        assert_eq!(output.content, "firstsecond");
+        assert!(!parent.has_active_wait());
+
+        processes.stop(&parent.handle).await.unwrap();
+        processes.stop(&child.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_child_wait_unmarks_the_parent() {
+        let processes = Arc::new(ProcessManager::new().unwrap());
+        let parent = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("parent".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let child = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("child".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let wait_processes = Arc::clone(&processes);
+        let parent_handle = parent.handle.clone();
+        let child_handle = child.handle.clone();
+        let wait = tokio::spawn(async move {
+            wait_processes
+                .wait_for_child(&parent_handle, &child_handle, Duration::from_secs(10))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            while !parent.has_active_wait() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("child wait did not mark its parent");
+        wait.abort();
+        assert!(wait.await.unwrap_err().is_cancelled());
+        assert!(!parent.has_active_wait());
+
+        processes.stop(&parent.handle).await.unwrap();
+        processes.stop(&child.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_cannot_wait_for_itself() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("process".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = processes
+            .wait_for_child(&process.handle, &process.handle, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "process test-process cannot wait for itself"
+        );
+        assert!(!process.has_active_wait());
+        processes.stop(&process.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnecting_a_control_client_cancels_its_child_wait() {
+        let processes = Arc::new(ProcessManager::new().unwrap());
+        let parent = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("parent".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let child = processes
+            .start(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("child".to_owned()),
+                "test-".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let request = RunnerRequestEnvelope {
+            request_id: 1,
+            request: RunnerRequest::WaitChildProcess {
+                waiting_process_handle: parent.handle.clone(),
+                process_handle: child.handle.clone(),
+                timeout_ms: 60_000,
+            },
+        };
+        let mut message = serde_json::to_vec(&request).unwrap();
+        message.push(b'\n');
+        client.write_all(&message).await.unwrap();
+        let connection_processes = Arc::clone(&processes);
+        let connection =
+            tokio::spawn(
+                async move { serve_control_connection(server, &connection_processes).await },
+            );
+
+        timeout(Duration::from_secs(1), async {
+            while !parent.has_active_wait() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("control request did not mark its parent");
+        drop(client);
+        timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("control connection did not stop after disconnect")
+            .unwrap()
+            .unwrap();
+        assert!(!parent.has_active_wait());
+
+        processes.stop(&parent.handle).await.unwrap();
+        processes.stop(&child.handle).await.unwrap();
     }
 }

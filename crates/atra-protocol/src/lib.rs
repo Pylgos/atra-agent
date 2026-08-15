@@ -103,14 +103,31 @@ pub enum ApprovalPolicy {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunnerOperationUpdate {
-    CommandStarted,
+    CommandStarted {
+        timer: CommandTimerState,
+    },
     CommandOutput {
         content: String,
         omitted_bytes: usize,
+        timer: CommandTimerState,
     },
     Completed {
         artifact: ToolArtifact,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandTimerState {
+    pub elapsed_ms: u64,
+    pub remaining_ms: u64,
+    pub paused: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProcessTiming {
+    pub active_elapsed_ms: u64,
+    pub paused: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -507,6 +524,11 @@ pub enum RunnerRequest {
     },
     WaitProcess {
         process_handle: ProcessHandle,
+        active_timeout_ms: u64,
+    },
+    WaitChildProcess {
+        waiting_process_handle: ProcessHandle,
+        process_handle: ProcessHandle,
         timeout_ms: u64,
     },
     SubscribeProcess {
@@ -537,12 +559,14 @@ pub enum RunnerResponse {
     ObjectStored,
     ProcessStarted {
         process_handle: ProcessHandle,
+        timing: ProcessTiming,
     },
     ProcessRunning {
         process_handle: ProcessHandle,
         output: CommandOutput,
         patch_results: Vec<ApplyPatchResult>,
         spawned_processes: Vec<SpawnedProcess>,
+        timing: ProcessTiming,
     },
     ProcessFinished {
         output: CommandOutput,

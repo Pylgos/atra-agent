@@ -13,8 +13,8 @@ use atra_patch::ApplyPatchResult;
 use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
-    CommandExecutionArtifact, CommandOutput, CompactionEvent, CustomToolType, EventSequence,
-    FrozenBoundaryEvent, InstructionEvent, InteractionId, ItemEvent, MessageEvent,
+    CommandExecutionArtifact, CommandOutput, CommandTimerState, CompactionEvent, CustomToolType,
+    EventSequence, FrozenBoundaryEvent, InstructionEvent, InteractionId, ItemEvent, MessageEvent,
     ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
     RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
     RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
@@ -29,7 +29,6 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::{Child, Command},
     sync::{Mutex, watch},
-    time::Instant,
 };
 
 mod commands;
@@ -451,9 +450,10 @@ impl State {
             .runners
             .generate_process_id(thread_id, runner_name)
             .await;
-        let process_handle = runner
+        let started = runner
             .start_command(command.clone(), thread_id, &process_id)
             .await?;
+        let process_handle = started.handle;
         let registered = async {
             let subscription = runner.subscribe(process_handle.clone()).await?;
             self.register_managed_process(

@@ -119,7 +119,7 @@ impl Runner {
         command: String,
         thread_id: ThreadId,
         process_id: &ProcessId,
-    ) -> Result<ProcessHandle> {
+    ) -> Result<runner_client::StartedProcess> {
         let process_prefix = format!("thread-{thread_id}-");
         self.client
             .start(
@@ -134,9 +134,9 @@ impl Runner {
     pub(super) async fn wait(
         &self,
         process_handle: ProcessHandle,
-        timeout_ms: u64,
+        active_timeout_ms: u64,
     ) -> Result<WaitOutcome> {
-        self.client.wait(process_handle, timeout_ms).await
+        self.client.wait(process_handle, active_timeout_ms).await
     }
 
     pub(super) async fn stop(&self, process_handle: ProcessHandle) -> Result<CommandOutput> {

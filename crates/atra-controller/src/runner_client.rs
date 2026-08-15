@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::ApplyPatchResult;
 use atra_protocol::{
-    CommandOutput, ProcessHandle, ProcessStatus, RunnerRequest, RunnerRequestEnvelope,
-    RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
+    CommandOutput, ProcessHandle, ProcessStatus, ProcessTiming, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
 };
 use atra_store::TreeManifest;
 use tokio::{
@@ -78,6 +78,7 @@ pub(super) enum WaitOutcome {
         output: CommandOutput,
         patch_results: Vec<ApplyPatchResult>,
         spawned_processes: Vec<SpawnedProcess>,
+        timing: ProcessTiming,
     },
     Finished {
         output: CommandOutput,
@@ -85,6 +86,11 @@ pub(super) enum WaitOutcome {
         patch_results: Vec<ApplyPatchResult>,
         spawned_processes: Vec<SpawnedProcess>,
     },
+}
+
+pub(super) struct StartedProcess {
+    pub(super) handle: ProcessHandle,
+    pub(super) timing: ProcessTiming,
 }
 
 impl RunnerClient {
@@ -159,8 +165,9 @@ impl RunnerClient {
                             let sender =
                                 reader_pending.lock().unwrap().remove(&envelope.request_id);
                             if let Some(sender) = sender {
-                                if let Err(RunnerResponse::ProcessStarted { process_handle }) =
-                                    sender.send(envelope.response)
+                                if let Err(RunnerResponse::ProcessStarted {
+                                    process_handle, ..
+                                }) = sender.send(envelope.response)
                                 {
                                     let request_id =
                                         reader_next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -237,7 +244,7 @@ impl RunnerClient {
         environment: atra_protocol::CommandEnvironment,
         process_id: atra_protocol::ProcessId,
         process_prefix: String,
-    ) -> Result<ProcessHandle> {
+    ) -> Result<StartedProcess> {
         match self
             .request_raw(RunnerRequest::StartCommand {
                 command,
@@ -247,7 +254,13 @@ impl RunnerClient {
             })
             .await?
         {
-            RunnerResponse::ProcessStarted { process_handle } => Ok(process_handle),
+            RunnerResponse::ProcessStarted {
+                process_handle,
+                timing,
+            } => Ok(StartedProcess {
+                handle: process_handle,
+                timing,
+            }),
             RunnerResponse::Error { message } => bail!("{message}"),
             _ => bail!("runner returned an invalid start_command response"),
         }
@@ -280,12 +293,12 @@ impl RunnerClient {
     pub(super) async fn wait(
         &self,
         process_handle: ProcessHandle,
-        timeout_ms: u64,
+        active_timeout_ms: u64,
     ) -> Result<WaitOutcome> {
         match self
             .request_raw(RunnerRequest::WaitProcess {
                 process_handle,
-                timeout_ms,
+                active_timeout_ms,
             })
             .await?
         {
@@ -294,11 +307,13 @@ impl RunnerClient {
                 output,
                 patch_results,
                 spawned_processes,
+                timing,
             } => Ok(WaitOutcome::Running {
                 process_handle,
                 output,
                 patch_results,
                 spawned_processes,
+                timing,
             }),
             RunnerResponse::ProcessFinished {
                 output,

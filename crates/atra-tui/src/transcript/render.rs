@@ -236,6 +236,7 @@ pub(crate) fn prepare_transcript(
     entries: &mut [TranscriptEntry],
     expanded_tools: &HashSet<usize>,
     width: u16,
+    _now_ms: i64,
 ) {
     for (item_index, entry) in entries.iter_mut().enumerate() {
         let expanded = expanded_tools.contains(&item_index);
@@ -685,11 +686,18 @@ fn append_runner_result(
         RunnerResult::Running {
             output,
             omitted_bytes,
+            timer,
         } => {
+            let paused = if timer.paused { " · paused" } else { "" };
             let status = (
                 Some('…'),
                 Line::from(Span::styled(
-                    "running",
+                    format!(
+                        "running · elapsed {} · detach in {}{}",
+                        format_duration_ms(timer.elapsed_ms, false),
+                        format_duration_ms(timer.remaining_ms, true),
+                        paused,
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -730,6 +738,21 @@ fn append_runner_result(
         RunnerResult::Running { .. } => fold_result_lines(result_lines, expanded),
         RunnerResult::Completed(_) => result_lines,
     });
+}
+
+fn format_duration_ms(milliseconds: u64, round_up: bool) -> String {
+    let seconds = if round_up {
+        milliseconds.saturating_add(999) / 1000
+    } else {
+        milliseconds / 1000
+    };
+    if seconds >= 60 * 60 {
+        format!("{}h{}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn fold_result_lines(
@@ -896,9 +919,9 @@ fn command_execution_lines(
             "",
         ),
         CommandExecutionArtifact::Running { output, .. } => (
-            '…',
-            "running".to_owned(),
-            Style::default().fg(Color::Yellow),
+            '↪',
+            "detached".to_owned(),
+            Style::default().fg(Color::Cyan),
             output.as_str(),
         ),
         CommandExecutionArtifact::Finished {

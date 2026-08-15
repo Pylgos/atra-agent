@@ -1,6 +1,15 @@
 use super::*;
 use futures_util::StreamExt;
 
+fn command_timer_state(timing: &atra_protocol::ProcessTiming) -> CommandTimerState {
+    let elapsed_ms = timing.active_elapsed_ms.min(FOREGROUND_TIMEOUT_MS);
+    CommandTimerState {
+        elapsed_ms,
+        remaining_ms: FOREGROUND_TIMEOUT_MS.saturating_sub(elapsed_ms),
+        paused: timing.paused,
+    }
+}
+
 pub(super) enum TurnRequest {
     Send {
         thread_id: ThreadId,
@@ -1229,47 +1238,55 @@ impl State {
             .runners
             .generate_process_id(thread_id, &runner_name)
             .await;
-        let process_handle = runner
+        let started = runner
             .start_command(arguments.command, thread_id, &process_id)
             .await?;
+        let process_handle = started.handle;
         active.set_process(Arc::clone(&runner), process_handle.clone());
-        send_operation_update(operation, updates, RunnerOperationUpdate::CommandStarted).await?;
-        let deadline = Instant::now() + std::time::Duration::from_millis(FOREGROUND_TIMEOUT_MS);
+        send_operation_update(
+            operation,
+            updates,
+            RunnerOperationUpdate::CommandStarted {
+                timer: command_timer_state(&started.timing),
+            },
+        )
+        .await?;
         let mut collected = None;
         let mut patch_results = Vec::new();
         let response = loop {
-            let timeout_ms = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(1000)
-                .try_into()
-                .unwrap_or(1000);
-            match runner.wait(process_handle.clone(), timeout_ms).await? {
+            match runner
+                .wait(process_handle.clone(), FOREGROUND_TIMEOUT_MS)
+                .await?
+            {
                 WaitOutcome::Running {
                     output,
                     patch_results: result_patch_results,
                     spawned_processes,
+                    timing,
                     ..
                 } => {
                     self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
                         .await?;
+                    let timer = command_timer_state(&timing);
                     send_operation_update(
                         operation,
                         updates,
                         RunnerOperationUpdate::CommandOutput {
                             content: output.content.clone(),
                             omitted_bytes: output.omitted_bytes,
+                            timer: timer.clone(),
                         },
                     )
                     .await?;
                     append_command_output(&mut collected, output);
                     patch_results.extend(result_patch_results);
-                    if Instant::now() >= deadline {
+                    if timer.remaining_ms == 0 {
                         break WaitOutcome::Running {
                             process_handle: process_handle.clone(),
                             output: collected.take().unwrap(),
                             patch_results,
                             spawned_processes: Vec::new(),
+                            timing,
                         };
                     }
                 }

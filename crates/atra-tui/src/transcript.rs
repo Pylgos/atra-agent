@@ -311,6 +311,7 @@ pub(crate) enum RunnerResult {
     Running {
         output: String,
         omitted_bytes: usize,
+        timer: atra_protocol::CommandTimerState,
     },
     Completed(ToolArtifact),
 }
@@ -409,18 +410,20 @@ impl TranscriptEntry {
             return false;
         }
         match update {
-            RunnerOperationUpdate::CommandStarted => {
+            RunnerOperationUpdate::CommandStarted { timer } => {
                 results.insert(
                     operation_index,
                     RunnerResult::Running {
                         output: String::new(),
                         omitted_bytes: 0,
+                        timer,
                     },
                 );
             }
             RunnerOperationUpdate::CommandOutput {
                 content,
                 omitted_bytes,
+                timer,
             } => {
                 let result =
                     results
@@ -428,16 +431,19 @@ impl TranscriptEntry {
                         .or_insert_with(|| RunnerResult::Running {
                             output: String::new(),
                             omitted_bytes: 0,
+                            timer: timer.clone(),
                         });
                 let RunnerResult::Running {
                     output,
                     omitted_bytes: total_omitted,
+                    timer: current_timer,
                 } = result
                 else {
                     return true;
                 };
                 output.push_str(&sanitize(&content));
                 *total_omitted += omitted_bytes;
+                *current_timer = timer;
                 truncate_live_output(output, total_omitted);
             }
             RunnerOperationUpdate::Completed { artifact } => {
