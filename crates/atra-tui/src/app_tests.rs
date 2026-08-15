@@ -258,7 +258,7 @@ fn model_picker_keeps_the_last_model_visible_in_a_long_list() {
 }
 
 #[test]
-fn deleting_the_last_thread_closes_the_picker() {
+fn deleting_the_last_thread_keeps_the_picker_open() {
     let mut app = test_app(Vec::new());
     let only_thread = app.threads()[0].clone();
     set_threads(&mut app, vec![only_thread]);
@@ -267,14 +267,48 @@ fn deleting_the_last_thread_closes_the_picker() {
         state: ThreadPickerState::Deleting,
     });
     let thread_id = app.threads()[0].id;
+    set_threads(&mut app, Vec::new());
     app.update(TurnUpdate::ThreadDeleted {
         thread_id,
         result: Ok(()),
     })
     .unwrap();
 
-    assert!(matches!(app.overlay, Overlay::None));
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            selected: 0,
+            state: ThreadPickerState::Browsing,
+        })
+    ));
     assert!(matches!(app.target, Target::New { .. }));
+}
+
+#[test]
+fn deleting_a_thread_keeps_the_picker_open_and_clamps_selection() {
+    let mut app = test_app(Vec::new());
+    let deleted_thread = app.threads()[1].id;
+    let remaining_thread = app.threads()[0].clone();
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 1,
+        state: ThreadPickerState::Deleting,
+    });
+    set_threads(&mut app, vec![remaining_thread]);
+
+    app.update(TurnUpdate::ThreadDeleted {
+        thread_id: deleted_thread,
+        result: Ok(()),
+    })
+    .unwrap();
+
+    assert!(matches!(
+        app.overlay,
+        Overlay::ThreadPicker(ThreadPicker {
+            selected: 0,
+            state: ThreadPickerState::Browsing,
+        })
+    ));
+    assert_eq!(app.target.thread_id(), Some(atra_protocol::ThreadId(2)));
 }
 
 #[test]

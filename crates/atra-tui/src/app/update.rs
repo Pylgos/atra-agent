@@ -234,7 +234,11 @@ impl App {
                         if self.target.thread_id() == Some(thread_id) {
                             self.reset_to_new_thread();
                         }
-                        self.overlay = Overlay::None;
+                        let thread_count = self.threads().len();
+                        if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+                            picker.selected = picker.selected.min(thread_count.saturating_sub(1));
+                            picker.state = ThreadPickerState::Browsing;
+                        }
                     }
                     Err(error) => {
                         if let Overlay::ThreadPicker(picker) = &mut self.overlay {
