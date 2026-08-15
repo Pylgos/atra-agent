@@ -4,7 +4,7 @@ use atra_client::{
 };
 use atra_protocol::{
     CheckpointState, ControllerChange, ControllerState, ProcessChange, ProcessState, ThreadChange,
-    ThreadState,
+    ThreadId, ThreadState,
 };
 
 pub(crate) enum ControllerSync {
@@ -38,6 +38,10 @@ pub(crate) enum ThreadSync {
 }
 
 impl ThreadSync {
+    pub(crate) fn thread_id(&self) -> ThreadId {
+        self.state().metadata().id
+    }
+
     pub(crate) fn state(&self) -> &ThreadState {
         match self {
             Self::Live(subscription) => subscription.state(),

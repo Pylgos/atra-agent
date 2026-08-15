@@ -19,10 +19,20 @@ impl App {
             });
     }
 
-    pub(crate) fn apply_thread_change(&mut self, change: ThreadChange) {
+    pub(crate) fn apply_thread_change(
+        &mut self,
+        thread_id: atra_protocol::ThreadId,
+        change: ThreadChange,
+    ) {
+        if self.target.thread_id() != Some(thread_id) {
+            return;
+        }
         let Some(subscription) = &self.thread_subscription else {
             return;
         };
+        if subscription.thread_id() != thread_id {
+            return;
+        }
         let state = subscription.state();
         self.transcript.apply_change(state, &change);
         let active = state.active_turn().is_some();
@@ -74,14 +84,17 @@ impl App {
                 thread_id,
                 subscription,
             } => {
+                if subscription.state().metadata().id != thread_id
+                    || self.target.thread_id().is_some()
+                {
+                    return Ok(());
+                }
                 self.transcript.rebuild(subscription.state());
                 self.thread_subscription = Some(subscription.into());
-                if self.target.thread_id().is_none() {
-                    self.target = Target::Thread {
-                        id: thread_id,
-                        view: ThreadView::Live,
-                    };
-                }
+                self.target = Target::Thread {
+                    id: thread_id,
+                    view: ThreadView::Live,
+                };
                 Ok(())
             }
             TurnUpdate::StreamFailed(error) => {
@@ -151,6 +164,15 @@ impl App {
                         return Ok(());
                     }
                 };
+                if subscription.state().metadata().id != thread_id {
+                    if let Overlay::ThreadPicker(picker) = &mut self.overlay {
+                        picker.state = ThreadPickerState::Browsing;
+                    }
+                    self.error = Some(anyhow::anyhow!(
+                        "thread subscription snapshot does not match the selected thread"
+                    ));
+                    return Ok(());
+                }
                 self.transcript.rebuild(subscription.state());
                 self.thread_subscription = Some(subscription.into());
                 self.sync_turn_interaction();

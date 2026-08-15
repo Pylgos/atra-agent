@@ -137,7 +137,7 @@ pub(super) async fn run(
                 dirty = true;
             }
             result = receive_thread(&mut app.thread_subscription) => {
-                let change = match result {
+                let (thread_id, change) = match result {
                     Ok(change) => change,
                     Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::Deleted) => {
                         app.thread_subscription = None;
@@ -148,7 +148,7 @@ pub(super) async fn run(
                     Err(error) if is_terminal(&error, atra_protocol::SubscriptionTerminal::ControllerShutdown) => return Ok(()),
                     Err(error) => return Err(error),
                 };
-                app.apply_thread_change(change);
+                app.apply_thread_change(thread_id, change);
                 dirty = true;
             }
             result = receive_process(&mut app.process_subscription) => {
@@ -207,9 +207,13 @@ fn is_terminal(error: &anyhow::Error, terminal: atra_protocol::SubscriptionTermi
 
 async fn receive_thread(
     subscription: &mut Option<crate::sync::ThreadSync>,
-) -> Result<atra_protocol::ThreadChange> {
+) -> Result<(ThreadId, atra_protocol::ThreadChange)> {
     match subscription {
-        Some(subscription) => subscription.receive().await,
+        Some(subscription) => {
+            let thread_id = subscription.thread_id();
+            let change = subscription.receive().await?;
+            Ok((thread_id, change))
+        }
         None => std::future::pending().await,
     }
 }

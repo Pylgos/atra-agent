@@ -103,6 +103,49 @@ fn set_active_turn(app: &mut App) {
     .unwrap();
 }
 
+#[test]
+fn resetting_to_new_thread_drops_the_previous_thread_subscription() {
+    let mut app = test_app(Vec::new());
+    set_active_turn(&mut app);
+
+    app.reset_to_new_thread();
+
+    assert!(app.target.thread_id().is_none());
+    assert!(app.thread_subscription.is_none());
+    assert!(app.checkpoint_subscription.is_none());
+    assert!(app.process_subscription.is_none());
+    assert!(matches!(app.turn, TurnState::Idle));
+    assert!(app.transcript.entries.is_empty());
+}
+
+#[test]
+fn update_from_another_thread_does_not_change_the_transcript() {
+    let mut app = test_app(Vec::new());
+    let stale_thread_id = app.thread_subscription.as_ref().unwrap().thread_id();
+    let selected_thread_id = app.threads()[1].id;
+    app.target = Target::Thread {
+        id: selected_thread_id,
+        view: ThreadView::Live,
+    };
+    let event = atra_protocol::ThreadEvent {
+        sequence: atra_protocol::EventSequence(0),
+        data: atra_protocol::ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+            content: "stale thread content".to_owned(),
+        }),
+    };
+    let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
+        panic!("test app must use a snapshot thread");
+    };
+    let change = ThreadOperation::EventAppended { event }
+        .apply(state)
+        .unwrap();
+
+    app.apply_thread_change(stale_thread_id, change);
+
+    assert!(app.transcript.entries.is_empty());
+    assert_eq!(app.target.thread_id(), Some(selected_thread_id));
+}
+
 fn set_pending_question(app: &mut App, request: atra_protocol::PendingQuestionRequest) {
     set_active_turn(app);
     let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {

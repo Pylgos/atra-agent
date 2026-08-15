@@ -756,7 +756,10 @@ impl App {
             )
         });
         self.target = Target::New { model };
+        self.thread_subscription = None;
+        self.checkpoint_subscription = None;
         self.process_subscription = None;
+        self.turn = TurnState::Idle;
         self.transcript.clear();
         self.message_input.clear();
         self.clear_selection();
