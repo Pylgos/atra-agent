@@ -250,7 +250,7 @@ impl TranscriptState {
     }
 
     fn append_event(&mut self, event: &ThreadEvent) {
-        if merge_runner_tool_result(&mut self.entries, event) {
+        if merge_tool_result(&mut self.entries, event) {
             return;
         }
         let Some(item) = item_from_event(event.clone()) else {
@@ -286,6 +286,11 @@ pub(crate) enum TranscriptItem {
     ToolCall {
         name: String,
         arguments: Option<serde_json::Value>,
+    },
+    Question {
+        call_id: Option<String>,
+        arguments: serde_json::Value,
+        answers: Option<Vec<atra_protocol::QuestionAnswer>>,
     },
     RunnerTool {
         call_id: String,
@@ -330,6 +335,10 @@ impl TranscriptItem {
     pub(crate) fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
             || matches!(self, Self::RunnerTool { results, .. } if !results.is_empty())
+    }
+
+    pub(crate) fn is_tool_call(&self) -> bool {
+        matches!(self, Self::ToolCall { .. } | Self::Question { .. })
     }
 
     pub(crate) fn is_user_message(&self) -> bool {
@@ -561,6 +570,12 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     pending_approval: None,
                     masked: false,
                 })
+            } else if name == "question" {
+                Some(TranscriptItem::Question {
+                    call_id: call_id.as_deref().map(sanitize),
+                    arguments,
+                    answers: None,
+                })
             } else {
                 Some(TranscriptItem::ToolCall {
                     name,
@@ -666,10 +681,66 @@ pub(crate) fn merge_runner_tool_result(
     true
 }
 
+fn merge_question_tool_result(transcript: &mut [TranscriptEntry], event: &ThreadEvent) -> bool {
+    let ThreadEventData::ToolResult(result) = &event.data else {
+        return false;
+    };
+    let (name, call_id, result) = match result {
+        ToolResultEvent::Custom {
+            name,
+            call_id,
+            result,
+            ..
+        }
+        | ToolResultEvent::Function {
+            name,
+            call_id,
+            result,
+            ..
+        } => (name, call_id, result),
+    };
+    if name != "question" {
+        return false;
+    }
+    let Some(call_id) = call_id.as_deref() else {
+        return false;
+    };
+    let Some(entry) = transcript.iter_mut().rev().find(|entry| {
+        matches!(
+            &entry.item,
+            TranscriptItem::Question {
+                call_id: Some(entry_call_id),
+                ..
+            } if entry_call_id == call_id
+        )
+    }) else {
+        return false;
+    };
+    let Ok(answers) = serde_json::from_value::<Vec<atra_protocol::QuestionAnswer>>(sanitize_value(
+        result.clone(),
+    )) else {
+        return false;
+    };
+    let TranscriptItem::Question {
+        answers: entry_answers,
+        ..
+    } = &mut entry.item
+    else {
+        unreachable!();
+    };
+    *entry_answers = Some(answers);
+    entry.rendered = None;
+    true
+}
+
+fn merge_tool_result(transcript: &mut [TranscriptEntry], event: &ThreadEvent) -> bool {
+    merge_runner_tool_result(transcript, event) || merge_question_tool_result(transcript, event)
+}
+
 pub(crate) fn transcript_from_events(events: &[ThreadEvent]) -> Vec<TranscriptEntry> {
     let mut transcript = Vec::new();
     for event in events {
-        if merge_runner_tool_result(&mut transcript, event) {
+        if merge_tool_result(&mut transcript, event) {
             continue;
         }
         if let Some(entry) = TranscriptEntry::from_event(event.clone()) {
@@ -781,6 +852,59 @@ mod tests {
             panic!("assistant message event was not converted");
         };
         assert_eq!(todos[0].step, "safe");
+    }
+
+    #[test]
+    fn question_results_merge_for_history_and_live_updates() {
+        let call = ThreadEvent {
+            sequence: EventSequence(1),
+            data: ThreadEventData::ToolCall(ToolCallEvent::Function {
+                name: "question".to_owned(),
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "question": "Choose",
+                        "options": [{"label": "A", "description": ""}],
+                        "recommended_options": []
+                    }]
+                }),
+                call_id: Some("question-1".to_owned()),
+            }),
+        };
+        let result = ThreadEvent {
+            sequence: EventSequence(2),
+            data: ThreadEventData::ToolResult(ToolResultEvent::Function {
+                call_type: None,
+                name: "question".to_owned(),
+                call_id: Some("question-1".to_owned()),
+                result: serde_json::json!([{
+                    "selected_option": "A",
+                    "note": "details"
+                }]),
+                artifacts: Vec::new(),
+                masked_result: None,
+            }),
+        };
+
+        let history = transcript_from_events(&[call.clone(), result.clone()]);
+        assert_answered_question(&history);
+
+        let mut live = TranscriptState::new(Vec::new());
+        live.append_event(&call);
+        live.append_event(&result);
+        assert_answered_question(&live.entries);
+    }
+
+    fn assert_answered_question(entries: &[TranscriptEntry]) {
+        assert_eq!(entries.len(), 1);
+        let TranscriptItem::Question {
+            answers: Some(answers),
+            ..
+        } = &entries[0].item
+        else {
+            panic!("question result should merge into the question call");
+        };
+        assert_eq!(answers[0].selected_option.as_deref(), Some("A"));
+        assert_eq!(answers[0].note, "details");
     }
 
     #[test]

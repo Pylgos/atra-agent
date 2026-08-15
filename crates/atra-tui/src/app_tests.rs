@@ -840,6 +840,47 @@ fn question_tool_call_has_a_structured_transcript_rendering() {
 }
 
 #[test]
+fn answered_question_marks_the_selection_and_shows_the_note() {
+    let mut items = vec![TranscriptEntry::new(TranscriptItem::Question {
+        call_id: Some("question-1".to_owned()),
+        arguments: serde_json::json!({
+            "questions": [{
+                "question": "Which layout?",
+                "options": [
+                    {"label": "Stacked", "description": "Keep the transcript visible"},
+                    {"label": "Overlay", "description": "Cover the transcript"}
+                ],
+                "recommended_options": ["Stacked"]
+            }, {
+                "question": "Anything else?",
+                "options": [
+                    {"label": "No", "description": ""}
+                ],
+                "recommended_options": []
+            }]
+        }),
+        answers: Some(vec![
+            atra_protocol::QuestionAnswer {
+                selected_option: Some("Overlay".to_owned()),
+                note: "Use it on narrow terminals".to_owned(),
+            },
+            atra_protocol::QuestionAnswer {
+                selected_option: None,
+                note: String::new(),
+            },
+        ]),
+    })];
+
+    prepare_transcript(&mut items, &HashSet::new(), 80);
+    let rendered = transcript_text(&items);
+
+    assert!(rendered.contains("○ Stacked  ★ recommended"));
+    assert!(rendered.contains("● Overlay"));
+    assert!(rendered.contains("note: Use it on narrow terminals"));
+    assert!(rendered.contains("● どれでもない"));
+}
+
+#[test]
 fn question_form_navigation_note_and_confirmation_keys() {
     use crate::state::{QuestionForm, QuestionFormMode};
     use atra_protocol::{InteractionId, PendingQuestionRequest, Question, QuestionOption};

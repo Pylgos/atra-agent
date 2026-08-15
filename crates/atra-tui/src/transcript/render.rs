@@ -74,9 +74,10 @@ pub(crate) fn layout_transcript(
             virtual_y += 1;
         }
         offset += 1;
-        if entries.get(item_index + 1).is_none_or(|next| {
-            !matches!(entry.item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
-        }) {
+        if entries
+            .get(item_index + 1)
+            .is_none_or(|next| !entry.item.is_tool_call() || !next.is_tool_result())
+        {
             virtual_y += 1;
         }
     }
@@ -198,9 +199,10 @@ pub(crate) fn transcript_lines(
             offset += line_len;
             row += 1;
         }
-        if entries.get(item_index + 1).is_none_or(|next| {
-            !matches!(item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
-        }) {
+        if entries
+            .get(item_index + 1)
+            .is_none_or(|next| !item.is_tool_call() || !next.is_tool_result())
+        {
             if visible.contains(&row) {
                 lines.push(Line::default());
             }
@@ -220,9 +222,10 @@ pub(crate) fn transcript_ranges(
         let start = row;
         row += entry.rendered.as_ref().unwrap().lines.len();
         ranges.push((item_index, start..row));
-        if entries.get(item_index + 1).is_none_or(|next| {
-            !matches!(entry.item, TranscriptItem::ToolCall { .. }) || !next.is_tool_result()
-        }) {
+        if entries
+            .get(item_index + 1)
+            .is_none_or(|next| !entry.item.is_tool_call() || !next.is_tool_result())
+        {
             row += 1;
         }
     }
@@ -322,6 +325,9 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
     let mut logical_lines = match item {
         TranscriptItem::WebSearch { action } => web_search_lines(action),
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
+        TranscriptItem::Question {
+            arguments, answers, ..
+        } => question_tool_lines(Some(arguments), answers.as_deref()),
         TranscriptItem::RunnerTool {
             input,
             results,
@@ -387,9 +393,9 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         } => Style::default().fg(Color::Cyan),
         TranscriptItem::ReasoningSummary { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::WebSearch { .. } => Style::default().fg(Color::Blue),
-        TranscriptItem::ToolCall { .. } | TranscriptItem::RunnerTool { .. } => {
-            Style::default().fg(Color::Yellow)
-        }
+        TranscriptItem::ToolCall { .. }
+        | TranscriptItem::Question { .. }
+        | TranscriptItem::RunnerTool { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
         TranscriptItem::Compaction => Style::default().fg(Color::DarkGray),
     };
@@ -447,7 +453,7 @@ fn tool_call_lines(
             false,
         ),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
-        "question" => question_tool_lines(arguments),
+        "question" => question_tool_lines(arguments, None),
         _ => {
             let mut lines = vec![(
                 Some('◆'),
@@ -472,6 +478,7 @@ fn tool_call_lines(
 
 fn question_tool_lines(
     arguments: Option<&serde_json::Value>,
+    answers: Option<&[atra_protocol::QuestionAnswer]>,
 ) -> Vec<(Option<char>, Line<'static>)> {
     let Some(questions) = arguments
         .and_then(|arguments| arguments.get("questions"))
@@ -481,6 +488,7 @@ fn question_tool_lines(
     };
     let mut lines = vec![(Some('◆'), Line::from("question"))];
     for (index, question) in questions.iter().enumerate() {
+        let answer = answers.and_then(|answers| answers.get(index));
         let prompt = question
             .get("question")
             .and_then(serde_json::Value::as_str)
@@ -506,7 +514,16 @@ fn question_tool_lines(
                 lines.push((
                     None,
                     Line::from(vec![
-                        Span::raw(format!("   ○ {label}")),
+                        Span::raw(format!(
+                            "   {} {label}",
+                            if answer.and_then(|answer| answer.selected_option.as_deref())
+                                == Some(label)
+                            {
+                                '●'
+                            } else {
+                                '○'
+                            }
+                        )),
                         Span::styled(
                             if is_recommended {
                                 "  ★ recommended"
@@ -531,6 +548,21 @@ fn question_tool_lines(
                     ));
                 }
             }
+        }
+        if answer.is_some_and(|answer| answer.selected_option.is_none()) {
+            lines.push((None, Line::from("   ● どれでもない")));
+        }
+        if let Some(note) = answer
+            .map(|answer| answer.note.as_str())
+            .filter(|note| !note.is_empty())
+        {
+            lines.push((
+                None,
+                Line::styled(
+                    format!("     note: {note}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ));
         }
     }
     lines
