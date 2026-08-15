@@ -1,6 +1,6 @@
 ---
 source: crates/atra-tui/src/app_tests.rs
-assertion_line: 811
+assertion_line: 870
 expression: terminal.backend().to_string()
 ---
 "┌Transcript──────────────────────────────┐"
@@ -12,4 +12,4 @@ expression: terminal.backend().to_string()
 "┌Message─────────────────────────────────┐"
 "│next                                    │"
 "└───────────Enter: newline · Ctrl-G: send┘"
-"Current work │ gpt-5.6-sol (medium) · cont"
+"gpt-5.6-sol (medium) · cont │ Current work"

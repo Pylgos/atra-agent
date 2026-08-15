@@ -11,7 +11,7 @@ use ratatui::{
 };
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::{App, COMMAND_HELP},
@@ -183,6 +183,15 @@ impl App {
         }
         self.render_composer(frame, input);
         frame.render_widget(Paragraph::new(self.status_line()), status);
+        if let Some(breadcrumb) = self.thread_breadcrumb() {
+            let width = breadcrumb.width().min(usize::from(status.width)) as u16;
+            let area = Rect {
+                x: status.right().saturating_sub(width),
+                width,
+                ..status
+            };
+            frame.render_widget(Paragraph::new(breadcrumb), area);
+        }
         self.render_overlays(frame, main);
         if let Some(error) = &self.error {
             render_error(frame, error);
@@ -441,22 +450,6 @@ impl App {
         if !spans.is_empty() {
             spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
         }
-        if let Some(current) = self.target.thread_id() {
-            let mut path = Vec::new();
-            let mut id = Some(current);
-            while let Some(current) = id {
-                let Some(thread) = self.threads().iter().find(|thread| thread.id == current) else {
-                    break;
-                };
-                path.push(breadcrumb_name(thread.display_name.as_deref()));
-                id = thread.parent_thread_id;
-            }
-            path.reverse();
-            if !path.is_empty() {
-                spans.push(Span::raw(path.join(" › ")));
-                spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-            }
-        }
         let selected = self
             .threads()
             .iter()
@@ -553,6 +546,28 @@ impl App {
             ));
         }
         Line::from(spans)
+    }
+
+    fn thread_breadcrumb(&self) -> Option<Line<'static>> {
+        if let Some(current) = self.target.thread_id() {
+            let mut path = Vec::new();
+            let mut id = Some(current);
+            while let Some(current) = id {
+                let Some(thread) = self.threads().iter().find(|thread| thread.id == current) else {
+                    break;
+                };
+                path.push(breadcrumb_name(thread.display_name.as_deref()));
+                id = thread.parent_thread_id;
+            }
+            path.reverse();
+            if !path.is_empty() {
+                return Some(Line::from(vec![
+                    Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(path.join(" › ")),
+                ]));
+            }
+        }
+        None
     }
 
     fn current_status(&self) -> Vec<Span<'static>> {
@@ -826,8 +841,27 @@ impl App {
 }
 
 fn breadcrumb_name(name: Option<&str>) -> String {
-    name.map(|name| expand_tabs(&sanitize(name)).replace('\n', " "))
+    name.map(|name| truncate_display_width(&expand_tabs(&sanitize(name)).replace('\n', " "), 24))
         .unwrap_or_else(|| "Untitled".to_owned())
+}
+
+fn truncate_display_width(value: &str, max_width: usize) -> String {
+    if value.width() <= max_width {
+        return value.to_owned();
+    }
+    let content_width = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width > content_width {
+            break;
+        }
+        result.push(character);
+        width += character_width;
+    }
+    result.push('…');
+    result
 }
 
 fn question_form_height(form: &QuestionForm, available: u16) -> u16 {
@@ -1644,6 +1678,18 @@ mod tests {
         assert_eq!(
             breadcrumb_name(Some("root\x1b[31m\nchild\tname")),
             "root child   name"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_name_is_truncated_to_24_display_columns() {
+        assert_eq!(
+            breadcrumb_name(Some("1234567890123456789012345")),
+            "12345678901234567890123…"
+        );
+        assert_eq!(
+            breadcrumb_name(Some("日本語日本語日本語日本語日本語")),
+            "日本語日本語日本語日本…"
         );
     }
 }
