@@ -1,4 +1,4 @@
-use atra_protocol::{ActiveItemData, ModelRequestKind, ProcessStatus, ThreadEventData, TurnPhase};
+use atra_protocol::{ModelRequestKind, ProcessStatus, ThreadEventData, TurnPhase};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -618,19 +618,7 @@ impl App {
                     TurnPhase::AwaitingInput => ("Input required".to_owned(), Color::Yellow),
                     TurnPhase::Cancelling => ("Cancelling".to_owned(), Color::Yellow),
                     TurnPhase::Compacting => ("Compacting".to_owned(), Color::Yellow),
-                    TurnPhase::Running => {
-                        let message =
-                            turn.items()
-                                .last()
-                                .map_or("Working", |item| match item.data() {
-                                    ActiveItemData::Assistant { .. } => "Responding",
-                                    ActiveItemData::Reasoning { .. } => "Thinking",
-                                    ActiveItemData::WebSearch { .. } => "Searching the web",
-                                    ActiveItemData::ToolCall { .. } => "Preparing tool",
-                                    ActiveItemData::RunnerTool { .. } => "Running tool",
-                                });
-                        (message.to_owned(), Color::Yellow)
-                    }
+                    TurnPhase::Running => ("Working".to_owned(), Color::Yellow),
                 }
             }
         };
