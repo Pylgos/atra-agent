@@ -11,7 +11,7 @@ command -v podman >/dev/null
 
 "$atra" runner launch \
   --name host \
-  --description "Host environment with no restriction." \
+  --description "Host environment with no restriction. Do not use this unless absolutely necessary." \
   --approval ask
 
 nix print-dev-env . >"$activation"
@@ -54,7 +54,7 @@ runner="$(
 
 "$atra" runner launch \
   --name sandbox \
-  --description "Sandboxed container environment" \
+  --description "Sandboxed container environment." \
   --approval allow \
   -- \
   "${container[@]}" \
