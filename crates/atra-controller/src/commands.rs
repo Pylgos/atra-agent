@@ -575,6 +575,12 @@ impl TurnProjector {
                     }
                 }
             }
+            ModelStreamEvent::ReasoningSummaryPartAdded => {
+                let Some(operation) = projection.reasoning_part_added() else {
+                    return Ok(());
+                };
+                operation
+            }
             ModelStreamEvent::WebSearchUpdate { item_id, action } => {
                 restore_running_phase(&self.state, self.thread_id, &mut projection).await?;
                 match projection.web_searches.get(&item_id).copied() {
@@ -724,6 +730,13 @@ impl TurnProjection {
         self.tool_calls.retain(|_, current| *current != active_id);
         Some(active_id)
     }
+
+    fn reasoning_part_added(&self) -> Option<ThreadOperation> {
+        Some(ThreadOperation::ActiveTextAppended {
+            id: self.reasoning?,
+            content: "\n".to_owned(),
+        })
+    }
 }
 
 async fn restore_running_phase(
@@ -829,5 +842,21 @@ mod tests {
         assert_eq!(projection.finish_tool_call(Some("missing")), None);
         assert_eq!(projection.finish_tool_call(Some("item-1")), Some(first));
         assert!(projection.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reasoning_part_boundary_separates_streamed_summaries() {
+        let mut projection = TurnProjection::new();
+        assert!(projection.reasoning_part_added().is_none());
+
+        let reasoning = projection.id();
+        projection.reasoning = Some(reasoning);
+        let operation = projection.reasoning_part_added().unwrap();
+
+        assert!(matches!(
+            operation,
+            ThreadOperation::ActiveTextAppended { id, content }
+                if id == reasoning && content == "\n"
+        ));
     }
 }

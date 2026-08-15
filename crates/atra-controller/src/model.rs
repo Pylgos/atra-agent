@@ -64,6 +64,7 @@ pub(crate) enum ModelStreamEvent {
     },
     AssistantDelta(String),
     ReasoningSummaryDelta(String),
+    ReasoningSummaryPartAdded,
     WebSearchUpdate {
         item_id: String,
         action: Option<serde_json::Value>,

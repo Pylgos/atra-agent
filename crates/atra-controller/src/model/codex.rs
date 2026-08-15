@@ -587,6 +587,9 @@ async fn handle_sse_event(
         "response.reasoning_summary_text.delta" => event["delta"]
             .as_str()
             .map(|value| ModelStreamEvent::ReasoningSummaryDelta(value.to_owned())),
+        "response.reasoning_summary_part.added" => {
+            Some(ModelStreamEvent::ReasoningSummaryPartAdded)
+        }
         "response.custom_tool_call_input.delta" => Some(ModelStreamEvent::ToolCallDelta {
             item_id: event["item_id"].as_str().unwrap_or_default().to_owned(),
             delta: event["delta"].as_str().unwrap_or_default().to_owned(),
@@ -1625,6 +1628,35 @@ mod tests {
         .unwrap();
         assert!(!completed);
         assert_eq!(rate_limits[0]["primary"]["used_percent"], 42);
+    }
+
+    #[tokio::test]
+    async fn reasoning_summary_part_boundary_is_streamed() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut response_id = None;
+        let mut token_usage = None;
+        let mut rate_limits = Vec::new();
+        let mut emitted = false;
+        let mut has_response = false;
+
+        let completed = handle_sse_event(
+            json!({"type": "response.reasoning_summary_part.added"}),
+            &sender,
+            &mut response_id,
+            &mut token_usage,
+            &mut rate_limits,
+            &mut emitted,
+            &mut has_response,
+        )
+        .await
+        .unwrap();
+
+        assert!(!completed);
+        assert!(emitted);
+        assert!(matches!(
+            receiver.recv().await.unwrap().unwrap(),
+            ModelEvent::Update(ModelStreamEvent::ReasoningSummaryPartAdded)
+        ));
     }
 
     #[tokio::test]
