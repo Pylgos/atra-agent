@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -9,8 +10,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::{ApplyPatchResult, PatchOperationOutcome, PatchOperationResult};
 use atra_protocol::{
-    CommandEnvironment, CommandOutput, ProcessHandle, ProcessId, RunnerRequest,
-    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope,
+    AgentControlRequestEnvelope, AgentControlResponseEnvelope, AgentRequest, AgentTarget,
+    CommandEnvironment, CommandOutput, EventSequence, ProcessHandle, ProcessId, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, ThreadId,
 };
 use clap::{Parser, Subcommand};
 use tokio::{
@@ -32,6 +34,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Proc {
         #[command(subcommand)]
         command: ProcCommand,
@@ -41,6 +47,41 @@ enum Command {
         #[arg(long)]
         all: bool,
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+    },
+    Send {
+        thread_id: i64,
+        message: Option<String>,
+    },
+    Wait {
+        #[arg(required = true, value_parser = agent_target)]
+        targets: Vec<AgentTarget>,
+        #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS)]
+        timeout: u64,
+    },
+    List,
+    Cancel {
+        #[arg(long)]
+        recursive: bool,
+        #[arg(required = true)]
+        thread_ids: Vec<i64>,
+    },
+    Delete {
+        #[arg(long)]
+        recursive: bool,
+        #[arg(required = true)]
+        thread_ids: Vec<i64>,
     },
 }
 
@@ -100,10 +141,124 @@ async fn run(cli: Cli) -> Result<bool> {
             .context("ATRI_RUNNER_ENDPOINT is not set; atri must run on an Atra Runner")?,
     );
     match cli.command {
+        Command::Agent { command } => run_agent(&endpoint, command).await,
         Command::Proc { command } => run_proc(endpoint, command).await,
         Command::Patch => run_patch(&endpoint).await,
         Command::Replace { all, path } => run_replace(&endpoint, path, all).await,
     }
+}
+
+async fn run_agent(endpoint: &Path, command: AgentCommand) -> Result<bool> {
+    let request = match command {
+        AgentCommand::Create {
+            name,
+            model,
+            effort,
+        } => AgentRequest::Create {
+            name,
+            model,
+            effort,
+        },
+        AgentCommand::Send { thread_id, message } => {
+            let message = match message {
+                Some(message) => message,
+                None => {
+                    if std::io::stdin().is_terminal() {
+                        bail!("message is required when stdin is a TTY");
+                    }
+                    let mut message = String::new();
+                    io::stdin()
+                        .read_to_string(&mut message)
+                        .await
+                        .context("failed to read agent message from stdin")?;
+                    message
+                }
+            };
+            AgentRequest::Send {
+                thread_id: ThreadId(thread_id),
+                message,
+            }
+        }
+        AgentCommand::Wait { targets, timeout } => AgentRequest::Wait {
+            targets,
+            timeout_ms: timeout.checked_mul(1000).context("timeout is too large")?,
+        },
+        AgentCommand::List => AgentRequest::List,
+        AgentCommand::Cancel {
+            recursive,
+            thread_ids,
+        } => AgentRequest::Cancel {
+            thread_ids: thread_ids.into_iter().map(ThreadId).collect(),
+            recursive,
+        },
+        AgentCommand::Delete {
+            recursive,
+            thread_ids,
+        } => AgentRequest::Delete {
+            thread_ids: thread_ids.into_iter().map(ThreadId).collect(),
+            recursive,
+        },
+    };
+    let process_handle = ProcessHandle(
+        env::var("ATRI_PROCESS_HANDLE")
+            .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
+    );
+    let response = request_agent(endpoint, process_handle, request).await?;
+    if !response.output.is_empty() {
+        println!("{}", response.output);
+    }
+    Ok(response.success)
+}
+
+fn agent_target(value: &str) -> std::result::Result<AgentTarget, String> {
+    let (thread, after_sequence) = match value.rsplit_once('@') {
+        Some((thread, sequence)) => {
+            let sequence = sequence
+                .parse::<i64>()
+                .map_err(|_| "sequence must be -1 or a non-negative integer".to_owned())?;
+            if sequence < -1 {
+                return Err("sequence must be -1 or a non-negative integer".to_owned());
+            }
+            (thread, Some(EventSequence(sequence)))
+        }
+        None => (value, None),
+    };
+    let thread_id = thread
+        .parse::<i64>()
+        .map_err(|_| "thread ID must be an integer".to_owned())?;
+    Ok(AgentTarget {
+        thread_id: ThreadId(thread_id),
+        after_sequence,
+    })
+}
+
+async fn request_agent(
+    endpoint: &Path,
+    process_handle: ProcessHandle,
+    request: AgentRequest,
+) -> Result<atra_protocol::AgentResponse> {
+    let mut stream = UnixStream::connect(endpoint)
+        .await
+        .with_context(|| format!("failed to connect to Runner at {}", endpoint.display()))?;
+    let mut encoded = serde_json::to_vec(&AgentControlRequestEnvelope {
+        request_id: 0,
+        process_handle,
+        request,
+    })
+    .context("failed to encode agent request")?;
+    encoded.push(b'\n');
+    stream
+        .write_all(&encoded)
+        .await
+        .context("failed to write agent request")?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .await
+        .context("failed to read agent response")?;
+    Ok(serde_json::from_str::<AgentControlResponseEnvelope>(&line)
+        .context("failed to decode agent response")?
+        .response)
 }
 
 async fn run_replace(endpoint: &Path, path: PathBuf, replace_all: bool) -> Result<bool> {
@@ -582,5 +737,25 @@ mod tests {
         };
 
         assert_eq!(timeout, 86_400);
+    }
+
+    #[test]
+    fn agent_wait_parses_sentinel_cursor_and_unbounded_timeout() {
+        let cli =
+            Cli::try_parse_from(["atri", "agent", "wait", "42@-1", "--timeout", "86400"]).unwrap();
+        let Command::Agent {
+            command: AgentCommand::Wait { targets, timeout },
+        } = cli.command
+        else {
+            panic!("expected agent wait")
+        };
+        assert_eq!(targets[0].thread_id, ThreadId(42));
+        assert_eq!(targets[0].after_sequence, Some(EventSequence(-1)));
+        assert_eq!(timeout, 86_400);
+    }
+
+    #[test]
+    fn agent_create_requires_a_name() {
+        assert!(Cli::try_parse_from(["atri", "agent", "create"]).is_err());
     }
 }

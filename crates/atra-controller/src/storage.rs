@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use atra_protocol::{
     CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, HistoryTarget,
@@ -15,6 +18,11 @@ pub(crate) struct Event {
     pub sequence: EventSequence,
     #[serde(flatten)]
     pub data: ThreadEventData,
+}
+
+pub(crate) struct ReportSnapshot {
+    pub(crate) through: EventSequence,
+    pub(crate) events: Vec<Event>,
 }
 
 pub(crate) struct FrozenBoundary {
@@ -52,7 +60,8 @@ impl Store {
                     PRAGMA foreign_keys = ON;
 
                     CREATE TABLE IF NOT EXISTS threads (
-                        id INTEGER PRIMARY KEY,
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        parent_thread_id INTEGER REFERENCES threads(id),
                         display_name TEXT,
                         provider TEXT NOT NULL,
                         model TEXT NOT NULL,
@@ -111,19 +120,37 @@ impl Store {
             .await
     }
 
+    pub async fn create_child_thread(
+        &self,
+        parent_thread_id: ThreadId,
+        display_name: String,
+        provider: String,
+        model: String,
+        reasoning_effort: String,
+    ) -> tokio_rusqlite::Result<ThreadId> {
+        self.connection.call(move |connection| {
+            connection.execute(
+                "INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![parent_thread_id.0, display_name, provider, model, reasoning_effort],
+            )?;
+            Ok(ThreadId(connection.last_insert_rowid()))
+        }).await
+    }
+
     pub async fn threads(&self) -> tokio_rusqlite::Result<Vec<Thread>> {
         self.connection
             .call(|connection| {
                 let mut statement = connection
-                    .prepare("SELECT id, display_name, provider, model, reasoning_effort FROM threads ORDER BY id DESC")?;
+                    .prepare("SELECT id, parent_thread_id, display_name, provider, model, reasoning_effort FROM threads ORDER BY id DESC")?;
                 statement
                     .query_map([], |row| {
                         Ok(Thread {
                             id: ThreadId(row.get(0)?),
-                            display_name: row.get(1)?,
-                            provider: row.get(2)?,
-                            model: row.get(3)?,
-                            reasoning_effort: row.get(4)?,
+                            parent_thread_id: row.get::<_, Option<i64>>(1)?.map(ThreadId),
+                            display_name: row.get(2)?,
+                            provider: row.get(3)?,
+                            model: row.get(4)?,
+                            reasoning_effort: row.get(5)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -135,20 +162,46 @@ impl Store {
         self.connection
             .call(move |connection| {
                 connection.query_row(
-                    "SELECT id, display_name, provider, model, reasoning_effort FROM threads WHERE id = ?1",
+                    "SELECT id, parent_thread_id, display_name, provider, model, reasoning_effort FROM threads WHERE id = ?1",
                     [thread_id.0],
                     |row| {
                         Ok(Thread {
                             id: ThreadId(row.get(0)?),
-                            display_name: row.get(1)?,
-                            provider: row.get(2)?,
-                            model: row.get(3)?,
-                            reasoning_effort: row.get(4)?,
+                            parent_thread_id: row.get::<_, Option<i64>>(1)?.map(ThreadId),
+                            display_name: row.get(2)?,
+                            provider: row.get(3)?,
+                            model: row.get(4)?,
+                            reasoning_effort: row.get(5)?,
                         })
                     },
                 )
             })
             .await
+    }
+
+    pub async fn descendants(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<Vec<ThreadId>> {
+        self.connection.call(move |connection| {
+            let mut statement = connection.prepare(
+                "WITH RECURSIVE descendants(id) AS (SELECT id FROM threads WHERE parent_thread_id = ?1 UNION ALL SELECT t.id FROM threads t JOIN descendants d ON t.parent_thread_id = d.id) SELECT id FROM descendants ORDER BY id"
+            )?;
+            statement.query_map([thread_id.0], |row| Ok(ThreadId(row.get(0)?)))?
+                .collect::<Result<Vec<_>, _>>()
+        }).await
+    }
+
+    pub async fn is_descendant(
+        &self,
+        ancestor: ThreadId,
+        candidate: ThreadId,
+    ) -> tokio_rusqlite::Result<bool> {
+        Ok(self.descendants(ancestor).await?.contains(&candidate))
+    }
+
+    pub async fn root_thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<ThreadId> {
+        self.connection.call(move |connection| connection.query_row(
+            "WITH RECURSIVE ancestry(id, parent_thread_id) AS (SELECT id, parent_thread_id FROM threads WHERE id = ?1 UNION ALL SELECT t.id, t.parent_thread_id FROM threads t JOIN ancestry a ON a.parent_thread_id = t.id) SELECT id FROM ancestry WHERE parent_thread_id IS NULL",
+            [thread_id.0], |row| Ok(ThreadId(row.get(0)?))
+        )).await
     }
 
     pub async fn rename_thread(
@@ -171,26 +224,19 @@ impl Store {
             .await
     }
 
-    pub async fn delete_thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<()> {
+    pub async fn delete_threads(&self, thread_ids: Vec<ThreadId>) -> tokio_rusqlite::Result<()> {
         self.connection
             .call(move |connection| {
-                let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
-                transaction.execute(
-                    "DELETE FROM checkpoint_events WHERE checkpoint_id IN (SELECT id FROM checkpoints WHERE thread_id = ?1)",
-                    [thread_id],
-                )?;
-                transaction.execute(
-                    "DELETE FROM checkpoints WHERE thread_id = ?1",
-                    [thread_id],
-                )?;
-                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
-                let updated = transaction.execute(
-                    "DELETE FROM threads WHERE id = ?1",
-                    [thread_id],
-                )?;
-                if updated == 0 {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                for thread_id in thread_ids {
+                    transaction.execute(
+                        "DELETE FROM checkpoint_events WHERE checkpoint_id IN (SELECT id FROM checkpoints WHERE thread_id = ?1)",
+                        [thread_id.0],
+                    )?;
+                    transaction.execute("DELETE FROM checkpoints WHERE thread_id = ?1", [thread_id.0])?;
+                    transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id.0])?;
+                    let updated = transaction.execute("DELETE FROM threads WHERE id = ?1", [thread_id.0])?;
+                    if updated == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
                 }
                 transaction.commit()?;
                 Ok(())
@@ -341,6 +387,35 @@ impl Store {
                 .collect()
             })
             .await
+    }
+
+    pub async fn report_snapshot(
+        &self,
+        thread_id: ThreadId,
+    ) -> tokio_rusqlite::Result<ReportSnapshot> {
+        self.connection.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let through = EventSequence(transaction.query_row(
+                "SELECT COALESCE(MAX(sequence), -1) FROM events WHERE thread_id = ?1",
+                [thread_id.0],
+                |row| row.get(0),
+            )?);
+            let events = read_event_rows(
+                &transaction,
+                "SELECT sequence, kind, payload FROM events WHERE thread_id = ?1 AND sequence <= ?2 ORDER BY sequence",
+                params![thread_id.0, through.0],
+            )?;
+            let mut output = Vec::new();
+            reconstruct_events(
+                &transaction,
+                thread_id.0,
+                events,
+                &mut output,
+                &mut HashSet::new(),
+            )?;
+            transaction.commit()?;
+            Ok(ReportSnapshot { through, events: output })
+        }).await
     }
 
     pub async fn active_tool_events(
@@ -559,7 +634,8 @@ impl Store {
                 let transaction = connection.transaction()?;
                 let kind =
                     validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
-                let (source_name, provider, model, reasoning_effort): (
+                let (source_parent, source_name, provider, model, reasoning_effort): (
+                    Option<i64>,
                     Option<String>,
                     String,
                     String,
@@ -567,29 +643,31 @@ impl Store {
                 ) = match checkpoint_id {
                     Some(checkpoint_id) => transaction.query_row(
                         "
-                            SELECT display_name, provider, model, reasoning_effort
+                            SELECT t.parent_thread_id, c.display_name, c.provider, c.model, c.reasoning_effort
                             FROM checkpoints
-                            WHERE id = ?1 AND thread_id = ?2
+                            c JOIN threads t ON t.id = c.thread_id
+                            WHERE c.id = ?1 AND c.thread_id = ?2
                             ",
                         params![checkpoint_id, thread_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )?,
                     None => transaction.query_row(
                         "
-                            SELECT display_name, provider, model, reasoning_effort
+                            SELECT parent_thread_id, display_name, provider, model, reasoning_effort
                             FROM threads
                             WHERE id = ?1
                             ",
                         [thread_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )?,
                 };
                 transaction.execute(
                     "
-                    INSERT INTO threads (display_name, provider, model, reasoning_effort)
-                    VALUES (?1, ?2, ?3, ?4)
+                    INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
                     ",
                     params![
+                        source_parent,
                         display_name.or(source_name),
                         provider,
                         model,
@@ -604,6 +682,7 @@ impl Store {
                     checkpoint_id,
                     Some(history_end_sequence(kind, sequence)),
                 )?;
+                clone_compaction_checkpoints(&transaction, thread_id, new_thread_id)?;
                 transaction.commit()?;
                 Ok(ThreadId(new_thread_id))
             })
@@ -704,22 +783,27 @@ impl Store {
             .call(move |connection| {
                 let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
+                let next_sequence: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence) + 1, 0) FROM events WHERE thread_id = ?1",
+                    [thread_id], |row| row.get(0),
+                )?;
                 transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
                 transaction.execute(
                     "
                     INSERT INTO events (thread_id, sequence, kind, payload)
-                    VALUES (?1, 0, ?2, ?3)
+                    VALUES (?1, ?2, ?3, ?4)
                     ",
-                    params![thread_id, "compaction", items],
+                    params![thread_id, next_sequence, "compaction", items],
                 )?;
                 if let Some(workspace_instructions) = workspace_instructions {
                     transaction.execute(
                         "
                         INSERT INTO events (thread_id, sequence, kind, payload)
-                        VALUES (?1, 1, ?2, ?3)
+                        VALUES (?1, ?2, ?3, ?4)
                         ",
                         params![
                             thread_id,
+                            next_sequence + 1,
                             "workspace_instructions",
                             workspace_instructions
                         ],
@@ -920,6 +1004,137 @@ fn copy_events(
     Ok(())
 }
 
+fn clone_compaction_checkpoints(
+    transaction: &rusqlite::Transaction<'_>,
+    source_thread_id: i64,
+    destination_thread_id: i64,
+) -> rusqlite::Result<()> {
+    let compactions = {
+        let mut statement = transaction.prepare(
+            "SELECT sequence, payload FROM events WHERE thread_id = ?1 AND kind = 'compaction' ORDER BY sequence",
+        )?;
+        statement
+            .query_map([destination_thread_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut cloned = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut previous_sequence = None;
+    for (sequence, payload) in compactions {
+        if previous_sequence.is_some_and(|previous| previous >= sequence) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        previous_sequence = Some(sequence);
+        let mut compaction: CompactionEvent = serde_json::from_str(&payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+        })?;
+        let (checkpoint_id, checkpoint_max) = clone_checkpoint_chain(
+            transaction,
+            source_thread_id,
+            destination_thread_id,
+            compaction.checkpoint_id.0,
+            &mut cloned,
+            &mut visiting,
+        )?;
+        if checkpoint_max.is_some_and(|checkpoint_max| checkpoint_max >= sequence) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        compaction.checkpoint_id = CheckpointId(checkpoint_id);
+        transaction.execute(
+            "UPDATE events SET payload = ?1 WHERE thread_id = ?2 AND sequence = ?3",
+            params![
+                serde_json::to_string(&compaction)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                destination_thread_id,
+                sequence
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn clone_checkpoint_chain(
+    transaction: &rusqlite::Transaction<'_>,
+    source_thread_id: i64,
+    destination_thread_id: i64,
+    source_checkpoint_id: i64,
+    cloned: &mut HashMap<i64, (i64, Option<i64>)>,
+    visiting: &mut HashSet<i64>,
+) -> rusqlite::Result<(i64, Option<i64>)> {
+    if let Some(cloned) = cloned.get(&source_checkpoint_id) {
+        return Ok(*cloned);
+    }
+    if !visiting.insert(source_checkpoint_id) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let metadata: (i64, i64, String, Option<String>, String, String, String) = transaction.query_row(
+        "SELECT thread_id, created_at_ms, reason, display_name, provider, model, reasoning_effort FROM checkpoints WHERE id = ?1",
+        [source_checkpoint_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+    )?;
+    if metadata.0 != source_thread_id {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let mut events = {
+        let mut statement = transaction.prepare(
+            "SELECT sequence, kind, payload FROM checkpoint_events WHERE checkpoint_id = ?1 ORDER BY sequence",
+        )?;
+        statement
+            .query_map([source_checkpoint_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut previous_sequence = None;
+    for (sequence, kind, payload) in &mut events {
+        if previous_sequence.is_some_and(|previous| previous >= *sequence) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        previous_sequence = Some(*sequence);
+        if kind != "compaction" {
+            continue;
+        }
+        let mut compaction: CompactionEvent = serde_json::from_str(payload).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+        })?;
+        let (checkpoint_id, checkpoint_max) = clone_checkpoint_chain(
+            transaction,
+            source_thread_id,
+            destination_thread_id,
+            compaction.checkpoint_id.0,
+            cloned,
+            visiting,
+        )?;
+        if checkpoint_max.is_some_and(|checkpoint_max| checkpoint_max >= *sequence) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        compaction.checkpoint_id = CheckpointId(checkpoint_id);
+        *payload = serde_json::to_string(&compaction)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
+    transaction.execute(
+        "INSERT INTO checkpoints (thread_id, created_at_ms, reason, display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![destination_thread_id, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6],
+    )?;
+    let new_id = transaction.last_insert_rowid();
+    for (sequence, kind, payload) in events {
+        transaction.execute(
+            "INSERT INTO checkpoint_events (checkpoint_id, sequence, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![new_id, sequence, kind, payload],
+        )?;
+    }
+    visiting.remove(&source_checkpoint_id);
+    let cloned_checkpoint = (new_id, previous_sequence);
+    cloned.insert(source_checkpoint_id, cloned_checkpoint);
+    Ok(cloned_checkpoint)
+}
+
 fn read_events(
     connection: &rusqlite::Connection,
     sql: &str,
@@ -941,9 +1156,382 @@ fn read_events(
     .collect()
 }
 
+fn read_event_rows<P: rusqlite::Params>(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    parameters: P,
+) -> rusqlite::Result<Vec<Event>> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map(parameters, |row| {
+            let sequence = EventSequence(row.get(0)?);
+            let kind: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            Ok(Event {
+                sequence,
+                data: event_data(&kind, &payload)?,
+            })
+        })?
+        .collect()
+}
+
+fn reconstruct_events(
+    transaction: &rusqlite::Transaction<'_>,
+    thread_id: i64,
+    events: Vec<Event>,
+    output: &mut Vec<Event>,
+    visiting: &mut HashSet<i64>,
+) -> rusqlite::Result<()> {
+    let mut previous_sequence = None;
+    for event in events {
+        if previous_sequence.is_some_and(|previous| previous >= event.sequence) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        previous_sequence = Some(event.sequence);
+        if let ThreadEventData::Compaction(compaction) = &event.data {
+            if !visiting.insert(compaction.checkpoint_id.0) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let owner: i64 = transaction.query_row(
+                "SELECT thread_id FROM checkpoints WHERE id = ?1",
+                [compaction.checkpoint_id.0],
+                |row| row.get(0),
+            )?;
+            if owner != thread_id {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let checkpoint_events = read_event_rows(
+                transaction,
+                "SELECT sequence, kind, payload FROM checkpoint_events WHERE checkpoint_id = ?1 ORDER BY sequence",
+                [compaction.checkpoint_id.0],
+            )?;
+            reconstruct_events(transaction, thread_id, checkpoint_events, output, visiting)?;
+            visiting.remove(&compaction.checkpoint_id.0);
+        }
+        if output
+            .last()
+            .is_some_and(|previous| previous.sequence >= event.sequence)
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        output.push(event);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl Store {
+    async fn delete_thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<()> {
+        self.delete_threads(vec![thread_id]).await
+    }
+
+    async fn report_events(
+        &self,
+        thread_id: ThreadId,
+        through: EventSequence,
+    ) -> tokio_rusqlite::Result<Vec<Event>> {
+        Ok(self
+            .report_snapshot(thread_id)
+            .await?
+            .events
+            .into_iter()
+            .filter(|event| event.sequence <= through)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(content: &str) -> ThreadEventData {
+        ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+            content: content.to_owned(),
+        })
+    }
+
+    fn assistant(content: &str) -> ThreadEventData {
+        ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
+            content: content.to_owned(),
+            phase: Some(atra_protocol::AssistantMessagePhase::FinalAnswer),
+            todos: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn child_hierarchy_and_forks_preserve_ownership() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let root = store
+            .create_thread(
+                Some("root".into()),
+                "fake".into(),
+                "model".into(),
+                "medium".into(),
+            )
+            .await
+            .unwrap();
+        let child = store
+            .create_child_thread(
+                root,
+                "child".into(),
+                "fake".into(),
+                "model".into(),
+                "medium".into(),
+            )
+            .await
+            .unwrap();
+        let grandchild = store
+            .create_child_thread(
+                child,
+                "grandchild".into(),
+                "fake".into(),
+                "model".into(),
+                "medium".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.descendants(root).await.unwrap(),
+            vec![child, grandchild]
+        );
+        assert_eq!(store.root_thread(grandchild).await.unwrap(), root);
+        store
+            .append_all(child, vec![user("question"), assistant("answer")])
+            .await
+            .unwrap();
+        let fork = store
+            .fork_thread(child, None, EventSequence(1), Some("fork".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.thread(fork).await.unwrap().parent_thread_id,
+            Some(root)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_cursors_are_monotonic_and_forks_own_checkpoint_chains() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let source = store
+            .create_thread(None, "fake".into(), "model".into(), "medium".into())
+            .await
+            .unwrap();
+        store
+            .append_all(source, vec![user("before"), assistant("kept")])
+            .await
+            .unwrap();
+        let checkpoint = store
+            .create_checkpoint(source, 1, "compaction".into())
+            .await
+            .unwrap();
+        store
+            .replace_with_compaction(
+                source,
+                CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: checkpoint,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let sequences = store
+            .append_all(source, vec![user("after"), assistant("done")])
+            .await
+            .unwrap();
+        assert_eq!(sequences, vec![EventSequence(3), EventSequence(4)]);
+        let report = store.report_events(source, EventSequence(4)).await.unwrap();
+        assert_eq!(
+            report
+                .iter()
+                .map(|event| event.sequence.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        let second_checkpoint = store
+            .create_checkpoint(source, 2, "compaction".into())
+            .await
+            .unwrap();
+        store
+            .replace_with_compaction(
+                source,
+                CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: second_checkpoint,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .append_all(source, vec![user("again"), assistant("finished")])
+            .await
+            .unwrap();
+
+        let fork = store
+            .fork_thread(source, None, EventSequence(7), Some("fork".into()))
+            .await
+            .unwrap();
+        let ThreadEventData::Compaction(compaction) = &store.events(fork).await.unwrap()[0].data
+        else {
+            panic!("missing compaction")
+        };
+        assert_ne!(compaction.checkpoint_id, second_checkpoint);
+        assert_eq!(
+            store
+                .checkpoint(compaction.checkpoint_id)
+                .await
+                .unwrap()
+                .thread_id,
+            fork
+        );
+        store.delete_thread(source).await.unwrap();
+        assert_eq!(
+            store
+                .report_events(fork, EventSequence(7))
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn report_and_fork_reject_a_cyclic_checkpoint_chain() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let thread = store
+            .create_thread(None, "fake".into(), "model".into(), "medium".into())
+            .await
+            .unwrap();
+        store.append(thread, user("first")).await.unwrap();
+        let first = store
+            .create_checkpoint(thread, 1, "compaction".into())
+            .await
+            .unwrap();
+        store
+            .replace_with_compaction(
+                thread,
+                CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: first,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let second = store
+            .create_checkpoint(thread, 2, "compaction".into())
+            .await
+            .unwrap();
+        store
+            .replace_with_compaction(
+                thread,
+                CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: second,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let cycle = serde_json::to_string(&CompactionEvent {
+            items: serde_json::json!([]),
+            checkpoint_id: second,
+        })
+        .unwrap();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE checkpoint_events SET kind = 'compaction', payload = ?1 WHERE checkpoint_id = ?2 AND sequence = 0",
+                    params![cycle, first.0],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        assert!(store.report_snapshot(thread).await.is_err());
+        let sequence = store.append(thread, user("fork point")).await.unwrap();
+        assert!(
+            store
+                .fork_thread(thread, None, sequence, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn report_rejects_checkpoint_owned_by_another_thread() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let thread = store
+            .create_thread(None, "fake".into(), "model".into(), "medium".into())
+            .await
+            .unwrap();
+        let other = store
+            .create_thread(None, "fake".into(), "model".into(), "medium".into())
+            .await
+            .unwrap();
+        store.append(other, user("other")).await.unwrap();
+        let checkpoint = store
+            .create_checkpoint(other, 1, "compaction".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                thread,
+                ThreadEventData::Compaction(CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: checkpoint,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.report_snapshot(thread).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn report_rejects_missing_and_corrupt_checkpoint_links() {
+        let store = Store::open(Path::new(":memory:")).await.unwrap();
+        let thread = store
+            .create_thread(None, "fake".into(), "model".into(), "medium".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                thread,
+                ThreadEventData::Compaction(CompactionEvent {
+                    items: serde_json::json!([]),
+                    checkpoint_id: CheckpointId(999),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(store.report_snapshot(thread).await.is_err());
+
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE events SET payload = 'not-json' WHERE thread_id = ?1 AND kind = 'compaction'",
+                    [thread.0],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        assert!(store.report_snapshot(thread).await.is_err());
+    }
 
     #[tokio::test]
     async fn events_keep_their_thread_order() {
@@ -1070,6 +1658,7 @@ mod tests {
             vec![
                 Thread {
                     id: second,
+                    parent_thread_id: None,
                     display_name: None,
                     provider: "fake".to_owned(),
                     model: "model-b".to_owned(),
@@ -1077,6 +1666,7 @@ mod tests {
                 },
                 Thread {
                     id: first,
+                    parent_thread_id: None,
                     display_name: Some("First".to_owned()),
                     provider: "fake".to_owned(),
                     model: "model-a".to_owned(),
@@ -1117,5 +1707,24 @@ mod tests {
         assert!(store.threads().await.unwrap().is_empty());
         assert!(store.events(thread).await.unwrap().is_empty());
         assert!(store.checkpoints(thread).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_thread_ids_are_never_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.db"))
+            .await
+            .unwrap();
+        let first = store
+            .create_thread(None, "fake".into(), "test".into(), "medium".into())
+            .await
+            .unwrap();
+        store.delete_thread(first).await.unwrap();
+        let second = store
+            .create_thread(None, "fake".into(), "test".into(), "medium".into())
+            .await
+            .unwrap();
+
+        assert!(second.0 > first.0);
     }
 }

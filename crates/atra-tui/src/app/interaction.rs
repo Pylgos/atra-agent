@@ -406,11 +406,16 @@ impl App {
             return Ok(false);
         }
 
-        let thread_ids = self
-            .threads()
-            .iter()
-            .map(|thread| thread.id)
-            .collect::<Vec<_>>();
+        let all_threads = self.threads().to_vec();
+        let thread_ids = match &self.overlay {
+            Overlay::ThreadPicker(picker) => {
+                crate::state::visible_threads(&all_threads, &picker.collapsed)
+                    .into_iter()
+                    .map(|(thread, _)| thread.id)
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
         if let Overlay::ThreadPicker(picker) = &mut self.overlay {
             picker.selected = picker.selected.min(thread_ids.len().saturating_sub(1));
             if matches!(
@@ -426,10 +431,37 @@ impl App {
                             picker.state = ThreadPickerState::Browsing;
                             return Ok(false);
                         };
+                        let current_is_in_subtree =
+                            self.target.thread_id().is_some_and(|current| {
+                                let mut candidate = Some(current);
+                                while let Some(id) = candidate {
+                                    if id == thread_id {
+                                        return true;
+                                    }
+                                    candidate = all_threads
+                                        .iter()
+                                        .find(|thread| thread.id == id)
+                                        .and_then(|thread| thread.parent_thread_id);
+                                }
+                                false
+                            });
+                        let select_after = current_is_in_subtree
+                            .then(|| {
+                                all_threads
+                                    .iter()
+                                    .find(|thread| thread.id == thread_id)
+                                    .and_then(|thread| thread.parent_thread_id)
+                            })
+                            .flatten();
                         effects
                             .send(Effect::DeleteThread {
                                 endpoint: self.endpoint.clone(),
                                 thread_id,
+                                recursive: all_threads
+                                    .iter()
+                                    .any(|thread| thread.parent_thread_id == Some(thread_id)),
+                                selected_subtree: current_is_in_subtree,
+                                select_after,
                             })
                             .ok();
                         picker.state = ThreadPickerState::Deleting;
@@ -445,6 +477,31 @@ impl App {
                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
                 KeyCode::Down => {
                     picker.selected = (picker.selected + 1).min(thread_ids.len().saturating_sub(1));
+                }
+                KeyCode::Right => {
+                    if let Some(id) = thread_ids.get(picker.selected) {
+                        picker.collapsed.remove(id);
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some(&id) = thread_ids.get(picker.selected) {
+                        let has_children = all_threads
+                            .iter()
+                            .any(|thread| thread.parent_thread_id == Some(id));
+                        if !has_children || picker.collapsed.contains(&id) {
+                            if let Some(parent) = all_threads
+                                .iter()
+                                .find(|thread| thread.id == id)
+                                .and_then(|thread| thread.parent_thread_id)
+                                && let Some(index) =
+                                    thread_ids.iter().position(|candidate| *candidate == parent)
+                            {
+                                picker.selected = index;
+                            }
+                        } else {
+                            picker.collapsed.insert(id);
+                        }
+                    }
                 }
                 KeyCode::Char('x') if !thread_ids.is_empty() => {
                     picker.state = ThreadPickerState::ConfirmingDelete;
@@ -828,14 +885,33 @@ impl App {
 
     fn open_thread_picker(&mut self) {
         self.overlay = Overlay::None;
-        let selected = self
-            .threads()
+        let current = self.target.thread_id();
+        let threads = self.threads();
+        let mut expanded = std::collections::HashSet::new();
+        let mut parent = current
+            .and_then(|id| threads.iter().find(|thread| thread.id == id))
+            .and_then(|thread| thread.parent_thread_id);
+        while let Some(id) = parent {
+            expanded.insert(id);
+            parent = threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .and_then(|thread| thread.parent_thread_id);
+        }
+        let collapsed = threads
             .iter()
-            .position(|thread| Some(thread.id) == self.target.thread_id())
+            .filter(|thread| thread.parent_thread_id.is_none() && !expanded.contains(&thread.id))
+            .map(|thread| thread.id)
+            .collect();
+        let visible = crate::state::visible_threads(threads, &collapsed);
+        let selected = visible
+            .iter()
+            .position(|(thread, _)| Some(thread.id) == current)
             .unwrap_or(0);
         self.overlay = Overlay::ThreadPicker(ThreadPicker {
             selected,
             state: ThreadPickerState::Browsing,
+            collapsed,
         });
     }
 

@@ -917,6 +917,7 @@ mod tests {
     fn finishing_a_turn_removes_uncommitted_active_entries() {
         let metadata = atra_protocol::Thread {
             id: atra_protocol::ThreadId(1),
+            parent_thread_id: None,
             display_name: None,
             provider: "fake".to_owned(),
             model: "test".to_owned(),

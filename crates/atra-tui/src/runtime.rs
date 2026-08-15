@@ -49,6 +49,9 @@ pub(crate) enum Effect {
     DeleteThread {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
+        recursive: bool,
+        selected_subtree: bool,
+        select_after: Option<ThreadId>,
     },
     ChangeModel {
         endpoint: std::path::PathBuf,
@@ -265,12 +268,40 @@ impl Effect {
                 Self::DeleteThread {
                     endpoint,
                     thread_id,
+                    recursive,
+                    selected_subtree,
+                    select_after,
                 } => {
                     let result = Client::new(&endpoint)
-                        .command(StateCommand::ThreadDelete { thread_id })
+                        .command(if recursive {
+                            StateCommand::ThreadDeleteRecursive { thread_id }
+                        } else {
+                            StateCommand::ThreadDelete { thread_id }
+                        })
                         .await
                         .and_then(accepted);
-                    let _ = updates.send(TurnUpdate::ThreadDeleted { thread_id, result });
+                    match result {
+                        Ok(()) => {
+                            let _ = updates.send(TurnUpdate::ThreadDeleted {
+                                thread_id,
+                                selected_subtree,
+                                result: Ok(()),
+                            });
+                            if let Some(thread_id) = select_after {
+                                let result =
+                                    Client::new(&endpoint).subscribe_thread(thread_id).await;
+                                let _ =
+                                    updates.send(TurnUpdate::ThreadSelected { thread_id, result });
+                            }
+                        }
+                        Err(error) => {
+                            let _ = updates.send(TurnUpdate::ThreadDeleted {
+                                thread_id,
+                                selected_subtree,
+                                result: Err(error),
+                            });
+                        }
+                    }
                 }
                 Self::ChangeModel {
                     endpoint,

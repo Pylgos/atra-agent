@@ -365,6 +365,7 @@ pub struct FrozenBoundaryEvent {
 #[serde(deny_unknown_fields)]
 pub struct CompactionEvent {
     pub items: Value,
+    pub checkpoint_id: CheckpointId,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -399,6 +400,7 @@ pub struct RateLimitsEvent {
 #[serde(deny_unknown_fields)]
 pub struct Thread {
     pub id: ThreadId,
+    pub parent_thread_id: Option<ThreadId>,
     pub display_name: Option<String>,
     pub provider: String,
     pub model: String,
@@ -464,6 +466,95 @@ pub struct RunnerRequestEnvelope {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct RunnerCallbackRequestEnvelope {
+    pub callback_id: u64,
+    pub execution_context: String,
+    #[serde(flatten)]
+    pub request: AgentRequest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RunnerCallbackResponseEnvelope {
+    pub callback_id: u64,
+    pub response: AgentResponse,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RunnerCallbackCancelEnvelope {
+    pub callback_id: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "message", content = "payload", rename_all = "snake_case")]
+pub enum ControllerRunnerMessage {
+    Request(RunnerRequestEnvelope),
+    CallbackResponse(RunnerCallbackResponseEnvelope),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "message", content = "payload", rename_all = "snake_case")]
+pub enum RunnerControllerMessage {
+    Response(RunnerResponseEnvelope),
+    CallbackRequest(RunnerCallbackRequestEnvelope),
+    CallbackCancel(RunnerCallbackCancelEnvelope),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTarget {
+    pub thread_id: ThreadId,
+    pub after_sequence: Option<EventSequence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentRequest {
+    Create {
+        name: String,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Send {
+        thread_id: ThreadId,
+        message: String,
+    },
+    Wait {
+        targets: Vec<AgentTarget>,
+        timeout_ms: u64,
+    },
+    List,
+    Cancel {
+        thread_ids: Vec<ThreadId>,
+        recursive: bool,
+    },
+    Delete {
+        thread_ids: Vec<ThreadId>,
+        recursive: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResponse {
+    pub output: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AgentControlRequestEnvelope {
+    pub request_id: u64,
+    pub process_handle: ProcessHandle,
+    #[serde(flatten)]
+    pub request: AgentRequest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AgentControlResponseEnvelope {
+    pub request_id: u64,
+    pub response: AgentResponse,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RunnerResponseEnvelope {
     pub request_id: u64,
     #[serde(flatten)]
@@ -501,6 +592,7 @@ pub enum RunnerRequest {
         environment: CommandEnvironment,
         process_id: ProcessId,
         process_prefix: String,
+        execution_context: String,
     },
     SpawnProcess {
         parent_process_handle: ProcessHandle,

@@ -102,6 +102,7 @@ impl RunnerState {
 pub struct ControllerState {
     lifecycle: ControllerLifecycle,
     threads: Vec<Thread>,
+    thread_statuses: Vec<ThreadStatus>,
     providers: Vec<ProviderState>,
     runners: Vec<RunnerState>,
 }
@@ -113,9 +114,17 @@ impl ControllerState {
         providers: Vec<ProviderState>,
         runners: Vec<RunnerState>,
     ) -> Self {
+        let thread_statuses = threads
+            .iter()
+            .map(|thread| ThreadStatus {
+                thread_id: thread.id,
+                status: AgentStatus::Idle,
+            })
+            .collect();
         Self {
             lifecycle,
             threads,
+            thread_statuses,
             providers,
             runners,
         }
@@ -127,6 +136,13 @@ impl ControllerState {
 
     pub fn threads(&self) -> &[Thread] {
         &self.threads
+    }
+
+    pub fn thread_status(&self, thread_id: ThreadId) -> Option<AgentStatus> {
+        self.thread_statuses
+            .iter()
+            .find(|status| status.thread_id == thread_id)
+            .map(|status| status.status)
     }
 
     pub fn providers(&self) -> &[ProviderState] {
@@ -141,12 +157,28 @@ impl ControllerState {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControllerOperation {
-    LifecycleChanged { lifecycle: ControllerLifecycle },
-    ThreadAdded { thread: Thread },
-    ThreadUpdated { thread: Thread },
-    ThreadRemoved { thread_id: ThreadId },
-    ProviderUpdated { provider: ProviderState },
-    RunnerUpdated { runner: RunnerState },
+    LifecycleChanged {
+        lifecycle: ControllerLifecycle,
+    },
+    ThreadAdded {
+        thread: Thread,
+    },
+    ThreadUpdated {
+        thread: Thread,
+    },
+    ThreadRemoved {
+        thread_id: ThreadId,
+    },
+    ThreadStatusUpdated {
+        thread_id: ThreadId,
+        status: AgentStatus,
+    },
+    ProviderUpdated {
+        provider: ProviderState,
+    },
+    RunnerUpdated {
+        runner: RunnerState,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +202,10 @@ impl ControllerOperation {
                 }
                 let id = thread.id;
                 state.threads.insert(0, thread);
+                state.thread_statuses.push(ThreadStatus {
+                    thread_id: id,
+                    status: AgentStatus::Idle,
+                });
                 Ok(ControllerChange::Thread(id))
             }
             Self::ThreadUpdated { thread } => {
@@ -189,6 +225,18 @@ impl ControllerOperation {
                     .position(|thread| thread.id == thread_id)
                     .ok_or_else(|| ApplyError::new("thread does not exist"))?;
                 state.threads.remove(index);
+                state
+                    .thread_statuses
+                    .retain(|status| status.thread_id != thread_id);
+                Ok(ControllerChange::Thread(thread_id))
+            }
+            Self::ThreadStatusUpdated { thread_id, status } => {
+                let current = state
+                    .thread_statuses
+                    .iter_mut()
+                    .find(|current| current.thread_id == thread_id)
+                    .ok_or_else(|| ApplyError::new("thread does not exist"))?;
+                current.status = status;
                 Ok(ControllerChange::Thread(thread_id))
             }
             Self::ProviderUpdated { provider } => {
@@ -203,6 +251,27 @@ impl ControllerOperation {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Idle,
+    Running,
+    Compacting,
+    AwaitingQuestion,
+    AwaitingApproval,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadStatus {
+    thread_id: ThreadId,
+    status: AgentStatus,
 }
 
 fn upsert_by<T, K: PartialEq>(values: &mut Vec<T>, value: T, key: impl Fn(&T) -> &K) {
@@ -1051,6 +1120,9 @@ pub enum Command {
     ThreadDelete {
         thread_id: ThreadId,
     },
+    ThreadDeleteRecursive {
+        thread_id: ThreadId,
+    },
     ThreadSetModel {
         thread_id: ThreadId,
         provider: String,
@@ -1203,6 +1275,7 @@ mod tests {
     fn thread() -> Thread {
         Thread {
             id: ThreadId(1),
+            parent_thread_id: None,
             display_name: None,
             provider: "fake".to_owned(),
             model: "test".to_owned(),

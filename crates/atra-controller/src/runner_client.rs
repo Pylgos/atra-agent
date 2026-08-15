@@ -1,5 +1,8 @@
 use std::{
+    any::Any,
     collections::HashMap,
+    future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -9,15 +12,73 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::ApplyPatchResult;
 use atra_protocol::{
-    CommandOutput, ProcessHandle, ProcessStatus, ProcessTiming, RunnerRequest,
-    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
+    AgentRequest, CommandOutput, ControllerRunnerMessage, ProcessHandle, ProcessStatus,
+    ProcessTiming, RunnerCallbackResponseEnvelope, RunnerControllerMessage, RunnerRequest,
+    RunnerRequestEnvelope, RunnerResponse, SpawnedProcess,
 };
 use atra_store::TreeManifest;
+use futures_util::FutureExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{Mutex, oneshot, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
 };
+
+use crate::State;
+
+pub(super) struct CallbackEvent {
+    pub(super) callback_id: u64,
+    pub(super) execution_context: String,
+    pub(super) request: AgentRequest,
+    pub(super) stdin: Arc<Mutex<ChildStdin>>,
+    pub(super) cancelled: oneshot::Receiver<()>,
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
+}
+
+async fn callback_response(
+    operation: impl Future<Output = atra_protocol::AgentResponse>,
+) -> atra_protocol::AgentResponse {
+    match AssertUnwindSafe(operation).catch_unwind().await {
+        Ok(response) => response,
+        Err(payload) => atra_protocol::AgentResponse {
+            output: format!("agent callback panicked: {}", panic_message(payload)),
+            success: false,
+        },
+    }
+}
+
+async fn write_callback_response(
+    stdin: &Mutex<ChildStdin>,
+    callback_id: u64,
+    response: atra_protocol::AgentResponse,
+) {
+    let message = ControllerRunnerMessage::CallbackResponse(RunnerCallbackResponseEnvelope {
+        callback_id,
+        response,
+    });
+    if let Ok(mut encoded) = serde_json::to_vec(&message) {
+        encoded.push(b'\n');
+        let _ = stdin.lock().await.write_all(&encoded).await;
+    }
+}
+
+pub(super) async fn execute_callback(
+    state: Arc<State>,
+    callback_id: u64,
+    execution_context: String,
+    request: AgentRequest,
+    stdin: Arc<Mutex<ChildStdin>>,
+) {
+    let response = callback_response(state.handle_agent_request(&execution_context, request)).await;
+    write_callback_response(&stdin, callback_id, response).await;
+}
 
 pub(super) struct RunnerClient {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -94,7 +155,12 @@ pub(super) struct StartedProcess {
 }
 
 impl RunnerClient {
-    pub(super) fn new(stdin: ChildStdin, stdout: ChildStdout, name: &str) -> Self {
+    pub(super) fn new(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        name: &str,
+        callback_events: mpsc::UnboundedSender<CallbackEvent>,
+    ) -> Self {
         let stdin = Arc::new(Mutex::new(stdin));
         let reader_stdin = Arc::clone(&stdin);
         let pending = Arc::new(StdMutex::new(
@@ -112,12 +178,13 @@ impl RunnerClient {
         tokio::spawn(async move {
             let mut stdout = BufReader::new(stdout);
             let mut line = String::new();
+            let mut callback_cancellations = HashMap::new();
             loop {
                 line.clear();
                 match stdout.read_line(&mut line).await {
                     Ok(0) => break,
-                    Ok(_) => match serde_json::from_str::<RunnerResponseEnvelope>(&line) {
-                        Ok(envelope) => {
+                    Ok(_) => match serde_json::from_str::<RunnerControllerMessage>(&line) {
+                        Ok(RunnerControllerMessage::Response(envelope)) => {
                             let subscription = reader_subscriptions
                                 .lock()
                                 .unwrap()
@@ -171,10 +238,12 @@ impl RunnerClient {
                                 {
                                     let request_id =
                                         reader_next_request_id.fetch_add(1, Ordering::Relaxed);
-                                    let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
-                                        request_id,
-                                        request: RunnerRequest::StopProcess { process_handle },
-                                    })
+                                    let mut request = serde_json::to_vec(
+                                        &ControllerRunnerMessage::Request(RunnerRequestEnvelope {
+                                            request_id,
+                                            request: RunnerRequest::StopProcess { process_handle },
+                                        }),
+                                    )
                                     .expect("runner stop request should encode");
                                     request.push(b'\n');
                                     if let Err(error) =
@@ -193,6 +262,46 @@ impl RunnerClient {
                                     request_id = envelope.request_id,
                                     "runner returned an unknown request ID"
                                 );
+                            }
+                        }
+                        Ok(RunnerControllerMessage::CallbackRequest(envelope)) => {
+                            let callback_id = envelope.callback_id;
+                            callback_cancellations.retain(
+                                |_, cancellation: &mut oneshot::Sender<()>| {
+                                    !cancellation.is_closed()
+                                },
+                            );
+                            let (cancellation, cancelled) = oneshot::channel();
+                            if let Some(previous) =
+                                callback_cancellations.insert(callback_id, cancellation)
+                            {
+                                let _ = previous.send(());
+                            }
+                            let event = CallbackEvent {
+                                callback_id,
+                                execution_context: envelope.execution_context,
+                                request: envelope.request,
+                                stdin: Arc::clone(&reader_stdin),
+                                cancelled,
+                            };
+                            if let Err(error) = callback_events.send(event) {
+                                let stdin = error.0.stdin;
+                                write_callback_response(
+                                    &stdin,
+                                    callback_id,
+                                    atra_protocol::AgentResponse {
+                                        output: "controller is stopping".to_owned(),
+                                        success: false,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(RunnerControllerMessage::CallbackCancel(envelope)) => {
+                            if let Some(cancellation) =
+                                callback_cancellations.remove(&envelope.callback_id)
+                            {
+                                let _ = cancellation.send(());
                             }
                         }
                         Err(error) => {
@@ -214,6 +323,7 @@ impl RunnerClient {
                     }
                 }
             }
+            callback_cancellations.clear();
             for (_, sender) in reader_pending.lock().unwrap().drain() {
                 let _ = sender.send(RunnerResponse::Error {
                     message: format!("runner {runner_name} disconnected"),
@@ -244,6 +354,7 @@ impl RunnerClient {
         environment: atra_protocol::CommandEnvironment,
         process_id: atra_protocol::ProcessId,
         process_prefix: String,
+        execution_context: String,
     ) -> Result<StartedProcess> {
         match self
             .request_raw(RunnerRequest::StartCommand {
@@ -251,6 +362,7 @@ impl RunnerClient {
                 environment,
                 process_id,
                 process_prefix,
+                execution_context,
             })
             .await?
         {
@@ -276,11 +388,12 @@ impl RunnerClient {
             .lock()
             .unwrap()
             .insert(request_id, sender);
-        let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
-            request_id,
-            request: RunnerRequest::SubscribeProcess { process_handle },
-        })
-        .context("failed to encode runner subscription request")?;
+        let mut request =
+            serde_json::to_vec(&ControllerRunnerMessage::Request(RunnerRequestEnvelope {
+                request_id,
+                request: RunnerRequest::SubscribeProcess { process_handle },
+            }))
+            .context("failed to encode runner subscription request")?;
         request.push(b'\n');
         if let Err(error) = self.stdin.lock().await.write_all(&request).await {
             self.subscriptions.lock().unwrap().remove(&request_id);
@@ -411,11 +524,12 @@ impl RunnerClient {
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().unwrap().insert(request_id, sender);
 
-        let mut request = serde_json::to_vec(&RunnerRequestEnvelope {
-            request_id,
-            request,
-        })
-        .context("failed to encode runner request")?;
+        let mut request =
+            serde_json::to_vec(&ControllerRunnerMessage::Request(RunnerRequestEnvelope {
+                request_id,
+                request,
+            }))
+            .context("failed to encode runner request")?;
         request.push(b'\n');
         if let Err(error) = self.stdin.lock().await.write_all(&request).await {
             self.pending.lock().unwrap().remove(&request_id);
@@ -473,5 +587,20 @@ mod tests {
         assert_eq!(terminal.output_tail, "final");
         assert_eq!(terminal.omitted_bytes, 2);
         assert!(subscription.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn panicking_callback_becomes_failure() {
+        let response = callback_response(async {
+            panic!("injected callback panic");
+            #[allow(unreachable_code)]
+            atra_protocol::AgentResponse {
+                output: String::new(),
+                success: true,
+            }
+        })
+        .await;
+        assert!(!response.success);
+        assert!(response.output.contains("injected callback panic"));
     }
 }

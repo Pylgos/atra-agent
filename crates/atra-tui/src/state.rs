@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use atra_protocol::{
     CheckpointId, EventSequence, InteractionId, Model, PendingQuestionRequest, ProcessId,
-    QuestionAnswer, TurnPhase,
+    QuestionAnswer, ThreadId, TurnPhase,
 };
 
 use crate::{input::InputBuffer, layout::SelectionPoint};
@@ -237,6 +237,39 @@ impl ModelPicker {
 pub(crate) struct ThreadPicker {
     pub(crate) selected: usize,
     pub(crate) state: ThreadPickerState,
+    pub(crate) collapsed: HashSet<ThreadId>,
+}
+
+pub(crate) fn visible_threads<'a>(
+    threads: &'a [atra_protocol::Thread],
+    collapsed: &HashSet<ThreadId>,
+) -> Vec<(&'a atra_protocol::Thread, usize)> {
+    let by_parent = threads.iter().fold(
+        HashMap::<Option<ThreadId>, Vec<_>>::new(),
+        |mut map, thread| {
+            map.entry(thread.parent_thread_id).or_default().push(thread);
+            map
+        },
+    );
+    fn append<'a>(
+        parent: Option<ThreadId>,
+        depth: usize,
+        map: &HashMap<Option<ThreadId>, Vec<&'a atra_protocol::Thread>>,
+        collapsed: &HashSet<ThreadId>,
+        output: &mut Vec<(&'a atra_protocol::Thread, usize)>,
+    ) {
+        if let Some(children) = map.get(&parent) {
+            for thread in children {
+                output.push((thread, depth));
+                if !collapsed.contains(&thread.id) {
+                    append(Some(thread.id), depth + 1, map, collapsed, output);
+                }
+            }
+        }
+    }
+    let mut output = Vec::new();
+    append(None, 0, &by_parent, collapsed, &mut output);
+    output
 }
 
 pub(crate) enum ThreadPickerState {

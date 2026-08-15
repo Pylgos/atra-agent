@@ -1,5 +1,17 @@
 use super::*;
+use crate::lifecycle::ActiveTurn;
 use futures_util::StreamExt;
+
+struct ExecutionContextGuard {
+    contexts: Arc<StdMutex<HashMap<String, ThreadId>>>,
+    context: String,
+}
+
+impl Drop for ExecutionContextGuard {
+    fn drop(&mut self) {
+        self.contexts.lock().unwrap().remove(&self.context);
+    }
+}
 
 fn command_timer_state(timing: &atra_protocol::ProcessTiming) -> CommandTimerState {
     let elapsed_ms = timing.active_elapsed_ms.min(FOREGROUND_TIMEOUT_MS);
@@ -99,9 +111,12 @@ impl State {
         active: Arc<lifecycle::ActiveTurn>,
         updates: &TurnProjector,
     ) -> Result<TurnCompletion> {
-        let mut cancel_requested = active.cancel_requested();
-        let mut cancellation = active.cancellation();
-        let mut turn = Box::pin(async {
+        let thread_id = match &request {
+            TurnRequest::Send { thread_id, .. }
+            | TurnRequest::Continue { thread_id, .. }
+            | TurnRequest::Compact { thread_id, .. } => *thread_id,
+        };
+        let mut turn = Box::pin(async move {
             match request {
                 TurnRequest::Send {
                     thread_id,
@@ -127,52 +142,16 @@ impl State {
                 }
             }
         });
-        let completed = tokio::select! {
+        let response = tokio::select! {
             biased;
-            changed = cancel_requested.changed() => {
-                changed.context("turn cancellation channel closed")?;
-                None
+            () = active.cancelled() => {
+                drop(turn);
+                return self.complete_turn_cancellation(thread_id, &active).await;
             }
-            response = &mut turn => Some(response),
+            response = &mut turn => response,
         };
-        let mut response = if let Some(response) = completed {
-            response
-        } else {
-            drop(turn);
-            cancellation
-                .changed()
-                .await
-                .context("turn cancellation channel closed")?;
-            match cancellation
-                .borrow()
-                .clone()
-                .expect("cancellation completed")
-            {
-                Ok(()) => Ok(TurnCompletion::Cancelled),
-                Err(message) => Err(anyhow!(message)),
-            }
-        };
-        if active.is_cancelling() && !matches!(response, Ok(TurnCompletion::Cancelled)) {
-            if !*cancel_requested.borrow() {
-                cancel_requested
-                    .changed()
-                    .await
-                    .context("turn cancellation channel closed")?;
-            }
-            if cancellation.borrow().is_none() {
-                cancellation
-                    .changed()
-                    .await
-                    .context("turn cancellation channel closed")?;
-            }
-            response = match cancellation
-                .borrow()
-                .clone()
-                .expect("cancellation completed")
-            {
-                Ok(()) => Ok(TurnCompletion::Cancelled),
-                Err(message) => Err(anyhow!(message)),
-            };
+        if active.is_cancelling() {
+            return self.complete_turn_cancellation(thread_id, &active).await;
         }
         response
     }
@@ -183,7 +162,6 @@ impl State {
         allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
-        let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
@@ -216,7 +194,6 @@ impl State {
         allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
-        let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
@@ -281,7 +258,6 @@ impl State {
         if pending.is_empty() {
             return Ok(());
         }
-        self.turns.clear_interactions(thread_id).await;
         for call in pending {
             let (name, call_id, custom) = match &call {
                 ToolCallEvent::Custom { name, call_id, .. } => {
@@ -305,42 +281,36 @@ impl State {
         Ok(())
     }
 
-    pub(super) async fn cancel_thread(&self, thread_id: ThreadId) -> Result<bool> {
-        let Some(active) = self.turns.begin_cancellation(thread_id).await else {
-            return Ok(false);
-        };
+    async fn complete_turn_cancellation(
+        &self,
+        thread_id: ThreadId,
+        active: &ActiveTurn,
+    ) -> Result<TurnCompletion> {
+        let publish = self.views.start_cancellation(thread_id).await;
         let stop = active.request_cancellation().await;
-        let cleanup = async {
-            let _guard = self.thread_lock(thread_id).lock_owned().await;
-            self.turns.clear_interactions(thread_id).await;
-            self.prepare_thread_for_turn(thread_id, None).await
-        }
-        .await;
-        let result = match (stop, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(stop), Ok(())) => Err(stop),
-            (Ok(()), Err(cleanup)) => Err(cleanup),
-            (Err(stop), Err(cleanup)) => {
-                Err(stop.context(format!("turn cleanup also failed: {cleanup:#}")))
+        self.turns.clear_interactions(thread_id);
+        let cleanup = self.prepare_thread_for_turn(thread_id, None).await;
+        let result = match (publish, stop, cleanup) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(publish), Ok(()), Ok(())) => Err(publish),
+            (Ok(()), Err(stop), Ok(())) => Err(stop),
+            (Ok(()), Ok(()), Err(cleanup)) => Err(cleanup),
+            (publish, stop, cleanup) => {
+                let mut failures = Vec::new();
+                if let Err(error) = publish {
+                    failures.push(format!("failed to publish cancellation: {error:#}"));
+                }
+                if let Err(error) = stop {
+                    failures.push(format!("failed to stop active process: {error:#}"));
+                }
+                if let Err(error) = cleanup {
+                    failures.push(format!("failed to clean up cancelled turn: {error:#}"));
+                }
+                Err(anyhow!(failures.join("; ")))
             }
         };
-        let outcome = result.map_err(|error| format!("{error:#}"));
-        active.complete_cancellation(outcome.clone());
-        outcome.map(|()| true).map_err(anyhow::Error::msg)
-    }
-
-    pub(super) fn thread_lock(&self, thread_id: ThreadId) -> Arc<Mutex<()>> {
-        Arc::clone(
-            self.thread_locks
-                .lock()
-                .unwrap()
-                .entry(thread_id)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    }
-
-    pub(super) async fn ensure_no_pending_interaction(&self, thread_id: ThreadId) -> Result<()> {
-        self.turns.ensure_no_pending_interaction(thread_id).await
+        result?;
+        Ok(TurnCompletion::Cancelled)
     }
 
     pub(super) async fn compact_thread(
@@ -349,7 +319,6 @@ impl State {
         allow_questions: bool,
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
-        let _guard = self.thread_lock(thread_id).lock_owned().await;
         self.prepare_thread_for_turn(thread_id, updates).await?;
         self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
@@ -422,7 +391,7 @@ impl State {
         )
         .await
         .context("failed to save compaction request")?;
-        {
+        let checkpoint_id = {
             let _mutation = self.lock_mutation().await?;
             let checkpoint_id = self
                 .store
@@ -433,7 +402,8 @@ impl State {
                 let checkpoint = self.store.checkpoint(checkpoint_id).await?;
                 updates.checkpoint_added(checkpoint).await?;
             }
-        }
+            checkpoint_id
+        };
         let Some(items) = model_session.compact(model_request).await? else {
             return Ok(false);
         };
@@ -449,6 +419,7 @@ impl State {
                     thread_id,
                     CompactionEvent {
                         items: serde_json::to_value(items).map_err(|error| anyhow!(error))?,
+                        checkpoint_id,
                     },
                     workspace_event,
                     skill_event(model_request.events),
@@ -1017,7 +988,7 @@ impl State {
                 } => {
                     if name == "question" && allow_questions {
                         let questions = parse_questions(arguments)?;
-                        let (request_id, answer) = self.turns.register_question(thread_id).await?;
+                        let (request_id, answer) = self.turns.register_question(thread_id)?;
                         updates
                             .context("question requires a streaming turn")?
                             .interaction_requested(atra_protocol::PendingInteraction::Questions(
@@ -1168,7 +1139,7 @@ impl State {
         let decision = if runner.approval().await == ApprovalPolicy::Ask {
             let arguments_json =
                 serde_json::to_value(&arguments).context("failed to encode approval arguments")?;
-            let (approval_id, approval) = self.turns.register_approval(thread_id).await?;
+            let (approval_id, approval) = self.turns.register_approval(thread_id)?;
             updates
                 .context("approval requires a streaming turn")?
                 .interaction_requested(atra_protocol::PendingInteraction::Approval(
@@ -1207,15 +1178,15 @@ impl State {
     pub(super) async fn claim_approval(
         &self,
         approval_id: InteractionId,
-    ) -> Result<lifecycle::InteractionWaiter> {
-        self.turns.claim_approval(approval_id).await
+    ) -> Result<(ThreadId, lifecycle::InteractionWaiter)> {
+        self.turns.claim_approval(approval_id)
     }
 
     pub(super) async fn claim_questions(
         &self,
         request_id: InteractionId,
-    ) -> Result<lifecycle::InteractionWaiter> {
-        self.turns.claim_questions(request_id).await
+    ) -> Result<(ThreadId, lifecycle::InteractionWaiter)> {
+        self.turns.claim_questions(request_id)
     }
 
     pub(super) async fn execute(
@@ -1232,14 +1203,27 @@ impl State {
         let active = self
             .turns
             .get(thread_id)
-            .await
             .context("thread has no active turn")?;
         let process_id = self
             .runners
             .generate_process_id(thread_id, &runner_name)
             .await;
+        let execution_context = format!("{}-{}", thread_id, atra_id::generate().replace(' ', "-"));
+        self.execution_contexts
+            .lock()
+            .unwrap()
+            .insert(execution_context.clone(), thread_id);
+        let _execution_context = ExecutionContextGuard {
+            contexts: Arc::clone(&self.execution_contexts),
+            context: execution_context.clone(),
+        };
         let started = runner
-            .start_command(arguments.command, thread_id, &process_id)
+            .start_command(
+                arguments.command,
+                thread_id,
+                &process_id,
+                Some(execution_context),
+            )
             .await?;
         let process_handle = started.handle;
         active.set_process(Arc::clone(&runner), process_handle.clone());

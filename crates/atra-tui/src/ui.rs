@@ -326,7 +326,7 @@ impl App {
             render_model_picker(frame, picker);
         }
         if let Overlay::ThreadPicker(picker) = &self.overlay {
-            render_thread_picker(frame, picker, self.threads());
+            render_thread_picker(frame, picker, self.controller_subscription.state());
         }
         if let Overlay::Processes(picker) = &self.overlay {
             render_process_picker(
@@ -440,6 +440,22 @@ impl App {
         let mut spans = self.current_status();
         if !spans.is_empty() {
             spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
+        if let Some(current) = self.target.thread_id() {
+            let mut path = Vec::new();
+            let mut id = Some(current);
+            while let Some(current) = id {
+                let Some(thread) = self.threads().iter().find(|thread| thread.id == current) else {
+                    break;
+                };
+                path.push(breadcrumb_name(thread.display_name.as_deref()));
+                id = thread.parent_thread_id;
+            }
+            path.reverse();
+            if !path.is_empty() {
+                spans.push(Span::raw(path.join(" › ")));
+                spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            }
         }
         let selected = self
             .threads()
@@ -809,6 +825,11 @@ impl App {
     }
 }
 
+fn breadcrumb_name(name: Option<&str>) -> String {
+    name.map(|name| expand_tabs(&sanitize(name)).replace('\n', " "))
+        .unwrap_or_else(|| "Untitled".to_owned())
+}
+
 fn question_form_height(form: &QuestionForm, available: u16) -> u16 {
     let desired = if matches!(
         form.mode,
@@ -992,10 +1013,12 @@ fn rounded_divide(numerator: usize, denominator: usize) -> usize {
 fn render_thread_picker(
     frame: &mut Frame<'_>,
     picker: &ThreadPicker,
-    threads: &[atra_protocol::Thread],
+    controller: &atra_protocol::ControllerState,
 ) {
+    let threads = controller.threads();
     let width = frame.area().width.saturating_sub(8).min(72);
-    let height = (threads.len() as u16 + 2)
+    let visible = crate::state::visible_threads(threads, &picker.collapsed);
+    let height = (visible.len() as u16 + 2)
         .min(frame.area().height.saturating_sub(4))
         .max(3);
     let area = Rect::new(
@@ -1004,19 +1027,66 @@ fn render_thread_picker(
         width,
         height,
     );
-    let items = threads
+    let items = visible
         .iter()
-        .map(|thread| {
+        .map(|(thread, depth)| {
             let display_name = thread
                 .display_name
                 .as_deref()
                 .map(|name| expand_tabs(&sanitize(name)).replace('\n', " "))
                 .unwrap_or_else(|| "Untitled thread".to_owned());
-            ListItem::new(display_name)
+            let has_children = threads
+                .iter()
+                .any(|candidate| candidate.parent_thread_id == Some(thread.id));
+            let marker = if !has_children {
+                "  "
+            } else if picker.collapsed.contains(&thread.id) {
+                "▸ "
+            } else {
+                "▾ "
+            };
+            let aggregate = if picker.collapsed.contains(&thread.id) {
+                let mut pending = vec![thread.id];
+                let mut running = 0;
+                let mut questions = 0;
+                let mut approvals = 0;
+                while let Some(parent) = pending.pop() {
+                    for child in threads
+                        .iter()
+                        .filter(|candidate| candidate.parent_thread_id == Some(parent))
+                    {
+                        pending.push(child.id);
+                        match controller.thread_status(child.id) {
+                            Some(
+                                atra_protocol::AgentStatus::Running
+                                | atra_protocol::AgentStatus::Compacting
+                                | atra_protocol::AgentStatus::Cancelling,
+                            ) => running += 1,
+                            Some(atra_protocol::AgentStatus::AwaitingQuestion) => questions += 1,
+                            Some(atra_protocol::AgentStatus::AwaitingApproval) => approvals += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                if running + questions + approvals == 0 {
+                    String::new()
+                } else {
+                    format!("  [▶{running} ?{questions} !{approvals}]")
+                }
+            } else {
+                String::new()
+            };
+            ListItem::new(format!(
+                "{}{}{}{}",
+                "  ".repeat(*depth),
+                marker,
+                display_name,
+                aggregate
+            ))
         })
         .collect::<Vec<_>>();
     let mut state =
-        ListState::default().with_selected((!threads.is_empty()).then_some(picker.selected));
+        ListState::default().with_selected((!visible.is_empty()).then_some(picker.selected));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("● ").block(
@@ -1032,7 +1102,23 @@ fn render_thread_picker(
     );
 
     match picker.state {
-        ThreadPickerState::ConfirmingDelete => render_delete_confirmation(frame, area),
+        ThreadPickerState::ConfirmingDelete => {
+            let count = visible.get(picker.selected).map_or(0, |(selected, _)| {
+                let mut descendants = vec![selected.id];
+                let mut count = 0;
+                while let Some(parent) = descendants.pop() {
+                    for child in threads
+                        .iter()
+                        .filter(|thread| thread.parent_thread_id == Some(parent))
+                    {
+                        count += 1;
+                        descendants.push(child.id);
+                    }
+                }
+                count
+            });
+            render_delete_confirmation(frame, area, count)
+        }
         ThreadPickerState::Deleting => render_delete_progress(frame, area),
         ThreadPickerState::Selecting => {
             render_progress(frame, area, "Please wait", "Loading thread…")
@@ -1041,7 +1127,7 @@ fn render_thread_picker(
     }
 }
 
-fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect) {
+fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect, descendants: usize) {
     let width = area.width.saturating_sub(8).min(54);
     let confirmation = Rect::new(
         area.x + (area.width - width) / 2,
@@ -1051,7 +1137,12 @@ fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect) {
     );
     frame.render_widget(Clear, confirmation);
     frame.render_widget(
-        Paragraph::new("[y] Delete thread  [n] Cancel").block(
+        Paragraph::new(if descendants == 0 {
+            "[y] Delete thread  [n] Cancel".to_owned()
+        } else {
+            format!("[y] Delete thread + {descendants} descendants  [n] Cancel")
+        })
+        .block(
             Block::default()
                 .title("Delete thread?")
                 .borders(Borders::ALL),
@@ -1546,5 +1637,13 @@ mod tests {
             "resets_at": null
         })));
         assert!(has_quota_window(&json!({"used_percent": 0.0})));
+    }
+
+    #[test]
+    fn breadcrumb_name_is_single_line_and_removes_terminal_sequences() {
+        assert_eq!(
+            breadcrumb_name(Some("root\x1b[31m\nchild\tname")),
+            "root child   name"
+        );
     }
 }

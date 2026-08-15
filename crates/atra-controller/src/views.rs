@@ -40,6 +40,28 @@ struct ProcessView {
     subscribers: Vec<mpsc::UnboundedSender<ProcessSubscriptionMessage>>,
 }
 
+fn agent_status(state: &ThreadState) -> atra_protocol::AgentStatus {
+    if let Some(turn) = state.active_turn() {
+        if turn.pending_question().is_some() {
+            return atra_protocol::AgentStatus::AwaitingQuestion;
+        }
+        if turn.pending_approval().is_some() {
+            return atra_protocol::AgentStatus::AwaitingApproval;
+        }
+        return match turn.phase() {
+            atra_protocol::TurnPhase::Compacting => atra_protocol::AgentStatus::Compacting,
+            atra_protocol::TurnPhase::Cancelling => atra_protocol::AgentStatus::Cancelling,
+            _ => atra_protocol::AgentStatus::Running,
+        };
+    }
+    match state.last_outcome() {
+        Some(atra_protocol::TurnOutcome::Completed) => atra_protocol::AgentStatus::Completed,
+        Some(atra_protocol::TurnOutcome::Failed { .. }) => atra_protocol::AgentStatus::Failed,
+        Some(atra_protocol::TurnOutcome::Cancelled) => atra_protocol::AgentStatus::Cancelled,
+        None => atra_protocol::AgentStatus::Idle,
+    }
+}
+
 impl Views {
     pub(super) fn new(controller: ControllerState) -> Self {
         Self {
@@ -57,6 +79,15 @@ impl Views {
 
     pub(super) async fn has_thread(&self, thread_id: ThreadId) -> bool {
         self.inner.lock().await.threads.contains_key(&thread_id)
+    }
+
+    pub(super) async fn thread_state(&self, thread_id: ThreadId) -> Option<ThreadState> {
+        self.inner
+            .lock()
+            .await
+            .threads
+            .get(&thread_id)
+            .map(|view| view.state.clone())
     }
 
     pub(super) async fn has_checkpoint(&self, checkpoint_id: CheckpointId) -> bool {
@@ -418,17 +449,47 @@ impl Views {
     ) -> Result<()> {
         let mut inner = self.inner.lock().await;
         ensure_inner_running(&inner)?;
-        let view = inner
+        let mut thread_state = inner
             .threads
-            .get_mut(&thread_id)
-            .context("thread state is not loaded")?;
+            .get(&thread_id)
+            .context("thread state is not loaded")?
+            .state
+            .clone();
         operation
             .clone()
-            .apply(&mut view.state)
+            .apply(&mut thread_state)
             .context("failed to apply thread operation")?;
+        let status = agent_status(&thread_state);
+        let controller_operation = (inner.controller.state.thread_status(thread_id)
+            != Some(status))
+        .then_some(ControllerOperation::ThreadStatusUpdated { thread_id, status });
+        let mut controller_state = inner.controller.state.clone();
+        if let Some(controller_operation) = &controller_operation {
+            controller_operation
+                .clone()
+                .apply(&mut controller_state)
+                .context("failed to update thread status")?;
+        }
+        inner
+            .threads
+            .get_mut(&thread_id)
+            .expect("thread state was cloned under the same lock")
+            .state = thread_state;
+        inner.controller.state = controller_state;
         let message = ThreadSubscriptionMessage::Operation { operation };
-        view.subscribers
+        inner
+            .threads
+            .get_mut(&thread_id)
+            .expect("thread state was committed under the same lock")
+            .subscribers
             .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+        if let Some(operation) = controller_operation {
+            let message = ControllerSubscriptionMessage::Operation { operation };
+            inner
+                .controller
+                .subscribers
+                .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+        }
         Ok(())
     }
 
@@ -470,58 +531,24 @@ impl Views {
 
     pub(super) async fn resolve_interaction(
         &self,
+        thread_id: ThreadId,
         interaction_id: atra_protocol::InteractionId,
-    ) -> Result<ThreadId> {
-        let mut inner = self.inner.lock().await;
-        ensure_inner_running(&inner)?;
-        let thread_id = inner
-            .threads
-            .iter()
-            .find_map(|(thread_id, view)| {
-                view.state
-                    .active_turn()
-                    .and_then(|turn| turn.pending_interaction())
-                    .is_some_and(|interaction| interaction.id() == interaction_id)
-                    .then_some(*thread_id)
-            })
-            .context("interaction is not pending in public state")?;
-        let view = inner.threads.get_mut(&thread_id).unwrap();
-        let operation = ThreadOperation::InteractionResolved { interaction_id };
-        operation
-            .clone()
-            .apply(&mut view.state)
-            .context("failed to resolve interaction in public state")?;
-        let message = ThreadSubscriptionMessage::Operation { operation };
-        view.subscribers
-            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
-        Ok(thread_id)
+    ) -> Result<()> {
+        self.apply_thread(
+            thread_id,
+            ThreadOperation::InteractionResolved { interaction_id },
+        )
+        .await
     }
 
     pub(super) async fn start_cancellation(&self, thread_id: ThreadId) -> Result<()> {
-        let mut inner = self.inner.lock().await;
-        ensure_inner_running(&inner)?;
-        let view = inner
-            .threads
-            .get_mut(&thread_id)
-            .context("thread state is not loaded")?;
-        let turn = view
-            .state
-            .active_turn()
-            .context("thread has no active turn")?;
-        if turn.phase() == atra_protocol::TurnPhase::Cancelling {
-            bail!("thread cancellation is already in progress");
-        }
-        let operation = ThreadOperation::PhaseChanged {
-            phase: atra_protocol::TurnPhase::Cancelling,
-        };
-        operation
-            .clone()
-            .apply(&mut view.state)
-            .context("failed to start cancellation")?;
-        let message = ThreadSubscriptionMessage::Operation { operation };
-        view.subscribers
-            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
-        Ok(())
+        self.apply_thread(
+            thread_id,
+            ThreadOperation::PhaseChanged {
+                phase: atra_protocol::TurnPhase::Cancelling,
+            },
+        )
+        .await
     }
 
     pub(super) async fn synchronize_process(
@@ -621,57 +648,81 @@ impl Views {
         ))
     }
 
-    pub(super) async fn delete_thread(&self, thread_id: ThreadId) -> Result<()> {
+    pub(super) async fn validate_delete_threads(&self, thread_ids: &[ThreadId]) -> Result<()> {
+        let inner = self.inner.lock().await;
+        let mut controller = inner.controller.state.clone();
+        for thread_id in thread_ids {
+            if controller
+                .threads()
+                .iter()
+                .any(|thread| thread.id == *thread_id)
+            {
+                ControllerOperation::ThreadRemoved {
+                    thread_id: *thread_id,
+                }
+                .apply(&mut controller)
+                .context("failed to project subtree removal")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn delete_threads(&self, thread_ids: &[ThreadId]) {
         let mut inner = self.inner.lock().await;
-        if let Some(view) = inner.threads.remove(&thread_id) {
-            terminal_thread(view.subscribers, SubscriptionTerminal::Deleted);
-        }
-        let checkpoints = inner
-            .checkpoints
-            .iter()
-            .filter_map(|(id, view)| (view.state.metadata().thread_id == thread_id).then_some(*id))
-            .collect::<Vec<_>>();
-        for checkpoint_id in checkpoints {
-            let view = inner
-                .checkpoints
-                .remove(&checkpoint_id)
-                .expect("checkpoint was collected from the same map");
-            terminal_checkpoint(view.subscribers, SubscriptionTerminal::Deleted);
-        }
-        let processes = inner
-            .processes
-            .keys()
-            .filter(|process| process.thread_id() == thread_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        for process in processes {
-            let view = inner
-                .processes
-                .remove(&process)
-                .expect("process was collected from the same map");
-            terminal_process(view.subscribers, SubscriptionTerminal::Deleted);
-        }
-        if inner
-            .controller
-            .state
-            .threads()
-            .iter()
-            .any(|thread| thread.id == thread_id)
-        {
-            let operation = ControllerOperation::ThreadRemoved { thread_id };
-            operation
-                .clone()
-                .apply(&mut inner.controller.state)
-                .context("failed to remove thread from controller state")?;
+        for thread_id in thread_ids {
+            if !inner
+                .controller
+                .state
+                .threads()
+                .iter()
+                .any(|thread| thread.id == *thread_id)
+            {
+                continue;
+            }
+            let operation = ControllerOperation::ThreadRemoved {
+                thread_id: *thread_id,
+            };
+            operation.clone().apply(&mut inner.controller.state).expect(
+                "subtree removal was prevalidated and committed thread IDs cannot reappear",
+            );
             let message = ControllerSubscriptionMessage::Operation { operation };
             inner
                 .controller
                 .subscribers
                 .retain(|subscriber| subscriber.send(message.clone()).is_ok());
-        } else {
-            bail!("thread does not exist in controller state");
         }
-        Ok(())
+        for thread_id in thread_ids {
+            if let Some(view) = inner.threads.remove(thread_id) {
+                terminal_thread(view.subscribers, SubscriptionTerminal::Deleted);
+            }
+            let checkpoints = inner
+                .checkpoints
+                .iter()
+                .filter_map(|(id, view)| {
+                    (view.state.metadata().thread_id == *thread_id).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for checkpoint_id in checkpoints {
+                let view = inner
+                    .checkpoints
+                    .remove(&checkpoint_id)
+                    .expect("checkpoint was collected from the same map");
+                terminal_checkpoint(view.subscribers, SubscriptionTerminal::Deleted);
+            }
+            let processes = inner
+                .processes
+                .keys()
+                .filter(|process| process.thread_id() == *thread_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for process in processes {
+                let view = inner
+                    .processes
+                    .remove(&process)
+                    .expect("process was collected from the same map");
+                terminal_process(view.subscribers, SubscriptionTerminal::Deleted);
+            }
+        }
     }
 
     pub(super) async fn shutdown(&self) -> Result<()> {
@@ -816,6 +867,7 @@ mod tests {
             atra_protocol::ControllerLifecycle::Running,
             vec![atra_protocol::Thread {
                 id: thread_id,
+                parent_thread_id: None,
                 display_name: None,
                 provider: "fake".to_owned(),
                 model: "test".to_owned(),
@@ -829,6 +881,7 @@ mod tests {
                 ThreadState::materialize(
                     atra_protocol::Thread {
                         id: thread_id,
+                        parent_thread_id: None,
                         display_name: None,
                         provider: "fake".to_owned(),
                         model: "test".to_owned(),

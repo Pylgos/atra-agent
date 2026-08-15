@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -17,17 +17,22 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_patch::apply;
 use atra_protocol::{
-    CommandEnvironment, CommandOutput, ProcessHandle, ProcessStatus, ProcessTiming, RunnerRequest,
-    RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
+    AgentControlRequestEnvelope, AgentControlResponseEnvelope, AgentResponse, CommandEnvironment,
+    CommandOutput, ControllerRunnerMessage, ProcessHandle, ProcessStatus, ProcessTiming,
+    RunnerCallbackCancelEnvelope, RunnerCallbackRequestEnvelope, RunnerControllerMessage,
+    RunnerRequest, RunnerRequestEnvelope, RunnerResponse, RunnerResponseEnvelope, SpawnedProcess,
 };
 use atra_store::{PreparedTree, Store};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
-    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{
+        self, AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{Mutex, Notify, watch},
+    sync::{Mutex, Notify, oneshot, watch},
     time::{Instant, sleep, sleep_until, timeout},
 };
 
@@ -48,9 +53,15 @@ async fn serve(
     {
         bail!("controller disconnected before initializing runner");
     }
-    let envelope: RunnerRequestEnvelope =
-        serde_json::from_str(&line).context("failed to decode runner initialize request")?;
-    let writer = Arc::new(Mutex::new(writer));
+    let envelope =
+        match serde_json::from_str(&line).context("failed to decode runner initialize request")? {
+            ControllerRunnerMessage::Request(envelope) => envelope,
+            ControllerRunnerMessage::CallbackResponse(_) => {
+                bail!("runner received a callback response before initialization")
+            }
+        };
+    let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+        Arc::new(Mutex::new(Box::new(writer)));
     let store = Arc::new(runner_store()?);
     let response = match envelope.request {
         RunnerRequest::Initialize => RunnerResponse::Ready,
@@ -65,6 +76,7 @@ async fn serve(
     )
     .await?;
 
+    let callbacks = Arc::new(CallbackBridge::new(Arc::clone(&writer)));
     let processes = Arc::new(ProcessManager::new()?);
     let listener = UnixListener::bind(&processes.control_endpoint).with_context(|| {
         format!(
@@ -72,19 +84,40 @@ async fn serve(
             processes.control_endpoint.display()
         )
     })?;
-    tokio::spawn(serve_control(listener, Arc::clone(&processes)));
+    tokio::spawn(serve_control(
+        listener,
+        Arc::clone(&processes),
+        Arc::clone(&callbacks),
+    ));
     loop {
         line.clear();
-        if reader
-            .read_line(&mut line)
-            .await
-            .context("failed to read runner request")?
-            == 0
-        {
+        let bytes = match reader.read_line(&mut line).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                callbacks.close().await;
+                return Err(error).context("failed to read runner request");
+            }
+        };
+        if bytes == 0 {
+            callbacks.close().await;
             return Ok(());
         }
-        let envelope: RunnerRequestEnvelope =
-            serde_json::from_str(&line).context("failed to decode runner request")?;
+        let message: ControllerRunnerMessage = match serde_json::from_str(&line) {
+            Ok(message) => message,
+            Err(error) => {
+                callbacks.close().await;
+                return Err(error).context("failed to decode runner request");
+            }
+        };
+        let envelope = match message {
+            ControllerRunnerMessage::Request(envelope) => envelope,
+            ControllerRunnerMessage::CallbackResponse(envelope) => {
+                callbacks
+                    .complete(envelope.callback_id, envelope.response)
+                    .await;
+                continue;
+            }
+        };
         let writer = Arc::clone(&writer);
         let processes = Arc::clone(&processes);
         let store = Arc::clone(&store);
@@ -186,10 +219,18 @@ async fn handle_request(
             environment,
             process_id,
             process_prefix,
+            execution_context,
         } => {
             tracing::debug!(%command, "starting command");
             let process = processes
-                .start(command, environment, process_id, process_prefix, None)
+                .start_with_context(
+                    command,
+                    environment,
+                    process_id,
+                    process_prefix,
+                    execution_context,
+                    None,
+                )
                 .await?;
             Ok(RunnerResponse::ProcessStarted {
                 process_handle: process.handle.clone(),
@@ -242,7 +283,11 @@ async fn handle_request(
     }
 }
 
-async fn serve_control(listener: UnixListener, processes: Arc<ProcessManager>) {
+async fn serve_control(
+    listener: UnixListener,
+    processes: Arc<ProcessManager>,
+    callbacks: Arc<CallbackBridge>,
+) {
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(connection) => connection,
@@ -252,15 +297,26 @@ async fn serve_control(listener: UnixListener, processes: Arc<ProcessManager>) {
             }
         };
         let processes = Arc::clone(&processes);
+        let callbacks = Arc::clone(&callbacks);
         tokio::spawn(async move {
-            if let Err(error) = serve_control_connection(stream, &processes).await {
+            if let Err(error) = serve_control_connection(stream, &processes, Some(&callbacks)).await
+            {
                 tracing::warn!(error = %format!("{error:#}"), "Runner control request failed");
             }
         });
     }
 }
 
-async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager) -> Result<()> {
+async fn serve_control_connection(
+    stream: UnixStream,
+    processes: &ProcessManager,
+    callbacks: Option<&CallbackBridge>,
+) -> Result<()> {
+    let peer_pid = stream
+        .peer_cred()
+        .context("failed to read Runner control peer credentials")?
+        .pid()
+        .context("Runner control peer did not provide a PID")?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -271,6 +327,39 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
         == 0
     {
         bail!("Runner control client disconnected before sending a request");
+    }
+    if let Ok(envelope) = serde_json::from_str::<AgentControlRequestEnvelope>(&line) {
+        let callbacks =
+            callbacks.context("agent operations are unavailable on this Runner connection")?;
+        let process = processes.process(&envelope.process_handle).await?;
+        process.authorize_control_peer(peer_pid)?;
+        let pause_timer = matches!(&envelope.request, atra_protocol::AgentRequest::Wait { .. });
+        let (callback_id, response) = callbacks
+            .begin(process.execution_context.clone(), envelope.request)
+            .await?;
+        let response = relay_agent_callback(
+            &mut reader,
+            &process,
+            callbacks,
+            callback_id,
+            response,
+            pause_timer,
+        )
+        .await?;
+        let Some(response) = response else {
+            return Ok(());
+        };
+        let mut encoded = serde_json::to_vec(&AgentControlResponseEnvelope {
+            request_id: envelope.request_id,
+            response,
+        })
+        .context("failed to encode agent control response")?;
+        encoded.push(b'\n');
+        writer
+            .write_all(&encoded)
+            .await
+            .context("failed to write agent control response")?;
+        return Ok(());
     }
     let envelope: RunnerRequestEnvelope =
         serde_json::from_str(&line).context("failed to decode Runner control request")?;
@@ -353,11 +442,70 @@ async fn serve_control_connection(stream: UnixStream, processes: &ProcessManager
         .context("failed to write Runner control response")
 }
 
+async fn relay_agent_callback(
+    reader: &mut (impl AsyncRead + Unpin),
+    process: &Arc<ManagedProcess>,
+    callbacks: &CallbackBridge,
+    callback_id: u64,
+    mut response: oneshot::Receiver<AgentResponse>,
+    pause_timer: bool,
+) -> Result<Option<AgentResponse>> {
+    enum Terminal {
+        Response(AgentResponse),
+        Cancel(Option<anyhow::Error>),
+    }
+
+    let terminal = {
+        let _active_wait = pause_timer.then(|| process.begin_wait());
+        let mut disconnected = [0];
+        tokio::select! {
+            response = &mut response => Terminal::Response(
+                response.context("Controller disconnected during agent request")?
+            ),
+            read = reader.read(&mut disconnected) => {
+                if callbacks.claim_cancel(callback_id).await {
+                    Terminal::Cancel(
+                        read.err().map(|error| {
+                            anyhow::Error::new(error)
+                                .context("failed to monitor agent control client")
+                        })
+                    )
+                } else {
+                    Terminal::Response(
+                        response.await.context("Controller disconnected during agent request")?
+                    )
+                }
+            }
+            result = process.wait_until_exit() => {
+                if callbacks.claim_cancel(callback_id).await {
+                    Terminal::Cancel(result.err())
+                } else {
+                    Terminal::Response(
+                        response.await.context("Controller disconnected during agent request")?
+                    )
+                }
+            }
+        }
+    };
+
+    match terminal {
+        Terminal::Response(response) => Ok(Some(response)),
+        Terminal::Cancel(error) => {
+            callbacks.send_cancel(callback_id).await;
+            match error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
 async fn write_response(
     writer: &Mutex<impl AsyncWrite + Unpin>,
     response: RunnerResponseEnvelope,
 ) -> Result<()> {
-    let mut response = serde_json::to_vec(&response).context("failed to encode runner response")?;
+    let mut response = serde_json::to_vec(&RunnerControllerMessage::Response(response))
+        .context("failed to encode runner response")?;
     response.push(b'\n');
     let mut writer = writer.lock().await;
     writer
@@ -393,6 +541,87 @@ fn runner_store() -> Result<Store> {
     Store::open(root)
 }
 
+struct CallbackBridge {
+    writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<AgentResponse>>>,
+    next_id: AtomicU64,
+    closed: AtomicBool,
+}
+
+impl CallbackBridge {
+    fn new(writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>) -> Self {
+        Self {
+            writer,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    async fn begin(
+        &self,
+        execution_context: String,
+        request: atra_protocol::AgentRequest,
+    ) -> Result<(u64, oneshot::Receiver<AgentResponse>)> {
+        if self.closed.load(Ordering::Acquire) {
+            bail!("Controller disconnected");
+        }
+        let callback_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = self.pending.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            bail!("Controller disconnected");
+        }
+        pending.insert(callback_id, sender);
+        drop(pending);
+        let message = RunnerControllerMessage::CallbackRequest(RunnerCallbackRequestEnvelope {
+            callback_id,
+            execution_context,
+            request,
+        });
+        let mut encoded =
+            serde_json::to_vec(&message).context("failed to encode agent callback")?;
+        encoded.push(b'\n');
+        if let Err(error) = self.writer.lock().await.write_all(&encoded).await {
+            self.pending.lock().await.remove(&callback_id);
+            return Err(error).context("failed to send agent callback");
+        }
+        Ok((callback_id, receiver))
+    }
+
+    async fn complete(&self, callback_id: u64, response: AgentResponse) {
+        if let Some(sender) = self.pending.lock().await.remove(&callback_id) {
+            let _ = sender.send(response);
+        }
+    }
+
+    #[cfg(test)]
+    async fn cancel(&self, callback_id: u64) {
+        if !self.claim_cancel(callback_id).await {
+            return;
+        }
+        self.send_cancel(callback_id).await;
+    }
+
+    async fn claim_cancel(&self, callback_id: u64) -> bool {
+        self.pending.lock().await.remove(&callback_id).is_some()
+    }
+
+    async fn send_cancel(&self, callback_id: u64) {
+        let message =
+            RunnerControllerMessage::CallbackCancel(RunnerCallbackCancelEnvelope { callback_id });
+        if let Ok(mut encoded) = serde_json::to_vec(&message) {
+            encoded.push(b'\n');
+            let _ = self.writer.lock().await.write_all(&encoded).await;
+        }
+    }
+
+    async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.pending.lock().await.clear();
+    }
+}
+
 struct ProcessManager {
     processes: Mutex<HashMap<ProcessHandle, Arc<ManagedProcess>>>,
     output_directory: tempfile::TempDir,
@@ -411,12 +640,33 @@ impl ProcessManager {
         })
     }
 
+    #[cfg(test)]
     async fn start(
         &self,
         command: String,
         environment: CommandEnvironment,
         process_id: atra_protocol::ProcessId,
         process_prefix: String,
+        cwd: Option<PathBuf>,
+    ) -> Result<Arc<ManagedProcess>> {
+        self.start_with_context(
+            command,
+            environment,
+            process_id,
+            process_prefix,
+            String::new(),
+            cwd,
+        )
+        .await
+    }
+
+    async fn start_with_context(
+        &self,
+        command: String,
+        environment: CommandEnvironment,
+        process_id: atra_protocol::ProcessId,
+        process_prefix: String,
+        execution_context: String,
         cwd: Option<PathBuf>,
     ) -> Result<Arc<ManagedProcess>> {
         let handle = ProcessHandle(format!("{process_prefix}{process_id}"));
@@ -492,6 +742,7 @@ impl ProcessManager {
             patch_results: Mutex::new(Vec::new()),
             spawned_processes: Mutex::new(Vec::new()),
             process_prefix,
+            execution_context,
             patching: Mutex::new(()),
             full_output_path,
             output_closed: AtomicBool::new(false),
@@ -565,11 +816,12 @@ impl ProcessManager {
     ) -> Result<RunnerResponse> {
         let parent = self.process(parent_handle).await?;
         let process = self
-            .start(
+            .start_with_context(
                 command.clone(),
                 environment,
                 process_id.clone(),
                 parent.process_prefix.clone(),
+                parent.execution_context.clone(),
                 Some(cwd),
             )
             .await?;
@@ -808,6 +1060,7 @@ struct ManagedProcess {
     patch_results: Mutex<Vec<atra_patch::ApplyPatchResult>>,
     spawned_processes: Mutex<Vec<SpawnedProcess>>,
     process_prefix: String,
+    execution_context: String,
     patching: Mutex<()>,
     full_output_path: PathBuf,
     output_closed: AtomicBool,
@@ -817,6 +1070,17 @@ struct ManagedProcess {
 }
 
 impl ManagedProcess {
+    fn authorize_control_peer(&self, peer_pid: i32) -> Result<()> {
+        let managed_pid = self.os_pid.as_raw_nonzero().get();
+        if process_descends_from(peer_pid, managed_pid)? {
+            return Ok(());
+        }
+        bail!(
+            "Runner control peer {peer_pid} does not belong to managed process {}",
+            self.handle
+        )
+    }
+
     fn begin_wait(self: &Arc<Self>) -> ActiveWait {
         if self.timing.lock().unwrap().begin_wait() {
             self.changed.notify_waiters();
@@ -868,6 +1132,18 @@ impl ManagedProcess {
         Ok(status.map(|status| status.code()))
     }
 
+    async fn wait_until_exit(&self) -> Result<()> {
+        loop {
+            if self.exit_code().await?.is_some() {
+                return Ok(());
+            }
+            tokio::select! {
+                () = self.changed.notified() => {}
+                () = sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
     async fn finish_output(&self) {
         if self.output_closed.load(Ordering::Acquire) {
             return;
@@ -902,6 +1178,33 @@ impl ManagedProcess {
             }
         }
     }
+}
+
+fn process_descends_from(mut pid: i32, ancestor: i32) -> Result<bool> {
+    let mut visited = 0;
+    while pid > 0 && visited < 1024 {
+        if pid == ancestor {
+            return Ok(true);
+        }
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .with_context(|| format!("failed to inspect Runner control peer process {pid}"))?;
+        let after_name = stat
+            .rfind(") ")
+            .and_then(|end| stat.get(end + 2..))
+            .context("invalid process stat")?;
+        let parent = after_name
+            .split_whitespace()
+            .nth(1)
+            .context("process stat is missing its parent PID")?
+            .parse::<i32>()
+            .context("process stat has an invalid parent PID")?;
+        if parent == pid {
+            break;
+        }
+        pid = parent;
+        visited += 1;
+    }
+    Ok(false)
 }
 
 struct ActiveWait {
@@ -1066,6 +1369,295 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn callback_request_multiplexes_with_an_ordinary_response() {
+        let (writer, reader) = tokio::io::duplex(4096);
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
+        let bridge = CallbackBridge::new(Arc::clone(&writer));
+        let (callback_id, response) = bridge
+            .begin("context".into(), atra_protocol::AgentRequest::List)
+            .await
+            .unwrap();
+        write_response(
+            &writer,
+            RunnerResponseEnvelope {
+                request_id: 41,
+                response: RunnerResponse::Ready,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RunnerControllerMessage>(&line).unwrap(),
+            RunnerControllerMessage::CallbackRequest(request)
+                if request.callback_id == callback_id
+        ));
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RunnerControllerMessage>(&line).unwrap(),
+            RunnerControllerMessage::Response(response) if response.request_id == 41
+        ));
+
+        bridge
+            .complete(
+                callback_id,
+                AgentResponse {
+                    output: "done".into(),
+                    success: true,
+                },
+            )
+            .await;
+        assert_eq!(response.await.unwrap().output, "done");
+    }
+
+    #[tokio::test]
+    async fn callback_response_and_late_cancel_are_first_terminal_wins() {
+        let (writer, reader) = tokio::io::duplex(4096);
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
+        let bridge = CallbackBridge::new(writer);
+        let (id, response) = bridge
+            .begin("context".into(), atra_protocol::AgentRequest::List)
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let RunnerControllerMessage::CallbackRequest(request) =
+            serde_json::from_str(&line).unwrap()
+        else {
+            panic!("expected callback request")
+        };
+        assert_eq!(request.callback_id, id);
+        bridge
+            .complete(
+                id,
+                AgentResponse {
+                    output: "done".into(),
+                    success: true,
+                },
+            )
+            .await;
+        assert_eq!(response.await.unwrap().output, "done");
+        bridge.cancel(id).await;
+        line.clear();
+        assert!(
+            timeout(Duration::from_millis(20), reader.read_line(&mut line))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_cancel_is_idempotent_and_discards_late_response() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
+        let bridge = CallbackBridge::new(writer);
+        let (id, response) = bridge
+            .begin("context".into(), atra_protocol::AgentRequest::List)
+            .await
+            .unwrap();
+        let mut discard = vec![0; 4096];
+        let _ = reader.read(&mut discard).await.unwrap();
+        bridge.cancel(id).await;
+        bridge.cancel(id).await;
+        assert!(response.await.is_err());
+        bridge
+            .complete(
+                id,
+                AgentResponse {
+                    output: "late".into(),
+                    success: true,
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn callback_terminal_releases_wait_before_large_control_response_is_read() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start_with_context(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("callback-wait".to_owned()),
+                "test-".to_owned(),
+                "context".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (callback_writer, callback_reader) = tokio::io::duplex(4096);
+        let callback_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(callback_writer)));
+        let bridge = Arc::new(CallbackBridge::new(callback_writer));
+        let (callback_id, response) = bridge
+            .begin(
+                "context".into(),
+                atra_protocol::AgentRequest::Wait {
+                    targets: Vec::new(),
+                    timeout_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let mut callback_reader = BufReader::new(callback_reader);
+        let mut request = String::new();
+        callback_reader.read_line(&mut request).await.unwrap();
+
+        let (control, _unread_client) = UnixStream::pair().unwrap();
+        let (reader, mut writer) = control.into_split();
+        let mut reader = BufReader::new(reader);
+        let relay_process = Arc::clone(&process);
+        let relay_bridge = Arc::clone(&bridge);
+        let relay = tokio::spawn(async move {
+            let response = relay_agent_callback(
+                &mut reader,
+                &relay_process,
+                &relay_bridge,
+                callback_id,
+                response,
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut encoded = serde_json::to_vec(&AgentControlResponseEnvelope {
+                request_id: 1,
+                response,
+            })
+            .unwrap();
+            encoded.push(b'\n');
+            writer.write_all(&encoded).await.unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !process.has_active_wait() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("callback did not pause the process timer");
+        bridge
+            .complete(
+                callback_id,
+                AgentResponse {
+                    output: "x".repeat(8 * 1024 * 1024),
+                    success: true,
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while process.has_active_wait() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal callback left the process timer paused");
+        assert!(
+            !relay.is_finished(),
+            "large response unexpectedly completed without a control reader"
+        );
+
+        relay.abort();
+        processes.stop(&process.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_disconnect_cancels_an_outstanding_callback() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start_with_context(
+                "sleep 10".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("callback-disconnect".to_owned()),
+                "test-".to_owned(),
+                "context".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (callback_writer, callback_reader) = tokio::io::duplex(4096);
+        let callback_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(callback_writer)));
+        let bridge = Arc::new(CallbackBridge::new(callback_writer));
+        let (callback_id, response) = bridge
+            .begin("context".into(), atra_protocol::AgentRequest::List)
+            .await
+            .unwrap();
+        let mut callback_reader = BufReader::new(callback_reader);
+        let mut line = String::new();
+        callback_reader.read_line(&mut line).await.unwrap();
+
+        let (control, client) = UnixStream::pair().unwrap();
+        let (reader, _) = control.into_split();
+        let mut reader = BufReader::new(reader);
+        drop(client);
+        assert!(
+            relay_agent_callback(&mut reader, &process, &bridge, callback_id, response, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        line.clear();
+        callback_reader.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RunnerControllerMessage>(&line).unwrap(),
+            RunnerControllerMessage::CallbackCancel(cancel) if cancel.callback_id == callback_id
+        ));
+        processes.stop(&process.handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_exit_cancels_an_outstanding_callback() {
+        let processes = ProcessManager::new().unwrap();
+        let process = processes
+            .start_with_context(
+                "exit 0".to_owned(),
+                CommandEnvironment::default(),
+                atra_protocol::ProcessId("callback-exit".to_owned()),
+                "test-".to_owned(),
+                "context".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (callback_writer, callback_reader) = tokio::io::duplex(4096);
+        let callback_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(callback_writer)));
+        let bridge = Arc::new(CallbackBridge::new(callback_writer));
+        let (callback_id, response) = bridge
+            .begin("context".into(), atra_protocol::AgentRequest::List)
+            .await
+            .unwrap();
+        let mut callback_reader = BufReader::new(callback_reader);
+        let mut line = String::new();
+        callback_reader.read_line(&mut line).await.unwrap();
+
+        let (control, _client) = UnixStream::pair().unwrap();
+        let (reader, _) = control.into_split();
+        let mut reader = BufReader::new(reader);
+        assert!(
+            relay_agent_callback(&mut reader, &process, &bridge, callback_id, response, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        line.clear();
+        callback_reader.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<RunnerControllerMessage>(&line).unwrap(),
+            RunnerControllerMessage::CallbackCancel(cancel) if cancel.callback_id == callback_id
+        ));
+    }
+
+    #[tokio::test]
     async fn process_clock_excludes_active_wait_time() {
         let mut clock = ProcessClock::new(Instant::now());
         sleep(Duration::from_millis(20)).await;
@@ -1158,7 +1750,10 @@ mod tests {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
-        let snapshot: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+        let RunnerControllerMessage::Response(snapshot) = serde_json::from_str(&line).unwrap()
+        else {
+            panic!("subscription returned a callback message")
+        };
         let RunnerResponse::ProcessInspected {
             output_tail,
             process_status: ProcessStatus::Running,
@@ -1171,7 +1766,10 @@ mod tests {
         while output_tail.is_empty() {
             line.clear();
             reader.read_line(&mut line).await.unwrap();
-            let envelope: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+            let RunnerControllerMessage::Response(envelope) = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("subscription returned a callback message")
+            };
             let RunnerResponse::ProcessInspected {
                 output_tail: current,
                 ..
@@ -1187,7 +1785,10 @@ mod tests {
         loop {
             line.clear();
             reader.read_line(&mut line).await.unwrap();
-            let envelope: RunnerResponseEnvelope = serde_json::from_str(&line).unwrap();
+            let RunnerControllerMessage::Response(envelope) = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("subscription returned a callback message")
+            };
             if matches!(
                 envelope.response,
                 RunnerResponse::ProcessInspected {
@@ -1401,10 +2002,9 @@ mod tests {
         message.push(b'\n');
         client.write_all(&message).await.unwrap();
         let connection_processes = Arc::clone(&processes);
-        let connection =
-            tokio::spawn(
-                async move { serve_control_connection(server, &connection_processes).await },
-            );
+        let connection = tokio::spawn(async move {
+            serve_control_connection(server, &connection_processes, None).await
+        });
 
         timeout(Duration::from_secs(1), async {
             while !parent.has_active_wait() {
@@ -1423,5 +2023,12 @@ mod tests {
 
         processes.stop(&parent.handle).await.unwrap();
         processes.stop(&child.handle).await.unwrap();
+    }
+
+    #[test]
+    fn process_ancestry_accepts_self_and_rejects_unrelated_pid() {
+        let current = i32::try_from(std::process::id()).unwrap();
+        assert!(process_descends_from(current, current).unwrap());
+        assert!(!process_descends_from(current, i32::MAX).unwrap());
     }
 }

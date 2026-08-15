@@ -250,10 +250,14 @@ impl App {
                 }
                 Ok(())
             }
-            TurnUpdate::ThreadDeleted { thread_id, result } => {
+            TurnUpdate::ThreadDeleted {
+                thread_id,
+                selected_subtree,
+                result,
+            } => {
                 match result {
                     Ok(()) => {
-                        if self.target.thread_id() == Some(thread_id) {
+                        if selected_subtree || self.target.thread_id() == Some(thread_id) {
                             self.reset_to_new_thread();
                         }
                         let thread_count = self.threads().len();

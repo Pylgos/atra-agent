@@ -15,7 +15,7 @@ use atra_protocol::{
     ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
     CommandExecutionArtifact, CommandOutput, CommandTimerState, CompactionEvent, CustomToolType,
     EventSequence, FrozenBoundaryEvent, InstructionEvent, InteractionId, ItemEvent, MessageEvent,
-    ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
+    ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, ProcessStatus,
     RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
     RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
     TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
@@ -28,9 +28,11 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
+    task::JoinSet,
 };
 
+mod agent;
 mod commands;
 mod connection;
 mod lifecycle;
@@ -48,7 +50,9 @@ use commands::TurnProjector;
 use lifecycle::TurnLifecycle;
 use model::{ModelProvider, ModelResponse, ModelStreamEvent};
 use runner::{CommandOutcome, Runner, RunnerConfig};
-use runner_client::{PrepareTreeResult, ProcessSubscription, RunnerClient, WaitOutcome};
+use runner_client::{
+    CallbackEvent, PrepareTreeResult, ProcessSubscription, RunnerClient, WaitOutcome,
+};
 use runner_pool::{ProcessKey, ProcessRecord, RunnerPool};
 use storage::Store;
 use tools::*;
@@ -155,24 +159,32 @@ pub async fn run(
         controller_providers,
         Vec::new(),
     );
+    let views = Arc::new(Views::new(public_state));
+    let (callback_sender, mut callback_events) = mpsc::unbounded_channel();
     let state = Arc::new(State {
-        runners: Arc::new(RunnerPool::new(platform)),
+        runners: Arc::new(RunnerPool::new(
+            platform,
+            Arc::downgrade(&views),
+            callback_sender,
+        )),
         store,
         providers,
         default_provider,
         turns: TurnLifecycle::new(),
-        thread_locks: StdMutex::new(HashMap::new()),
+        execution_contexts: Arc::new(StdMutex::new(HashMap::new())),
         skill_store,
         skill_generation: Mutex::new(None),
         data_home: data_home.to_owned(),
         prompt_cache_namespace,
         workspace,
-        mutation: Mutex::new(()),
-        views: Arc::new(Views::new(public_state)),
+        mutation: Arc::new(Mutex::new(())),
+        views,
     });
 
     let (shutdown, mut shutdown_requested) = watch::channel(false);
+    let mut callback_tasks = JoinSet::new();
     loop {
+        let has_callback_tasks = !callback_tasks.is_empty();
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -189,11 +201,42 @@ pub async fn run(
             changed = shutdown_requested.changed() => {
                 if changed.is_ok() && *shutdown_requested.borrow() {
                     tracing::info!("controller stopping");
-                    return Ok(());
+                    break;
                 }
+            }
+            event = callback_events.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                let callback_state = Arc::clone(&state);
+                let CallbackEvent {
+                    callback_id,
+                    execution_context,
+                    request,
+                    stdin,
+                    cancelled,
+                } = event;
+                callback_tasks.spawn(async move {
+                    tokio::select! {
+                        _ = runner_client::execute_callback(
+                            callback_state,
+                            callback_id,
+                            execution_context,
+                            request,
+                            stdin,
+                        ) => {}
+                        _ = cancelled => {}
+                    }
+                });
+            }
+            completed = callback_tasks.join_next(), if has_callback_tasks => {
+                let _ = completed;
             }
         }
     }
+    callback_tasks.abort_all();
+    while callback_tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 pub(crate) struct State {
@@ -202,13 +245,13 @@ pub(crate) struct State {
     providers: HashMap<String, Arc<dyn ModelProvider>>,
     default_provider: String,
     turns: TurnLifecycle,
-    thread_locks: StdMutex<HashMap<ThreadId, Arc<Mutex<()>>>>,
+    execution_contexts: Arc<StdMutex<HashMap<String, ThreadId>>>,
     skill_store: AtraStore,
     skill_generation: Mutex<Option<Arc<skills::SkillGeneration>>>,
     data_home: PathBuf,
     prompt_cache_namespace: String,
     workspace: PathBuf,
-    mutation: Mutex<()>,
+    mutation: Arc<Mutex<()>>,
     views: Arc<Views>,
 }
 
@@ -315,8 +358,8 @@ async fn watch_process(
 }
 
 impl State {
-    async fn lock_mutation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
-        let guard = self.mutation.lock().await;
+    async fn lock_mutation(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = Arc::clone(&self.mutation).lock_owned().await;
         self.views.ensure_running().await?;
         Ok(guard)
     }
@@ -328,6 +371,10 @@ impl State {
 
     pub(crate) async fn materialize_thread(&self, thread_id: ThreadId) -> Result<()> {
         let _mutation = self.lock_mutation().await?;
+        self.materialize_thread_locked(thread_id).await
+    }
+
+    pub(crate) async fn materialize_thread_locked(&self, thread_id: ThreadId) -> Result<()> {
         if self.views.has_thread(thread_id).await {
             return Ok(());
         }
@@ -401,7 +448,6 @@ impl State {
         &self,
         process: &atra_protocol::ProcessLocator,
     ) -> Result<()> {
-        let _mutation = self.lock_mutation().await?;
         if self.views.has_process(process).await {
             return Ok(());
         }
@@ -415,7 +461,19 @@ impl State {
             .process(&key)
             .await
             .context("managed process does not exist")?;
-        let detail = self.runners.inspect_process(key, record).await;
+        let detail = self.runners.inspect_process(key.clone(), record).await;
+        let _mutation = self.lock_mutation().await?;
+        if self.views.has_process(process).await {
+            return Ok(());
+        }
+        self.store
+            .thread(process.thread_id())
+            .await
+            .context("managed process thread no longer exists")?;
+        self.runners
+            .process(&key)
+            .await
+            .context("managed process is no longer available")?;
         let summary = atra_protocol::ProcessSummary::new(
             process.clone(),
             detail.process.command,
@@ -451,7 +509,7 @@ impl State {
             .generate_process_id(thread_id, runner_name)
             .await;
         let started = runner
-            .start_command(command.clone(), thread_id, &process_id)
+            .start_command(command.clone(), thread_id, &process_id, None)
             .await?;
         let process_handle = started.handle;
         let registered = async {
@@ -520,11 +578,37 @@ impl State {
         record: ProcessRecord,
         subscription: ProcessSubscription,
     ) -> Result<()> {
-        if !self.runners.insert_process(key.clone(), record).await {
+        let _mutation = self.lock_mutation().await?;
+        self.store
+            .thread(key.thread_id)
+            .await
+            .context("managed process thread no longer exists")?;
+        if !self
+            .runners
+            .insert_process(key.clone(), record.clone())
+            .await
+        {
             return Ok(());
         }
-        let process = atra_protocol::ProcessLocator::new(key.thread_id, key.runner, key.process_id);
-        self.materialize_process(&process).await?;
+        let process = atra_protocol::ProcessLocator::new(
+            key.thread_id,
+            key.runner.clone(),
+            key.process_id.clone(),
+        );
+        let summary = atra_protocol::ProcessSummary::new(
+            process.clone(),
+            record.command,
+            record.started_at_ms,
+            ProcessStatus::Running,
+        );
+        if let Err(error) = self
+            .views
+            .insert_process(atra_protocol::ProcessState::new(summary, String::new(), 0))
+            .await
+        {
+            self.runners.remove_process(&key).await;
+            return Err(error);
+        }
         tokio::spawn(watch_process(
             Arc::downgrade(&self.views),
             process,
@@ -534,12 +618,12 @@ impl State {
     }
 
     async fn launch_runner(
-        &self,
+        self: &Arc<Self>,
         name: String,
         description: String,
         approval: ApprovalPolicy,
         command: Vec<String>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let cached_generation = self.skill_generation.lock().await.clone();
         let generation = match cached_generation {
             Some(generation) => generation,

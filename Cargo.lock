@@ -191,6 +191,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tokio-rusqlite",
+ "tokio-util",
  "tracing",
  "webbrowser",
  "yaml-rust",
@@ -3045,6 +3046,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

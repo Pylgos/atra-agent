@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
 
 use crate::{
     State, checkpoint_time_ms,
@@ -9,9 +9,10 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
     ActiveItem, ActiveItemData, ActiveItemId, Command, CommandResult, ControllerOperation,
-    ProcessStatus, ProviderLifecycle, ProviderState, RetryStatus, ThreadEvent, ThreadEventData,
+    EventSequence, ProviderLifecycle, ProviderState, RetryStatus, ThreadEvent, ThreadEventData,
     ThreadOperation, ToolCallEvent, ToolResultEvent, TurnOutcome, TurnPhase,
 };
+use futures_util::FutureExt;
 
 impl State {
     pub(super) async fn handle_command(
@@ -45,14 +46,8 @@ impl State {
                 display_name,
             } => {
                 self.materialize_thread(thread_id).await?;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot rename a thread while a turn is active");
-                }
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot rename a thread while a turn is active");
-                }
                 let _mutation = self.lock_mutation().await?;
+                self.turns.ensure_mutable(thread_id)?;
                 if display_name.trim().is_empty() {
                     bail!("thread display name must not be empty");
                 }
@@ -65,17 +60,12 @@ impl State {
             }
             Command::ThreadDelete { thread_id } => {
                 self.materialize_thread(thread_id).await?;
-                self.turns.begin_delete(thread_id).await?;
-                let result = async {
-                    let _guard = self.thread_lock(thread_id).lock_owned().await;
-                    self.runners.stop_thread_processes(thread_id).await;
-                    let _mutation = self.lock_mutation().await?;
-                    self.store.delete_thread(thread_id).await?;
-                    self.views.delete_thread(thread_id).await
-                }
-                .await;
-                self.turns.finish_delete(thread_id).await;
-                result?;
+                self.delete_thread_subtree(thread_id, false).await?;
+                Ok(CommandResult::Accepted)
+            }
+            Command::ThreadDeleteRecursive { thread_id } => {
+                self.materialize_thread(thread_id).await?;
+                self.delete_thread_subtree(thread_id, true).await?;
                 Ok(CommandResult::Accepted)
             }
             Command::ThreadSetModel {
@@ -85,9 +75,6 @@ impl State {
                 reasoning_effort,
             } => {
                 self.materialize_thread(thread_id).await?;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot change the model while a turn is active");
-                }
                 if model.trim().is_empty() {
                     bail!("thread model must not be empty");
                 }
@@ -108,11 +95,8 @@ impl State {
                         "reasoning effort {reasoning_effort} is not supported by model {provider}/{model}"
                     );
                 }
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot change the model while a turn is active");
-                }
                 let _mutation = self.lock_mutation().await?;
+                self.turns.ensure_mutable(thread_id)?;
                 let (current_provider, _, _) = self.store.thread_model(thread_id).await?;
                 if current_provider != provider && !self.store.events(thread_id).await?.is_empty() {
                     bail!("cannot change provider after the thread history has started");
@@ -128,15 +112,8 @@ impl State {
             }
             Command::ThreadCheckpointCreate { thread_id } => {
                 self.materialize_thread(thread_id).await?;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot create a checkpoint while a turn is active");
-                }
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot create a checkpoint while a turn is active");
-                }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_interaction(thread_id).await?;
+                self.turns.ensure_mutable(thread_id)?;
                 let checkpoint_id = self
                     .store
                     .create_checkpoint(thread_id, checkpoint_time_ms(), "manual".to_owned())
@@ -155,15 +132,8 @@ impl State {
                 display_name,
             } => {
                 self.materialize_thread(thread_id).await?;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot fork a thread while a turn is active");
-                }
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot fork a thread while a turn is active");
-                }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_interaction(thread_id).await?;
+                self.turns.ensure_mutable(thread_id)?;
                 let forked_id = self
                     .store
                     .fork_thread(thread_id, checkpoint_id, sequence, display_name)
@@ -177,15 +147,8 @@ impl State {
             }
             Command::ThreadReplaceHistory { thread_id, target } => {
                 self.materialize_thread(thread_id).await?;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot replace history while a turn is active");
-                }
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
-                if self.turns.get(thread_id).await.is_some() {
-                    bail!("cannot replace history while a turn is active");
-                }
                 let _mutation = self.lock_mutation().await?;
-                self.ensure_no_pending_interaction(thread_id).await?;
+                self.turns.ensure_mutable(thread_id)?;
                 let checkpoint_id = self
                     .store
                     .replace_history(thread_id, target, checkpoint_time_ms())
@@ -202,21 +165,15 @@ impl State {
             Command::ThreadCancel { thread_id } => {
                 self.materialize_thread(thread_id).await?;
                 self.turns
-                    .get(thread_id)
-                    .await
+                    .begin_cancellation(thread_id)
                     .context("thread has no active turn")?;
-                self.views.start_cancellation(thread_id).await?;
-                let state = Arc::clone(self);
-                tokio::spawn(async move {
-                    if let Err(error) = state.cancel_thread(thread_id).await {
-                        tracing::error!(thread_id = %thread_id, error = %format!("{error:#}"), "turn cancellation failed");
-                    }
-                });
                 Ok(CommandResult::Accepted)
             }
             Command::ApprovalAllow { approval_id } => {
-                let approval = self.claim_approval(approval_id).await?;
-                self.views.resolve_interaction(approval_id).await?;
+                let (thread_id, approval) = self.claim_approval(approval_id).await?;
+                self.views
+                    .resolve_interaction(thread_id, approval_id)
+                    .await?;
                 approval.resolve_approval(approval_id, true, None)?;
                 Ok(CommandResult::Accepted)
             }
@@ -224,8 +181,10 @@ impl State {
                 approval_id,
                 reason,
             } => {
-                let approval = self.claim_approval(approval_id).await?;
-                self.views.resolve_interaction(approval_id).await?;
+                let (thread_id, approval) = self.claim_approval(approval_id).await?;
+                self.views
+                    .resolve_interaction(thread_id, approval_id)
+                    .await?;
                 approval.resolve_approval(approval_id, false, reason)?;
                 Ok(CommandResult::Accepted)
             }
@@ -236,8 +195,10 @@ impl State {
                 self.views
                     .validate_question_answers(request_id, &answers)
                     .await?;
-                let question = self.claim_questions(request_id).await?;
-                self.views.resolve_interaction(request_id).await?;
+                let (thread_id, question) = self.claim_questions(request_id).await?;
+                self.views
+                    .resolve_interaction(thread_id, request_id)
+                    .await?;
                 question.resolve_questions(request_id, answers)?;
                 Ok(CommandResult::Accepted)
             }
@@ -318,37 +279,8 @@ impl State {
                 approval,
                 command,
             } => {
-                let runner = atra_protocol::Runner {
-                    name: name.clone(),
-                    description: description.clone(),
-                };
-                self.views.start_runner_launch(runner.clone()).await?;
-                let state = Arc::clone(self);
-                tokio::spawn(async move {
-                    let result = state
-                        .launch_runner(name.clone(), description, approval, command)
-                        .await;
-                    let launched = result.as_ref().copied().unwrap_or(false);
-                    let lifecycle = match result {
-                        Ok(_) => atra_protocol::RunnerLifecycle::Running,
-                        Err(error) => atra_protocol::RunnerLifecycle::Failed {
-                            message: format!("{error:#}"),
-                        },
-                    };
-                    if let Err(error) = state
-                        .views
-                        .apply_controller(ControllerOperation::RunnerUpdated {
-                            runner: atra_protocol::RunnerState::new(runner.clone(), lifecycle),
-                        })
-                        .await
-                    {
-                        tracing::error!(runner = name, error = %format!("{error:#}"), "failed to update public Runner state");
-                    }
-                    if launched {
-                        let state = Arc::downgrade(&state);
-                        watch_runner(state, name, runner).await;
-                    }
-                });
+                self.launch_runner(name, description, approval, command)
+                    .await?;
                 Ok(CommandResult::Accepted)
             }
             Command::ExecCommand {
@@ -357,7 +289,6 @@ impl State {
                 command,
             } => {
                 self.materialize_thread(thread_id).await?;
-                let _guard = self.thread_lock(thread_id).lock_owned().await;
                 {
                     let _mutation = self.lock_mutation().await?;
                     self.store
@@ -379,15 +310,7 @@ impl State {
                     runner: process.runner().to_owned(),
                     process_id: process.process_id().clone(),
                 };
-                let output = self.runners.stop_process(&key).await?;
-                self.views
-                    .synchronize_process(
-                        &process,
-                        output.content,
-                        output.omitted_bytes,
-                        ProcessStatus::Exited { exit_code: None },
-                    )
-                    .await?;
+                self.runners.stop_process(&key).await?;
                 Ok(CommandResult::Accepted)
             }
         }
@@ -399,38 +322,108 @@ impl State {
         phase: TurnPhase,
         request: TurnRequest,
     ) -> Result<CommandResult> {
-        self.materialize_thread(thread_id).await?;
-        let active = self.turns.start(thread_id).await?;
+        let active = {
+            let _mutation = self.lock_mutation().await?;
+            self.materialize_thread_locked(thread_id).await?;
+            self.turns.start(thread_id)?
+        };
+        self.launch_turn(thread_id, phase, request, active).await
+    }
+
+    pub(super) async fn start_agent_turn(
+        self: &Arc<Self>,
+        invoking: atra_protocol::ThreadId,
+        thread_id: atra_protocol::ThreadId,
+        message: String,
+    ) -> Result<(CommandResult, EventSequence)> {
+        let state = Arc::clone(self);
+        crate::agent::run_callback_operation("agent send", async move {
+            let mutation = state.lock_mutation().await?;
+            if thread_id == invoking || !state.store.is_descendant(invoking, thread_id).await? {
+                bail!("thread {thread_id} is not a descendant of invoking thread {invoking}");
+            }
+            state.materialize_thread_locked(thread_id).await?;
+            let root = state.store.root_thread(invoking).await?;
+            let after = state
+                .store
+                .events(thread_id)
+                .await?
+                .last()
+                .map_or(EventSequence(-1), |event| event.sequence);
+            let active = state.turns.start_agent(thread_id, root)?;
+            Ok(async move {
+                let _mutation = mutation;
+                if let Err(error) = state
+                    .views
+                    .apply_thread(
+                        thread_id,
+                        ThreadOperation::ActiveTurnStarted {
+                            phase: TurnPhase::Running,
+                        },
+                    )
+                    .await
+                {
+                    state.turns.finish(thread_id);
+                    return Err(error);
+                }
+                let result = state.launch_registered_turn(
+                    thread_id,
+                    TurnRequest::Send {
+                        thread_id,
+                        message,
+                        allow_questions: false,
+                    },
+                    active,
+                );
+                Ok((result, after))
+            })
+        })
+        .await?
+    }
+
+    async fn launch_turn(
+        self: &Arc<Self>,
+        thread_id: atra_protocol::ThreadId,
+        phase: TurnPhase,
+        request: TurnRequest,
+        active: Arc<crate::lifecycle::ActiveTurn>,
+    ) -> Result<CommandResult> {
         if let Err(error) = self
             .views
             .apply_thread(thread_id, ThreadOperation::ActiveTurnStarted { phase })
             .await
         {
-            self.turns.finish(thread_id, &active).await;
+            self.turns.finish(thread_id);
             return Err(error);
         }
+        Ok(self.launch_registered_turn(thread_id, request, active))
+    }
+
+    fn launch_registered_turn(
+        self: &Arc<Self>,
+        thread_id: atra_protocol::ThreadId,
+        request: TurnRequest,
+        active: Arc<crate::lifecycle::ActiveTurn>,
+    ) -> CommandResult {
         let state = Arc::clone(self);
         tokio::spawn(async move {
-            let lifecycle_active = Arc::clone(&active);
             let updates = TurnProjector::new(&state, thread_id);
-            let response = state
-                .handle_started_streaming(request, active, &updates)
-                .await;
-            let outcome = match response {
-                Ok(TurnCompletion::Cancelled) => TurnOutcome::Cancelled,
-                Ok(TurnCompletion::Completed | TurnCompletion::Compacted) => TurnOutcome::Completed,
-                Err(error) => TurnOutcome::Failed {
-                    message: format!("{error:#}"),
+            let publish_state = Arc::clone(&state);
+            let finish_state = Arc::clone(&state);
+            complete_registered_turn(
+                thread_id,
+                state.handle_started_streaming(request, active, &updates),
+                move |outcome| async move {
+                    publish_state
+                        .views
+                        .apply_thread(thread_id, ThreadOperation::TurnFinished { outcome })
+                        .await
                 },
-            };
-            if let Err(error) = state
-                .views
-                .apply_thread(thread_id, ThreadOperation::TurnFinished { outcome })
-                .await
-            {
-                tracing::error!(thread_id = %thread_id, error = %format!("{error:#}"), "failed to finish public turn state");
-            }
-            state.turns.finish(thread_id, &lifecycle_active).await;
+                move || async move {
+                    finish_state.turns.finish(thread_id);
+                },
+            )
+            .await;
             if let Ok((provider_id, _, _)) = state.store.thread_model(thread_id).await
                 && let Ok(provider) = state.provider(&provider_id)
             {
@@ -444,7 +437,7 @@ impl State {
                 }
             }
         });
-        Ok(CommandResult::Accepted)
+        CommandResult::Accepted
     }
 
     async fn start_provider_operation(
@@ -487,37 +480,56 @@ impl State {
     }
 }
 
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
+}
+
+async fn turn_outcome(future: impl Future<Output = Result<TurnCompletion>>) -> TurnOutcome {
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(TurnCompletion::Cancelled)) => TurnOutcome::Cancelled,
+        Ok(Ok(TurnCompletion::Completed | TurnCompletion::Compacted)) => TurnOutcome::Completed,
+        Ok(Err(error)) => TurnOutcome::Failed {
+            message: format!("{error:#}"),
+        },
+        Err(payload) => TurnOutcome::Failed {
+            message: format!("turn task panicked: {}", panic_message(payload)),
+        },
+    }
+}
+
+async fn complete_registered_turn<Execution, Publish, Published, Finish, Finished>(
+    thread_id: atra_protocol::ThreadId,
+    execution: Execution,
+    publish: Publish,
+    finish: Finish,
+) where
+    Execution: Future<Output = Result<TurnCompletion>>,
+    Publish: FnOnce(TurnOutcome) -> Published,
+    Published: Future<Output = Result<()>>,
+    Finish: FnOnce() -> Finished,
+    Finished: Future<Output = ()>,
+{
+    let outcome = turn_outcome(execution).await;
+    match AssertUnwindSafe(publish(outcome)).catch_unwind().await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(thread_id = %thread_id, error = %format!("{error:#}"), "failed to finish public turn state");
+        }
+        Err(payload) => {
+            tracing::error!(thread_id = %thread_id, panic = %panic_message(payload), "public turn finalization panicked");
+        }
+    }
+    finish().await;
+}
+
 enum ProviderTask {
     Login(Option<String>),
     Reload,
     Logout,
-}
-
-async fn watch_runner(state: std::sync::Weak<State>, name: String, runner: atra_protocol::Runner) {
-    loop {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let Some(state) = state.upgrade() else {
-            return;
-        };
-        let failure = match state.runners.list().await {
-            Ok(runners) if runners.iter().any(|current| current.name == name) => continue,
-            Ok(_) => "Runner exited".to_owned(),
-            Err(error) => format!("failed to inspect Runner: {error:#}"),
-        };
-        if let Err(error) = state
-            .views
-            .apply_controller(ControllerOperation::RunnerUpdated {
-                runner: atra_protocol::RunnerState::new(
-                    runner,
-                    atra_protocol::RunnerLifecycle::Failed { message: failure },
-                ),
-            })
-            .await
-        {
-            tracing::error!(runner = name, error = %format!("{error:#}"), "failed to update stopped Runner state");
-        }
-        return;
-    }
 }
 
 pub(super) struct TurnProjector {
@@ -827,6 +839,71 @@ fn tool_result_call_id(result: &ToolResultEvent) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn turn_panic_becomes_failed_terminal_outcome() {
+        let outcome = turn_outcome(async {
+            panic!("injected provider panic");
+            #[allow(unreachable_code)]
+            Ok(TurnCompletion::Completed)
+        })
+        .await;
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Failed { message }
+                if message.contains("injected provider panic")
+        ));
+    }
+
+    #[tokio::test]
+    async fn panicking_agent_turn_publishes_failure_and_releases_concurrency_slot() {
+        let lifecycle = Arc::new(crate::lifecycle::TurnLifecycle::new());
+        let root = atra_protocol::ThreadId(1);
+        let thread_id = atra_protocol::ThreadId(2);
+        lifecycle.start_agent(thread_id, root).unwrap();
+        let (approval_id, approval) = lifecycle.register_approval(thread_id).unwrap();
+        for id in 3..10 {
+            lifecycle
+                .start_agent(atra_protocol::ThreadId(id), root)
+                .unwrap();
+        }
+        assert!(
+            lifecycle
+                .start_agent(atra_protocol::ThreadId(10), root)
+                .is_err()
+        );
+        let published = Arc::new(tokio::sync::Mutex::new(None));
+        let published_outcome = Arc::clone(&published);
+        let finish_lifecycle = Arc::clone(&lifecycle);
+        complete_registered_turn(
+            thread_id,
+            async {
+                panic!("injected session panic");
+                #[allow(unreachable_code)]
+                Ok(TurnCompletion::Completed)
+            },
+            move |outcome| async move {
+                *published_outcome.lock().await = Some(outcome);
+                Ok(())
+            },
+            move || async move {
+                finish_lifecycle.finish(thread_id);
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            published.lock().await.as_ref(),
+            Some(TurnOutcome::Failed { message }) if message.contains("injected session panic")
+        ));
+        assert!(
+            lifecycle
+                .start_agent(atra_protocol::ThreadId(10), root)
+                .is_ok()
+        );
+        assert!(approval.await.is_err());
+        assert!(lifecycle.claim_approval(approval_id).is_err());
+    }
 
     #[test]
     fn function_call_finalization_uses_the_explicit_call_id() {

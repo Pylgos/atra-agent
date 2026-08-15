@@ -23,6 +23,7 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
     let threads = vec![
         Thread {
             id: atra_protocol::ThreadId(2),
+            parent_thread_id: None,
             display_name: Some("Current work".to_owned()),
             provider: "codex".to_owned(),
             model: "gpt-5.6-sol".to_owned(),
@@ -30,6 +31,7 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         },
         Thread {
             id: atra_protocol::ThreadId(1),
+            parent_thread_id: None,
             display_name: None,
             provider: "codex".to_owned(),
             model: "gpt-5.6-sol".to_owned(),
@@ -465,11 +467,13 @@ fn deleting_the_last_thread_keeps_the_picker_open() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 0,
         state: ThreadPickerState::Deleting,
+        collapsed: Default::default(),
     });
     let thread_id = app.threads()[0].id;
     set_threads(&mut app, Vec::new());
     app.update(TurnUpdate::ThreadDeleted {
         thread_id,
+        selected_subtree: false,
         result: Ok(()),
     })
     .unwrap();
@@ -479,6 +483,7 @@ fn deleting_the_last_thread_keeps_the_picker_open() {
         Overlay::ThreadPicker(ThreadPicker {
             selected: 0,
             state: ThreadPickerState::Browsing,
+            ..
         })
     ));
     assert!(matches!(app.target, Target::New { .. }));
@@ -492,11 +497,13 @@ fn deleting_a_thread_keeps_the_picker_open_and_clamps_selection() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 1,
         state: ThreadPickerState::Deleting,
+        collapsed: Default::default(),
     });
     set_threads(&mut app, vec![remaining_thread]);
 
     app.update(TurnUpdate::ThreadDeleted {
         thread_id: deleted_thread,
+        selected_subtree: false,
         result: Ok(()),
     })
     .unwrap();
@@ -506,9 +513,31 @@ fn deleting_a_thread_keeps_the_picker_open_and_clamps_selection() {
         Overlay::ThreadPicker(ThreadPicker {
             selected: 0,
             state: ThreadPickerState::Browsing,
+            ..
         })
     ));
     assert_eq!(app.target.thread_id(), Some(atra_protocol::ThreadId(2)));
+}
+
+#[test]
+fn failed_delete_keeps_the_current_thread_selected() {
+    let mut app = test_app(Vec::new());
+    let current = app.target.thread_id().unwrap();
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected: 0,
+        state: ThreadPickerState::Deleting,
+        collapsed: Default::default(),
+    });
+
+    app.update(TurnUpdate::ThreadDeleted {
+        thread_id: current,
+        selected_subtree: false,
+        result: Err(anyhow::anyhow!("delete failed")),
+    })
+    .unwrap();
+
+    assert_eq!(app.target.thread_id(), Some(current));
+    assert!(app.error.is_some());
 }
 
 #[test]
@@ -518,6 +547,7 @@ fn empty_thread_picker_stays_open() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 0,
         state: ThreadPickerState::Browsing,
+        collapsed: Default::default(),
     });
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
 
@@ -535,6 +565,7 @@ fn thread_picker_handles_threads_disappearing_during_delete_confirmation() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 1,
         state: ThreadPickerState::ConfirmingDelete,
+        collapsed: Default::default(),
     });
     set_threads(&mut app, Vec::new());
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
@@ -551,6 +582,7 @@ fn thread_picker_handles_threads_disappearing_during_delete_confirmation() {
         Overlay::ThreadPicker(ThreadPicker {
             selected: 0,
             state: ThreadPickerState::Browsing,
+            ..
         })
     ));
 }
@@ -561,6 +593,7 @@ fn thread_picker_clamps_selection_when_threads_shrink() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 1,
         state: ThreadPickerState::Browsing,
+        collapsed: Default::default(),
     });
     let remaining_thread = app.threads()[0].clone();
     let remaining_thread_id = remaining_thread.id;
@@ -579,6 +612,7 @@ fn thread_picker_clamps_selection_when_threads_shrink() {
         Overlay::ThreadPicker(ThreadPicker {
             selected: 0,
             state: ThreadPickerState::Selecting,
+            ..
         })
     ));
 }
@@ -720,6 +754,7 @@ fn thread_picker_ignores_input_while_deleting() {
     app.overlay = Overlay::ThreadPicker(ThreadPicker {
         selected: 0,
         state: ThreadPickerState::ConfirmingDelete,
+        collapsed: Default::default(),
     });
     let deleted_thread = app.threads()[0].id;
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
@@ -753,8 +788,45 @@ fn thread_picker_ignores_input_while_deleting() {
         Overlay::ThreadPicker(ThreadPicker {
             selected: 0,
             state: ThreadPickerState::Deleting,
+            ..
         })
     ));
+}
+
+#[test]
+fn recursive_delete_defers_parent_selection_until_delete_completes() {
+    let mut app = test_app(Vec::new());
+    let mut child = app.threads()[0].clone();
+    let parent = app.threads()[1].clone();
+    child.parent_thread_id = Some(parent.id);
+    set_threads(&mut app, vec![child.clone(), parent.clone()]);
+    let selected = crate::state::visible_threads(app.threads(), &Default::default())
+        .iter()
+        .position(|(thread, _)| thread.id == child.id)
+        .unwrap();
+    app.overlay = Overlay::ThreadPicker(ThreadPicker {
+        selected,
+        state: ThreadPickerState::ConfirmingDelete,
+        collapsed: Default::default(),
+    });
+    let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &effects,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        pending_effects.try_recv().unwrap(),
+        Effect::DeleteThread {
+            thread_id,
+            select_after: Some(parent_id),
+            ..
+        } if thread_id == child.id && parent_id == parent.id
+    ));
+    assert!(pending_effects.try_recv().is_err());
+    assert_eq!(app.target.thread_id(), Some(child.id));
 }
 
 #[test]

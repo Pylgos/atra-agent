@@ -1,20 +1,33 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use atra_platform::PlatformStore;
 use atra_protocol::{
-    ApprovalPolicy, CommandOutput, ProcessHandle, ProcessId, ProcessStatus, Runner as RunnerInfo,
-    ThreadId,
+    ApprovalPolicy, ControllerOperation, ProcessHandle, ProcessId, ProcessStatus,
+    Runner as RunnerInfo, RunnerLifecycle, RunnerState, ThreadId,
 };
 use atra_store::Store;
 use tokio::sync::Mutex;
 
-use crate::{Runner, RunnerConfig, skills};
+use crate::{Runner, RunnerConfig, Views, runner_client::CallbackEvent, skills};
 
 pub(super) struct RunnerPool {
-    runners: Mutex<HashMap<String, Arc<Runner>>>,
+    runners: Mutex<HashMap<String, RunnerSlot>>,
     processes: Mutex<HashMap<ProcessKey, ProcessRecord>>,
     platform: Option<Arc<PlatformStore>>,
+    views: std::sync::Weak<Views>,
+    callback_events: tokio::sync::mpsc::UnboundedSender<CallbackEvent>,
+}
+
+struct RunnerSlot {
+    runner: Arc<Runner>,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RunnerSlot {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -29,6 +42,12 @@ pub(super) struct ProcessRecord {
     pub(super) handle: ProcessHandle,
     pub(super) command: String,
     pub(super) started_at_ms: i64,
+}
+
+pub(super) struct TakenProcess {
+    key: ProcessKey,
+    record: ProcessRecord,
+    runner: Option<Arc<Runner>>,
 }
 
 pub(super) struct ManagedProcess {
@@ -46,11 +65,17 @@ pub(super) struct ManagedProcessDetail {
 }
 
 impl RunnerPool {
-    pub(super) fn new(platform: Option<Arc<PlatformStore>>) -> Self {
+    pub(super) fn new(
+        platform: Option<Arc<PlatformStore>>,
+        views: std::sync::Weak<Views>,
+        callback_events: tokio::sync::mpsc::UnboundedSender<CallbackEvent>,
+    ) -> Self {
         Self {
             runners: Mutex::new(HashMap::new()),
             processes: Mutex::new(HashMap::new()),
             platform,
+            views,
+            callback_events,
         }
     }
 
@@ -62,7 +87,7 @@ impl RunnerPool {
         command: Vec<String>,
         skill_store: &Store,
         generation: &skills::SkillGeneration,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if name.is_empty() {
             bail!("runner name must not be empty");
         }
@@ -70,38 +95,86 @@ impl RunnerPool {
             bail!("runner command must not be empty");
         }
 
+        let views = self.views.upgrade().context("controller is stopping")?;
+        let info = RunnerInfo {
+            name: name.clone(),
+            description: description.clone(),
+        };
         let mut runners = self.runners.lock().await;
-        if let Some(runner) = runners.get(&name) {
-            if runner
-                .child
-                .lock()
-                .await
-                .try_wait()
-                .with_context(|| format!("failed to inspect runner {name}"))?
-                .is_none()
+        views.start_runner_launch(info.clone()).await?;
+        if let Some(slot) = runners.get_mut(&name) {
+            slot.watcher.abort();
+        }
+
+        let result = async {
+            let existing = runners.get(&name).map(|slot| Arc::clone(&slot.runner));
+            if let Some(runner) = existing
+                && runner
+                    .child
+                    .lock()
+                    .await
+                    .try_wait()
+                    .with_context(|| format!("failed to inspect runner {name}"))?
+                    .is_none()
             {
                 *runner.config.lock().await = RunnerConfig {
                     description,
                     approval,
                 };
-                return Ok(false);
+                let watcher = watch_runner(
+                    Arc::downgrade(&views),
+                    RunnerInfo {
+                        name: name.clone(),
+                        description: runner.config.lock().await.description.clone(),
+                    },
+                    Arc::clone(&runner),
+                );
+                runners.insert(name.clone(), RunnerSlot { runner, watcher });
+                return Ok(());
             }
-            runners.remove(&name);
-        }
 
-        let runner = Arc::new(
-            Runner::start(&name, description, approval, command, self.platform.clone()).await?,
-        );
-        runner.sync_skills(skill_store, generation).await?;
-        runners.insert(name, runner);
-        Ok(true)
+            let runner = Arc::new(
+                Runner::start(
+                    &name,
+                    description,
+                    approval,
+                    command,
+                    self.platform.clone(),
+                    self.callback_events.clone(),
+                )
+                .await?,
+            );
+            runner.sync_skills(skill_store, generation).await?;
+            let watcher = watch_runner(Arc::downgrade(&views), info.clone(), Arc::clone(&runner));
+            runners.insert(name.clone(), RunnerSlot { runner, watcher });
+            Ok(())
+        }
+        .await;
+
+        let lifecycle = match &result {
+            Ok(()) => RunnerLifecycle::Running,
+            Err(error) => RunnerLifecycle::Failed {
+                message: format!("{error:#}"),
+            },
+        };
+        views
+            .apply_controller(ControllerOperation::RunnerUpdated {
+                runner: RunnerState::new(info, lifecycle),
+            })
+            .await?;
+        result
     }
 
     pub(super) async fn list(&self) -> Result<Vec<RunnerInfo>> {
-        let mut runners = self.runners.lock().await;
-        let mut stopped = Vec::new();
+        let runners = self
+            .runners
+            .lock()
+            .await
+            .iter()
+            .map(|(name, slot)| (name.clone(), Arc::clone(&slot.runner)))
+            .collect::<Vec<_>>();
         let mut result = Vec::new();
-        for (name, runner) in runners.iter() {
+        for (name, runner) in &runners {
             if runner
                 .child
                 .lock()
@@ -110,7 +183,6 @@ impl RunnerPool {
                 .with_context(|| format!("failed to inspect runner {name}"))?
                 .is_some()
             {
-                stopped.push(name.clone());
                 continue;
             }
             result.push(RunnerInfo {
@@ -118,20 +190,29 @@ impl RunnerPool {
                 description: runner.config.lock().await.description.clone(),
             });
         }
-        for name in stopped {
-            runners.remove(&name);
-        }
         result.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(result)
     }
 
     pub(super) async fn get(&self, name: &str) -> Result<Arc<Runner>> {
-        self.runners
+        let runner = self
+            .runners
             .lock()
             .await
             .get(name)
-            .cloned()
-            .with_context(|| format!("runner {name} is not running"))
+            .map(|slot| Arc::clone(&slot.runner))
+            .with_context(|| format!("runner {name} is not running"))?;
+        if runner
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .with_context(|| format!("failed to inspect runner {name}"))?
+            .is_some()
+        {
+            bail!("runner {name} is not running");
+        }
+        Ok(runner)
     }
 
     pub(super) async fn sync_skills(
@@ -139,8 +220,24 @@ impl RunnerPool {
         store: &Store,
         generation: &skills::SkillGeneration,
     ) -> Result<()> {
-        let runners = self.runners.lock().await;
-        for (name, runner) in runners.iter() {
+        let runners = self
+            .runners
+            .lock()
+            .await
+            .iter()
+            .map(|(name, slot)| (name.clone(), Arc::clone(&slot.runner)))
+            .collect::<Vec<_>>();
+        for (name, runner) in runners {
+            if runner
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .with_context(|| format!("failed to inspect runner {name}"))?
+                .is_some()
+            {
+                continue;
+            }
             runner
                 .sync_skills(store, generation)
                 .await
@@ -167,6 +264,46 @@ impl RunnerPool {
 
     pub(super) async fn remove_process(&self, key: &ProcessKey) {
         self.processes.lock().await.remove(key);
+    }
+
+    pub(super) async fn take_thread_processes(&self, thread_ids: &[ThreadId]) -> Vec<TakenProcess> {
+        let runners = self.runners.lock().await;
+        let mut processes = self.processes.lock().await;
+        let keys = processes
+            .keys()
+            .filter(|key| thread_ids.contains(&key.thread_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .map(|key| TakenProcess {
+                runner: runners
+                    .get(&key.runner)
+                    .map(|slot| Arc::clone(&slot.runner)),
+                record: processes
+                    .remove(&key)
+                    .expect("process key was collected under the same lock"),
+                key,
+            })
+            .collect()
+    }
+
+    pub(super) async fn stop_taken_processes(processes: Vec<TakenProcess>) {
+        for process in processes {
+            let result = match process.runner {
+                Some(runner) => runner.stop(process.record.handle).await.map(|_| ()),
+                None => Err(anyhow::anyhow!(
+                    "runner {} is no longer available",
+                    process.key.runner
+                )),
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    process_id = %process.key.process_id,
+                    error = %format!("{error:#}"),
+                    "failed to stop process while deleting its thread"
+                );
+            }
+        }
     }
 
     pub(super) async fn generate_process_id(&self, thread_id: ThreadId, runner: &str) -> ProcessId {
@@ -271,34 +408,45 @@ impl RunnerPool {
         }
     }
 
-    pub(super) async fn stop_process(&self, key: &ProcessKey) -> Result<CommandOutput> {
+    pub(super) async fn stop_process(&self, key: &ProcessKey) -> Result<()> {
         let record = self
             .process(key)
             .await
             .context("background process is no longer available")?;
-        let output = self.get(&key.runner).await?.stop(record.handle).await?;
+        self.get(&key.runner).await?.stop(record.handle).await?;
         self.remove_process(key).await;
-        Ok(output)
+        Ok(())
     }
+}
 
-    pub(super) async fn stop_thread_processes(&self, thread_id: ThreadId) {
-        let keys = self
-            .processes
-            .lock()
-            .await
-            .keys()
-            .filter(|key| key.thread_id == thread_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in keys {
-            if let Err(error) = self.stop_process(&key).await {
-                tracing::warn!(
-                    process_id = %key.process_id,
-                    error = %format!("{error:#}"),
-                    "failed to stop process while deleting its thread"
-                );
-                self.remove_process(&key).await;
+fn watch_runner(
+    views: std::sync::Weak<Views>,
+    info: RunnerInfo,
+    runner: Arc<Runner>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let failure = match runner.child.lock().await.try_wait() {
+                Ok(None) => continue,
+                Ok(Some(_)) => "Runner exited".to_owned(),
+                Err(error) => format!("failed to inspect Runner: {error:#}"),
+            };
+            let Some(views) = views.upgrade() else {
+                return;
+            };
+            if let Err(error) = views
+                .apply_controller(ControllerOperation::RunnerUpdated {
+                    runner: RunnerState::new(
+                        info.clone(),
+                        RunnerLifecycle::Failed { message: failure },
+                    ),
+                })
+                .await
+            {
+                tracing::error!(runner = info.name, error = %format!("{error:#}"), "failed to update stopped Runner state");
             }
+            return;
         }
-    }
+    })
 }

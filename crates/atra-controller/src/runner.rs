@@ -32,6 +32,7 @@ impl Runner {
         approval: ApprovalPolicy,
         command: Vec<String>,
         platform: Option<Arc<PlatformStore>>,
+        callback_events: tokio::sync::mpsc::UnboundedSender<runner_client::CallbackEvent>,
     ) -> Result<Self> {
         tracing::info!(runner = name, executable = command[0], "starting runner");
         let mut child = Command::new(&command[0])
@@ -82,7 +83,7 @@ impl Runner {
             }
         });
 
-        let client = RunnerClient::new(stdin, stdout, name);
+        let client = RunnerClient::new(stdin, stdout, name, callback_events);
         client
             .initialize()
             .await
@@ -119,6 +120,7 @@ impl Runner {
         command: String,
         thread_id: ThreadId,
         process_id: &ProcessId,
+        execution_context: Option<String>,
     ) -> Result<runner_client::StartedProcess> {
         let process_prefix = format!("thread-{thread_id}-");
         self.client
@@ -127,6 +129,7 @@ impl Runner {
                 self.environment.lock().await.clone(),
                 process_id.clone(),
                 process_prefix,
+                execution_context.unwrap_or_default(),
             )
             .await
     }

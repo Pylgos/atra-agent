@@ -138,6 +138,7 @@ pub(crate) enum TurnUpdate {
     },
     ThreadDeleted {
         thread_id: ThreadId,
+        selected_subtree: bool,
         result: Result<()>,
     },
     ModelChanged {

@@ -66,6 +66,12 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
                 Run `atri proc stop <process-id>...` to stop named processes.
                 These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
 
+                Subagents:
+                `atri agent create --name <name> [--model <provider>/<model>] [--effort <effort>]` creates an empty child thread without copying this conversation.
+                Use `atri agent send <thread-id> [<message>]`, `atri agent wait [--timeout <seconds>] <thread-id>[@<after-sequence>]...`, `atri agent list`, `atri agent cancel [--recursive] <thread-id>...`, and `atri agent delete [--recursive] <thread-id>...`.
+                Automated child turns cannot ask questions, remain alive independently of the parent turn, and are limited to eight concurrently running descendants per root.
+                Use the cursor returned by `send` and `through` returned by `wait` for small incremental results.
+
                 Patches:
                 Run `atri patch` and pass the patch on standard input to add, update, delete, or move files.
                 Use a quoted Bash heredoc ending the command line with `atri patch <<'PATCH'` and terminate it with `PATCH` on its own line.
