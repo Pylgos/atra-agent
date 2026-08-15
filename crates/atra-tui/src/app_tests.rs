@@ -187,6 +187,163 @@ fn approval_is_derived_from_the_thread_snapshot() {
     assert!(matches!(app.turn, TurnState::Idle));
 }
 
+#[test]
+fn thread_command_opens_while_waiting_for_approval() {
+    let mut app = test_app(Vec::new());
+    let history = std::env::temp_dir().join(format!(
+        "atra-tui-pending-approval-command-history-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::File::create(&history).unwrap();
+    app.command_history_path = history.clone();
+    set_active_turn(&mut app);
+    let Some(crate::sync::ThreadSync::Snapshot(state)) = &mut app.thread_subscription else {
+        panic!("test app must use a snapshot thread");
+    };
+    atra_protocol::ThreadOperation::InteractionRequested {
+        interaction: atra_protocol::PendingInteraction::Approval(
+            atra_protocol::PendingApproval::new(
+                atra_protocol::InteractionId(7),
+                "command".to_owned(),
+                serde_json::json!({"runner": "local"}),
+                Some(2),
+                Some("Run tests".to_owned()),
+            ),
+        ),
+    }
+    .apply(state)
+    .unwrap();
+    let (effects, mut effect_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        &effects,
+    )
+    .unwrap();
+
+    assert!(matches!(app.overlay, Overlay::Command));
+    app.command_input.set("thread".to_owned());
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(app.overlay, Overlay::ThreadPicker(_)));
+    assert_eq!(
+        app.pending_approval().unwrap().id(),
+        atra_protocol::InteractionId(7)
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(
+        effect_rx.try_recv().unwrap(),
+        Effect::SelectThread {
+            thread_id: atra_protocol::ThreadId(1),
+            ..
+        }
+    ));
+    std::fs::remove_file(history).unwrap();
+}
+
+#[test]
+fn command_input_opens_without_losing_question_drafts() {
+    use crate::state::{QuestionForm, QuestionFormMode};
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question};
+
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Add details".to_owned(),
+            options: Vec::new(),
+            recommended_options: Vec::new(),
+        }],
+    };
+    let mut form = QuestionForm::new(request);
+    form.mode = QuestionFormMode::Note;
+    form.drafts[0].note.set("keep this".to_owned());
+    let mut app = test_app(Vec::new());
+    app.turn = TurnState::AnsweringQuestions(form);
+    let (effects, _) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        &effects,
+    )
+    .unwrap();
+    assert!(matches!(app.overlay, Overlay::Command));
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(app.overlay, Overlay::None));
+    assert!(matches!(
+        app.turn,
+        TurnState::AnsweringQuestions(ref form)
+            if form.mode == QuestionFormMode::Note
+                && form.drafts[0].note.value == "keep this"
+    ));
+}
+
+#[test]
+fn thread_picker_from_question_form_handles_keys_before_the_form() {
+    use crate::state::QuestionForm;
+    use atra_protocol::{InteractionId, PendingQuestionRequest, Question};
+
+    let history = std::env::temp_dir().join(format!(
+        "atra-tui-question-command-history-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::File::create(&history).unwrap();
+    let request = PendingQuestionRequest {
+        id: InteractionId(9),
+        questions: vec![Question {
+            question: "Add details".to_owned(),
+            options: Vec::new(),
+            recommended_options: Vec::new(),
+        }],
+    };
+    let mut app = test_app(Vec::new());
+    app.command_history_path = history.clone();
+    app.turn = TurnState::AnsweringQuestions(QuestionForm::new(request));
+    let (effects, mut effect_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        &effects,
+    )
+    .unwrap();
+    app.command_input.set("thread".to_owned());
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &effects)
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &effects)
+        .unwrap();
+
+    assert!(matches!(
+        effect_rx.try_recv().unwrap(),
+        Effect::SelectThread {
+            thread_id: atra_protocol::ThreadId(1),
+            ..
+        }
+    ));
+    assert!(matches!(
+        app.turn,
+        TurnState::AnsweringQuestions(ref form)
+            if form.current == 0 && form.mode == crate::state::QuestionFormMode::Normal
+    ));
+    std::fs::remove_file(history).unwrap();
+}
+
 fn model(provider: &str, id: &str, display_name: &str, description: &str) -> Model {
     Model {
         provider: provider.to_owned(),

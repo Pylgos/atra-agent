@@ -37,6 +37,11 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
 }
 
+fn is_command_toggle(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'))
+}
+
 impl App {
     pub(crate) fn handle_key(
         &mut self,
@@ -49,7 +54,32 @@ impl App {
             }
             return Ok(false);
         }
-        if self.handle_question_key(key, effects)? {
+        if self.overlay.is_none() && is_command_toggle(key) {
+            self.command_input.clear();
+            self.overlay = Overlay::Command;
+            return Ok(false);
+        }
+        if matches!(self.overlay, Overlay::Command) {
+            if is_ctrl_c(key) {
+                self.handle_ctrl_c(effects)?;
+                return Ok(false);
+            }
+            if is_command_toggle(key) || key.code == KeyCode::Esc {
+                self.overlay = Overlay::None;
+                self.command_input.clear();
+                return Ok(false);
+            }
+            if matches!(
+                self.command_input.handle_key(key, &self.word_segmenter),
+                InputAction::Submit
+            ) {
+                self.overlay = Overlay::None;
+                let command = self.command_input.take();
+                return self.execute_command(&command, effects);
+            }
+            return Ok(false);
+        }
+        if self.overlay.is_none() && self.handle_question_key(key, effects)? {
             return Ok(false);
         }
         if self.turn_is_running()
@@ -61,9 +91,7 @@ impl App {
             return Ok(false);
         }
         if matches!(self.overlay, Overlay::Help) {
-            let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
-            if toggle || matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            if is_command_toggle(key) || matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 self.overlay = Overlay::None;
             }
             return Ok(false);
@@ -80,41 +108,20 @@ impl App {
             return Ok(false);
         }
 
-        if matches!(self.overlay, Overlay::Command) {
-            if is_ctrl_c(key) {
-                self.handle_ctrl_c(effects)?;
-                return Ok(false);
-            }
-            let toggle = key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/'));
-            if toggle || key.code == KeyCode::Esc {
-                self.overlay = Overlay::None;
-                self.command_input.clear();
-                return Ok(false);
-            }
-            if matches!(
-                self.command_input.handle_key(key, &self.word_segmenter),
-                InputAction::Submit
-            ) {
-                self.overlay = Overlay::None;
-                let command = self.command_input.take();
-                return self.execute_command(&command, effects);
-            }
-            return Ok(false);
-        }
-
-        if (self.pending_approval().is_some()
-            || matches!(self.turn, TurnState::EnteringDenyReason { .. }))
+        if self.overlay.is_none()
+            && (self.pending_approval().is_some()
+                || matches!(self.turn, TurnState::EnteringDenyReason { .. }))
             && is_ctrl_c(key)
         {
             self.handle_ctrl_c(effects)?;
             return Ok(false);
         }
 
-        if let TurnState::EnteringDenyReason {
-            approval_id,
-            reason,
-        } = &mut self.turn
+        if self.overlay.is_none()
+            && let TurnState::EnteringDenyReason {
+                approval_id,
+                reason,
+            } = &mut self.turn
         {
             match key.code {
                 KeyCode::Enter => {
@@ -131,7 +138,9 @@ impl App {
             return Ok(false);
         }
 
-        if let Some(approval_id) = self.pending_approval().map(|approval| approval.id()) {
+        if self.overlay.is_none()
+            && let Some(approval_id) = self.pending_approval().map(|approval| approval.id())
+        {
             match key.code {
                 KeyCode::Esc => self.cancel_turn(effects),
                 KeyCode::Char('y') => {
@@ -232,12 +241,6 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
                 self.handle_ctrl_c(effects)?;
-                return Ok(false);
-            }
-            if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('/')) && self.overlay.is_none()
-            {
-                self.command_input.clear();
-                self.overlay = Overlay::Command;
                 return Ok(false);
             }
             if matches!(key.code, KeyCode::Enter | KeyCode::Char('g'))
