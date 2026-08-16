@@ -58,7 +58,7 @@
             name = "atra-${version}";
             src = cargoSource;
             # hash = pkgs.lib.fakeHash;
-            hash = "sha256-jHGJX1uhQyxgfMbM27tZAXewpPxvkJbv6D2hx7qld08=";
+            hash = "sha256-IlmLUPC6drklmN/U1YL4IeUUyV70ttIoH67qXVRbiIE=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"
@@ -199,7 +199,7 @@
               pkg-config
               rustToolchain
             ];
-            CHROMIUM_PATH = pkgs.lib.getExe pkgs.chromium;
+            PLAYWRIGHT_CHROMIUM_EXECUTABLE = pkgs.lib.getExe pkgs.chromium;
             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
           };
         }
