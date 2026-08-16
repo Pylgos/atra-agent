@@ -99,6 +99,7 @@ impl RunnerPool {
         let info = RunnerInfo {
             name: name.clone(),
             description: description.clone(),
+            approval,
         };
         let mut runners = self.runners.lock().await;
         views.start_runner_launch(info.clone()).await?;
@@ -121,14 +122,15 @@ impl RunnerPool {
                     description,
                     approval,
                 };
-                let watcher = watch_runner(
-                    Arc::downgrade(&views),
+                let info = {
+                    let config = runner.config.lock().await;
                     RunnerInfo {
                         name: name.clone(),
-                        description: runner.config.lock().await.description.clone(),
-                    },
-                    Arc::clone(&runner),
-                );
+                        description: config.description.clone(),
+                        approval: config.approval,
+                    }
+                };
+                let watcher = watch_runner(Arc::downgrade(&views), info, Arc::clone(&runner));
                 runners.insert(name.clone(), RunnerSlot { runner, watcher });
                 return Ok(());
             }
@@ -185,9 +187,11 @@ impl RunnerPool {
             {
                 continue;
             }
+            let config = runner.config.lock().await;
             result.push(RunnerInfo {
                 name: name.clone(),
-                description: runner.config.lock().await.description.clone(),
+                description: config.description.clone(),
+                approval: config.approval,
             });
         }
         result.sort_unstable_by(|left, right| left.name.cmp(&right.name));

@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -108,6 +110,34 @@ pub(crate) fn install(source: &Path) -> Result<()> {
     let bundle = atra_platform::PlatformBundle::load(source)?;
     let installed = bundle.install(&data_directory()?)?;
     println!("{}", installed.display());
+    Ok(())
+}
+
+pub(crate) async fn exec(tool: &OsStr, args: &[std::ffi::OsString]) -> Result<()> {
+    validate_tool_name(tool)?;
+    let platform = current_platform()?.context("no default platform is installed")?;
+    let path = platform.tool_path(tool)?;
+    let status = Command::new(&path)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("failed to start platform tool {}", path.display()))?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn validate_tool_name(name: &OsStr) -> Result<()> {
+    let name = name
+        .to_str()
+        .with_context(|| format!("platform tool name {name:?} is not valid UTF-8"))?;
+    if name.is_empty() || matches!(name, "." | "..") || name.contains('/') || name.contains('\\') {
+        bail!("invalid platform tool name {name:?}");
+    }
     Ok(())
 }
 

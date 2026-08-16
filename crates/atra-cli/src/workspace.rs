@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use atra_protocol::{Command as StateCommand, CommandResult};
+use atra_protocol::{ApprovalPolicy, Command as StateCommand, CommandResult};
 use rustix::process::getuid;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -17,15 +17,32 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-use crate::controller_client::{client, not_running as controller_not_running};
+use crate::{
+    controller_client::{client, not_running as controller_not_running},
+    runner,
+};
 
 const CONFIG: &str = ".config/atra.toml";
-const SETUP: &str = ".config/atra-setup.bash";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    setup: String,
+    #[serde(default = "default_builtin_runners")]
+    builtin_runners: bool,
+    setup: Option<String>,
+}
+
+fn default_builtin_runners() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            builtin_runners: true,
+            setup: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -48,69 +65,94 @@ pub(crate) fn id(workspace: &Path) -> String {
         .to_owned()
 }
 
-pub(crate) fn init(workspace: &Path) -> Result<()> {
-    let config_path = workspace.join(CONFIG);
-    let setup_path = workspace.join(SETUP);
-    if config_path.exists() {
-        bail!(
-            "workspace is already initialized at {}",
-            config_path.display()
-        );
-    }
-    if setup_path.exists() {
-        bail!("refusing to overwrite {}", setup_path.display());
-    }
-
-    let config_directory = config_path
-        .parent()
-        .expect("workspace config path should have a parent");
-    fs::create_dir_all(config_directory).with_context(|| {
-        format!(
-            "failed to create workspace config directory {}",
-            config_directory.display()
-        )
-    })?;
-    fs::write(&config_path, format!("setup = \"bash {SETUP}\"\n"))
-        .with_context(|| format!("failed to write workspace config {}", config_path.display()))?;
-    fs::write(
-        &setup_path,
-        concat!(
-            "#!/usr/bin/env bash\n",
-            "set -euo pipefail\n",
-            "\n",
-            "\"${ATRA_BINARY:-atra}\" runner launch \\\n",
-            "  --name host \\\n",
-            "  --description \"Run commands directly in the workspace host environment\" \\\n",
-            "  --approval ask\n",
-        ),
-    )
-    .with_context(|| format!("failed to write workspace setup {}", setup_path.display()))?;
-    fs::set_permissions(&setup_path, fs::Permissions::from_mode(0o755)).with_context(|| {
-        format!(
-            "failed to make workspace setup executable {}",
-            setup_path.display()
-        )
-    })?;
-    println!("initialized {}", config_path.display());
-    Ok(())
-}
-
 fn load_config(workspace: &Path) -> Result<Config> {
     let path = workspace.join(CONFIG);
-    let config = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read workspace config {}", path.display()))?;
+    let config = match fs::read_to_string(&path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read workspace config {}", path.display()));
+        }
+    };
     toml::from_str(&config)
         .with_context(|| format!("failed to parse workspace config {}", path.display()))
 }
 
-pub(crate) async fn start(workspace: &Path, endpoint: &Path, workspace_id: &str) -> Result<()> {
+pub(crate) async fn start(workspace: &Path) -> Result<()> {
     let config = load_config(workspace)?;
-    let database = database(workspace_id)?;
-    start_controller(workspace, endpoint, &database).await?;
+    let workspace_id = id(workspace);
+    let endpoint = endpoint(&workspace_id)?;
+    let database = database(&workspace_id)?;
+    start_controller(workspace, &endpoint, &database).await?;
+    if config.builtin_runners {
+        launch_builtin_runners(workspace, &endpoint).await?;
+    }
+    if let Some(setup) = &config.setup {
+        run_setup(workspace, &endpoint, setup).await?;
+    }
+    println!("workspace started");
+    Ok(())
+}
 
+async fn launch_builtin_runners(workspace: &Path, endpoint: &Path) -> Result<()> {
+    launch_host(endpoint).await?;
+    launch_sandbox(workspace, endpoint).await?;
+    Ok(())
+}
+
+async fn launch_host(endpoint: &Path) -> Result<()> {
+    runner::launch(
+        endpoint,
+        runner::RunnerLaunch {
+            name: "host".to_owned(),
+            description: "Run commands directly in the workspace host environment.".to_owned(),
+            approval: ApprovalPolicy::Ask,
+            command: runner::runner_command(Vec::new())?,
+        },
+    )
+    .await
+}
+
+async fn launch_sandbox(workspace: &Path, endpoint: &Path) -> Result<()> {
+    let executable = env::current_exe().context("failed to determine the atra executable path")?;
+    let executable = executable
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("atra executable path is not valid UTF-8"))?;
+    let workspace = workspace
+        .as_os_str()
+        .to_str()
+        .context("workspace path is not valid UTF-8")?;
+    runner::launch(
+        endpoint,
+        runner::RunnerLaunch {
+            name: "sandbox".to_owned(),
+            description: "Sandboxed workspace environment. Only the workspace and the \
+                          sandbox HOME are writable by default; the host filesystem is \
+                          visible read-only and the network is shared."
+                .to_owned(),
+            approval: ApprovalPolicy::Allow,
+            command: vec![
+                executable,
+                "runner".to_owned(),
+                "sandbox".to_owned(),
+                "--preset".to_owned(),
+                "standard".to_owned(),
+                "--workspace".to_owned(),
+                workspace.to_owned(),
+            ],
+        },
+    )
+    .await
+}
+
+async fn run_setup(workspace: &Path, endpoint: &Path, setup: &str) -> Result<()> {
     let atra_binary = env::current_exe().context("failed to determine the atra executable path")?;
     let status = Command::new("bash")
-        .args(["-c", &config.setup])
+        .args(["-c", setup])
         .current_dir(workspace)
         .env("ATRA_BINARY", &atra_binary)
         .env("ATRA_CONTROLLER_ENDPOINT", endpoint)
@@ -123,20 +165,45 @@ pub(crate) async fn start(workspace: &Path, endpoint: &Path, workspace_id: &str)
     if !status.success() {
         bail!("workspace setup command exited with {status}");
     }
-    println!("workspace started");
     Ok(())
 }
 
-pub(crate) async fn prepare_tui(
-    workspace: &Path,
-    endpoint: &Path,
-    workspace_id: &str,
-) -> Result<bool> {
+pub(crate) async fn clean(workspace: &Path, endpoint: &Path, force: bool) -> Result<()> {
+    if controller_is_running(endpoint).await? {
+        bail!("controller is running; stop it before cleaning the workspace");
+    }
+    let home = sandbox_home_path(workspace)?;
+    if !home.exists() {
+        return Ok(());
+    }
+    for directory in sandbox_directories(workspace)? {
+        check_private_directory(&directory)?;
+    }
+    if !force {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!("workspace clean requires --force when not running interactively");
+        }
+        print!("Remove {}? [y/N] ", home.display());
+        std::io::stdout()
+            .flush()
+            .context("failed to display workspace clean prompt")?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read workspace clean confirmation")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Ok(());
+        }
+    }
+    fs::remove_dir_all(&home)
+        .with_context(|| format!("failed to remove sandbox home {}", home.display()))?;
+    println!("removed {}", home.display());
+    Ok(())
+}
+
+pub(crate) async fn prepare_tui(workspace: &Path, endpoint: &Path) -> Result<bool> {
     if controller_is_running(endpoint).await? {
         return Ok(true);
-    }
-    if !workspace.join(CONFIG).is_file() {
-        bail!("controller is not running");
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("controller is not running");
@@ -153,7 +220,7 @@ pub(crate) async fn prepare_tui(
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return Ok(false);
     }
-    start(workspace, endpoint, workspace_id).await?;
+    start(workspace).await?;
     Ok(true)
 }
 
@@ -190,6 +257,38 @@ pub(crate) fn database(workspace_id: &str) -> Result<PathBuf> {
     Ok(workspace_dir.join("controller.sqlite3"))
 }
 
+pub(crate) fn sandbox_home(workspace: &Path) -> Result<PathBuf> {
+    let home = sandbox_home_path(workspace)?;
+    let state_home = xdg::BaseDirectories::new()
+        .get_state_home()
+        .context("cannot determine the XDG state directory")?;
+    fs::create_dir_all(&state_home)
+        .with_context(|| format!("failed to create state directory {}", state_home.display()))?;
+    for directory in sandbox_directories(workspace)? {
+        ensure_private_directory(&directory)?;
+    }
+    Ok(home)
+}
+
+fn sandbox_home_path(workspace: &Path) -> Result<PathBuf> {
+    Ok(sandbox_directories(workspace)?
+        .pop()
+        .expect("sandbox directories should not be empty"))
+}
+
+fn sandbox_directories(workspace: &Path) -> Result<Vec<PathBuf>> {
+    let workspace_id = id(workspace);
+    let state_home = xdg::BaseDirectories::new()
+        .get_state_home()
+        .context("cannot determine the XDG state directory")?;
+    let atra = state_home.join("atra");
+    let workspaces = atra.join("workspaces");
+    let workspace = workspaces.join(workspace_id);
+    let sandbox = workspace.join("sandbox");
+    let home = sandbox.join("home");
+    Ok(vec![atra, workspaces, workspace, sandbox, home])
+}
+
 fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -200,7 +299,10 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create directory {}", path.display()));
         }
     }
+    check_private_directory(path)
+}
 
+fn check_private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect directory {}", path.display()))?;
     if !metadata.is_dir()
@@ -324,5 +426,53 @@ async fn controller_is_running(endpoint: &Path) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if controller_not_running(&error) => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_config_without_file_uses_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = load_config(directory.path()).unwrap();
+        assert!(config.builtin_runners);
+        assert_eq!(config.setup, None);
+    }
+
+    #[test]
+    fn config_combinations() {
+        let cases = [
+            ("", true, None),
+            ("builtin_runners = true", true, None),
+            ("builtin_runners = false", false, None),
+            ("setup = \"bash setup.bash\"", true, Some("bash setup.bash")),
+            ("builtin_runners = true\nsetup = \"x\"", true, Some("x")),
+            ("builtin_runners = false\nsetup = \"x\"", false, Some("x")),
+        ];
+        for (input, builtin, setup) in cases {
+            let config: Config = toml::from_str(input).unwrap();
+            assert_eq!(config.builtin_runners, builtin, "input: {input:?}");
+            assert_eq!(config.setup.as_deref(), setup, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_unknown_field() {
+        assert!(toml::from_str::<Config>("unknown = 1").is_err());
+    }
+
+    #[test]
+    fn config_rejects_malformed_toml() {
+        assert!(toml::from_str::<Config>("builtin_runners = ").is_err());
+    }
+
+    #[test]
+    fn load_config_rejects_unreadable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".config")).unwrap();
+        fs::write(directory.path().join(CONFIG), "builtin_runners = ").unwrap();
+        assert!(load_config(directory.path()).is_err());
     }
 }

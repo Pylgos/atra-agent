@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use super::{
     ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse, ModelSession,
-    ModelStreamEvent, ModelTool, ProviderLoginStatus, ProviderOutput,
+    ModelStreamEvent, ModelTool, ProviderLoginStatus, ProviderOutput, format_runners,
 };
 use crate::storage::Event;
 
@@ -707,14 +707,9 @@ fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
             ThreadEventData::Runners(event) => Message {
                 role: "system".to_owned(),
                 content: match event {
-                    RunnersEvent::Initial(runners) | RunnersEvent::Replacement(runners) => format!(
-                        "Available Atra Runners:\n{}",
-                        runners
-                            .iter()
-                            .map(|runner| format!("{}: {}", runner.name, runner.description))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ),
+                    RunnersEvent::Initial(runners) | RunnersEvent::Replacement(runners) => {
+                        format_runners(runners)
+                    }
                 },
                 ..Message::default()
             },

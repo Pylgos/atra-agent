@@ -99,6 +99,7 @@
                 install -m755 ${runner}/bin/atra-runner "$staging/bin/atra-runner"
                 install -m755 ${runner}/bin/atri "$staging/bin/atri"
                 install -m755 ${static.bash}/bin/bash "$staging/bin/bash"
+                install -m755 ${static.bubblewrap}/bin/bwrap "$staging/bin/bwrap"
                 install -m755 ${static.fd}/bin/fd "$staging/bin/fd"
                 install -m755 ${static.jq}/bin/jq "$staging/bin/jq"
                 install -m755 ${static.ripgrep}/bin/rg "$staging/bin/rg"

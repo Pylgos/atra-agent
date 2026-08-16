@@ -1,5 +1,5 @@
 use std::{
-    env,
+    ffi::OsString,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -9,13 +9,15 @@ use atra_client::{Client, ProcessSubscription, ThreadSubscription};
 use atra_protocol::{
     ApprovalPolicy, AssistantMessagePhase, CheckpointId, Command as StateCommand, CommandResult,
     EventSequence, HistoryTarget, InteractionId, ProcessId, ProcessLocator, ProcessStatus,
-    ProviderLifecycle, RunnerLifecycle, ThreadEventData, ThreadId, TurnOutcome,
+    ProviderLifecycle, ThreadEventData, ThreadId, TurnOutcome,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 
 mod controller_client;
 mod platform;
+mod runner;
+mod sandbox;
 mod workspace;
 
 use controller_client::{client, not_running as controller_not_running};
@@ -75,8 +77,11 @@ enum ControllerCommand {
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
-    Init,
     Start,
+    Clean {
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,7 +202,14 @@ enum ApprovalCommand {
 #[derive(Subcommand)]
 enum PlatformCommand {
     Download,
-    Install { bundle: PathBuf },
+    Install {
+        bundle: PathBuf,
+    },
+    Exec {
+        tool: OsString,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,6 +218,7 @@ enum RunnerCommand {
         #[arg(long)]
         stdio: bool,
     },
+    Sandbox(sandbox::SandboxOptions),
     List,
     Upload {
         #[arg(long)]
@@ -303,6 +316,12 @@ async fn run(command: Command) -> Result<()> {
         }
         return atra_runner::run_stdio().await;
     }
+    if let Command::Runner {
+        command: RunnerCommand::Sandbox(options),
+    } = &command
+    {
+        return sandbox::execute(options.clone()).await;
+    }
     match &command {
         Command::Platform {
             command: PlatformCommand::Download,
@@ -310,17 +329,12 @@ async fn run(command: Command) -> Result<()> {
         Command::Platform {
             command: PlatformCommand::Install { bundle },
         } => return platform::install(bundle),
+        Command::Platform {
+            command: PlatformCommand::Exec { tool, args },
+        } => return platform::exec(tool, args).await,
         _ => {}
     }
     let workspace = workspace::root()?;
-    if matches!(
-        &command,
-        Command::Workspace {
-            command: WorkspaceCommand::Init
-        }
-    ) {
-        return workspace::init(&workspace);
-    }
     let workspace_id = workspace::id(&workspace);
     let endpoint = workspace::endpoint(&workspace_id)?;
 
@@ -484,11 +498,11 @@ async fn run(command: Command) -> Result<()> {
             command: ControllerCommand::Status,
         } => workspace::controller_status(&endpoint).await,
         Command::Workspace {
-            command: WorkspaceCommand::Init,
-        } => unreachable!("workspace init is handled before controller endpoint setup"),
-        Command::Workspace {
             command: WorkspaceCommand::Start,
-        } => workspace::start(&workspace, &endpoint, &workspace_id).await,
+        } => workspace::start(&workspace).await,
+        Command::Workspace {
+            command: WorkspaceCommand::Clean { force },
+        } => workspace::clean(&workspace, &endpoint, force).await,
         Command::Thread { command } => run_thread(&endpoint, command).await,
         Command::Approval {
             command: ApprovalCommand::Allow { approval },
@@ -516,8 +530,8 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Runner {
-            command: RunnerCommand::Run { .. },
-        } => unreachable!("runner run is handled before workspace setup"),
+            command: RunnerCommand::Run { .. } | RunnerCommand::Sandbox(_),
+        } => unreachable!("runner run and sandbox are handled before workspace setup"),
         Command::Runner {
             command: RunnerCommand::List,
         } => {
@@ -548,33 +562,16 @@ async fn run(command: Command) -> Result<()> {
                     command,
                 },
         } => {
-            let command = runner_command(command)?;
-            let mut subscription = client(&endpoint).subscribe_controller().await?;
-            expect_accepted(
-                client(&endpoint)
-                    .command(StateCommand::RunnerLaunch {
-                        name: name.clone(),
-                        description,
-                        approval: approval.into(),
-                        command,
-                    })
-                    .await?,
-            )?;
-            loop {
-                subscription.receive().await?;
-                let lifecycle = subscription
-                    .state()
-                    .runners()
-                    .iter()
-                    .find(|runner| runner.runner().name == name)
-                    .with_context(|| format!("Runner {name} is not available"))?
-                    .lifecycle();
-                match lifecycle {
-                    RunnerLifecycle::Launching => {}
-                    RunnerLifecycle::Running => break,
-                    RunnerLifecycle::Failed { message } => bail!(message.clone()),
-                }
-            }
+            runner::launch(
+                &endpoint,
+                runner::RunnerLaunch {
+                    name,
+                    description,
+                    approval: approval.into(),
+                    command: runner::runner_command(command)?,
+                },
+            )
+            .await?;
             println!("launched");
             Ok(())
         }
@@ -617,7 +614,7 @@ async fn run(command: Command) -> Result<()> {
             }
         }
         Command::Tui => {
-            if workspace::prepare_tui(&workspace, &endpoint, &workspace_id).await? {
+            if workspace::prepare_tui(&workspace, &endpoint).await? {
                 let database = workspace::database(&workspace_id)?;
                 let message_history = database.with_file_name("tui-history.jsonl");
                 let command_history = database.with_file_name("tui-command-history.jsonl");
@@ -1051,23 +1048,6 @@ async fn wait_provider_command(
             return Ok(lifecycle.clone());
         }
     }
-}
-
-fn runner_command(command: Vec<String>) -> Result<Vec<String>> {
-    if !command.is_empty() {
-        return Ok(command);
-    }
-
-    let binary = env::current_exe().context("failed to determine the atra executable path")?;
-    Ok(vec![
-        binary
-            .into_os_string()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("atra executable path is not valid UTF-8"))?,
-        "runner".to_owned(),
-        "run".to_owned(),
-        "--stdio".to_owned(),
-    ])
 }
 
 fn provider_auth_home() -> Result<PathBuf> {

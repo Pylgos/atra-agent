@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -175,6 +176,36 @@ impl PlatformStore {
         Ok(content)
     }
 
+    pub fn runner_path(&self) -> Result<PathBuf> {
+        let (path, executable) = self.store.object_path(&self.profile.runner)?;
+        if !executable {
+            bail!("platform runner object is not executable");
+        }
+        Ok(path)
+    }
+
+    pub fn tool_path(&self, name: &OsStr) -> Result<PathBuf> {
+        let name = name
+            .to_str()
+            .with_context(|| format!("platform tool name {name:?} is not valid UTF-8"))?;
+        let manifest = self.tools()?;
+        let object = manifest
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                TreeEntry::File { path, object } if path == &format!("bin/{name}") => {
+                    Some(object.as_str())
+                }
+                _ => None,
+            })
+            .with_context(|| format!("platform tool {name:?} is not available"))?;
+        let (path, executable) = self.store.object_path(object)?;
+        if !executable {
+            bail!("platform tool {name:?} is not executable");
+        }
+        Ok(path)
+    }
+
     pub fn tools(&self) -> Result<TreeManifest> {
         self.store.read_manifest(&self.profile.tools)
     }
@@ -203,4 +234,83 @@ fn read_object(archive: &mut ZipArchive<File>, manifest: ManifestObject) -> Resu
         executable: manifest.executable,
         compressed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    fn setup_platform(root: &Path) -> (String, String) {
+        let store = Store::open(root.to_owned()).unwrap();
+        let runner_content = b"runner";
+        let runner_digest = atra_store::object_digest(runner_content, true);
+        store
+            .put_object(&runner_digest, true, Cursor::new(runner_content))
+            .unwrap();
+        let tool_content = b"tool";
+        let tool_digest = atra_store::object_digest(tool_content, true);
+        store
+            .put_object(&tool_digest, true, Cursor::new(tool_content))
+            .unwrap();
+        let manifest = TreeManifest {
+            entries: vec![TreeEntry::File {
+                path: "bin/bwrap".to_owned(),
+                object: tool_digest.clone(),
+            }],
+        };
+        let tree_digest = manifest.digest();
+        match store.prepare_tree(&manifest).unwrap() {
+            PreparedTree::Ready { .. } => {}
+            PreparedTree::MissingObjects(_) => panic!("tree was not ready"),
+        }
+        let profile = PlatformProfile {
+            runner: runner_digest.clone(),
+            tools: tree_digest,
+        };
+        let platform_directory = root.join("platforms").join("test-linux-static");
+        fs::create_dir_all(&platform_directory).unwrap();
+        fs::write(
+            platform_directory.join("default.json"),
+            serde_json::to_vec(&profile).unwrap(),
+        )
+        .unwrap();
+        (runner_digest, tool_digest)
+    }
+
+    fn load(root: &Path) -> PlatformStore {
+        PlatformStore::load(root.to_owned(), "test-linux-static")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn runner_path_returns_the_executable_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (runner_digest, _) = setup_platform(temporary.path());
+        let path = load(temporary.path()).runner_path().unwrap();
+        assert!(path.ends_with(&runner_digest));
+    }
+
+    #[test]
+    fn tool_path_returns_the_executable_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, tool_digest) = setup_platform(temporary.path());
+        let path = load(temporary.path())
+            .tool_path(OsStr::new("bwrap"))
+            .unwrap();
+        assert!(path.ends_with(&tool_digest));
+    }
+
+    #[test]
+    fn tool_path_rejects_a_missing_tool() {
+        let temporary = tempfile::tempdir().unwrap();
+        setup_platform(temporary.path());
+        assert!(
+            load(temporary.path())
+                .tool_path(OsStr::new("missing"))
+                .is_err()
+        );
+    }
 }

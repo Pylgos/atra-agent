@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use atra_protocol::{AssistantMessagePhase, Model, RunnerOperationUpdate};
+use atra_protocol::{ApprovalPolicy, AssistantMessagePhase, Model, Runner, RunnerOperationUpdate};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
@@ -197,4 +197,39 @@ pub(crate) fn text_tokens(text: &str) -> usize {
     tiktoken_rs::o200k_base_singleton()
         .encode_ordinary(text)
         .len()
+}
+
+pub(crate) fn format_runners(runners: &[Runner]) -> String {
+    if runners.is_empty() {
+        return "No Atra Runners are currently available.".to_owned();
+    }
+    let mut lines = vec!["Available Atra Runners:".to_owned()];
+    lines.extend(runners.iter().map(|runner| {
+        format!(
+            "{}: {} (approval: {})",
+            runner.name,
+            runner
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            approval_name(runner.approval),
+        )
+    }));
+    lines.push(String::new());
+    lines.push(
+        "Each Runner has an approval policy. Commands routed to a Runner with `ask` approval \
+         require approval before execution; commands routed to a Runner with `allow` approval \
+         execute without per-command approval. Approval is requested automatically when a command \
+         is executed. If an approval request is denied, the tool call fails."
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
+fn approval_name(approval: ApprovalPolicy) -> &'static str {
+    match approval {
+        ApprovalPolicy::Ask => "ask",
+        ApprovalPolicy::Allow => "allow",
+    }
 }

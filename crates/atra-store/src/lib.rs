@@ -162,13 +162,14 @@ impl Store {
         }
     }
 
+    pub fn object_path(&self, digest: &str) -> Result<(PathBuf, bool)> {
+        let (path, executable) = self.object_metadata(digest)?;
+        verify_object(&path, digest, executable)?;
+        Ok((path, executable))
+    }
+
     pub fn copy_object_to(&self, digest: &str, mut destination: impl Write) -> Result<bool> {
-        validate_digest(digest)?;
-        let path = self.root.join("objects").join(digest);
-        let metadata = path
-            .metadata()
-            .with_context(|| format!("failed to inspect object {}", path.display()))?;
-        let executable = metadata.permissions().mode() & 0o111 != 0;
+        let (path, executable) = self.object_metadata(digest)?;
         let mut source = fs::File::open(&path)
             .with_context(|| format!("failed to open object {}", path.display()))?;
         let mut actual = object_hasher(executable);
@@ -190,6 +191,19 @@ impl Store {
             bail!("object digest mismatch: expected {digest}, got {actual}");
         }
         Ok(executable)
+    }
+
+    fn object_metadata(&self, digest: &str) -> Result<(PathBuf, bool)> {
+        validate_digest(digest)?;
+        let path = self.root.join("objects").join(digest);
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("failed to inspect object {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("object {} is not a regular file", path.display());
+        }
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        Ok((path, executable))
     }
 
     pub fn prepare_tree(&self, manifest: &TreeManifest) -> Result<PreparedTree> {
@@ -303,6 +317,27 @@ fn object_hasher(executable: bool) -> Sha256 {
     digest.update(b"atra-object\0");
     digest.update([u8::from(executable)]);
     digest
+}
+
+fn verify_object(path: &Path, digest: &str, executable: bool) -> Result<()> {
+    let mut source = fs::File::open(path)
+        .with_context(|| format!("failed to open object {}", path.display()))?;
+    let mut actual = object_hasher(executable);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = source
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read object {}", path.display()))?;
+        if length == 0 {
+            break;
+        }
+        actual.update(&buffer[..length]);
+    }
+    let actual = format!("{:x}", actual.finalize());
+    if actual != digest {
+        bail!("object digest mismatch: expected {digest}, got {actual}");
+    }
+    Ok(())
 }
 
 fn set_object_permissions(path: &Path, executable: bool) -> Result<()> {
@@ -424,6 +459,30 @@ mod tests {
             store.read_manifest(&manifest.digest()).unwrap().digest(),
             manifest.digest()
         );
+    }
+
+    #[test]
+    fn object_path_returns_the_verified_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store")).unwrap();
+        let content = b"executable content";
+        let object = object_digest(content, true);
+        store
+            .put_object(&object, true, Cursor::new(content))
+            .unwrap();
+
+        let (path, executable) = store.object_path(&object).unwrap();
+        assert!(executable);
+        assert_eq!(path, temporary.path().join("store/objects").join(&object));
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn object_path_rejects_a_missing_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store")).unwrap();
+        let object = object_digest(b"missing", true);
+        assert!(store.object_path(&object).is_err());
     }
 
     #[test]

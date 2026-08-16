@@ -435,6 +435,7 @@ pub enum HistoryTarget {
 pub struct Runner {
     pub name: String,
     pub description: String,
+    pub approval: ApprovalPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

@@ -17,15 +17,14 @@ use reqwest::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use atra_protocol::{
-    InstructionEvent, Model, Runner, RunnersEvent, ThreadEventData, ToolResultEvent,
-};
+use atra_protocol::{InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent};
 
 use super::{
     ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
     ModelResponseMetadata, ModelSession, ModelStreamEvent, ModelTool, ProviderLoginStatus,
     ProviderOutput,
     codex_auth::{Auth, AuthManager},
+    format_runners,
 };
 use crate::storage::Event;
 
@@ -1001,25 +1000,6 @@ fn instruction_text(event: &InstructionEvent, label: &str) -> String {
         }
         InstructionEvent::Removal => format!("The previously provided {label} no longer apply."),
     }
-}
-
-fn format_runners(runners: &[Runner]) -> String {
-    if runners.is_empty() {
-        return "No Atra Runners are currently available.".to_owned();
-    }
-    let mut lines = vec!["Available Atra Runners:".to_owned()];
-    lines.extend(runners.iter().map(|runner| {
-        format!(
-            "{}: {}",
-            runner.name,
-            runner
-                .description
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    }));
-    lines.join("\n")
 }
 
 fn tool_result_text(result: &Value) -> String {
