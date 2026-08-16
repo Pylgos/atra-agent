@@ -86,3 +86,8 @@ xdg = "3.0.0"
 yaml-rust = "0.4.5"
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 zstd = "0.13.3"
+
+[profile.wasm-release]
+inherits = "release"
+debug = 0
+strip = "debuginfo"
