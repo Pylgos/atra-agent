@@ -68,10 +68,11 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
 
                 Subagents:
                 `atri agent create --name <name> [--model <provider>/<model>] [--effort <effort>] [--allow-delegation]` creates an empty child thread without copying this conversation.
+                Omit `--model` and `--effort` normally; omitted values are inherited from the parent thread. Override them only when explicitly required by the user or applicable instructions.
                 `--allow-delegation` permits that child to create its own children. A child without this permission is rejected by the Controller if it attempts `agent create`.
-                Use `atri agent send <thread-id> [<message>]`, `atri agent wait [--timeout <seconds>] <thread-id>[@<after-sequence>]...`, `atri agent list`, `atri agent cancel [--recursive] <thread-id>...`, and `atri agent delete [--recursive] <thread-id>...`.
+                Use `atri agent send <thread-id> [<message>]`, `atri agent wait [--timeout <seconds>] <thread-id>@<after-sequence>...`, `atri agent list`, `atri agent cancel [--recursive] <thread-id>...`, and `atri agent delete [--recursive] <thread-id>...`.
                 Automated child turns cannot ask questions, remain alive independently of the parent turn, and are limited to eight concurrently running descendants per root.
-                Use the cursor returned by `send` and `through` returned by `wait` for small incremental results.
+                For the first `wait` after `send`, use the `after_sequence` returned by `send`. For subsequent waits, use the `through` returned by the previous `wait`. Use `-1` only when intentionally reading the thread from its beginning.
                 Before completing the parent turn, stop every descendant that is still running.
 
                 Patches:

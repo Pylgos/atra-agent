@@ -215,24 +215,21 @@ async fn run_agent(endpoint: &Path, command: AgentCommand) -> Result<bool> {
 }
 
 fn agent_target(value: &str) -> std::result::Result<AgentTarget, String> {
-    let (thread, after_sequence) = match value.rsplit_once('@') {
-        Some((thread, sequence)) => {
-            let sequence = sequence
-                .parse::<i64>()
-                .map_err(|_| "sequence must be -1 or a non-negative integer".to_owned())?;
-            if sequence < -1 {
-                return Err("sequence must be -1 or a non-negative integer".to_owned());
-            }
-            (thread, Some(EventSequence(sequence)))
-        }
-        None => (value, None),
-    };
+    let (thread, sequence) = value
+        .rsplit_once('@')
+        .ok_or_else(|| "target must be formatted as <thread-id>@<after-sequence>".to_owned())?;
+    let sequence = sequence
+        .parse::<i64>()
+        .map_err(|_| "sequence must be -1 or a non-negative integer".to_owned())?;
+    if sequence < -1 {
+        return Err("sequence must be -1 or a non-negative integer".to_owned());
+    }
     let thread_id = thread
         .parse::<i64>()
         .map_err(|_| "thread ID must be an integer".to_owned())?;
     Ok(AgentTarget {
         thread_id: ThreadId(thread_id),
-        after_sequence,
+        after_sequence: EventSequence(sequence),
     })
 }
 
@@ -754,8 +751,13 @@ mod tests {
             panic!("expected agent wait")
         };
         assert_eq!(targets[0].thread_id, ThreadId(42));
-        assert_eq!(targets[0].after_sequence, Some(EventSequence(-1)));
+        assert_eq!(targets[0].after_sequence, EventSequence(-1));
         assert_eq!(timeout, 86_400);
+    }
+
+    #[test]
+    fn agent_wait_requires_an_after_sequence() {
+        assert!(Cli::try_parse_from(["atri", "agent", "wait", "42"]).is_err());
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     - For non-trivial work, put a todo annotation at the beginning of a commentary message or final answer when the todo state changes. Use `<todo>` and `</todo>` on separate lines with one or more `- [x]: completed`, `- [-]: in progress`, or `- [ ]: pending` lines between them. Omit the annotation when the todo state does not change.
     - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
     - Use subagents only when the user message, applicable AGENTS.md instructions, or an applicable skill explicitly instructs you to do so. Do not create subagents merely because delegation or parallelism may be useful.
+    - When creating a subagent, omit `--model` and `--effort` so it inherits them from its parent unless the user message, applicable AGENTS.md instructions, or an applicable skill explicitly requires an override. Do not select a different model or reasoning effort merely because a task appears complex, important, or suited to a particular role.
     - The same rule applies to recursive delegation. A subagent may create child agents only when its thread context allows delegation and one of those instruction sources explicitly authorizes recursive delegation.
     - You are responsible for subagents you create. Before completing your turn, wait for required results and stop every descendant that is still running. Do not leave automated child turns running in the background."#};
 

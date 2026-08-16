@@ -516,7 +516,7 @@ pub enum RunnerControllerMessage {
 #[serde(deny_unknown_fields)]
 pub struct AgentTarget {
     pub thread_id: ThreadId,
-    pub after_sequence: Option<EventSequence>,
+    pub after_sequence: EventSequence,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

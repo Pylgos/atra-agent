@@ -471,15 +471,7 @@ impl State {
             ));
         }
         let events = snapshot.events;
-        let after = target.after_sequence.unwrap_or_else(|| {
-            events
-                .iter()
-                .rev()
-                .find(|event| matches!(event.data, ThreadEventData::UserMessage(_)))
-                .map_or(EventSequence(-1), |event| {
-                    EventSequence(event.sequence.0 - 1)
-                })
-        });
+        let after = target.after_sequence;
         let selected = events
             .iter()
             .filter(|event| event.sequence.0 > after.0)
