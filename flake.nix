@@ -2,6 +2,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -9,6 +13,7 @@
       self,
       nixpkgs,
       crane,
+      rust-overlay,
       ...
     }:
     let
@@ -125,23 +130,38 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          rustToolchain = pkgs.rust-bin.stable."1.96.0".minimal.override {
+            extensions = [
+              "clippy"
+              "rust-analyzer"
+              "rust-src"
+              "rustfmt"
+            ];
+            targets = [ "wasm32-unknown-unknown" ];
+          };
         in
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
+              binaryen
               bubblewrap
-              cargo
               clang
-              clippy
+              chromium
+              dioxus-cli
               git
               mold
+              nodejs
               openssl
+              pnpm
               pkg-config
-              rust-analyzer
-              rustc
-              rustfmt
+              rustToolchain
             ];
+            CHROMIUM_PATH = pkgs.lib.getExe pkgs.chromium;
+            PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
           };
         }
       );

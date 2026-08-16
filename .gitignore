@@ -1,5 +1,6 @@
 /target/
 /dist/
+/.scratch/
 /result
 /result-atra
 __pycache__/

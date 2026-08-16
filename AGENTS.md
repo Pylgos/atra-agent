@@ -27,3 +27,13 @@
   - ユーザとの対話を通して実装方針を洗練させる。
   - ユーザの明示的な同意を得てから実装を開始する。
   - 実装が完了したらユーザへ内容を説明し、確認を依頼する。方針から外れた点、拡張した点を必ずユーザに報告する。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked as local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+This is a single-context repository using root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
