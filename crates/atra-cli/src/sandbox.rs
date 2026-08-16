@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     env,
     ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
 };
 
@@ -47,8 +48,15 @@ struct SandboxContext {
     runner_binary: PathBuf,
     bwrap: PathBuf,
     hidden_host_home: Option<PathBuf>,
+    preserved_path_directories: Vec<ReadOnlyMount>,
     uid: u32,
     gid: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadOnlyMount {
+    source: PathBuf,
+    destination: PathBuf,
 }
 
 struct SandboxPlan {
@@ -68,12 +76,15 @@ pub(crate) async fn execute(options: SandboxOptions) -> Result<()> {
         SandboxPreset::Standard => Some(resolve_host_home(env::var_os("HOME"))?),
         SandboxPreset::Relaxed => None,
     };
+    let preserved_path_directories =
+        preserved_path_directories(env::var_os("PATH"), &workspace, hidden_host_home.as_deref());
     let context = SandboxContext {
         workspace,
         sandbox_home,
         runner_binary,
         bwrap,
         hidden_host_home,
+        preserved_path_directories,
         uid: getuid().as_raw(),
         gid: getgid().as_raw(),
     };
@@ -159,6 +170,46 @@ fn canonicalize_mount(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve mount path {}", path.display()))
 }
 
+fn preserved_path_directories(
+    path: Option<OsString>,
+    workspace: &Path,
+    hidden_host_home: Option<&Path>,
+) -> Vec<ReadOnlyMount> {
+    let mut hidden_roots = vec![Path::new("/tmp"), Path::new("/run"), Path::new("/var/tmp")];
+    if let Some(home) = hidden_host_home {
+        hidden_roots.push(home);
+    }
+
+    let mut destinations = HashSet::new();
+    path.into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .filter(|directory| directory.is_absolute())
+        .filter(|directory| !directory.starts_with(workspace))
+        .filter(|directory| {
+            hidden_roots
+                .iter()
+                .any(|root| is_strict_descendant(directory, root))
+        })
+        .filter(|directory| destinations.insert(directory.clone()))
+        .filter_map(|destination| {
+            let source = fs::canonicalize(&destination).ok()?;
+            source.is_dir().then_some(ReadOnlyMount {
+                source,
+                destination,
+            })
+        })
+        .collect()
+}
+
+fn is_strict_descendant(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    })
+}
+
 fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<SandboxPlan> {
     let mut args = Vec::new();
 
@@ -216,6 +267,16 @@ fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<Sandbo
     args.push(OsString::from("--bind"));
     args.push(context.workspace.clone().into_os_string());
     args.push(context.workspace.clone().into_os_string());
+
+    // Preserve inherited PATH entries hidden by the temporary filesystems or
+    // host HOME masking without exposing their parent trees.
+    for mount in context.preserved_path_directories {
+        args.push(OsString::from("--dir"));
+        args.push(mount.destination.clone().into_os_string());
+        args.push(OsString::from("--ro-bind"));
+        args.push(mount.source.into_os_string());
+        args.push(mount.destination.into_os_string());
+    }
 
     // Runner binary at a fixed private path.
     args.push(OsString::from("--ro-bind"));
@@ -289,6 +350,7 @@ mod tests {
             runner_binary: PathBuf::from("/platform/runner"),
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             hidden_host_home: Some(PathBuf::from("/home/user")),
+            preserved_path_directories: Vec::new(),
             uid: 1000,
             gid: 1000,
         }
@@ -364,6 +426,79 @@ mod tests {
         let plan = build_plan(options(), context()).unwrap();
         let arguments = args(&plan);
         assert!(position(&arguments, "/home/user") < position(&arguments, "/ws"));
+    }
+
+    #[test]
+    fn path_directories_hidden_by_the_sandbox_are_preserved() {
+        let temporary = tempfile::tempdir().unwrap();
+        let hidden_root = temporary.path().join("hidden");
+        let profile_bin = hidden_root.join(".nix-profile/bin");
+        let profile_target = temporary.path().join("profiles/profile");
+        let visible_bin = Path::new("/usr");
+        fs::create_dir_all(profile_target.join("bin")).unwrap();
+        fs::create_dir(&hidden_root).unwrap();
+        symlink(&profile_target, hidden_root.join(".nix-profile")).unwrap();
+        let path =
+            env::join_paths([profile_bin.as_path(), profile_bin.as_path(), visible_bin]).unwrap();
+
+        let mounts =
+            preserved_path_directories(Some(path), Path::new("/workspace"), Some(&hidden_root));
+
+        assert_eq!(
+            mounts,
+            vec![ReadOnlyMount {
+                source: fs::canonicalize(profile_target.join("bin")).unwrap(),
+                destination: profile_bin,
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_path_directories_are_not_remounted_read_only() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let workspace_bin = workspace.join("bin");
+        fs::create_dir_all(&workspace_bin).unwrap();
+
+        assert!(
+            preserved_path_directories(
+                Some(workspace_bin.into_os_string()),
+                &workspace,
+                Some(temporary.path()),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn preserved_path_mounts_follow_masking_and_precede_explicit_mounts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("home/.nix-profile/bin");
+        let explicit = temporary.path().join("explicit");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&explicit).unwrap();
+        let mut context = context();
+        context.preserved_path_directories = vec![ReadOnlyMount {
+            source: source.clone(),
+            destination: destination.clone(),
+        }];
+        let mut options = options();
+        options.mount_ro = vec![explicit.clone()];
+
+        let arguments = args(&build_plan(options, context).unwrap());
+        let hidden_home = position(&arguments, "/home/user");
+        let destination = position(&arguments, &destination.to_string_lossy());
+        let source = position(&arguments, &source.to_string_lossy());
+        let explicit = position(
+            &arguments,
+            &fs::canonicalize(explicit).unwrap().to_string_lossy(),
+        );
+
+        assert!(hidden_home < destination);
+        assert_eq!(arguments[destination - 1], "--dir");
+        assert_eq!(arguments[source - 1], "--ro-bind");
+        assert!(source < explicit);
     }
 
     #[test]
