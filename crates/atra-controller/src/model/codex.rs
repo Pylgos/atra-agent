@@ -849,6 +849,9 @@ fn model_input(events: &[Event]) -> Result<Vec<Value>> {
             ThreadEventData::Skills(value) => {
                 Some(message("developer", instruction_text(value, "skills list")))
             }
+            ThreadEventData::SkillInvocation(value) => {
+                Some(message("user", super::format_skill_invocation(value)))
+            }
             ThreadEventData::Runners(value) => Some(message(
                 "developer",
                 match value {
@@ -1438,6 +1441,41 @@ mod tests {
         assert_eq!(
             request.pointer("/input/0/content/0/text"),
             Some(&json!("hello"))
+        );
+    }
+
+    #[test]
+    fn skill_invocation_is_sent_as_user_context_before_the_request() {
+        let events = vec![
+            Event {
+                sequence: atra_protocol::EventSequence(0),
+                data: ThreadEventData::SkillInvocation(atra_protocol::SkillInvocationEvent {
+                    name: "review-code".to_owned(),
+                    path: "$ATRA_SKILLS/review-code/SKILL.md".to_owned(),
+                    instructions: "Review carefully.".to_owned(),
+                }),
+            },
+            Event {
+                sequence: atra_protocol::EventSequence(1),
+                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "$review-code inspect this".to_owned(),
+                }),
+            },
+        ];
+
+        let input = model_input(&events).unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert!(
+            input[0]
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .contains("Review carefully.")
+        );
+        assert_eq!(
+            input[1].pointer("/content/0/text"),
+            Some(&json!("$review-code inspect this"))
         );
     }
 

@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use atra_protocol::{ApprovalPolicy, AssistantMessagePhase, Model, Runner, RunnerOperationUpdate};
+use atra_protocol::{
+    ApprovalPolicy, AssistantMessagePhase, Model, Runner, RunnerOperationUpdate,
+    SkillInvocationEvent,
+};
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
@@ -197,6 +200,18 @@ pub(crate) fn text_tokens(text: &str) -> usize {
     tiktoken_rs::o200k_base_singleton()
         .encode_ordinary(text)
         .len()
+}
+
+pub(crate) fn format_skill_invocation(invocation: &SkillInvocationEvent) -> String {
+    format!(
+        "The user explicitly invoked the following skill for this request. Follow its \
+         instructions and resolve relative references against the directory containing \
+         {path}.\n\n<skill name=\"{name}\" path=\"{path}\">\n<instructions>\n{instructions}\
+         \n</instructions>\n</skill>",
+        name = invocation.name,
+        path = invocation.path,
+        instructions = invocation.instructions,
+    )
 }
 
 pub(crate) fn format_runners(runners: &[Runner]) -> String {

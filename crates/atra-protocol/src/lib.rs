@@ -191,6 +191,7 @@ pub enum ThreadEventData {
     ThreadContext(MessageEvent),
     WorkspaceInstructions(InstructionEvent),
     Skills(InstructionEvent),
+    SkillInvocation(SkillInvocationEvent),
     Runners(RunnersEvent),
     UserMessage(MessageEvent),
     AssistantMessage(AssistantMessageEvent),
@@ -212,6 +213,7 @@ impl ThreadEventData {
             Self::ThreadContext(_) => "thread_context",
             Self::WorkspaceInstructions(_) => "workspace_instructions",
             Self::Skills(_) => "skills",
+            Self::SkillInvocation(_) => "skill_invocation",
             Self::Runners(_) => "runners",
             Self::UserMessage(_) => "user_message",
             Self::AssistantMessage(_) => "assistant_message",
@@ -258,6 +260,14 @@ pub enum RunnersEvent {
 #[serde(deny_unknown_fields)]
 pub struct MessageEvent {
     pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInvocationEvent {
+    pub name: String,
+    pub path: String,
+    pub instructions: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

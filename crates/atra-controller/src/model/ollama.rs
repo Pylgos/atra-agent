@@ -704,6 +704,11 @@ fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
             ThreadEventData::ThreadContext(_) => continue,
             ThreadEventData::WorkspaceInstructions(event) => system_instruction("AGENTS.md", event),
             ThreadEventData::Skills(event) => system_instruction("Skills", event),
+            ThreadEventData::SkillInvocation(event) => Message {
+                role: "user".to_owned(),
+                content: super::format_skill_invocation(event),
+                ..Message::default()
+            },
             ThreadEventData::Runners(event) => Message {
                 role: "system".to_owned(),
                 content: match event {

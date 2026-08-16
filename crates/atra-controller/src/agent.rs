@@ -1146,6 +1146,7 @@ mod tests {
                         entries: Vec::new(),
                     },
                     prompt: None,
+                    skills: Vec::new(),
                 },
             )
             .await

@@ -359,6 +359,9 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
             }));
             lines
         }
+        TranscriptItem::SkillInvocation { name } => {
+            vec![(Some('·'), Line::from(format!("Using skill: {name}")))]
+        }
         TranscriptItem::Compaction => {
             vec![(Some('·'), Line::from("Earlier context compacted"))]
         }
@@ -398,6 +401,7 @@ fn marker_style(item: &TranscriptItem, selected: bool) -> Style {
         | TranscriptItem::Question { .. }
         | TranscriptItem::RunnerTool { .. } => Style::default().fg(Color::Yellow),
         TranscriptItem::ToolResult { .. } => Style::default().fg(Color::DarkGray),
+        TranscriptItem::SkillInvocation { .. } => Style::default().fg(Color::Magenta),
         TranscriptItem::Compaction => Style::default().fg(Color::DarkGray),
     };
     if selected {

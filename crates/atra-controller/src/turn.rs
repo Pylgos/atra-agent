@@ -163,7 +163,7 @@ impl State {
         updates: Option<&TurnProjector>,
     ) -> Result<TurnCompletion> {
         self.prepare_thread_for_turn(thread_id, updates).await?;
-        self.sync_skills(thread_id, updates).await?;
+        let skills = self.sync_skills(thread_id, updates).await?;
         self.sync_runners(thread_id, updates).await?;
         {
             let _mutation = self.lock_mutation().await?;
@@ -177,13 +177,33 @@ impl State {
                 .await?;
         }
         self.sync_workspace_instructions(thread_id, updates).await?;
-        self.append_event(
-            thread_id,
-            ThreadEventData::UserMessage(MessageEvent { content: message }),
-            updates,
-        )
-        .await
-        .context("failed to save user message")?;
+        let (message, invocations) = skills::resolve_invocations(&message, &skills.skills);
+        let mut events = invocations
+            .into_iter()
+            .map(|invocation| {
+                ThreadEventData::SkillInvocation(atra_protocol::SkillInvocationEvent {
+                    path: format!("$ATRA_SKILLS/{}/SKILL.md", invocation.name),
+                    name: invocation.name,
+                    instructions: invocation.instructions,
+                })
+            })
+            .collect::<Vec<_>>();
+        events.push(ThreadEventData::UserMessage(MessageEvent {
+            content: message,
+        }));
+        {
+            let _mutation = self.lock_mutation().await?;
+            let saved = self
+                .store
+                .append_all(thread_id, events.clone())
+                .await
+                .context("failed to save user request")?;
+            if let Some(updates) = updates {
+                for (sequence, data) in saved.into_iter().zip(events) {
+                    send_thread_event(updates, ThreadEvent { sequence, data }).await?;
+                }
+            }
+        }
         self.continue_turn(thread_id, allow_questions, updates)
             .await
     }
@@ -844,7 +864,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         updates: Option<&TurnProjector>,
-    ) -> Result<()> {
+    ) -> Result<Arc<skills::SkillGeneration>> {
         let generation = self.collect_skill_generation().await?;
 
         self.runners
@@ -872,7 +892,7 @@ impl State {
                 None
             )
         ) {
-            return Ok(());
+            return Ok(generation);
         }
         let event = match (&previous, &generation.prompt) {
             (_, None) => InstructionEvent::Removal,
@@ -886,7 +906,7 @@ impl State {
         self.append_event(thread_id, ThreadEventData::Skills(event), updates)
             .await
             .context("failed to save skills")?;
-        Ok(())
+        Ok(generation)
     }
 
     pub(super) async fn collect_skill_generation(&self) -> Result<Arc<skills::SkillGeneration>> {

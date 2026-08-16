@@ -27,11 +27,20 @@ const BUILTIN_SKILLS: &[EmbeddedSkill] = &[EmbeddedSkill {
 pub(crate) struct SkillGeneration {
     pub(crate) manifest: TreeManifest,
     pub(crate) prompt: Option<String>,
+    pub(crate) skills: Vec<SkillDefinition>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SkillDefinition {
+    pub(crate) name: String,
+    pub(crate) instructions: String,
 }
 
 struct Skill {
     name: String,
     description: String,
+    instructions: String,
+    disable_model_invocation: bool,
     files: SkillFiles,
     location: String,
 }
@@ -134,8 +143,23 @@ pub(crate) fn collect(
     let manifest = TreeManifest { entries };
     manifest.validate().map_err(anyhow::Error::msg)?;
 
-    let prompt = (!skills.is_empty()).then(|| format_prompt(&skills));
-    Ok(SkillGeneration { manifest, prompt })
+    let model_invocable = skills
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect::<Vec<_>>();
+    let prompt = (!model_invocable.is_empty()).then(|| format_prompt(&model_invocable));
+    let skills = skills
+        .into_iter()
+        .map(|skill| SkillDefinition {
+            name: skill.name,
+            instructions: skill.instructions,
+        })
+        .collect();
+    Ok(SkillGeneration {
+        manifest,
+        prompt,
+        skills,
+    })
 }
 
 fn discover(root: &Path) -> Result<Vec<Skill>> {
@@ -250,7 +274,7 @@ fn parse_skill(
     files: SkillFiles,
     location: String,
 ) -> Result<Skill> {
-    let frontmatter = parse_frontmatter(content)?;
+    let (frontmatter, instructions) = parse_document(content)?;
     let name = frontmatter["name"]
         .as_str()
         .context("frontmatter name is required")?
@@ -279,15 +303,22 @@ fn parse_skill(
     if name != directory_name {
         bail!("frontmatter name must match parent directory {directory_name:?}");
     }
+    let disable_model_invocation = match &frontmatter["disable-model-invocation"] {
+        yaml_rust::Yaml::BadValue => false,
+        yaml_rust::Yaml::Boolean(value) => *value,
+        _ => bail!("frontmatter disable-model-invocation must be a boolean"),
+    };
     Ok(Skill {
         name,
         description,
+        instructions,
+        disable_model_invocation,
         files,
         location,
     })
 }
 
-fn parse_frontmatter(content: &str) -> Result<yaml_rust::Yaml> {
+fn parse_document(content: &str) -> Result<(yaml_rust::Yaml, String)> {
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let rest = normalized
         .strip_prefix("---\n")
@@ -299,13 +330,18 @@ fn parse_frontmatter(content: &str) -> Result<yaml_rust::Yaml> {
             *offset += line.len() + 1;
             Some((current, line))
         })
-        .find_map(|(offset, line)| (line == "---").then_some(offset.saturating_sub(1)))
+        .find_map(|(offset, line)| (line == "---").then_some(offset))
         .context("SKILL.md frontmatter is not terminated")?;
     let documents = YamlLoader::load_from_str(&rest[..end]).context("invalid YAML frontmatter")?;
-    documents
+    let frontmatter = documents
         .into_iter()
         .next()
-        .context("SKILL.md frontmatter is empty")
+        .context("SKILL.md frontmatter is empty")?;
+    let instructions = rest[end + 3..]
+        .strip_prefix('\n')
+        .unwrap_or(&rest[end + 3..])
+        .to_owned();
+    Ok((frontmatter, instructions))
 }
 
 fn collect_skill(skill: &Skill, store: &Store, entries: &mut Vec<TreeEntry>) -> Result<()> {
@@ -520,7 +556,7 @@ fn logical_path(name: &str, relative: &Path) -> Result<String> {
         .map(|path| path.replace('\\', "/"))
 }
 
-fn format_prompt(skills: &[Skill]) -> String {
+fn format_prompt(skills: &[&Skill]) -> String {
     let mut lines = vec![
         "The following skills provide specialized instructions for specific tasks.".to_owned(),
         "When a skill applies, read $ATRA_SKILLS/<name>/SKILL.md with command. \
@@ -542,4 +578,147 @@ fn format_prompt(skills: &[Skill]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+pub(crate) fn resolve_invocations(
+    message: &str,
+    skills: &[SkillDefinition],
+) -> (String, Vec<SkillDefinition>) {
+    let skills = skills
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill))
+        .collect::<HashMap<_, _>>();
+    let mut normalized = String::with_capacity(message.len());
+    let mut selected = Vec::new();
+    let mut selected_names = HashSet::new();
+    let mut offset = 0;
+    while offset < message.len() {
+        let rest = &message[offset..];
+        let (escaped, marker_offset) = if rest.starts_with("\\$") {
+            (true, 1)
+        } else if rest.starts_with('$') {
+            (false, 0)
+        } else {
+            let character = rest.chars().next().expect("offset is in bounds");
+            normalized.push(character);
+            offset += character.len_utf8();
+            continue;
+        };
+        let name_start = offset + marker_offset + 1;
+        let name_length = message[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+            .count();
+        let name_end = name_start + name_length;
+        let name = &message[name_start..name_end];
+        let Some(skill) = skills.get(name).copied() else {
+            let character = rest.chars().next().expect("offset is in bounds");
+            normalized.push(character);
+            offset += character.len_utf8();
+            continue;
+        };
+        if !escaped && selected_names.insert(name) {
+            selected.push(skill.clone());
+        }
+        normalized.push('$');
+        normalized.push_str(name);
+        offset = name_end;
+    }
+    (normalized, selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn definition(name: &str) -> SkillDefinition {
+        SkillDefinition {
+            name: name.to_owned(),
+            instructions: format!("instructions for {name}"),
+        }
+    }
+
+    #[test]
+    fn parses_instructions_and_disable_model_invocation() {
+        let skill = parse_skill(
+            "---\nname: example\ndescription: Example skill\ndisable-model-invocation: true\n---\nDo the work.\n",
+            "example",
+            SkillFiles::Embedded(&[]),
+            "test".to_owned(),
+        )
+        .unwrap();
+
+        assert!(skill.disable_model_invocation);
+        assert_eq!(skill.instructions, "Do the work.\n");
+    }
+
+    #[test]
+    fn rejects_non_boolean_disable_model_invocation() {
+        let error = parse_skill(
+            "---\nname: example\ndescription: Example skill\ndisable-model-invocation: yes\n---\nBody\n",
+            "example",
+            SkillFiles::Embedded(&[]),
+            "test".to_owned(),
+        )
+        .err()
+        .unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("disable-model-invocation must be a boolean")
+        );
+    }
+
+    #[test]
+    fn prompt_omits_model_disabled_skills() {
+        let visible = parse_skill(
+            "---\nname: visible\ndescription: Visible\n---\nBody\n",
+            "visible",
+            SkillFiles::Embedded(&[]),
+            "test".to_owned(),
+        )
+        .unwrap();
+        let hidden = parse_skill(
+            "---\nname: hidden\ndescription: Hidden\ndisable-model-invocation: true\n---\nBody\n",
+            "hidden",
+            SkillFiles::Embedded(&[]),
+            "test".to_owned(),
+        )
+        .unwrap();
+
+        let prompt = format_prompt(&[&visible]);
+        assert!(prompt.contains("visible: Visible"));
+        assert!(!prompt.contains("hidden"));
+        assert!(hidden.disable_model_invocation);
+    }
+
+    #[test]
+    fn resolves_known_mentions_once_and_unescapes_explicit_literals() {
+        let skills = vec![definition("review-code"), definition("test")];
+        let (message, selected) = resolve_invocations(
+            "$review-code run $test then $review-code; show \\$test and $unknown",
+            &skills,
+        );
+
+        assert_eq!(
+            message,
+            "$review-code run $test then $review-code; show $test and $unknown"
+        );
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>(),
+            ["review-code", "test"]
+        );
+    }
+
+    #[test]
+    fn does_not_match_a_known_name_as_a_prefix() {
+        let skills = vec![definition("test")];
+        let (_, selected) = resolve_invocations("$test-extra $testing", &skills);
+
+        assert!(selected.is_empty());
+    }
 }

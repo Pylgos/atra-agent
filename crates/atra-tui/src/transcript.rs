@@ -303,6 +303,9 @@ pub(crate) enum TranscriptItem {
         artifacts: Vec<ToolArtifact>,
         masked: bool,
     },
+    SkillInvocation {
+        name: String,
+    },
     Compaction,
 }
 
@@ -520,6 +523,9 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             Author::User,
             sanitize(&message.content),
         )),
+        ThreadEventData::SkillInvocation(invocation) => Some(TranscriptItem::SkillInvocation {
+            name: sanitize(&invocation.name),
+        }),
         ThreadEventData::AssistantMessage(message) => Some(TranscriptItem::assistant_message(
             sanitize(&message.content),
             message
@@ -859,6 +865,23 @@ mod tests {
             panic!("assistant message event was not converted");
         };
         assert_eq!(todos[0].step, "safe");
+    }
+
+    #[test]
+    fn skill_invocation_has_a_short_transcript_item() {
+        let event = ThreadEvent {
+            sequence: EventSequence(1),
+            data: ThreadEventData::SkillInvocation(atra_protocol::SkillInvocationEvent {
+                name: "review-code".to_owned(),
+                path: "$ATRA_SKILLS/review-code/SKILL.md".to_owned(),
+                instructions: "secret body".to_owned(),
+            }),
+        };
+
+        let Some(TranscriptItem::SkillInvocation { name }) = item_from_event(event) else {
+            panic!("skill invocation event was not converted");
+        };
+        assert_eq!(name, "review-code");
     }
 
     #[test]
