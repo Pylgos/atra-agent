@@ -1,0 +1,25 @@
+[package]
+name = "atra-web-ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+atra-protocol.workspace = true
+dioxus = { version = "0.7.10", features = ["web"] }
+gloo-net = { version = "0.6.0", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4.56"
+web-sys = { version = "0.3.83", features = [
+    "Event",
+    "EventSource",
+    "History",
+    "Location",
+    "MessageEvent",
+    "Storage",
+    "Window",
+] }

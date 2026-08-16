@@ -1,0 +1,3 @@
+@import "tailwindcss";
+@import "../crates/atra-web-ui/assets/app.css";
+@source "../crates/atra-web-ui/src";

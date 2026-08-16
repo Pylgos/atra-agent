@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use atra_protocol::{
     CheckpointId, CheckpointState, CheckpointSubscriptionMessage, Command, CommandResponse,
-    CommandResult, ControllerChange, ControllerState, ControllerSubscriptionMessage, ProcessChange,
-    ProcessLocator, ProcessState, ProcessSubscriptionMessage, StateRequest, Subscribe,
-    SubscriptionTerminal, ThreadChange, ThreadId, ThreadState, ThreadSubscriptionMessage,
+    CommandResult, ControllerChange, ControllerOperation, ControllerState,
+    ControllerSubscriptionMessage, ProcessChange, ProcessLocator, ProcessOperation, ProcessState,
+    ProcessSubscriptionMessage, StateRequest, Subscribe, SubscriptionTerminal, ThreadChange,
+    ThreadId, ThreadOperation, ThreadState, ThreadSubscriptionMessage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
@@ -202,10 +203,18 @@ impl ControllerSubscription {
     }
 
     pub async fn receive(&mut self) -> Result<ControllerChange> {
+        self.receive_operation().await.map(|(_, change)| change)
+    }
+
+    pub async fn receive_operation(&mut self) -> Result<(ControllerOperation, ControllerChange)> {
         match self.connection.receive().await? {
-            ControllerSubscriptionMessage::Operation { operation } => operation
-                .apply(&mut self.state)
-                .context("controller operation could not be applied"),
+            ControllerSubscriptionMessage::Operation { operation } => {
+                let change = operation
+                    .clone()
+                    .apply(&mut self.state)
+                    .context("controller operation could not be applied")?;
+                Ok((operation, change))
+            }
             ControllerSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
             ControllerSubscriptionMessage::Snapshot { .. } => {
                 bail!("controller sent a second subscription snapshot")
@@ -220,10 +229,18 @@ impl ThreadSubscription {
     }
 
     pub async fn receive(&mut self) -> Result<ThreadChange> {
+        self.receive_operation().await.map(|(_, change)| change)
+    }
+
+    pub async fn receive_operation(&mut self) -> Result<(ThreadOperation, ThreadChange)> {
         match self.connection.receive().await? {
-            ThreadSubscriptionMessage::Operation { operation } => operation
-                .apply(&mut self.state)
-                .context("thread operation could not be applied"),
+            ThreadSubscriptionMessage::Operation { operation } => {
+                let change = operation
+                    .clone()
+                    .apply(&mut self.state)
+                    .context("thread operation could not be applied")?;
+                Ok((operation, change))
+            }
             ThreadSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
             ThreadSubscriptionMessage::Snapshot { .. } => {
                 bail!("controller sent a second subscription snapshot")
@@ -253,10 +270,18 @@ impl ProcessSubscription {
     }
 
     pub async fn receive(&mut self) -> Result<ProcessChange> {
+        self.receive_operation().await.map(|(_, change)| change)
+    }
+
+    pub async fn receive_operation(&mut self) -> Result<(ProcessOperation, ProcessChange)> {
         match self.connection.receive().await? {
-            ProcessSubscriptionMessage::Operation { operation } => operation
-                .apply(&mut self.state)
-                .context("process operation could not be applied"),
+            ProcessSubscriptionMessage::Operation { operation } => {
+                let change = operation
+                    .clone()
+                    .apply(&mut self.state)
+                    .context("process operation could not be applied")?;
+                Ok((operation, change))
+            }
             ProcessSubscriptionMessage::Terminal { terminal } => Err(terminal_error(terminal)),
             ProcessSubscriptionMessage::Snapshot { .. } => {
                 bail!("controller sent a second subscription snapshot")

@@ -29,6 +29,13 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          hostPkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          hostRust = hostPkgs.rust-bin.stable."1.96.0".minimal.override {
+            targets = [ "wasm32-unknown-unknown" ];
+          };
           static = pkgs.pkgsStatic;
           craneLib = crane.mkLib static;
           architecture =
@@ -44,6 +51,7 @@
               ./Cargo.toml
               ./Cargo.lock
               ./crates
+              ./web
             ];
           };
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
@@ -58,13 +66,42 @@
             substitute ${nixCargoVendor}/.cargo/config.toml "$out/config.toml" \
               --replace-fail '@vendor@' "$out"
           '';
+          webAssets = pkgs.stdenv.mkDerivation {
+            pname = "atra-web-assets";
+            inherit version;
+            src = cargoSource;
+            nativeBuildInputs = [
+              hostRust
+              hostPkgs.binaryen
+              hostPkgs.dioxus-cli
+              hostPkgs.tailwindcss_4
+            ];
+            buildPhase = ''
+              runHook preBuild
+              export CARGO_HOME=$TMPDIR/cargo-home
+              mkdir -p "$CARGO_HOME" .cargo target/web-assets
+              cp ${cargoVendorDir}/config.toml .cargo/config.toml
+              tailwindcss -i web/app.css -o target/web-assets/app.css --minify
+              cp target/web-assets/app.css crates/atra-web-ui/assets/app.css
+              (
+                cd crates/atra-web-ui
+                dx build --release
+              )
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              cp -R target/dx/atra-web-ui/release/web/public "$out"
+              runHook postInstall
+            '';
+          };
           common = {
             pname = "atra";
             inherit version;
             src = cargoSource;
             inherit cargoVendorDir;
             strictDeps = true;
-            cargoExtraArgs = "-p atra-cli -p atra-runner --bin atra --bin atra-runner --bin atri";
+            cargoExtraArgs = "-p atra-cli -p atra-runner -p atra-web --bin atra --bin atra-runner --bin atri --bin atra-web";
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ static.openssl ];
             doCheck = false;
@@ -74,6 +111,7 @@
             common
             // {
               inherit cargoArtifacts;
+              ATRA_WEB_ASSETS_DIR = webAssets;
             }
             // pkgs.lib.optionalAttrs (self ? rev) {
               ATRA_BUILD_COMMIT = self.rev;
@@ -117,12 +155,13 @@
           atra = pkgs.runCommand "atra-${version}" { } ''
             mkdir -p "$out/bin" "$out/share"
             install -m755 ${cli}/bin/atra "$out/bin/atra"
+            install -m755 ${binaries}/bin/atra-web "$out/bin/atra-web"
             XDG_DATA_HOME="$out/share" ${cli}/bin/atra platform install \
               ${platformBundle}/atra-platform-${platform}.zip
           '';
         in
         {
-          inherit atra runner;
+          inherit atra runner webAssets;
           default = atra;
           platform-bundle = platformBundle;
         }

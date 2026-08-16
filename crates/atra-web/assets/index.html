@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Atra Web Client</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="main"></div><!-- fallback shell: Web Client -->
+<main class="shell" hidden>
+  <aside class="navigation"><h1>Atra</h1><p>Web Client <span class="status">experimental</span></p><nav id="workspaces" aria-label="Workspaces"></nav></aside>
+  <section class="conversation">
+    <header><strong id="connection">Connecting…</strong></header>
+    <nav id="threads" aria-label="Threads"></nav>
+    <article id="transcript" aria-live="polite"><p>Select a running Workspace and Thread.</p></article>
+    <form id="composer"><label for="message">Message</label><textarea id="message" name="message"></textarea><button type="submit" disabled>Send</button></form>
+  </section>
+  <aside class="details" id="details"><h2>Details</h2><p>Model, checkpoints, and processes are shown for the selected Thread.</p></aside>
+</main>
+
+</body>
+</html>

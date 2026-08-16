@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use atra_protocol::{ApprovalPolicy, Command as StateCommand, CommandResult};
 use rustix::process::getuid;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     process::Command,
@@ -30,6 +30,12 @@ struct Config {
     #[serde(default = "default_builtin_runners")]
     builtin_runners: bool,
     setup: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceMetadata<'a> {
+    workspace_id: &'a str,
+    path: &'a Path,
 }
 
 fn default_builtin_runners() -> bool {
@@ -324,6 +330,7 @@ pub(crate) async fn start_controller(
     database: &Path,
 ) -> Result<ControllerStart> {
     if controller_is_running(endpoint).await? {
+        write_workspace_metadata(endpoint, &id(workspace), workspace)?;
         return Ok(ControllerStart::AlreadyRunning);
     }
 
@@ -362,6 +369,7 @@ pub(crate) async fn start_controller(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if controller_is_running(endpoint).await? {
+            write_workspace_metadata(endpoint, &id(workspace), workspace)?;
             return Ok(ControllerStart::Started);
         }
         if let Some(status) = child
@@ -386,6 +394,51 @@ pub(crate) async fn start_controller(
         }
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+fn write_workspace_metadata(endpoint: &Path, workspace_id: &str, workspace: &Path) -> Result<()> {
+    let directory = endpoint
+        .parent()
+        .context("controller endpoint has no runtime directory")?;
+    // Custom controller endpoints may live in caller-owned directories that are
+    // intentionally not private. They remain usable by the CLI, but are not
+    // published for automatic Web daemon discovery.
+    if check_private_directory(directory).is_err() {
+        return Ok(());
+    }
+    let path = directory.join("workspace.json");
+    let temporary = directory.join(format!(".workspace.json.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(&WorkspaceMetadata {
+        workspace_id,
+        path: workspace,
+    })
+    .context("failed to encode Workspace runtime metadata")?;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "failed to create Workspace runtime metadata {}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path).with_context(|| {
+            format!(
+                "failed to publish Workspace runtime metadata {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(crate) async fn stop_controller(endpoint: &Path) -> Result<()> {
@@ -474,5 +527,24 @@ mod tests {
         fs::create_dir_all(directory.path().join(".config")).unwrap();
         fs::write(directory.path().join(CONFIG), "builtin_runners = ").unwrap();
         assert!(load_config(directory.path()).is_err());
+    }
+
+    #[test]
+    fn workspace_metadata_is_private_and_strict() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+
+        write_workspace_metadata(&runtime.join("controller.sock"), "abc", &workspace).unwrap();
+
+        let path = runtime.join("workspace.json");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["workspace_id"], "abc");
+        assert_eq!(value["path"], workspace.to_str().unwrap());
     }
 }

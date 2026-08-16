@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
-use atra_patch::ApplyPatchResult;
-use atra_store::TreeManifest;
+use atra_patch_types::ApplyPatchResult;
+use atra_tree::TreeManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

@@ -5,11 +5,15 @@ members = [
     "crates/atra-controller",
     "crates/atra-id",
     "crates/atra-patch",
+    "crates/atra-patch-types",
     "crates/atra-platform",
     "crates/atra-protocol",
     "crates/atra-runner",
     "crates/atra-store",
     "crates/atra-tui",
+    "crates/atra-tree",
+    "crates/atra-web",
+    "crates/atra-web-ui",
 ]
 resolver = "3"
 
@@ -20,16 +24,21 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+async-stream = "0.3.6"
 async-trait = "0.1.91"
 atra-controller = { path = "crates/atra-controller" }
 atra-id = { path = "crates/atra-id" }
 atra-patch = { path = "crates/atra-patch" }
+atra-patch-types = { path = "crates/atra-patch-types" }
 atra-client = { path = "crates/atra-client" }
 atra-platform = { path = "crates/atra-platform" }
 atra-protocol = { path = "crates/atra-protocol" }
 atra-runner = { path = "crates/atra-runner" }
 atra-store = { path = "crates/atra-store" }
+atra-tree = { path = "crates/atra-tree" }
 atra-tui = { path = "crates/atra-tui" }
+atra-web = { path = "crates/atra-web" }
+axum = "0.8.7"
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
@@ -59,9 +68,11 @@ tokio = { version = "1.48.0", features = [
     "net",
     "process",
     "rt",
+    "signal",
     "sync",
     "time",
 ] }
+tower = "0.5.2"
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 toml = "0.9.12"

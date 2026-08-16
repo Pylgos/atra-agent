@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
 const ADD: &str = "*** Add File: ";
@@ -14,73 +13,7 @@ const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
 const MOVE: &str = "*** Move to: ";
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ApplyPatchResult {
-    ParseError { error: String },
-    Operations { results: Vec<PatchOperationResult> },
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PatchOperationResult {
-    Added {
-        path: PathBuf,
-        outcome: PatchOperationOutcome,
-    },
-    Deleted {
-        path: PathBuf,
-        outcome: PatchOperationOutcome,
-    },
-    Updated {
-        path: PathBuf,
-        outcome: PatchOperationOutcome,
-    },
-    Moved {
-        from: PathBuf,
-        to: PathBuf,
-        outcome: PatchOperationOutcome,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum PatchOperationOutcome {
-    Applied { diff: Result<FileDiff, String> },
-    Failed { error: String },
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct FileDiff {
-    pub old_path: Option<PathBuf>,
-    pub new_path: Option<PathBuf>,
-    pub hunks: Vec<DiffHunk>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct DiffHunk {
-    pub old_start: usize,
-    pub old_count: usize,
-    pub new_start: usize,
-    pub new_count: usize,
-    pub lines: Vec<DiffLine>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct DiffLine {
-    pub kind: DiffLineKind,
-    pub old_line: Option<usize>,
-    pub new_line: Option<usize>,
-    pub text: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffLineKind {
-    Context,
-    Added,
-    Removed,
-}
+pub use atra_patch_types::{ApplyPatchResult, DiffHunk, DiffLine, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult};
 
 pub fn apply(patch: &str, cwd: &Path) -> ApplyPatchResult {
     let operations = match parse(patch) {
@@ -161,16 +94,17 @@ fn replace_text(
             &content,
         ))
     })();
-    result.into()
+    outcome(result)
 }
 
 fn apply_operation(operation: Operation, cwd: &Path) -> PatchOperationResult {
     match operation {
         Operation::Add { path, content } => {
             let resolved = resolve(cwd, &path);
-            let outcome = apply_add(&resolved, &content)
-                .map(|()| file_diff(None, Some(path.clone()), "", &content))
-                .into();
+            let outcome = outcome(
+                apply_add(&resolved, &content)
+                    .map(|()| file_diff(None, Some(path.clone()), "", &content)),
+            );
             PatchOperationResult::Added { path, outcome }
         }
         Operation::Delete { path } => {
@@ -207,14 +141,10 @@ fn apply_operation(operation: Operation, cwd: &Path) -> PatchOperationResult {
     }
 }
 
-impl From<Result<FileDiff>> for PatchOperationOutcome {
-    fn from(result: Result<FileDiff>) -> Self {
-        match result {
-            Ok(diff) => Self::Applied { diff: Ok(diff) },
-            Err(error) => Self::Failed {
-                error: format!("{error:#}"),
-            },
-        }
+fn outcome(result: Result<FileDiff>) -> PatchOperationOutcome {
+    match result {
+        Ok(diff) => PatchOperationOutcome::Applied { diff: Ok(diff) },
+        Err(error) => PatchOperationOutcome::Failed { error: format!("{error:#}") },
     }
 }
 
@@ -244,7 +174,7 @@ fn apply_update(cwd: &Path, path: &Path, chunks: &[Chunk]) -> PatchOperationOutc
             &content,
         ))
     })();
-    result.into()
+    outcome(result)
 }
 
 fn apply_move(
@@ -301,7 +231,7 @@ fn apply_move(
             &content,
         ))
     })();
-    result.into()
+    outcome(result)
 }
 
 fn atomic_write(
