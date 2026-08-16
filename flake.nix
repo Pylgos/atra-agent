@@ -51,7 +51,6 @@
               ./Cargo.toml
               ./Cargo.lock
               ./crates
-              ./web
             ];
           };
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
@@ -79,10 +78,8 @@
             buildPhase = ''
               runHook preBuild
               export CARGO_HOME=$TMPDIR/cargo-home
-              mkdir -p "$CARGO_HOME" .cargo target/web-assets
+              mkdir -p "$CARGO_HOME" .cargo
               cp ${cargoVendorDir}/config.toml .cargo/config.toml
-              tailwindcss -i web/app.css -o target/web-assets/app.css --minify
-              cp target/web-assets/app.css crates/atra-web-ui/assets/app.css
               (
                 cd crates/atra-web-ui
                 dx build --release
@@ -198,6 +195,7 @@
               pnpm
               pkg-config
               rustToolchain
+              tailwindcss_4
             ];
             PLAYWRIGHT_CHROMIUM_EXECUTABLE = pkgs.lib.getExe pkgs.chromium;
             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";

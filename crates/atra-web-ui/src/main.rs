@@ -136,7 +136,7 @@ fn App() -> Element {
     let current = route.read().clone();
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("/assets/app.css") }
+        document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
         main { class: "shell",
             aside { class: "navigation",
                 h1 { "Atra" }

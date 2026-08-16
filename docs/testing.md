@@ -11,12 +11,12 @@ available:
 ```console
 rustc --version
 dx --version
+tailwindcss --help
 pnpm --version
 test -x "$PLAYWRIGHT_CHROMIUM_EXECUTABLE"
 ```
 
-Install the pinned JavaScript development dependencies without changing the
-lockfile:
+Install the pinned Playwright dependencies without changing the lockfile:
 
 ```console
 pnpm --dir web install --frozen-lockfile
@@ -36,15 +36,16 @@ cargo check -p atra-web-ui --target wasm32-unknown-unknown
 cargo test -p atra-web -p atra-web-ui
 ```
 
-Build the Tailwind CSS, Dioxus application, and self-contained native
-executable:
+Build the Dioxus application, its Tailwind CSS, and the self-contained
+native executable:
 
 ```console
 ./tools/build-atra-web.sh
 ```
 
-The script restores the checked-in source stylesheet after Dioxus finishes and
-embeds the generated Web assets into `target/release/atra-web`.
+Dioxus uses the explicit `tailwind_input` and `tailwind_output` settings in
+`crates/atra-web-ui/Dioxus.toml` to generate the bundled stylesheet. The script
+then embeds all generated Web assets into `target/release/atra-web`.
 
 ## Playwright smoke test
 

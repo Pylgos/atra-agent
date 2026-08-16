@@ -1,14 +1,11 @@
 {
-  "name": "atra-web-assets",
+  "name": "atra-web-tests",
   "private": true,
   "packageManager": "pnpm@10.17.1",
   "scripts": {
-    "css": "tailwindcss -i ./app.css -o ../target/web-assets/app.css --minify",
     "test": "playwright test"
   },
   "devDependencies": {
-    "@playwright/test": "1.55.0",
-    "@tailwindcss/cli": "4.1.13",
-    "tailwindcss": "4.1.13"
+    "@playwright/test": "1.55.0"
   }
 }
