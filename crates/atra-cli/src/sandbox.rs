@@ -14,7 +14,7 @@ use tokio::process::Command;
 
 use crate::{platform, workspace};
 
-const SANDBOX_HOME: &str = "/home/atra";
+const SANDBOX_HOME: &str = "/run/atra-home";
 const RUNNER_PATH: &str = "/run/atra-runner";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -206,6 +206,8 @@ fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<Sandbo
     }
 
     // Persistent sandbox HOME.
+    args.push(OsString::from("--dir"));
+    args.push(OsString::from(SANDBOX_HOME));
     args.push(OsString::from("--bind"));
     args.push(context.sandbox_home.into_os_string());
     args.push(OsString::from(SANDBOX_HOME));
@@ -362,6 +364,19 @@ mod tests {
         let plan = build_plan(options(), context()).unwrap();
         let arguments = args(&plan);
         assert!(position(&arguments, "/home/user") < position(&arguments, "/ws"));
+    }
+
+    #[test]
+    fn sandbox_home_mount_point_is_created_under_run_before_bind() {
+        let plan = build_plan(options(), context()).unwrap();
+        let arguments = args(&plan);
+        let mount_point = position(&arguments, SANDBOX_HOME);
+        let persistent_home = position(&arguments, "/state/ws/sandbox/home");
+        assert_eq!(Path::new(SANDBOX_HOME).parent(), Some(Path::new("/run")));
+        assert_eq!(arguments[mount_point - 1], "--dir");
+        assert_eq!(arguments[persistent_home - 1], "--bind");
+        assert_eq!(arguments[persistent_home + 1], SANDBOX_HOME);
+        assert!(mount_point < persistent_home);
     }
 
     #[test]
