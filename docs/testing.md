@@ -40,7 +40,7 @@ Build the Tailwind CSS, Dioxus application, and self-contained native
 executable:
 
 ```console
-./tools/build-web-assets.sh
+./tools/build-atra-web.sh
 ```
 
 The script restores the checked-in source stylesheet after Dioxus finishes and
