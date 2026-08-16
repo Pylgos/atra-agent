@@ -780,6 +780,13 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
 
 fn model_input(events: &[Event]) -> Result<Vec<Value>> {
     let mut items = Vec::new();
+    let message = |role: &str, text: String| json!({"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]});
+    if let Some(context) = events.iter().find_map(|event| match &event.data {
+        ThreadEventData::ThreadContext(context) => Some(context),
+        _ => None,
+    }) {
+        items.push(message("developer", context.content.clone()));
+    }
     let events = if let Some(index) = events
         .iter()
         .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
@@ -831,8 +838,8 @@ fn model_input(events: &[Event]) -> Result<Vec<Value>> {
             );
             continue;
         }
-        let message = |role: &str, text: String| json!({"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]});
         let item = match &event.data {
+            ThreadEventData::ThreadContext(_) => None,
             ThreadEventData::WorkspaceInstructions(value) => Some(message(
                 "developer",
                 format!(
@@ -1451,6 +1458,45 @@ mod tests {
         assert_eq!(
             request.pointer("/input/0/content/0/text"),
             Some(&json!("hello"))
+        );
+    }
+
+    #[test]
+    fn thread_context_survives_compaction() {
+        let events = vec![
+            Event {
+                sequence: atra_protocol::EventSequence(0),
+                data: ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
+                    content: "Thread context:\n- position: root (thread 1)".to_owned(),
+                }),
+            },
+            Event {
+                sequence: atra_protocol::EventSequence(1),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    items: serde_json::to_value(ProviderOutput {
+                        provider: PROVIDER_ID.to_owned(),
+                        data: json!([]),
+                    })
+                    .unwrap(),
+                    checkpoint_id: atra_protocol::CheckpointId(1),
+                }),
+            },
+            Event {
+                sequence: atra_protocol::EventSequence(2),
+                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "continue".to_owned(),
+                }),
+            },
+        ];
+
+        let input = model_input(&events).unwrap();
+        assert_eq!(
+            input[0].pointer("/content/0/text"),
+            Some(&json!("Thread context:\n- position: root (thread 1)"))
+        );
+        assert_eq!(
+            input[1].pointer("/content/0/text"),
+            Some(&json!("continue"))
         );
     }
 

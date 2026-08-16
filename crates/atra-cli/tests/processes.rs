@@ -254,6 +254,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
+            "thread_context",
             "skills",
             "runners",
             "user_message",
@@ -267,11 +268,11 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        tool_result(&events[6]),
+        tool_result(&events[7]),
         serde_json::json!("Operation 1 [one] Command:\nmodel-output")
     );
     assert_eq!(
-        match &events[9].data {
+        match &events[10].data {
             ThreadEventData::AssistantMessage(message) => message.content.as_str(),
             _ => panic!("expected assistant message"),
         },
@@ -284,6 +285,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
+            "thread_context",
             "skills",
             "runners",
             "user_message",
@@ -297,7 +299,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        tool_result(&denied_events[6]),
+        tool_result(&denied_events[7]),
         serde_json::json!(
             "Operation 1 [two] Command:\nuser denied the tool call: not in this environment"
         )
@@ -309,6 +311,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             .map(|event| event.data.kind())
             .collect::<Vec<_>>(),
         [
+            "thread_context",
             "skills",
             "runners",
             "user_message",
@@ -322,7 +325,7 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         ]
     );
     assert_eq!(
-        tool_result(&allowed_events[6]),
+        tool_result(&allowed_events[7]),
         serde_json::json!("Operation 1 [two] Command:\napproved-output")
     );
 }

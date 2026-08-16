@@ -5,7 +5,8 @@ use std::{
 
 use atra_protocol::{
     CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, HistoryTarget,
-    InstructionEvent, RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
+    InstructionEvent, MessageEvent, RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData,
+    ThreadId,
 };
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -65,7 +66,8 @@ impl Store {
                         display_name TEXT,
                         provider TEXT NOT NULL,
                         model TEXT NOT NULL,
-                        reasoning_effort TEXT NOT NULL
+                        reasoning_effort TEXT NOT NULL,
+                        allow_delegation INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE TABLE IF NOT EXISTS events (
@@ -111,11 +113,15 @@ impl Store {
     ) -> tokio_rusqlite::Result<ThreadId> {
         self.connection
             .call(move |connection| {
-                connection.execute(
-                    "INSERT INTO threads (display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4)",
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "INSERT INTO threads (display_name, provider, model, reasoning_effort, allow_delegation) VALUES (?1, ?2, ?3, ?4, 0)",
                     params![display_name, provider, model, reasoning_effort],
                 )?;
-                Ok(ThreadId(connection.last_insert_rowid()))
+                let thread_id = transaction.last_insert_rowid();
+                insert_thread_context(&transaction, thread_id, false)?;
+                transaction.commit()?;
+                Ok(ThreadId(thread_id))
             })
             .await
     }
@@ -127,14 +133,31 @@ impl Store {
         provider: String,
         model: String,
         reasoning_effort: String,
+        allow_delegation: bool,
     ) -> tokio_rusqlite::Result<ThreadId> {
         self.connection.call(move |connection| {
-            connection.execute(
-                "INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![parent_thread_id.0, display_name, provider, model, reasoning_effort],
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort, allow_delegation) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![parent_thread_id.0, display_name, provider, model, reasoning_effort, allow_delegation],
             )?;
-            Ok(ThreadId(connection.last_insert_rowid()))
+            let thread_id = transaction.last_insert_rowid();
+            insert_thread_context(&transaction, thread_id, allow_delegation)?;
+            transaction.commit()?;
+            Ok(ThreadId(thread_id))
         }).await
+    }
+
+    pub async fn delegation_allowed(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<bool> {
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT allow_delegation FROM threads WHERE id = ?1",
+                    [thread_id.0],
+                    |row| row.get(0),
+                )
+            })
+            .await
     }
 
     pub async fn threads(&self) -> tokio_rusqlite::Result<Vec<Thread>> {
@@ -634,44 +657,71 @@ impl Store {
                 let transaction = connection.transaction()?;
                 let kind =
                     validate_history_point(&transaction, thread_id, checkpoint_id, sequence)?;
-                let (source_parent, source_name, provider, model, reasoning_effort): (
+                let (
+                    source_parent,
+                    source_name,
+                    provider,
+                    model,
+                    reasoning_effort,
+                    allow_delegation,
+                ): (
                     Option<i64>,
                     Option<String>,
                     String,
                     String,
                     String,
+                    bool,
                 ) = match checkpoint_id {
                     Some(checkpoint_id) => transaction.query_row(
                         "
-                            SELECT t.parent_thread_id, c.display_name, c.provider, c.model, c.reasoning_effort
+                            SELECT t.parent_thread_id, c.display_name, c.provider, c.model, c.reasoning_effort, t.allow_delegation
                             FROM checkpoints
                             c JOIN threads t ON t.id = c.thread_id
                             WHERE c.id = ?1 AND c.thread_id = ?2
                             ",
                         params![checkpoint_id, thread_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
                     )?,
                     None => transaction.query_row(
                         "
-                            SELECT parent_thread_id, display_name, provider, model, reasoning_effort
+                            SELECT parent_thread_id, display_name, provider, model, reasoning_effort, allow_delegation
                             FROM threads
                             WHERE id = ?1
                             ",
                         [thread_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
                     )?,
                 };
                 transaction.execute(
                     "
-                    INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort)
-                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    INSERT INTO threads (parent_thread_id, display_name, provider, model, reasoning_effort, allow_delegation)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                     ",
                     params![
                         source_parent,
                         display_name.or(source_name),
                         provider,
                         model,
-                        reasoning_effort
+                        reasoning_effort,
+                        allow_delegation
                     ],
                 )?;
                 let new_thread_id = transaction.last_insert_rowid();
@@ -783,11 +833,23 @@ impl Store {
             .call(move |connection| {
                 let thread_id = thread_id.0;
                 let transaction = connection.transaction()?;
+                let thread_context: String = transaction.query_row(
+                    "SELECT payload FROM events WHERE thread_id = ?1 AND kind = 'thread_context'",
+                    [thread_id],
+                    |row| row.get(0),
+                )?;
                 let next_sequence: i64 = transaction.query_row(
                     "SELECT COALESCE(MAX(sequence) + 1, 0) FROM events WHERE thread_id = ?1",
                     [thread_id], |row| row.get(0),
                 )?;
                 transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
+                transaction.execute(
+                    "
+                    INSERT INTO events (thread_id, sequence, kind, payload)
+                    VALUES (?1, 0, 'thread_context', ?2)
+                    ",
+                    params![thread_id, thread_context],
+                )?;
                 transaction.execute(
                     "
                     INSERT INTO events (thread_id, sequence, kind, payload)
@@ -845,6 +907,88 @@ impl Store {
 
 fn to_sql_error(error: serde_json::Error) -> tokio_rusqlite::Error {
     tokio_rusqlite::Error::Error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn insert_thread_context(
+    transaction: &rusqlite::Transaction<'_>,
+    thread_id: i64,
+    allow_delegation: bool,
+) -> rusqlite::Result<()> {
+    let mut statement = transaction.prepare(
+        "
+        WITH RECURSIVE ancestry(id, parent_thread_id, display_name, depth) AS (
+            SELECT id, parent_thread_id, display_name, 0
+            FROM threads
+            WHERE id = ?1
+            UNION ALL
+            SELECT t.id, t.parent_thread_id, t.display_name, a.depth + 1
+            FROM threads t
+            JOIN ancestry a ON a.parent_thread_id = t.id
+        )
+        SELECT id, display_name
+        FROM ancestry
+        ORDER BY depth DESC
+        ",
+    )?;
+    let rows = statement
+        .query_map([thread_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let position = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name))| {
+            let name = if index == 0 {
+                "root".to_owned()
+            } else {
+                let name = name.as_deref().map(one_line).unwrap_or_default();
+                if name.is_empty() {
+                    "unnamed".to_owned()
+                } else {
+                    name
+                }
+            };
+            format!("{name} (thread {id})")
+        })
+        .collect::<Vec<_>>()
+        .join(" > ");
+    let role = if rows.len() == 1 { "root" } else { "subagent" };
+    let mut content = format!("Thread context:\n- position: {position}\n- role: {role}");
+    if role == "subagent" {
+        content.push_str(&format!(
+            "\n- recursive delegation: {}",
+            if allow_delegation {
+                "allowed"
+            } else {
+                "denied"
+            }
+        ));
+    }
+    let payload = serde_json::to_string(&MessageEvent { content })
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    transaction.execute(
+        "INSERT INTO events (thread_id, sequence, kind, payload) VALUES (?1, 0, 'thread_context', ?2)",
+        params![thread_id, payload],
+    )?;
+    Ok(())
+}
+
+fn one_line(value: &str) -> String {
+    let mut output = String::new();
+    let mut separated = false;
+    for character in value.chars() {
+        if character.is_whitespace() || character.is_control() {
+            separated = !output.is_empty();
+        } else {
+            if separated {
+                output.push(' ');
+                separated = false;
+            }
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn event_columns(data: &ThreadEventData) -> tokio_rusqlite::Result<(String, Value)> {
@@ -1188,6 +1332,13 @@ fn reconstruct_events(
             return Err(rusqlite::Error::InvalidQuery);
         }
         previous_sequence = Some(event.sequence);
+        if matches!(event.data, ThreadEventData::ThreadContext(_))
+            && output
+                .iter()
+                .any(|event| matches!(event.data, ThreadEventData::ThreadContext(_)))
+        {
+            continue;
+        }
         if let ThreadEventData::Compaction(compaction) = &event.data {
             if !visiting.insert(compaction.checkpoint_id.0) {
                 return Err(rusqlite::Error::InvalidQuery);
@@ -1273,10 +1424,11 @@ mod tests {
         let child = store
             .create_child_thread(
                 root,
-                "child".into(),
+                "child\nforged".into(),
                 "fake".into(),
                 "model".into(),
                 "medium".into(),
+                true,
             )
             .await
             .unwrap();
@@ -1287,6 +1439,7 @@ mod tests {
                 "fake".into(),
                 "model".into(),
                 "medium".into(),
+                false,
             )
             .await
             .unwrap();
@@ -1295,17 +1448,42 @@ mod tests {
             vec![child, grandchild]
         );
         assert_eq!(store.root_thread(grandchild).await.unwrap(), root);
+        let root_context = &store.events(root).await.unwrap()[0].data;
+        assert_eq!(
+            root_context,
+            &ThreadEventData::ThreadContext(MessageEvent {
+                content: format!(
+                    "Thread context:\n- position: root (thread {})\n- role: root",
+                    root.0
+                ),
+            })
+        );
+        let child_context = &store.events(child).await.unwrap()[0].data;
+        assert_eq!(
+            child_context,
+            &ThreadEventData::ThreadContext(MessageEvent {
+                content: format!(
+                    "Thread context:\n- position: root (thread {}) > child forged (thread {})\n- role: subagent\n- recursive delegation: allowed",
+                    root.0, child.0
+                ),
+            })
+        );
         store
             .append_all(child, vec![user("question"), assistant("answer")])
             .await
             .unwrap();
         let fork = store
-            .fork_thread(child, None, EventSequence(1), Some("fork".into()))
+            .fork_thread(child, None, EventSequence(2), Some("fork".into()))
             .await
             .unwrap();
         assert_eq!(
             store.thread(fork).await.unwrap().parent_thread_id,
             Some(root)
+        );
+        assert!(store.delegation_allowed(fork).await.unwrap());
+        assert_eq!(
+            store.events(fork).await.unwrap()[0].data,
+            store.events(child).await.unwrap()[0].data
         );
     }
 
@@ -1337,18 +1515,28 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            store
+                .events(source)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.data.kind())
+                .collect::<Vec<_>>(),
+            ["thread_context", "compaction"]
+        );
         let sequences = store
             .append_all(source, vec![user("after"), assistant("done")])
             .await
             .unwrap();
-        assert_eq!(sequences, vec![EventSequence(3), EventSequence(4)]);
-        let report = store.report_events(source, EventSequence(4)).await.unwrap();
+        assert_eq!(sequences, vec![EventSequence(4), EventSequence(5)]);
+        let report = store.report_events(source, EventSequence(5)).await.unwrap();
         assert_eq!(
             report
                 .iter()
                 .map(|event| event.sequence.0)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 3, 4, 5]
         );
 
         let second_checkpoint = store
@@ -1368,16 +1556,30 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            store
+                .events(source)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.data.kind())
+                .collect::<Vec<_>>(),
+            ["thread_context", "compaction"]
+        );
         store
             .append_all(source, vec![user("again"), assistant("finished")])
             .await
             .unwrap();
 
         let fork = store
-            .fork_thread(source, None, EventSequence(7), Some("fork".into()))
+            .fork_thread(source, None, EventSequence(8), Some("fork".into()))
             .await
             .unwrap();
-        let ThreadEventData::Compaction(compaction) = &store.events(fork).await.unwrap()[0].data
+        let events = store.events(fork).await.unwrap();
+        let Some(ThreadEventData::Compaction(compaction)) = events
+            .iter()
+            .find(|event| matches!(event.data, ThreadEventData::Compaction(_)))
+            .map(|event| &event.data)
         else {
             panic!("missing compaction")
         };
@@ -1393,11 +1595,11 @@ mod tests {
         store.delete_thread(source).await.unwrap();
         assert_eq!(
             store
-                .report_events(fork, EventSequence(7))
+                .report_events(fork, EventSequence(8))
                 .await
                 .unwrap()
                 .len(),
-            8
+            9
         );
     }
 
@@ -1556,7 +1758,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            EventSequence(0)
+            EventSequence(1)
         );
         assert_eq!(
             store
@@ -1570,19 +1772,28 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            EventSequence(1)
+            EventSequence(2)
         );
         assert_eq!(
             store.events(thread).await.unwrap(),
             vec![
                 Event {
                     sequence: EventSequence(0),
+                    data: ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
+                        content: format!(
+                            "Thread context:\n- position: root (thread {})\n- role: root",
+                            thread.0
+                        )
+                    }),
+                },
+                Event {
+                    sequence: EventSequence(1),
                     data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
                         content: "one".to_owned()
                     }),
                 },
                 Event {
-                    sequence: EventSequence(1),
+                    sequence: EventSequence(2),
                     data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                         content: "two".to_owned(),
                         phase: None,
@@ -1622,12 +1833,23 @@ mod tests {
 
         assert_eq!(
             reopened.events(thread).await.unwrap(),
-            vec![Event {
-                sequence: EventSequence(0),
-                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
-                    content: "saved".to_owned()
-                }),
-            }]
+            vec![
+                Event {
+                    sequence: EventSequence(0),
+                    data: ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
+                        content: format!(
+                            "Thread context:\n- position: root (thread {})\n- role: root",
+                            thread.0
+                        )
+                    }),
+                },
+                Event {
+                    sequence: EventSequence(1),
+                    data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                        content: "saved".to_owned()
+                    }),
+                }
+            ]
         );
     }
 

@@ -613,7 +613,8 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             })
         }
         ThreadEventData::Compaction(_) => Some(TranscriptItem::Compaction),
-        ThreadEventData::WorkspaceInstructions(_)
+        ThreadEventData::ThreadContext(_)
+        | ThreadEventData::WorkspaceInstructions(_)
         | ThreadEventData::Skills(_)
         | ThreadEventData::Runners(_)
         | ThreadEventData::FrozenBoundary(_)

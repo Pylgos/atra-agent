@@ -59,6 +59,8 @@ enum AgentCommand {
         model: Option<String>,
         #[arg(long)]
         effort: Option<String>,
+        #[arg(long)]
+        allow_delegation: bool,
     },
     Send {
         thread_id: i64,
@@ -154,10 +156,12 @@ async fn run_agent(endpoint: &Path, command: AgentCommand) -> Result<bool> {
             name,
             model,
             effort,
+            allow_delegation,
         } => AgentRequest::Create {
             name,
             model,
             effort,
+            allow_delegation,
         },
         AgentCommand::Send { thread_id, message } => {
             let message = match message {

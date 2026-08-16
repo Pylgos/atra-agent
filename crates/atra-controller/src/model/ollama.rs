@@ -651,6 +651,16 @@ fn request_messages(request: &ModelRequest<'_>) -> Result<Vec<Message>> {
 
 fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
+    if let Some(context) = events.iter().find_map(|event| match &event.data {
+        ThreadEventData::ThreadContext(context) => Some(context),
+        _ => None,
+    }) {
+        messages.push(Message {
+            role: "system".to_owned(),
+            content: context.content.clone(),
+            ..Message::default()
+        });
+    }
     let events = if let Some(index) = events
         .iter()
         .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
@@ -691,6 +701,7 @@ fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
             continue;
         }
         let message = match &event.data {
+            ThreadEventData::ThreadContext(_) => continue,
             ThreadEventData::WorkspaceInstructions(event) => system_instruction("AGENTS.md", event),
             ThreadEventData::Skills(event) => system_instruction("Skills", event),
             ThreadEventData::Runners(event) => Message {
@@ -852,6 +863,45 @@ mod tests {
         assert_eq!(messages[1].tool_calls[0].function.name, "web_search");
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_name.as_deref(), Some("web_search"));
+    }
+
+    #[test]
+    fn thread_context_survives_compaction() {
+        let events = vec![
+            Event {
+                sequence: EventSequence(0),
+                data: ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
+                    content: "Thread context:\n- position: root (thread 1)".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(1),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    items: serde_json::to_value(ProviderOutput {
+                        provider: PROVIDER_ID.to_owned(),
+                        data: serde_json::to_value(Vec::<Message>::new()).unwrap(),
+                    })
+                    .unwrap(),
+                    checkpoint_id: atra_protocol::CheckpointId(1),
+                }),
+            },
+            Event {
+                sequence: EventSequence(2),
+                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
+                    content: "continue".to_owned(),
+                }),
+            },
+        ];
+
+        let messages = event_messages(&events).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(
+            messages[0].content,
+            "Thread context:\n- position: root (thread 1)"
+        );
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, "continue");
     }
 
     #[tokio::test]

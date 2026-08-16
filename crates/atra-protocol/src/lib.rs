@@ -188,6 +188,7 @@ pub struct ThreadEvent {
     deny_unknown_fields
 )]
 pub enum ThreadEventData {
+    ThreadContext(MessageEvent),
     WorkspaceInstructions(InstructionEvent),
     Skills(InstructionEvent),
     Runners(RunnersEvent),
@@ -208,6 +209,7 @@ pub enum ThreadEventData {
 impl ThreadEventData {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ThreadContext(_) => "thread_context",
             Self::WorkspaceInstructions(_) => "workspace_instructions",
             Self::Skills(_) => "skills",
             Self::Runners(_) => "runners",
@@ -513,6 +515,7 @@ pub enum AgentRequest {
         name: String,
         model: Option<String>,
         effort: Option<String>,
+        allow_delegation: bool,
     },
     Send {
         thread_id: ThreadId,

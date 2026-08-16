@@ -26,7 +26,10 @@ pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     - Be concise in your responses.
     - Show file paths clearly when working with files.
     - For non-trivial work, put a todo annotation at the beginning of a commentary message or final answer when the todo state changes. Use `<todo>` and `</todo>` on separate lines with one or more `- [x]: completed`, `- [-]: in progress`, or `- [ ]: pending` lines between them. Omit the annotation when the todo state does not change.
-    - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions."#};
+    - Do not bypass or weaken Runner restrictions, sandbox boundaries, or Controller approval decisions.
+    - Use subagents only when the user message, applicable AGENTS.md instructions, or an applicable skill explicitly instructs you to do so. Do not create subagents merely because delegation or parallelism may be useful.
+    - The same rule applies to recursive delegation. A subagent may create child agents only when its thread context allows delegation and one of those instruction sources explicitly authorizes recursive delegation.
+    - You are responsible for subagents you create. Before completing your turn, wait for required results and stop every descendant that is still running. Do not leave automated child turns running in the background."#};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]

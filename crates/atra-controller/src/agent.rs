@@ -69,11 +69,17 @@ impl State {
                 name,
                 model,
                 effort,
+                allow_delegation,
             } => {
                 if name.trim().is_empty() {
                     bail!("agent name must not be empty");
                 }
                 let parent = self.store.thread(invoking).await?;
+                if parent.parent_thread_id.is_some()
+                    && !self.store.delegation_allowed(invoking).await?
+                {
+                    bail!("this subagent is not allowed to create child agents");
+                }
                 let (provider, model_id) = match model {
                     Some(profile) => profile
                         .split_once('/')
@@ -110,6 +116,7 @@ impl State {
                                 provider,
                                 model_id,
                                 reasoning_effort,
+                                allow_delegation,
                             )
                             .await?;
                         let thread = state.store.thread(id).await?;
@@ -884,6 +891,7 @@ mod tests {
                     name: name.to_owned(),
                     model: None,
                     effort: None,
+                    allow_delegation: false,
                 },
             )
             .await;
@@ -896,6 +904,63 @@ mod tests {
                 .parse()
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn recursive_agent_creation_requires_explicit_permission() {
+        let (state, _directory, _root) = test_state().await;
+        let denied_parent = create_agent(&state, "denied-parent").await;
+        let denied = state
+            .agent_request(
+                denied_parent,
+                AgentRequest::Create {
+                    name: "denied-child".to_owned(),
+                    model: None,
+                    effort: None,
+                    allow_delegation: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            denied
+                .to_string()
+                .contains("not allowed to create child agents")
+        );
+
+        let allowed_parent = state
+            .handle_agent_request(
+                "context",
+                AgentRequest::Create {
+                    name: "allowed-parent".to_owned(),
+                    model: None,
+                    effort: None,
+                    allow_delegation: true,
+                },
+            )
+            .await;
+        assert!(allowed_parent.success, "{}", allowed_parent.output);
+        let allowed_parent = ThreadId(
+            allowed_parent
+                .output
+                .strip_prefix("thread_id=")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let child = state
+            .agent_request(
+                allowed_parent,
+                AgentRequest::Create {
+                    name: "allowed-child".to_owned(),
+                    model: None,
+                    effort: None,
+                    allow_delegation: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(child.0.starts_with("thread_id="));
     }
 
     #[test]
@@ -1146,6 +1211,7 @@ mod tests {
                     name: "must-not-resurrect".to_owned(),
                     model: None,
                     effort: None,
+                    allow_delegation: false,
                 },
             )
             .await;
@@ -1242,7 +1308,7 @@ mod tests {
             )
             .await;
         assert!(sent.success, "{}", sent.output);
-        assert_eq!(sent.output, "after_sequence=-1");
+        assert_eq!(sent.output, "after_sequence=0");
         tokio::time::timeout(Duration::from_secs(1), async {
             while state.turns.get(child).is_some() {
                 tokio::task::yield_now().await;
