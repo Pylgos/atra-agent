@@ -56,8 +56,11 @@
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
             name = "atra-${version}";
             src = cargoSource;
+            # To update after Cargo.lock changes, temporarily use
+            # `hash = pkgs.lib.fakeHash;`, run `nix build .#atra`, then copy
+            # the `got: sha256-...` value from the hash mismatch below.
             # hash = pkgs.lib.fakeHash;
-            hash = "sha256-IlmLUPC6drklmN/U1YL4IeUUyV70ttIoH67qXVRbiIE=";
+            hash = "sha256-mNlCwvJwbg5q+PZ0idjAHKaNIZjery/vR8eCbiD+GJQ=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"

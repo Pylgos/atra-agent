@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -407,7 +407,14 @@ fn write_workspace_metadata(endpoint: &Path, workspace_id: &str, workspace: &Pat
         return Ok(());
     }
     let path = directory.join("workspace.json");
-    let temporary = directory.join(format!(".workspace.json.{}.tmp", std::process::id()));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!(
+        ".workspace.json.{}.{nonce}.tmp",
+        std::process::id()
+    ));
     let bytes = serde_json::to_vec(&WorkspaceMetadata {
         workspace_id,
         path: workspace,
@@ -542,8 +549,7 @@ mod tests {
 
         let path = runtime.join("workspace.json");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-        let value: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value["workspace_id"], "abc");
         assert_eq!(value["path"], workspace.to_str().unwrap());
     }

@@ -28,4 +28,5 @@ webbrowser.workspace = true
 xdg.workspace = true
 
 [dev-dependencies]
+atra-controller.workspace = true
 tempfile.workspace = true
