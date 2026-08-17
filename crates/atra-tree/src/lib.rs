@@ -38,9 +38,16 @@ impl TreeManifest {
                 bail!("tree entries are not in unique path order");
             }
             if let Some(parent) = Path::new(entry.path()).parent() {
-                for ancestor in parent.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+                for ancestor in parent
+                    .ancestors()
+                    .filter(|path| !path.as_os_str().is_empty())
+                {
                     let ancestor = ancestor.to_string_lossy();
-                    if self.entries.binary_search_by_key(&ancestor.as_ref(), TreeEntry::path).is_ok() {
+                    if self
+                        .entries
+                        .binary_search_by_key(&ancestor.as_ref(), TreeEntry::path)
+                        .is_ok()
+                    {
                         bail!("tree entry {} has a non-directory parent", entry.path());
                     }
                 }
@@ -51,7 +58,10 @@ impl TreeManifest {
                     validate_tree_path(target)?;
                     let exists = self.entries.iter().any(|entry| {
                         entry.path() == target
-                            || entry.path().strip_prefix(target).is_some_and(|suffix| suffix.starts_with('/'))
+                            || entry
+                                .path()
+                                .strip_prefix(target)
+                                .is_some_and(|suffix| suffix.starts_with('/'))
                     });
                     if !exists {
                         bail!("tree symlink target {target} does not exist");
@@ -98,7 +108,11 @@ fn validate_tree_path(path: &str) -> Result<()> {
 }
 
 fn validate_digest(digest: &str) -> Result<()> {
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
         bail!("invalid object digest {digest}");
     }
     Ok(())

@@ -47,7 +47,7 @@ async fn subscriptions_receive_snapshot_then_shared_operations() {
     );
     assert_eq!(
         thread_subscription.receive().await.unwrap(),
-        ThreadChange::Metadata
+        ThreadChange::MetadataUpdated
     );
     assert_eq!(
         thread_subscription

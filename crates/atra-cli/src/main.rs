@@ -829,7 +829,7 @@ async fn run_checkpoint(endpoint: &Path, command: CheckpointCommand) -> Result<(
                     .await?,
             )?;
             loop {
-                if let atra_protocol::ThreadChange::Checkpoint(checkpoint_id) =
+                if let atra_protocol::ThreadChange::CheckpointAdded(checkpoint_id) =
                     subscription.receive().await?
                 {
                     println!("{checkpoint_id}");

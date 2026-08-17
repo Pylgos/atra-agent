@@ -392,6 +392,8 @@ dependencies = [
  "atra-protocol",
  "dioxus",
  "gloo-net",
+ "gloo-timers",
+ "js-sys",
  "pulldown-cmark",
  "serde",
  "serde_json",

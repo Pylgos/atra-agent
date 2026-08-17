@@ -747,19 +747,22 @@ pub enum ThreadOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadChange {
-    Metadata,
-    Event(EventSequence),
-    ActiveItem(ActiveItemId),
+    MetadataUpdated,
+    EventAppended(EventSequence),
+    EventsReplaced,
+    ActiveTurnStarted,
+    ActiveTurnStateUpdated,
+    ActiveItemAdded(ActiveItemId),
+    ActiveItemUpdated(ActiveItemId),
+    ActiveItemRemoved(ActiveItemId),
     ActiveItemFinalized {
         active_id: ActiveItemId,
         sequence: EventSequence,
     },
-    Phase,
-    Interaction,
+    InteractionUpdated,
     TurnFinished,
-    HistoryReplaced,
-    Checkpoint(CheckpointId),
-    Process(ProcessLocator),
+    CheckpointAdded(CheckpointId),
+    ProcessUpdated(ProcessLocator),
 }
 
 impl ThreadOperation {
@@ -770,7 +773,7 @@ impl ThreadOperation {
                     return Err(ApplyError::new("thread metadata id changed"));
                 }
                 state.metadata = metadata;
-                Ok(ThreadChange::Metadata)
+                Ok(ThreadChange::MetadataUpdated)
             }
             Self::EventAppended { event } => append_event(&mut state.events, event),
             Self::ActiveTurnStarted { phase } => {
@@ -779,7 +782,7 @@ impl ThreadOperation {
                 }
                 state.active_turn = Some(ActiveTurn::new(phase));
                 state.last_outcome = None;
-                Ok(ThreadChange::Phase)
+                Ok(ThreadChange::ActiveTurnStarted)
             }
             Self::ActiveItemAdded { item } => {
                 let turn = active_turn_mut(state)?;
@@ -788,7 +791,7 @@ impl ThreadOperation {
                 }
                 let id = item.id;
                 turn.items.push(item);
-                Ok(ThreadChange::ActiveItem(id))
+                Ok(ThreadChange::ActiveItemAdded(id))
             }
             Self::ActiveTextAppended { id, content } => {
                 let item = active_turn_mut(state)?
@@ -797,7 +800,7 @@ impl ThreadOperation {
                     .find(|item| item.id == id)
                     .ok_or_else(|| ApplyError::new("active item does not exist"))?;
                 item.data.append_text(&content)?;
-                Ok(ThreadChange::ActiveItem(id))
+                Ok(ThreadChange::ActiveItemUpdated(id))
             }
             Self::ActiveWebSearchUpdated { id, action } => {
                 let item = active_turn_mut(state)?
@@ -812,7 +815,7 @@ impl ThreadOperation {
                     return Err(ApplyError::new("active item is not a web search"));
                 };
                 *current = action;
-                Ok(ThreadChange::ActiveItem(id))
+                Ok(ThreadChange::ActiveItemUpdated(id))
             }
             Self::ActiveRunnerUpdated { id, update } => {
                 let item = active_turn_mut(state)?
@@ -827,7 +830,7 @@ impl ThreadOperation {
                     return Err(ApplyError::new("active item is not a Runner tool"));
                 };
                 *current = update;
-                Ok(ThreadChange::ActiveItem(id))
+                Ok(ThreadChange::ActiveItemUpdated(id))
             }
             Self::ActiveItemDiscarded { id } => {
                 let turn = active_turn_mut(state)?;
@@ -837,7 +840,7 @@ impl ThreadOperation {
                     .position(|item| item.id == id)
                     .ok_or_else(|| ApplyError::new("active item does not exist"))?;
                 turn.items.remove(index);
-                Ok(ThreadChange::ActiveItem(id))
+                Ok(ThreadChange::ActiveItemRemoved(id))
             }
             Self::ActiveItemFinalized { active_id, event } => {
                 let index = state
@@ -866,13 +869,13 @@ impl ThreadOperation {
                 let turn = active_turn_mut(state)?;
                 turn.phase = phase;
                 turn.retry = None;
-                Ok(ThreadChange::Phase)
+                Ok(ThreadChange::ActiveTurnStateUpdated)
             }
             Self::RetryScheduled { retry } => {
                 let turn = active_turn_mut(state)?;
                 turn.phase = TurnPhase::Retrying;
                 turn.retry = Some(Box::new(retry));
-                Ok(ThreadChange::Phase)
+                Ok(ThreadChange::ActiveTurnStateUpdated)
             }
             Self::InteractionRequested { interaction } => {
                 let turn = active_turn_mut(state)?;
@@ -882,7 +885,7 @@ impl ThreadOperation {
                 turn.phase = TurnPhase::AwaitingInput;
                 turn.retry = None;
                 turn.pending_interaction = Some(interaction);
-                Ok(ThreadChange::Interaction)
+                Ok(ThreadChange::InteractionUpdated)
             }
             Self::InteractionResolved { interaction_id } => {
                 let turn = active_turn_mut(state)?;
@@ -899,7 +902,7 @@ impl ThreadOperation {
                 turn.pending_interaction = None;
                 turn.phase = TurnPhase::Running;
                 turn.retry = None;
-                Ok(ThreadChange::Interaction)
+                Ok(ThreadChange::InteractionUpdated)
             }
             Self::TurnFinished { outcome } => {
                 if state.active_turn.take().is_none() {
@@ -911,7 +914,7 @@ impl ThreadOperation {
             Self::EventsReplaced { events } => {
                 validate_events(&events)?;
                 state.events = events;
-                Ok(ThreadChange::HistoryReplaced)
+                Ok(ThreadChange::EventsReplaced)
             }
             Self::CheckpointAdded { checkpoint } => {
                 if checkpoint.thread_id != state.metadata.id {
@@ -926,7 +929,7 @@ impl ThreadOperation {
                 }
                 let id = checkpoint.id;
                 state.checkpoints.insert(0, checkpoint);
-                Ok(ThreadChange::Checkpoint(id))
+                Ok(ThreadChange::CheckpointAdded(id))
             }
             Self::ProcessUpdated { process } => {
                 if process.locator.thread_id != state.metadata.id {
@@ -934,7 +937,7 @@ impl ThreadOperation {
                 }
                 let locator = process.locator.clone();
                 upsert_by(&mut state.processes, process, |process| &process.locator);
-                Ok(ThreadChange::Process(locator))
+                Ok(ThreadChange::ProcessUpdated(locator))
             }
         }
     }
@@ -954,7 +957,7 @@ fn append_event(
     validate_appended_event(events, &event)?;
     let sequence = event.sequence;
     events.push(event);
-    Ok(ThreadChange::Event(sequence))
+    Ok(ThreadChange::EventAppended(sequence))
 }
 
 fn validate_appended_event(events: &[ThreadEvent], event: &ThreadEvent) -> Result<(), ApplyError> {
@@ -999,6 +1002,10 @@ impl CheckpointState {
 
     pub fn events(&self) -> &[ThreadEvent] {
         &self.events
+    }
+
+    pub fn into_parts(self) -> (ThreadCheckpoint, Vec<ThreadEvent>) {
+        (self.metadata, self.events)
     }
 }
 
@@ -1343,6 +1350,58 @@ mod tests {
         );
         assert!(state.active_turn().unwrap().items().is_empty());
         assert_eq!(state.events(), &[event(1)]);
+    }
+
+    #[test]
+    fn active_operations_report_observer_facing_changes() {
+        let mut state =
+            ThreadState::materialize(thread(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            ThreadOperation::ActiveTurnStarted {
+                phase: TurnPhase::Running,
+            }
+            .apply(&mut state)
+            .unwrap(),
+            ThreadChange::ActiveTurnStarted
+        );
+        assert_eq!(
+            ThreadOperation::ActiveItemAdded {
+                item: ActiveItem::new(
+                    ActiveItemId(8),
+                    ActiveItemData::Assistant {
+                        content: "partial".to_owned(),
+                    },
+                ),
+            }
+            .apply(&mut state)
+            .unwrap(),
+            ThreadChange::ActiveItemAdded(ActiveItemId(8))
+        );
+        assert_eq!(
+            ThreadOperation::ActiveTextAppended {
+                id: ActiveItemId(8),
+                content: " response".to_owned(),
+            }
+            .apply(&mut state)
+            .unwrap(),
+            ThreadChange::ActiveItemUpdated(ActiveItemId(8))
+        );
+        assert_eq!(
+            ThreadOperation::PhaseChanged {
+                phase: TurnPhase::Cancelling,
+            }
+            .apply(&mut state)
+            .unwrap(),
+            ThreadChange::ActiveTurnStateUpdated
+        );
+        assert_eq!(
+            ThreadOperation::ActiveItemDiscarded {
+                id: ActiveItemId(8),
+            }
+            .apply(&mut state)
+            .unwrap(),
+            ThreadChange::ActiveItemRemoved(ActiveItemId(8))
+        );
     }
 
     #[test]

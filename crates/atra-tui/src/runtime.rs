@@ -462,7 +462,7 @@ impl Effect {
                                         .await?,
                                 )?;
                                 loop {
-                                    if let atra_protocol::ThreadChange::Checkpoint(_) =
+                                    if let atra_protocol::ThreadChange::CheckpointAdded(_) =
                                         subscription.receive().await?
                                     {
                                         break;

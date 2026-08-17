@@ -6,9 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+pub use atra_tree::{TreeEntry, TreeManifest};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use sha2::{Digest, Sha256};
-pub use atra_tree::{TreeEntry, TreeManifest};
 
 pub fn object_digest(content: &[u8], executable: bool) -> String {
     let mut digest = object_hasher(executable);

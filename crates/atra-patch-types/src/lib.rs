@@ -69,4 +69,3 @@ pub enum DiffLineKind {
     Added,
     Removed,
 }
-

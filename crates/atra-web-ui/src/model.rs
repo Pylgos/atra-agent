@@ -1,11 +1,13 @@
 use atra_protocol::{
-    CheckpointState, CheckpointSubscriptionMessage, ControllerState, ControllerSubscriptionMessage,
-    ProcessState, ProcessSubscriptionMessage, ThreadEventData, ThreadState,
-    ThreadSubscriptionMessage,
+    AgentStatus, ControllerState, ControllerSubscriptionMessage, ProcessState,
+    ProcessSubscriptionMessage, Thread, ThreadEventData, ThreadId, ThreadState,
 };
 use pulldown_cmark::{CowStr, Event, Options, Parser, html};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Workspace {
@@ -47,13 +49,16 @@ macro_rules! apply_subscription {
                         self.terminal = None;
                     }
                     $message::Operation { operation } => {
-                        let result: Result<(), String> = match self.value.as_mut() {
-                            Some(state) => operation
-                                .apply(state)
-                                .map(|_| ())
-                                .map_err(|error| error.to_string()),
-                            None => Err("operation arrived before snapshot".to_owned()),
-                        };
+                        let result = self
+                            .value
+                            .as_mut()
+                            .ok_or_else(|| "operation arrived before snapshot".to_owned())
+                            .and_then(|state| {
+                                operation
+                                    .apply(state)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            });
                         if let Err(error) = result {
                             self.connected = false;
                             self.terminal = Some(error);
@@ -70,24 +75,7 @@ macro_rules! apply_subscription {
 }
 
 apply_subscription!(ControllerState, ControllerSubscriptionMessage);
-apply_subscription!(ThreadState, ThreadSubscriptionMessage);
 apply_subscription!(ProcessState, ProcessSubscriptionMessage);
-
-impl RemoteState<CheckpointState> {
-    pub fn apply(&mut self, message: CheckpointSubscriptionMessage) {
-        match message {
-            CheckpointSubscriptionMessage::Snapshot { state } => {
-                self.value = Some(state);
-                self.connected = true;
-                self.terminal = None;
-            }
-            CheckpointSubscriptionMessage::Terminal { terminal } => {
-                self.connected = false;
-                self.terminal = Some(format!("{terminal:?}"));
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
@@ -104,7 +92,7 @@ pub struct Route {
 
 impl Route {
     pub fn parse(path: &str) -> Self {
-        let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+        let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
         match parts.as_slice() {
             ["w", workspace, "threads", thread, "checkpoints", checkpoint] => Self {
                 workspace: Some((*workspace).to_owned()),
@@ -160,63 +148,403 @@ impl Route {
     }
 }
 
-pub fn draft_key(workspace: &str, thread: i64) -> String {
-    format!("atra:draft:{workspace}:{thread}")
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptMode {
+    Pretty,
+    Raw,
 }
 
-pub fn history_key(workspace: &str) -> String {
-    format!("atra:sent-history:{workspace}")
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UtilityTab {
+    Thread,
+    Children,
+    Checkpoints,
+    Processes,
+}
+
+impl UtilityTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thread => "Thread",
+            Self::Children => "Children",
+            Self::Checkpoints => "Checkpoints",
+            Self::Processes => "Processes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Pin {
+    pub workspace: String,
+    pub thread: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InboxItem {
+    pub id: String,
+    pub workspace: String,
+    pub workspace_name: String,
+    pub thread: i64,
+    pub thread_name: String,
+    pub kind: String,
+    pub summary: String,
+    pub observed_at_ms: i64,
+    pub read: bool,
 }
 
 pub const THEME_KEY: &str = "atra:theme";
 pub const NOTIFICATIONS_KEY: &str = "atra:notifications";
+pub const PINS_KEY: &str = "atra:pins";
+pub const INBOX_KEY: &str = "atra:inbox";
+pub const LAST_ROUTE_KEY: &str = "atra:last-route";
+pub const NAV_OPEN_KEY: &str = "atra:navigation-open";
+pub const UTILITY_OPEN_KEY: &str = "atra:utility-open";
+pub const UTILITY_TAB_KEY: &str = "atra:utility-tab";
+pub const NAV_WIDTH_KEY: &str = "atra:navigation-width";
+pub const UTILITY_WIDTH_KEY: &str = "atra:utility-width";
+pub const WORKSPACE_COLLAPSE_KEY: &str = "atra:workspace-collapse";
 
-#[derive(Clone, Debug, Serialize)]
-pub struct TranscriptItem {
-    pub label: String,
-    pub body: String,
-    pub active: bool,
-    pub markdown: bool,
+pub fn draft_key(workspace: &str, thread: i64) -> String {
+    format!("atra:draft:{workspace}:{thread}")
 }
 
-pub fn transcript(state: &ThreadState) -> Vec<TranscriptItem> {
-    let mut items = state
+pub fn history_key(workspace: &str, thread: i64) -> String {
+    format!("atra:sent-history:{workspace}:{thread}")
+}
+
+pub fn thread_name(thread: &Thread) -> String {
+    thread
+        .display_name
+        .clone()
+        .unwrap_or_else(|| format!("Thread {}", thread.id.0))
+}
+
+pub fn root_id(threads: &[Thread], thread_id: ThreadId) -> ThreadId {
+    let by_id = threads
+        .iter()
+        .map(|thread| (thread.id, thread))
+        .collect::<HashMap<_, _>>();
+    let mut current = thread_id;
+    while let Some(parent) = by_id
+        .get(&current)
+        .and_then(|thread| thread.parent_thread_id)
+    {
+        current = parent;
+    }
+    current
+}
+
+pub fn child_count(threads: &[Thread], root: ThreadId) -> usize {
+    threads
+        .iter()
+        .filter(|thread| thread.id != root && root_id(threads, thread.id) == root)
+        .count()
+}
+
+pub fn root_threads(controller: &ControllerState) -> Vec<Thread> {
+    let mut roots = controller
+        .threads()
+        .iter()
+        .filter(|thread| thread.parent_thread_id.is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|thread| std::cmp::Reverse(thread.id));
+    roots
+}
+
+pub fn family_threads(controller: &ControllerState, selected: ThreadId) -> Vec<Thread> {
+    let root = root_id(controller.threads(), selected);
+    let mut family = controller
+        .threads()
+        .iter()
+        .filter(|thread| root_id(controller.threads(), thread.id) == root)
+        .cloned()
+        .collect::<Vec<_>>();
+    family.sort_by_key(|thread| {
+        (
+            thread.parent_thread_id.is_some(),
+            std::cmp::Reverse(thread.id),
+        )
+    });
+    family
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    pub token_summary: Option<String>,
+    pub context_summary: Option<String>,
+    pub cache_summary: Option<String>,
+    pub composer_context: String,
+    pub composer_cache: String,
+    pub composer_quotas: Vec<String>,
+    pub quota_windows: Vec<String>,
+    pub usage_raw: Option<String>,
+    pub limits_raw: Option<String>,
+}
+
+pub fn latest_diagnostics(state: &ThreadState) -> Diagnostics {
+    let usage_event = state
         .events()
         .iter()
-        .map(|event| {
-            let (label, body, markdown) = match &event.data {
-                ThreadEventData::UserMessage(message) => ("You", message.content.clone(), false),
-                ThreadEventData::AssistantMessage(message) => {
-                    ("Assistant", message.content.clone(), true)
-                }
-                ThreadEventData::Reasoning(item) => ("Reasoning", pretty(&item.item), false),
-                ThreadEventData::ToolCall(call) => ("Tool call", pretty(call), false),
-                ThreadEventData::ToolResult(result) => ("Tool result", pretty(result), false),
-                ThreadEventData::WebSearch(item) => ("Web search", pretty(&item.item), false),
-                ThreadEventData::Compaction(event) => ("Compaction", pretty(event), false),
-                ThreadEventData::ModelRequest(event) => ("Model request", pretty(event), false),
-                ThreadEventData::FrozenBoundary(event) => {
-                    ("History boundary", pretty(event), false)
-                }
-                other => (other.kind(), pretty(other), false),
-            };
-            TranscriptItem {
-                label: format!("{label} · {}", event.sequence.0),
-                body,
-                active: false,
-                markdown,
-            }
+        .rev()
+        .find_map(|event| match &event.data {
+            ThreadEventData::TokenUsage(value) => Some(value),
+            _ => None,
+        });
+    let context_window = usage_event.and_then(|usage| {
+        state.events().iter().find_map(|event| {
+            (event.sequence == usage.request_sequence)
+                .then_some(&event.data)
+                .and_then(|data| match data {
+                    ThreadEventData::ModelRequest(request) => request.context_window,
+                    _ => None,
+                })
         })
-        .collect::<Vec<_>>();
-    if let Some(turn) = state.active_turn() {
-        items.extend(turn.items().iter().map(|item| TranscriptItem {
-            label: format!("Active · {:?}", turn.phase()),
-            body: pretty(item.data()),
-            active: true,
-            markdown: false,
-        }));
+    });
+    let limits = state
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match &event.data {
+            ThreadEventData::RateLimits(value) => Some(&value.snapshots),
+            _ => None,
+        });
+    diagnostics_from_values(
+        usage_event.map(|event| &event.usage),
+        context_window,
+        limits,
+    )
+}
+
+fn diagnostics_from_values(
+    usage: Option<&Value>,
+    context_window: Option<i64>,
+    limits: Option<&Value>,
+) -> Diagnostics {
+    let input = usage.and_then(|usage| integer(&usage["input_tokens"]));
+    let output = usage.and_then(|usage| integer(&usage["output_tokens"]));
+    let total = usage
+        .and_then(|usage| integer(&usage["total_tokens"]))
+        .or_else(|| Some(input? + output?));
+    let cached = usage.and_then(|usage| integer(&usage["cached_input_tokens"]));
+    let token_summary = total.or(input).or(output).map(|_| {
+        let mut parts = Vec::new();
+        if let Some(total) = total {
+            parts.push(format!("Tokens {}", format_integer(total)));
+        }
+        if let Some(input) = input {
+            parts.push(format!("in {}", format_integer(input)));
+        }
+        if let Some(output) = output {
+            parts.push(format!("out {}", format_integer(output)));
+        }
+        parts.join(" · ")
+    });
+    let context_summary =
+        input
+            .zip(context_window.filter(|window| *window > 0))
+            .map(|(input, window)| {
+                format!(
+                    "Context {} / {} ({:.1}%)",
+                    format_integer(input),
+                    format_integer(window),
+                    input as f64 / window as f64 * 100.0,
+                )
+            });
+    let cache_summary = cached
+        .zip(input.filter(|input| *input > 0))
+        .map(|(cached, input)| {
+            format!(
+                "Cache {} / {} ({:.1}%)",
+                format_integer(cached),
+                format_integer(input),
+                cached as f64 / input as f64 * 100.0,
+            )
+        });
+    let composer_context = input
+        .zip(context_window.filter(|window| *window > 0))
+        .map(|(input, window)| format!("context {:.0}%", input as f64 / window as f64 * 100.0))
+        .unwrap_or_else(|| "context —".to_owned());
+    let composer_cache = input
+        .filter(|input| *input > 0)
+        .map(|input| {
+            format!(
+                "cache {:.0}%",
+                cached.unwrap_or_default() as f64 / input as f64 * 100.0
+            )
+        })
+        .unwrap_or_else(|| "cache —".to_owned());
+    Diagnostics {
+        token_summary,
+        context_summary,
+        cache_summary,
+        composer_context,
+        composer_cache,
+        composer_quotas: limits.map(format_composer_quotas).unwrap_or_default(),
+        quota_windows: limits.map(format_quota_windows).unwrap_or_default(),
+        usage_raw: usage.map(pretty),
+        limits_raw: limits.map(pretty),
     }
-    items
+}
+
+fn format_composer_quotas(value: &Value) -> Vec<String> {
+    let snapshot = value
+        .as_array()
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .rev()
+                .find(|snapshot| snapshot["limit_id"] == "codex")
+                .or_else(|| snapshots.last())
+        })
+        .or_else(|| value.is_object().then_some(value));
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|name| {
+            let window = snapshot.get(name)?;
+            let used = window["used_percent"].as_f64()?;
+            let label = integer(&window["window_minutes"])
+                .map(format_minutes)
+                .unwrap_or_else(|| name.to_owned());
+            Some(format!(
+                "{label} {}",
+                format_percent((100.0 - used).clamp(0.0, 100.0))
+            ))
+        })
+        .collect()
+}
+
+fn format_quota_windows(value: &Value) -> Vec<String> {
+    let snapshots = value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(value));
+    let multiple = snapshots.len() > 1;
+    let now = unix_timestamp();
+    let mut formatted = Vec::new();
+    for snapshot in snapshots {
+        let limit_name = snapshot["limit_name"]
+            .as_str()
+            .or_else(|| snapshot["limit_id"].as_str())
+            .filter(|name| *name != "codex");
+        for key in ["primary", "secondary"] {
+            let window = &snapshot[key];
+            let Some(used) = window["used_percent"].as_f64() else {
+                continue;
+            };
+            let duration = integer(&window["window_minutes"])
+                .map(format_minutes)
+                .unwrap_or_else(|| key.to_owned());
+            let prefix = if multiple {
+                limit_name
+                    .map(|name| format!("{name} "))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let remaining = (100.0 - used).clamp(0.0, 100.0);
+            let reset = integer(&window["resets_at"])
+                .map(|timestamp| format!(" · resets {}", format_seconds((timestamp - now).max(0))));
+            formatted.push(format!(
+                "{prefix}{duration} quota {} left{}",
+                format_percent(remaining),
+                reset.unwrap_or_default(),
+            ));
+        }
+        if let Some(balance) = snapshot.pointer("/credits/balance").and_then(Value::as_f64) {
+            formatted.push(format!("Credits {balance:.2}"));
+        } else if snapshot
+            .pointer("/credits/unlimited")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            formatted.push("Credits unlimited".to_owned());
+        }
+    }
+    formatted
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unix_timestamp() -> i64 {
+    (js_sys::Date::now() / 1000.0) as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn integer(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_u64()?.try_into().ok())
+}
+
+fn format_integer(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    if negative {
+        formatted.insert(0, '-');
+    }
+    formatted
+}
+
+fn format_percent(value: f64) -> String {
+    if value.fract().abs() < 0.05 {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+fn format_minutes(minutes: i64) -> String {
+    if minutes == 7 * 24 * 60 {
+        "weekly".to_owned()
+    } else if minutes >= 24 * 60 && minutes % (24 * 60) == 0 {
+        format!("{}d", minutes / (24 * 60))
+    } else if minutes >= 60 && minutes % 60 == 0 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn format_seconds(seconds: i64) -> String {
+    if seconds >= 24 * 60 * 60 {
+        format!("in {}d", (seconds + 43_199) / (24 * 60 * 60))
+    } else if seconds >= 60 * 60 {
+        format!("in {}h", (seconds + 1_799) / (60 * 60))
+    } else {
+        format!("in {}m", ((seconds + 59) / 60).max(1))
+    }
+}
+
+pub fn factual_status(status: Option<AgentStatus>) -> &'static str {
+    match status {
+        Some(AgentStatus::Idle) => "Idle",
+        Some(AgentStatus::Running) => "Running",
+        Some(AgentStatus::Compacting) => "Compacting",
+        Some(AgentStatus::AwaitingQuestion) => "Question required",
+        Some(AgentStatus::AwaitingApproval) => "Approval required",
+        Some(AgentStatus::Cancelling) => "Cancelling",
+        Some(AgentStatus::Completed) => "Completed",
+        Some(AgentStatus::Failed) => "Failed",
+        Some(AgentStatus::Cancelled) => "Cancelled",
+        None => "Unknown",
+    }
 }
 
 pub fn render_markdown(source: &str) -> String {
@@ -235,7 +563,6 @@ pub fn render_markdown(source: &str) -> String {
     });
     let mut rendered = String::new();
     html::push_html(&mut rendered, parser);
-
     let tags = [
         "a",
         "blockquote",
@@ -276,13 +603,15 @@ pub fn render_markdown(source: &str) -> String {
         .to_string()
 }
 
-fn pretty(value: &impl Serialize) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| "Unable to render event".to_owned())
+pub fn pretty(value: &impl Serialize) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "Unable to render value".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atra_protocol::ThreadEvent;
+    use serde_json::json;
 
     #[test]
     fn routes_are_strict_and_round_trip() {
@@ -297,10 +626,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_storage_is_scoped_without_migrations() {
+    fn browser_storage_is_scoped_per_thread() {
         assert_eq!(draft_key("one", 2), "atra:draft:one:2");
-        assert_eq!(history_key("one"), "atra:sent-history:one");
+        assert_eq!(history_key("one", 2), "atra:sent-history:one:2");
         assert_ne!(draft_key("one", 2), draft_key("two", 2));
+        assert_ne!(history_key("one", 2), history_key("one", 3));
     }
 
     #[test]
@@ -313,5 +643,142 @@ mod tests {
         assert!(rendered.contains("href=\"https://example.com\""));
         assert!(rendered.contains("rel=\"noopener noreferrer\""));
         assert!(!rendered.contains("href=\"javascript:"));
+    }
+
+    #[test]
+    fn diagnostics_show_actual_usage_and_quota_values() {
+        let usage = json!({
+            "input_tokens": 6567,
+            "cached_input_tokens": 3456,
+            "output_tokens": 17,
+            "total_tokens": 6584
+        });
+        let limits = json!([{
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": 42.0,
+                "window_minutes": 300,
+                "resets_at": 2_000_000_000
+            },
+            "secondary": {
+                "used_percent": 20.0,
+                "window_minutes": 10_080,
+                "resets_at": 2_000_000_000
+            }
+        }]);
+        let diagnostics = diagnostics_from_values(Some(&usage), Some(128_000), Some(&limits));
+
+        assert_eq!(
+            diagnostics.token_summary.as_deref(),
+            Some("Tokens 6,584 · in 6,567 · out 17")
+        );
+        assert_eq!(
+            diagnostics.context_summary.as_deref(),
+            Some("Context 6,567 / 128,000 (5.1%)")
+        );
+        assert_eq!(
+            diagnostics.cache_summary.as_deref(),
+            Some("Cache 3,456 / 6,567 (52.6%)")
+        );
+        assert_eq!(diagnostics.composer_context, "context 5%");
+        assert_eq!(diagnostics.composer_cache, "cache 53%");
+        assert_eq!(diagnostics.composer_quotas, ["5h 58%", "weekly 80%"]);
+        assert!(diagnostics.quota_windows[0].starts_with("5h quota 58% left"));
+        assert!(diagnostics.quota_windows[1].starts_with("weekly quota 80% left"));
+    }
+
+    #[test]
+    fn diagnostic_events_use_the_wire_shape_expected_by_the_web_client() {
+        for value in [
+            json!({
+                "sequence": 74,
+                "kind": "token_usage",
+                "payload": {
+                    "request_sequence": 71,
+                    "usage": {
+                        "input_tokens": 6567,
+                        "cached_input_tokens": 3456,
+                        "output_tokens": 17,
+                        "total_tokens": 6584
+                    }
+                }
+            }),
+            json!({
+                "sequence": 75,
+                "kind": "rate_limits",
+                "payload": {
+                    "request_sequence": 71,
+                    "snapshots": [{
+                        "limit_id": "codex",
+                        "primary": {
+                            "used_percent": 42,
+                            "window_minutes": 300,
+                            "resets_at": 2_000_000_000_i64
+                        }
+                    }]
+                }
+            }),
+        ] {
+            serde_json::from_value::<ThreadEvent>(value).unwrap();
+        }
+    }
+
+    #[test]
+    fn thread_state_with_diagnostics_deserializes() {
+        let state = json!({
+            "metadata": {
+                "id": 1,
+                "parent_thread_id": null,
+                "display_name": "Web Thread",
+                "provider": "provider",
+                "model": "model",
+                "reasoning_effort": "medium"
+            },
+            "events": [
+                {
+                    "sequence": 1,
+                    "kind": "user_message",
+                    "payload": {"content": "prompt"}
+                },
+                {
+                    "sequence": 2,
+                    "kind": "assistant_message",
+                    "payload": {"content": "answer"}
+                },
+                {
+                    "sequence": 3,
+                    "kind": "token_usage",
+                    "payload": {
+                        "request_sequence": 1,
+                        "usage": {
+                            "input_tokens": 6567,
+                            "cached_input_tokens": 3456,
+                            "output_tokens": 17,
+                            "total_tokens": 6584
+                        }
+                    }
+                },
+                {
+                    "sequence": 4,
+                    "kind": "rate_limits",
+                    "payload": {
+                        "request_sequence": 1,
+                        "snapshots": [{
+                            "limit_id": "codex",
+                            "primary": {
+                                "used_percent": 42,
+                                "window_minutes": 300,
+                                "resets_at": 2_000_000_000_i64
+                            }
+                        }]
+                    }
+                }
+            ],
+            "active_turn": null,
+            "last_outcome": null,
+            "checkpoints": [],
+            "processes": []
+        });
+        serde_json::from_value::<ThreadState>(state).unwrap();
     }
 }

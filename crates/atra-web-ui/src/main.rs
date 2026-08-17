@@ -1,22 +1,38 @@
 mod model;
+mod thread_store;
+mod transcript_view;
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use atra_protocol::{
-    AgentStatus, CheckpointId, CheckpointState, CheckpointSubscriptionMessage, Command,
-    CommandResult, ControllerOperation, ControllerState, ControllerSubscriptionMessage,
-    HistoryTarget, InteractionId, ProcessId, ProcessState, ProcessSubscriptionMessage,
-    QuestionAnswer, ThreadId, ThreadState, ThreadSubscriptionMessage,
+    AgentStatus, CheckpointId, CheckpointSubscriptionMessage, Command, CommandResult,
+    ControllerOperation, ControllerState, ControllerSubscriptionMessage, EventSequence,
+    HistoryTarget, InteractionId, PendingInteraction, ProcessId, ProcessState, ProcessStatus,
+    ProcessSubscriptionMessage, QuestionAnswer, ThreadId, ThreadState, ThreadSubscriptionMessage,
 };
 use dioxus::prelude::*;
 use gloo_net::http::Request;
+use gloo_timers::future::TimeoutFuture;
 use model::{
-    Detail, NOTIFICATIONS_KEY, RemoteState, Route, THEME_KEY, WorkspaceList, draft_key,
-    history_key, render_markdown, transcript,
+    Detail, INBOX_KEY, InboxItem, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, NOTIFICATIONS_KEY,
+    PINS_KEY, Pin, RemoteState, Route, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY,
+    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
+    WorkspaceList, child_count, draft_key, factual_status, family_threads, history_key,
+    render_markdown, root_id, root_threads, thread_name,
 };
+use thread_store::ThreadStore;
+use transcript_view::{ActivityKey, ActivityKind, RawKey, TurnKey};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, EventSource, MessageEvent};
+use web_sys::{
+    Event, EventSource, HtmlDialogElement, HtmlFormElement, HtmlTextAreaElement, MessageEvent,
+};
+
+type Controllers = HashMap<String, RemoteState<ControllerState>>;
 
 fn main() {
     dioxus::launch(App);
@@ -99,9 +115,19 @@ fn browser_route() -> Route {
 }
 
 fn navigate(mut route: Signal<Route>, next: Route) {
+    storage_set(LAST_ROUTE_KEY, &next.path());
     if let Some(window) = web_sys::window() {
         let _ = window.history().and_then(|history| {
             history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next.path()))
+        });
+    }
+    route.set(next);
+}
+
+fn replace_route(mut route: Signal<Route>, next: Route) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.history().and_then(|history| {
+            history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next.path()))
         });
     }
     route.set(next);
@@ -126,33 +152,24 @@ fn storage_set(key: &str, value: &str) {
     }
 }
 
-fn confirm(message: &str) -> bool {
-    web_sys::window()
-        .and_then(|window| window.confirm_with_message(message).ok())
-        .unwrap_or(false)
+fn storage_json<T: serde::de::DeserializeOwned + Default>(key: &str) -> T {
+    serde_json::from_str(&storage_get(key)).unwrap_or_default()
 }
 
-fn prompt(message: &str, default: &str) -> Option<String> {
-    web_sys::window()
-        .and_then(|window| {
-            window
-                .prompt_with_message_and_default(message, default)
-                .ok()
-        })
-        .flatten()
+fn save_json(key: &str, value: &impl serde::Serialize) {
+    if let Ok(value) = serde_json::to_string(value) {
+        storage_set(key, &value);
+    }
 }
 
-fn save_sent_message(workspace: &str, message: &str) {
-    let key = history_key(workspace);
-    let mut history = serde_json::from_str::<Vec<String>>(&storage_get(&key)).unwrap_or_default();
-    history.retain(|current| current != message);
+fn save_sent_message(workspace: &str, thread: i64, message: &str) {
+    let key = history_key(workspace, thread);
+    let mut history = storage_json::<Vec<String>>(&key);
     history.push(message.to_owned());
-    if history.len() > 50 {
-        history.drain(..history.len() - 50);
+    if history.len() > 100 {
+        history.drain(..history.len() - 100);
     }
-    if let Ok(value) = serde_json::to_string(&history) {
-        storage_set(&key, &value);
-    }
+    save_json(&key, &history);
 }
 
 fn request_notification_permission() {
@@ -169,12 +186,13 @@ fn notify(title: &str) {
     }
 }
 
-fn copy_text(value: String) {
-    spawn(async move {
-        if let Some(window) = web_sys::window() {
-            let _ = JsFuture::from(window.navigator().clipboard().write_text(&value)).await;
-        }
-    });
+async fn copy_text(value: String) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    JsFuture::from(window.navigator().clipboard().write_text(&value))
+        .await
+        .is_ok()
 }
 
 async fn command(workspace: &str, command: &Command) -> Result<CommandResult, String> {
@@ -191,10 +209,86 @@ async fn command(workspace: &str, command: &Command) -> Result<CommandResult, St
         let value: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
         Err(value
             .get("error")
+            .or_else(|| value.get("message"))
             .and_then(|message| message.as_str())
             .unwrap_or("command failed")
             .to_owned())
     }
+}
+
+fn ensure_pin(
+    mut pins: Signal<Vec<Pin>>,
+    workspace: &str,
+    thread: ThreadId,
+    controller: &ControllerState,
+) {
+    let root = root_id(controller.threads(), thread).0;
+    if !pins
+        .read()
+        .iter()
+        .any(|pin| pin.workspace == workspace && pin.thread == root)
+    {
+        pins.write().insert(
+            0,
+            Pin {
+                workspace: workspace.to_owned(),
+                thread: root,
+            },
+        );
+        save_json(PINS_KEY, &*pins.read());
+    }
+}
+
+fn set_document_title(workspace: &str, thread: &str) {
+    if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+        document.set_title(&format!("{thread} · {workspace} · Atra"));
+    }
+}
+
+fn is_narrow_viewport() -> bool {
+    web_sys::window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|width| width.as_f64())
+        .is_some_and(|width| width <= 980.0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MobilePanel {
+    None,
+    Navigation,
+    Utility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderThreadAction {
+    Continue,
+    Compact,
+    Checkpoint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum DialogState {
+    Rename {
+        current: String,
+    },
+    Fork {
+        checkpoint: Option<i64>,
+        sequence: EventSequence,
+    },
+    Rewind {
+        checkpoint: Option<i64>,
+        sequence: EventSequence,
+    },
+    Restore {
+        checkpoint: i64,
+    },
+    Delete {
+        name: String,
+    },
+    StopProcess {
+        runner: String,
+        process: String,
+    },
 }
 
 #[component]
@@ -202,16 +296,30 @@ fn App() -> Element {
     let route = use_signal(browser_route);
     let _popstate = use_hook(move || Rc::new(PopstateListener::new(route)));
     let mut workspaces = use_signal(WorkspaceList::default);
+    let controllers = use_signal(Controllers::new);
     let mut daemon_connected = use_signal(|| false);
-    let mut theme = use_signal(|| {
-        let value = storage_get(THEME_KEY);
-        if value == "light" {
-            "light".to_owned()
-        } else {
-            "dark".to_owned()
-        }
+    let theme = use_signal(|| match storage_get(THEME_KEY).as_str() {
+        "light" => "light".to_owned(),
+        "dark" => "dark".to_owned(),
+        _ => "system".to_owned(),
     });
-    let mut notifications = use_signal(|| storage_get(NOTIFICATIONS_KEY) == "enabled");
+    let notifications = use_signal(|| storage_get(NOTIFICATIONS_KEY) == "enabled");
+    let pins = use_signal(|| storage_json::<Vec<Pin>>(PINS_KEY));
+    let inbox = use_signal(|| storage_json::<Vec<InboxItem>>(INBOX_KEY));
+    let nav_open = use_signal(|| storage_get(NAV_OPEN_KEY) != "closed");
+    let utility_open = use_signal(|| storage_get(UTILITY_OPEN_KEY) != "closed");
+    let utility_tab = use_signal(|| match storage_get(UTILITY_TAB_KEY).as_str() {
+        "children" => UtilityTab::Children,
+        "checkpoints" => UtilityTab::Checkpoints,
+        "processes" => UtilityTab::Processes,
+        _ => UtilityTab::Thread,
+    });
+    let nav_width = use_signal(|| storage_get(NAV_WIDTH_KEY).parse::<i32>().unwrap_or(288));
+    let utility_width = use_signal(|| storage_get(UTILITY_WIDTH_KEY).parse::<i32>().unwrap_or(352));
+    let mut mobile_panel = use_signal(|| MobilePanel::None);
+    let modes = use_signal(HashMap::<String, TranscriptMode>::new);
+    let scroll_positions = use_signal(HashMap::<String, i32>::new);
+    let mut route_notice = use_signal(String::new);
     let _workspace_stream = use_hook(move || {
         connect_sse(
             "/api/workspaces/events",
@@ -223,493 +331,1273 @@ fn App() -> Element {
             move |connected| daemon_connected.set(connected),
         )
     });
+    use_effect(move || {
+        if let Some(root) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.document_element())
+        {
+            let _ = root.set_attribute("data-theme", &theme());
+        }
+    });
+
     let current = route.read().clone();
+    use_effect(move || {
+        if route.read().workspace.is_some() || controllers.read().is_empty() {
+            return;
+        }
+        let saved = Route::parse(&storage_get(LAST_ROUTE_KEY));
+        let saved_exists = saved.workspace.as_ref().is_some_and(|workspace| {
+            controllers
+                .read()
+                .get(workspace)
+                .and_then(|remote| remote.value.as_ref())
+                .is_some_and(|controller| {
+                    saved.thread.is_some_and(|thread| {
+                        controller.threads().iter().any(|item| item.id.0 == thread)
+                    })
+                })
+        });
+        if saved_exists {
+            replace_route(route, saved);
+            return;
+        }
+        if let Some(pin) = pins.read().first().cloned() {
+            let exists = controllers
+                .read()
+                .get(&pin.workspace)
+                .and_then(|remote| remote.value.as_ref())
+                .is_some_and(|controller| {
+                    controller
+                        .threads()
+                        .iter()
+                        .any(|thread| thread.id.0 == pin.thread)
+                });
+            if exists {
+                replace_route(
+                    route,
+                    Route {
+                        workspace: Some(pin.workspace),
+                        thread: Some(pin.thread),
+                        detail: None,
+                    },
+                );
+                return;
+            }
+        }
+        if let Some(workspace) = saved.workspace
+            && let Some(thread) = controllers
+                .read()
+                .get(&workspace)
+                .and_then(|remote| remote.value.as_ref())
+                .and_then(|controller| root_threads(controller).first().cloned())
+        {
+            replace_route(
+                route,
+                Route {
+                    workspace: Some(workspace),
+                    thread: Some(thread.id.0),
+                    detail: None,
+                },
+            );
+        }
+    });
+    use_effect(move || {
+        let selected = route.read().clone();
+        let Some(workspace) = selected.workspace else {
+            return;
+        };
+        if !workspaces.read().workspaces.is_empty()
+            && !workspaces
+                .read()
+                .workspaces
+                .iter()
+                .any(|item| item.workspace_id == workspace)
+        {
+            route_notice.set("The requested Workspace is not available.".to_owned());
+            replace_route(route, Route::parse("/"));
+            return;
+        }
+        let Some(controller) = controllers
+            .read()
+            .get(&workspace)
+            .and_then(|remote| remote.value.clone())
+        else {
+            return;
+        };
+        if selected
+            .thread
+            .is_some_and(|thread| !controller.threads().iter().any(|item| item.id.0 == thread))
+        {
+            route_notice.set("The requested Thread is not available.".to_owned());
+            replace_route(
+                route,
+                Route {
+                    workspace: Some(workspace),
+                    thread: root_threads(&controller).first().map(|thread| thread.id.0),
+                    detail: None,
+                },
+            );
+        }
+    });
+
+    let shell_class = format!(
+        "app-shell{}{}",
+        if nav_open() { "" } else { " navigation-closed" },
+        if utility_open() {
+            ""
+        } else {
+            " utility-closed"
+        },
+    );
+    let shell_style = format!(
+        "--navigation-width: {}px; --utility-width: {}px",
+        nav_width().clamp(224, 420),
+        utility_width().clamp(272, 520),
+    );
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
-        main { class: "shell", "data-theme": "{theme}",
-            aside { class: "navigation",
-                h1 { "Atra" }
-                p { "Web Client " span { class: "status", "experimental" } }
-                p { class: "connection",
-                    if daemon_connected() { "Daemon connected" } else { "Daemon reconnecting…" }
+        main {
+            class: "{shell_class}",
+            style: "{shell_style}",
+            "data-theme": "{theme}",
+            for workspace in workspaces.read().workspaces.clone() {
+                ControllerMonitor {
+                    key: "{workspace.workspace_id}",
+                    workspace: workspace.clone(),
+                    controllers,
+                    route,
+                    inbox,
+                    notifications,
                 }
-                nav { aria_label: "Workspaces",
-                    if workspaces.read().workspaces.is_empty() {
-                        p { "No running Workspaces." }
+            }
+            Navigation {
+                workspaces: workspaces.read().workspaces.clone(),
+                controllers,
+                route,
+                pins,
+                nav_open,
+                nav_width,
+                mobile_panel,
+                theme,
+                notifications,
+            }
+            if nav_open() {
+                ResizeHandle {
+                    side: "Navigation",
+                    value: nav_width,
+                    default_value: 288,
+                    min: 224,
+                    max: 420,
+                    storage_key: NAV_WIDTH_KEY,
+                }
+            }
+            section { class: "main-thread",
+                if let Some(workspace_id) = current.workspace.clone() {
+                    if let Some(remote) = controllers.read().get(&workspace_id).cloned() {
+                        if let Some(controller) = remote.value {
+                            if let Some(thread) = current.thread {
+                                ThreadPage {
+                                    key: "{workspace_id}:{thread}",
+                                    workspace: workspaces
+                                        .read()
+                                        .workspaces
+                                        .iter()
+                                        .find(|item| item.workspace_id == workspace_id)
+                                        .cloned()
+                                        .unwrap_or(Workspace {
+                                            workspace_id: workspace_id.clone(),
+                                            name: workspace_id.clone(),
+                                            path: String::new(),
+                                        }),
+                                    thread,
+                                    detail: current.detail.clone(),
+                                    controller,
+                                    controller_connected: remote.connected,
+                                    route,
+                                    pins,
+                                    inbox,
+                                    nav_open,
+                                    utility_open,
+                                    utility_tab,
+                                    utility_width,
+                                    mobile_panel,
+                                    modes,
+                                    scroll_positions,
+                                }
+                            } else {
+                                WorkspaceLanding {
+                                    workspace: workspace_id,
+                                    controller,
+                                    connected: remote.connected,
+                                    route,
+                                    pins,
+                                }
+                            }
+                        } else {
+                            LoadingState { label: "Loading Workspace…" }
+                        }
+                    } else {
+                        LoadingState { label: "Loading Workspace…" }
                     }
-                    for workspace in workspaces.read().workspaces.clone() {
-                        div { class: "item workspace-entry",
+                } else {
+                    Landing { connected: daemon_connected() }
+                }
+            }
+            if mobile_panel() != MobilePanel::None {
+                button {
+                    class: "drawer-backdrop",
+                    aria_label: "Close drawer",
+                    onclick: move |_| mobile_panel.set(MobilePanel::None),
+                }
+            }
+            if !route_notice().is_empty() {
+                div { class: "toast route-toast", role: "status",
+                    span { "{route_notice}" }
+                    button {
+                        aria_label: "Dismiss route notice",
+                        onclick: move |_| route_notice.set(String::new()),
+                        "×"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ControllerMonitor(
+    workspace: Workspace,
+    controllers: Signal<Controllers>,
+    route: Signal<Route>,
+    inbox: Signal<Vec<InboxItem>>,
+    notifications: Signal<bool>,
+) -> Element {
+    let workspace_id = workspace.workspace_id.clone();
+    let workspace_name = workspace.name.clone();
+    let workspace_for_status = workspace_id.clone();
+    let _stream = use_hook(move || {
+        connect_sse(
+            &format!("/api/workspaces/{workspace_id}/controller/events"),
+            move |data| {
+                let Ok(message) = serde_json::from_str::<ControllerSubscriptionMessage>(&data)
+                else {
+                    return;
+                };
+                let attention = match &message {
+                    ControllerSubscriptionMessage::Operation {
+                        operation: ControllerOperation::ThreadStatusUpdated { thread_id, status },
+                    } => Some((*thread_id, *status)),
+                    _ => None,
+                };
+                let mut states = controllers.write();
+                let remote = states.entry(workspace_id.clone()).or_default();
+                let previous = attention.and_then(|(thread, _)| {
+                    remote
+                        .value
+                        .as_ref()
+                        .and_then(|controller| controller.thread_status(thread))
+                });
+                remote.apply(message);
+                if let Some((thread_id, status)) = attention {
+                    if previous == Some(status)
+                        || route.read().workspace.as_deref() == Some(&workspace_id)
+                            && route.read().thread == Some(thread_id.0)
+                    {
+                        return;
+                    }
+                    let (kind, summary) = match status {
+                        AgentStatus::AwaitingApproval => ("Approval", "Approval required"),
+                        AgentStatus::AwaitingQuestion => ("Question", "Questions require answers"),
+                        AgentStatus::Failed => ("Failed", "Turn failed"),
+                        AgentStatus::Completed => ("Completed", "Turn completed"),
+                        _ => return,
+                    };
+                    let thread_name = remote
+                        .value
+                        .as_ref()
+                        .and_then(|controller| {
+                            controller
+                                .threads()
+                                .iter()
+                                .find(|thread| thread.id == thread_id)
+                        })
+                        .map(thread_name)
+                        .unwrap_or_else(|| format!("Thread {}", thread_id.0));
+                    let item = InboxItem {
+                        id: format!(
+                            "{}:{}:{}:{}",
+                            workspace_id,
+                            thread_id.0,
+                            kind,
+                            js_sys::Date::now() as i64
+                        ),
+                        workspace: workspace_id.clone(),
+                        workspace_name: workspace_name.clone(),
+                        thread: thread_id.0,
+                        thread_name: thread_name.clone(),
+                        kind: kind.to_owned(),
+                        summary: summary.to_owned(),
+                        observed_at_ms: js_sys::Date::now() as i64,
+                        read: false,
+                    };
+                    inbox.write().insert(0, item);
+                    let mut seen_read = 0;
+                    inbox.write().retain(|item| {
+                        if item.read {
+                            seen_read += 1;
+                            seen_read <= 100
+                        } else {
+                            true
+                        }
+                    });
+                    save_json(INBOX_KEY, &*inbox.read());
+                    if notifications()
+                        && matches!(
+                            status,
+                            AgentStatus::AwaitingApproval | AgentStatus::AwaitingQuestion
+                        )
+                    {
+                        notify(&format!("{workspace_name} · {thread_name} · {summary}"));
+                    }
+                }
+            },
+            move |connected| {
+                if let Some(remote) = controllers.write().get_mut(&workspace_for_status) {
+                    remote.connected = connected;
+                }
+            },
+        )
+    });
+    rsx! {}
+}
+
+#[component]
+fn ResizeHandle(
+    side: &'static str,
+    value: Signal<i32>,
+    default_value: i32,
+    min: i32,
+    max: i32,
+    storage_key: &'static str,
+) -> Element {
+    let mut dragging = use_signal(|| false);
+    rsx! {
+        div { class: "resize-handle",
+            button {
+                aria_label: "Resize {side}",
+                title: "Drag or use arrow keys to resize; double-click to reset",
+                onpointerdown: move |event| {
+                    event.prevent_default();
+                    dragging.set(true);
+                },
+                onclick: move |event| {
+                    let delta = if event.modifiers().contains(Modifiers::SHIFT) { -24 } else { 24 };
+                    let next = (value() + delta).clamp(min, max);
+                    value.set(next);
+                    storage_set(storage_key, &next.to_string());
+                },
+                onkeydown: move |event| {
+                    let delta = match event.key() {
+                        Key::ArrowLeft => if side == "Navigation" { -16 } else { 16 },
+                        Key::ArrowRight => if side == "Navigation" { 16 } else { -16 },
+                        _ => return,
+                    };
+                    event.prevent_default();
+                    let next = (value() + delta).clamp(min, max);
+                    value.set(next);
+                    storage_set(storage_key, &next.to_string());
+                },
+                ondoubleclick: move |_| {
+                    value.set(default_value);
+                    storage_set(storage_key, &default_value.to_string());
+                },
+                "⋮"
+            }
+        }
+        if dragging() {
+            div {
+                class: "resize-drag-overlay",
+                onpointermove: move |event| {
+                    let x = event.client_coordinates().x as i32;
+                    let raw = if side == "Navigation" {
+                        x
+                    } else {
+                        web_sys::window()
+                            .and_then(|window| window.inner_width().ok())
+                            .and_then(|width| width.as_f64())
+                            .map(|width| width as i32 - x)
+                            .unwrap_or(value())
+                    };
+                    let next = raw.clamp(min, max);
+                    value.set(next);
+                    storage_set(storage_key, &next.to_string());
+                },
+                onpointerup: move |_| dragging.set(false),
+                onpointercancel: move |_| dragging.set(false),
+            }
+        }
+    }
+}
+
+#[component]
+fn Navigation(
+    workspaces: Vec<Workspace>,
+    controllers: Signal<Controllers>,
+    route: Signal<Route>,
+    pins: Signal<Vec<Pin>>,
+    nav_open: Signal<bool>,
+    nav_width: Signal<i32>,
+    mobile_panel: Signal<MobilePanel>,
+    theme: Signal<String>,
+    notifications: Signal<bool>,
+) -> Element {
+    let mut collapsed = use_signal(|| storage_json::<HashSet<String>>(WORKSPACE_COLLAPSE_KEY));
+    let mut dragging_pin = use_signal(|| None::<usize>);
+    let selected_workspace = route.read().workspace.clone();
+    use_effect(move || {
+        if let Some(workspace) = route.read().workspace.clone()
+            && collapsed.write().remove(&workspace)
+        {
+            save_json(WORKSPACE_COLLAPSE_KEY, &*collapsed.read());
+        }
+    });
+    let mut sorted_workspaces = workspaces.clone();
+    sorted_workspaces.sort_by_key(|workspace| workspace.name.to_lowercase());
+
+    rsx! {
+        aside {
+            class: if mobile_panel() == MobilePanel::Navigation { "navigation drawer-open" } else { "navigation" },
+            aria_label: "Navigation",
+            div { class: "navigation-brand",
+                h1 { "Atra" }
+                button {
+                    class: "icon-button mobile-only",
+                    aria_label: "Close navigation",
+                    onclick: move |_| mobile_panel.set(MobilePanel::None),
+                    "×"
+                }
+            }
+            section { class: "pinned-section",
+                h2 { "Pinned Threads" }
+                if pins.read().is_empty() {
+                    p { class: "muted compact", "Threads you use appear here." }
+                }
+                for (index, pin) in pins.read().clone().into_iter().enumerate() {
+                    if let Some((workspace_name, thread, status, children)) =
+                        find_pin(&workspaces, &controllers.read(), &pin)
+                    {
+                        div {
+                            class: "navigation-row pin-row",
+                            ondragover: move |event| event.prevent_default(),
+                            ondrop: move |_| {
+                                if let Some(from) = dragging_pin() {
+                                    move_pin(pins, from, index);
+                                }
+                                dragging_pin.set(None);
+                            },
                             button {
-                                class: "workspace-button",
+                                class: "drag-handle",
+                                aria_label: "Reorder {thread_name(&thread)}",
+                                title: "Drag to reorder",
+                                draggable: "true",
+                                ondragstart: move |_| dragging_pin.set(Some(index)),
+                                ondragend: move |_| dragging_pin.set(None),
+                                "⠿"
+                            }
+                            button {
+                                class: "navigation-link",
+                                aria_current: if selected_workspace.as_deref() == Some(&pin.workspace)
+                                    && route.read().thread == Some(pin.thread) { "page" } else { "false" },
                                 onclick: {
-                                    let workspace_id = workspace.workspace_id.clone();
+                                    let workspace = pin.workspace.clone();
+                                    move |_| {
+                                        navigate(route, Route {
+                                            workspace: Some(workspace.clone()),
+                                            thread: Some(pin.thread),
+                                            detail: None,
+                                        });
+                                        mobile_panel.set(MobilePanel::None);
+                                    }
+                                },
+                                span { class: "row-title", "{thread_name(&thread)}" }
+                                small { "{workspace_name} · {factual_status(status)} · {children} children" }
+                            }
+                            details { class: "row-menu",
+                                summary { aria_label: "Pin actions for {thread_name(&thread)}", "•••" }
+                                button {
+                                    disabled: index == 0,
+                                    onclick: move |_| move_pin(pins, index, 0),
+                                    "Move to top"
+                                }
+                                button {
+                                    disabled: index == 0,
+                                    onclick: move |_| move_pin(pins, index, index.saturating_sub(1)),
+                                    "Move up"
+                                }
+                                button {
+                                    disabled: index + 1 >= pins.read().len(),
+                                    onclick: move |_| move_pin(pins, index, index + 1),
+                                    "Move down"
+                                }
+                                button {
+                                    onclick: move |_| {
+                                        pins.write().remove(index);
+                                        save_json(PINS_KEY, &*pins.read());
+                                    },
+                                    "Unpin"
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "navigation-row pin-row offline",
+                            span { class: "drag-handle", "⠿" }
+                            button {
+                                class: "navigation-link",
+                                onclick: {
+                                    let workspace = pin.workspace.clone();
                                     move |_| navigate(route, Route {
-                                        workspace: Some(workspace_id.clone()),
-                                        thread: None,
+                                        workspace: Some(workspace.clone()),
+                                        thread: Some(pin.thread),
                                         detail: None,
                                     })
                                 },
+                                span { class: "row-title", "Thread {pin.thread}" }
+                                small { "{pin.workspace} · Offline" }
+                            }
+                        }
+                    }
+                }
+            }
+            nav { class: "workspace-tree", aria_label: "Workspaces",
+                h2 { "Workspaces" }
+                if sorted_workspaces.is_empty() {
+                    p { class: "empty-copy", "No running Workspaces." }
+                }
+                for workspace in sorted_workspaces {
+                    section { class: "workspace-group",
+                        header {
+                            button {
+                                class: "workspace-toggle",
+                                aria_expanded: !collapsed.read().contains(&workspace.workspace_id),
+                                onclick: {
+                                    let id = workspace.workspace_id.clone();
+                                    move |_| {
+                                        if !collapsed.write().insert(id.clone()) {
+                                            collapsed.write().remove(&id);
+                                        }
+                                        save_json(WORKSPACE_COLLAPSE_KEY, &*collapsed.read());
+                                    }
+                                },
+                                span { if collapsed.read().contains(&workspace.workspace_id) { "▸" } else { "▾" } }
                                 strong { "{workspace.name}" }
-                                br {}
-                                small { "{workspace.path}" }
                             }
-                            WorkspaceMonitor {
-                                workspace_id: workspace.workspace_id.clone(),
-                                workspace_name: workspace.name.clone(),
-                            }
-                        }
-                    }
-                }
-                details {
-                    summary { "Display settings" }
-                    label {
-                        "Theme"
-                        select {
-                            value: "{theme}",
-                            onchange: move |event| {
-                                let value = event.value();
-                                storage_set(THEME_KEY, &value);
-                                theme.set(value);
-                            },
-                            option { value: "dark", "Dark" }
-                            option { value: "light", "Light" }
-                        }
-                    }
-                    label { class: "check-row",
-                        input {
-                            r#type: "checkbox",
-                            checked: notifications(),
-                            onchange: move |event| {
-                                let enabled = event.checked();
-                                storage_set(NOTIFICATIONS_KEY, if enabled { "enabled" } else { "" });
-                                if enabled {
-                                    request_notification_permission();
-                                }
-                                notifications.set(enabled);
+                            NewThreadButton {
+                                workspace: workspace.workspace_id.clone(),
+                                connected: controllers
+                                    .read()
+                                    .get(&workspace.workspace_id)
+                                    .is_some_and(|remote| remote.connected),
+                                controller: controllers
+                                    .read()
+                                    .get(&workspace.workspace_id)
+                                    .and_then(|remote| remote.value.clone()),
+                                route,
+                                pins,
                             }
                         }
-                        "Browser notifications"
-                    }
-                    small { "Notifications are emitted only while this page is connected." }
-                }
-            }
-            if let Some(workspace) = current.workspace {
-                ControllerView {
-                    key: "{workspace}",
-                    workspace,
-                    selected_thread: current.thread,
-                    detail: current.detail,
-                    route,
-                }
-            } else {
-                section { class: "conversation empty",
-                    h2 { "Choose a Workspace" }
-                    p { "Start a Workspace Controller with atra, then select it here." }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn WorkspaceMonitor(workspace_id: String, workspace_name: String) -> Element {
-    let mut remote = use_signal(RemoteState::<ControllerState>::default);
-    let id_for_stream = workspace_id.clone();
-    let name_for_stream = workspace_name.clone();
-    let _stream = use_hook(move || {
-        let statuses = Rc::new(RefCell::new(std::collections::HashMap::new()));
-        connect_sse(
-            &format!("/api/workspaces/{id_for_stream}/controller/events"),
-            move |data| {
-                if let Ok(message) = serde_json::from_str::<ControllerSubscriptionMessage>(&data) {
-                    match &message {
-                        ControllerSubscriptionMessage::Snapshot { state } => {
-                            let mut current = statuses.borrow_mut();
-                            current.clear();
-                            for thread in state.threads() {
-                                if let Some(status) = state.thread_status(thread.id) {
-                                    current.insert(thread.id.0, status);
-                                }
-                            }
-                        }
-                        ControllerSubscriptionMessage::Operation {
-                            operation:
-                                ControllerOperation::ThreadStatusUpdated { thread_id, status },
-                        } => {
-                            let previous = statuses.borrow_mut().insert(thread_id.0, *status);
-                            let thread_name = remote
+                        if !collapsed.read().contains(&workspace.workspace_id) {
+                            if let Some(controller) = controllers
                                 .read()
-                                .value
-                                .as_ref()
-                                .and_then(|state| {
-                                    state
-                                        .threads()
-                                        .iter()
-                                        .find(|thread| thread.id == *thread_id)
-                                        .and_then(|thread| thread.display_name.clone())
-                                })
-                                .unwrap_or_else(|| format!("Thread {}", thread_id.0));
-                            if previous != Some(*status)
-                                && storage_get(NOTIFICATIONS_KEY) == "enabled"
-                                && matches!(
-                                    status,
-                                    AgentStatus::AwaitingApproval | AgentStatus::AwaitingQuestion
-                                )
+                                .get(&workspace.workspace_id)
+                                .and_then(|remote| remote.value.clone())
                             {
-                                let category = match status {
-                                    AgentStatus::AwaitingApproval => "approval required",
-                                    AgentStatus::AwaitingQuestion => "question awaiting answer",
-                                    _ => unreachable!(),
-                                };
-                                notify(&format!("{name_for_stream} · {thread_name} · {category}"));
-                            }
-                        }
-                        _ => {}
-                    }
-                    remote.write().apply(message);
-                }
-            },
-            move |connected| {
-                if !connected {
-                    remote.write().connected = false;
-                }
-            },
-        )
-    });
-    let (running, awaiting) = remote
-        .read()
-        .value
-        .as_ref()
-        .map(|state| {
-            state
-                .threads()
-                .iter()
-                .fold((0, 0), |(running, awaiting), thread| {
-                    match state.thread_status(thread.id) {
-                        Some(AgentStatus::Running | AgentStatus::Compacting) => {
-                            (running + 1, awaiting)
-                        }
-                        Some(AgentStatus::AwaitingApproval | AgentStatus::AwaitingQuestion) => {
-                            (running, awaiting + 1)
-                        }
-                        _ => (running, awaiting),
-                    }
-                })
-        })
-        .unwrap_or((0, 0));
-    rsx! {
-        small { class: "workspace-summary",
-            if remote.read().connected {
-                "{running} running · {awaiting} awaiting"
-            } else {
-                "reconnecting…"
-            }
-        }
-    }
-}
-
-#[component]
-fn ControllerView(
-    workspace: String,
-    selected_thread: Option<i64>,
-    detail: Option<Detail>,
-    route: Signal<Route>,
-) -> Element {
-    let mut remote = use_signal(RemoteState::<ControllerState>::default);
-    let mut error = use_signal(String::new);
-    let workspace_for_stream = workspace.clone();
-    let _controller_stream = use_hook(move || {
-        connect_sse(
-            &format!("/api/workspaces/{workspace_for_stream}/controller/events"),
-            move |data| match serde_json::from_str::<ControllerSubscriptionMessage>(&data) {
-                Ok(message) => remote.write().apply(message),
-                Err(parse_error) => error.set(parse_error.to_string()),
-            },
-            move |connected| {
-                if !connected {
-                    remote.write().connected = false;
-                }
-            },
-        )
-    });
-    let controller = remote.read().value.clone();
-    let connected = remote.read().connected;
-    let workspace_for_create = workspace.clone();
-
-    rsx! {
-        section { class: "conversation",
-            header { class: "connection-header",
-                strong { if connected { "Connected" } else { "Read only — reconnecting…" } }
-                if !error().is_empty() { p { role: "alert", "{error}" } }
-            }
-            nav { class: "thread-list", aria_label: "Threads",
-                button {
-                    disabled: !connected,
-                    onclick: move |_| {
-                        let workspace = workspace_for_create.clone();
-                        spawn(async move {
-                            match command(&workspace, &Command::ThreadCreate { display_name: None }).await {
-                                Ok(CommandResult::ThreadCreated { thread_id }) => navigate(route, Route {
-                                    workspace: Some(workspace),
-                                    thread: Some(thread_id.0),
-                                    detail: None,
-                                }),
-                                Ok(_) => error.set("Controller returned an unexpected result".to_owned()),
-                                Err(message) => error.set(message),
-                            }
-                        });
-                    },
-                    "New Thread"
-                }
-                if let Some(controller) = controller.clone() {
-                    for thread in controller.threads().iter().cloned() {
-                        button {
-                            class: "item thread-button",
-                            onclick: {
-                                let workspace = workspace.clone();
-                                move |_| navigate(route, Route {
-                                    workspace: Some(workspace.clone()),
-                                    thread: Some(thread.id.0),
-                                    detail: None,
-                                })
-                            },
-                            span {
-                                {thread.display_name.clone().unwrap_or_else(|| format!("Thread {}", thread.id.0))}
-                                if let Some(status) = controller.thread_status(thread.id) {
-                                    span { class: "status", "{status:?}" }
+                                for thread in root_threads(&controller) {
+                                    button {
+                                        class: "navigation-link root-thread",
+                                        aria_current: if selected_workspace.as_deref() == Some(&workspace.workspace_id)
+                                            && route.read().thread.is_some_and(|selected| {
+                                                root_id(controller.threads(), ThreadId(selected)) == thread.id
+                                            }) { "page" } else { "false" },
+                                        onclick: {
+                                            let workspace_id = workspace.workspace_id.clone();
+                                            move |_| {
+                                                navigate(route, Route {
+                                                    workspace: Some(workspace_id.clone()),
+                                                    thread: Some(thread.id.0),
+                                                    detail: None,
+                                                });
+                                                mobile_panel.set(MobilePanel::None);
+                                            }
+                                        },
+                                        span { class: "row-title", "{thread_name(&thread)}" }
+                                        small {
+                                            "{factual_status(controller.thread_status(thread.id))} · {child_count(controller.threads(), thread.id)} children"
+                                        }
+                                    }
                                 }
+                            } else {
+                                p { class: "muted compact", "Loading…" }
                             }
-                            br {}
-                            small { "{thread.provider} / {thread.model} / {thread.reasoning_effort}" }
                         }
                     }
                 }
             }
-            if let Some(thread) = selected_thread {
-                ThreadView {
-                    key: "{workspace}:{thread}",
-                    workspace: workspace.clone(),
-                    thread,
-                    detail,
-                    controller,
-                    controller_connected: connected,
-                    route,
+            details { class: "global-settings",
+                summary { "Application settings" }
+                label {
+                    "Theme"
+                    select {
+                        value: "{theme}",
+                        onchange: move |event| {
+                            let value = event.value();
+                            storage_set(THEME_KEY, &value);
+                            theme.set(value);
+                        },
+                        option { value: "system", "System" }
+                        option { value: "light", "Light" }
+                        option { value: "dark", "Dark" }
+                    }
                 }
-            } else {
-                article { id: "transcript", p { "Select or create a Thread." } }
+                label { class: "check-row",
+                    input {
+                        r#type: "checkbox",
+                        checked: notifications(),
+                        onchange: move |event| {
+                            let enabled = event.checked();
+                            storage_set(NOTIFICATIONS_KEY, if enabled { "enabled" } else { "" });
+                            if enabled {
+                                request_notification_permission();
+                            }
+                            notifications.set(enabled);
+                        }
+                    }
+                    "Browser notifications"
+                }
+                if web_sys::Notification::permission() == web_sys::NotificationPermission::Denied {
+                    small { "Notifications are blocked by your browser." }
+                }
+                div { class: "button-row",
+                    button {
+                        onclick: move |_| {
+                            nav_open.set(false);
+                            storage_set(NAV_OPEN_KEY, "closed");
+                        },
+                        "Hide navigation"
+                    }
+                    button {
+                        onclick: move |_| {
+                            nav_width.set(288);
+                            storage_set(NAV_WIDTH_KEY, "288");
+                        },
+                        "Reset width"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_pin(
+    workspaces: &[Workspace],
+    controllers: &Controllers,
+    pin: &Pin,
+) -> Option<(String, atra_protocol::Thread, Option<AgentStatus>, usize)> {
+    let workspace = workspaces
+        .iter()
+        .find(|item| item.workspace_id == pin.workspace)?;
+    let controller = controllers.get(&pin.workspace)?.value.as_ref()?;
+    let thread = controller
+        .threads()
+        .iter()
+        .find(|thread| thread.id.0 == pin.thread)?
+        .clone();
+    Some((
+        workspace.name.clone(),
+        thread.clone(),
+        controller.thread_status(thread.id),
+        child_count(controller.threads(), thread.id),
+    ))
+}
+
+fn move_pin(mut pins: Signal<Vec<Pin>>, from: usize, to: usize) {
+    if from >= pins.read().len() || to >= pins.read().len() || from == to {
+        return;
+    }
+    let pin = pins.write().remove(from);
+    pins.write().insert(to, pin);
+    save_json(PINS_KEY, &*pins.read());
+}
+
+#[component]
+fn NewThreadButton(
+    workspace: String,
+    connected: bool,
+    controller: Option<ControllerState>,
+    route: Signal<Route>,
+    pins: Signal<Vec<Pin>>,
+) -> Element {
+    let mut pending = use_signal(|| false);
+    let mut error = use_signal(String::new);
+    rsx! {
+        button {
+            class: "icon-button",
+            aria_label: "New Thread in {workspace}",
+            disabled: !connected || pending(),
+            title: if error().is_empty() { "New Thread" } else { "{error}" },
+            onclick: move |_| {
+                let workspace = workspace.clone();
+                let controller = controller.clone();
+                pending.set(true);
+                spawn(async move {
+                    match command(&workspace, &Command::ThreadCreate { display_name: None }).await {
+                        Ok(CommandResult::ThreadCreated { thread_id }) => {
+                            if let Some(controller) = controller.as_ref() {
+                                ensure_pin(pins, &workspace, thread_id, controller);
+                            } else {
+                                pins.write().insert(0, Pin { workspace: workspace.clone(), thread: thread_id.0 });
+                                save_json(PINS_KEY, &*pins.read());
+                            }
+                            navigate(route, Route {
+                                workspace: Some(workspace),
+                                thread: Some(thread_id.0),
+                                detail: None,
+                            });
+                            error.set(String::new());
+                        }
+                        Ok(_) => error.set("Unexpected Controller response".to_owned()),
+                        Err(message) => error.set(message),
+                    }
+                    pending.set(false);
+                });
+            },
+            "+"
+        }
+        if !error().is_empty() {
+            small { class: "inline-error", "{error}" }
+        }
+    }
+}
+
+#[component]
+fn Landing(connected: bool) -> Element {
+    rsx! {
+        section { class: "landing",
+            div { class: "landing-mark", "A" }
+            h2 { "Choose a Workspace" }
+            p {
+                if connected {
+                    "Select a Thread from Navigation, or create one in a Workspace."
+                } else {
+                    "Connecting to Atra…"
+                }
             }
         }
     }
 }
 
 #[component]
-fn ThreadView(
+fn LoadingState(label: &'static str) -> Element {
+    rsx! {
+        section { class: "loading-state", aria_busy: "true",
+            div { class: "skeleton wide" }
+            div { class: "skeleton" }
+            p { "{label}" }
+        }
+    }
+}
+
+#[component]
+fn WorkspaceLanding(
     workspace: String,
+    controller: ControllerState,
+    connected: bool,
+    route: Signal<Route>,
+    pins: Signal<Vec<Pin>>,
+) -> Element {
+    rsx! {
+        section { class: "landing",
+            h2 { "Choose a Thread" }
+            p { "Open a root Thread from Navigation or create a new one." }
+            NewThreadButton { workspace, connected, controller: Some(controller), route, pins }
+        }
+    }
+}
+
+#[component]
+fn ThreadPage(
+    workspace: Workspace,
     thread: i64,
     detail: Option<Detail>,
-    controller: Option<ControllerState>,
+    controller: ControllerState,
     controller_connected: bool,
     route: Signal<Route>,
+    pins: Signal<Vec<Pin>>,
+    inbox: Signal<Vec<InboxItem>>,
+    nav_open: Signal<bool>,
+    utility_open: Signal<bool>,
+    utility_tab: Signal<UtilityTab>,
+    utility_width: Signal<i32>,
+    mobile_panel: Signal<MobilePanel>,
+    modes: Signal<HashMap<String, TranscriptMode>>,
+    scroll_positions: Signal<HashMap<String, i32>>,
 ) -> Element {
-    let mut remote = use_signal(RemoteState::<ThreadState>::default);
+    let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut error = use_signal(String::new);
-    let mut draft = use_signal(|| storage_get(&draft_key(&workspace, thread)));
-    let workspace_for_stream = workspace.clone();
+    let dialog = use_signal(|| None::<DialogState>);
+    let workspace_id = workspace.workspace_id.clone();
+    let workspace_for_stream = workspace_id.clone();
     let _thread_stream = use_hook(move || {
         connect_sse(
             &format!("/api/workspaces/{workspace_for_stream}/threads/{thread}/events"),
             move |data| match serde_json::from_str::<ThreadSubscriptionMessage>(&data) {
-                Ok(message) => remote.write().apply(message),
+                Ok(message) => store.apply(message),
                 Err(parse_error) => error.set(parse_error.to_string()),
             },
-            move |connected| {
-                if !connected {
-                    remote.write().connected = false;
-                }
-            },
+            move |connected| store.set_connected(connected),
         )
     });
-    let connected = controller_connected && remote.read().connected;
-    let state = remote.read().value.clone();
-    let workspace_for_send = workspace.clone();
-    let workspace_for_draft = workspace.clone();
-    let workspace_for_shortcut = workspace.clone();
+    let connection = store.read_connection();
+    let connected = controller_connected && connection.connected();
+    let connection_message = connection
+        .terminal()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "The live connection was interrupted.".to_owned());
+    let metadata = store.read_metadata();
+    let has_state = metadata.is_loaded();
+    let checkpoint_metadata = metadata.metadata().cloned();
+    let selected = controller
+        .threads()
+        .iter()
+        .find(|item| item.id.0 == thread)
+        .cloned();
+    let name = selected
+        .as_ref()
+        .map(thread_name)
+        .unwrap_or_else(|| format!("Thread {thread}"));
+    let status = selected
+        .as_ref()
+        .and_then(|selected| controller.thread_status(selected.id));
+    let mode_key = format!("{}:{thread}", workspace.workspace_id);
+    let mode = modes
+        .read()
+        .get(&mode_key)
+        .copied()
+        .unwrap_or(TranscriptMode::Pretty);
+    let selected_detail = detail.clone();
+
+    use_effect({
+        let workspace_name = workspace.name.clone();
+        let name = name.clone();
+        move || set_document_title(&workspace_name, &name)
+    });
     use_effect(move || {
-        let _ = remote
-            .read()
-            .value
-            .as_ref()
-            .map(|state| state.events().len());
-        if let Some(element) = web_sys::window()
-            .and_then(|window| window.document())
-            .and_then(|document| document.get_element_by_id("transcript"))
-        {
-            element.set_scroll_top(element.scroll_height());
+        if let Some(detail) = detail.clone() {
+            utility_open.set(true);
+            let tab = match detail {
+                Detail::Checkpoint(_) => UtilityTab::Checkpoints,
+                Detail::Process { .. } => UtilityTab::Processes,
+            };
+            utility_tab.set(tab);
+            storage_set(UTILITY_OPEN_KEY, "open");
+            storage_set(UTILITY_TAB_KEY, &format!("{tab:?}").to_lowercase());
         }
     });
 
     rsx! {
-        article { id: "transcript", aria_live: "polite",
-            if let Some(state) = state.clone() {
-                for item in transcript(&state) {
-                    section { class: if item.active { "item transcript-item active" } else { "item transcript-item" },
-                        small { "{item.label}" }
-                        if item.markdown {
-                            div {
-                                class: "markdown",
-                                dangerous_inner_html: "{render_markdown(&item.body)}",
-                            }
-                        } else if item.body.len() > 4000 {
-                            details {
-                                summary { "Show long output ({item.body.len()} characters)" }
-                                pre { "{item.body}" }
-                            }
+        ContextHeader {
+            workspace: workspace.clone(),
+            name: name.clone(),
+            status,
+            connected,
+            mode,
+            mode_key: mode_key.clone(),
+            modes,
+            route,
+            thread,
+            inbox,
+            nav_open,
+            utility_open,
+            utility_tab,
+            mobile_panel,
+            controller: controller.clone(),
+            pins,
+            error,
+        }
+        if !connected {
+            div { class: "connection-banner", role: "status",
+                strong { "Read only — reconnecting" }
+                span { "{connection_message}" }
+                button { onclick: move |_| {
+                    if let Some(window) = web_sys::window() { let _ = window.location().reload(); }
+                }, "Retry" }
+            }
+        }
+        if !error().is_empty() {
+            div { class: "toast error-toast", role: "alert",
+                span { "{error}" }
+                button { aria_label: "Dismiss error", onclick: move |_| error.set(String::new()), "×" }
+            }
+        }
+        if has_state {
+            if let Some(Detail::Checkpoint(checkpoint)) = selected_detail {
+                CheckpointPreview {
+                    workspace: workspace_id.clone(),
+                    thread,
+                    checkpoint,
+                    metadata: checkpoint_metadata.expect("loaded thread has metadata"),
+                    connected,
+                    mode,
+                    route,
+                    dialog,
+                    error,
+                    scroll_positions,
+                }
+            } else {
+                Transcript {
+                    store,
+                    mode,
+                    workspace: workspace_id.clone(),
+                    thread,
+                    dialog,
+                    error,
+                    scroll_positions,
+                }
+                Composer {
+                    workspace: workspace_id.clone(),
+                    thread,
+                    store,
+                    controller: controller.clone(),
+                    connected,
+                    pins,
+                    error,
+                }
+            }
+            if utility_open() && (!is_narrow_viewport() || mobile_panel() == MobilePanel::Utility) {
+                UtilityPanel {
+                    workspace: workspace_id.clone(),
+                    thread,
+                    store,
+                    controller: controller.clone(),
+                    connected,
+                    route,
+                    utility_open,
+                    utility_tab,
+                    mobile_panel,
+                    dialog,
+                    error,
+                }
+            }
+            if utility_open() && !is_narrow_viewport() {
+                ResizeHandle {
+                    side: "Utility",
+                    value: utility_width,
+                    default_value: 352,
+                    min: 272,
+                    max: 520,
+                    storage_key: UTILITY_WIDTH_KEY,
+                }
+            }
+        } else {
+            LoadingState { label: "Loading Thread…" }
+        }
+        if let Some(dialog_state) = dialog.read().clone() {
+            AppDialog {
+                workspace: workspace_id,
+                thread,
+                state: dialog_state,
+                controller,
+                connected,
+                dialog,
+                route,
+                pins,
+                error,
+            }
+        }
+    }
+}
+
+#[component]
+fn ContextHeader(
+    workspace: Workspace,
+    name: String,
+    status: Option<AgentStatus>,
+    connected: bool,
+    mode: TranscriptMode,
+    mode_key: String,
+    modes: Signal<HashMap<String, TranscriptMode>>,
+    route: Signal<Route>,
+    thread: i64,
+    inbox: Signal<Vec<InboxItem>>,
+    nav_open: Signal<bool>,
+    utility_open: Signal<bool>,
+    utility_tab: Signal<UtilityTab>,
+    mobile_panel: Signal<MobilePanel>,
+    controller: ControllerState,
+    pins: Signal<Vec<Pin>>,
+    error: Signal<String>,
+) -> Element {
+    let unread = inbox.read().iter().filter(|item| !item.read).count();
+    rsx! {
+        header { class: "context-header",
+            button {
+                class: "icon-button",
+                aria_label: "Toggle navigation",
+                onclick: move |_| {
+                    if is_narrow_viewport() {
+                        nav_open.set(true);
+                        storage_set(NAV_OPEN_KEY, "open");
+                        if mobile_panel() == MobilePanel::Navigation {
+                            mobile_panel.set(MobilePanel::None);
                         } else {
-                            pre { "{item.body}" }
+                            mobile_panel.set(MobilePanel::Navigation);
                         }
-                        button {
-                            class: "copy-button",
-                            onclick: {
-                                let body = item.body.clone();
-                                move |_| copy_text(body.clone())
-                            },
-                            "Copy"
-                        }
+                    } else {
+                        mobile_panel.set(MobilePanel::None);
+                        let next = !nav_open();
+                        nav_open.set(next);
+                        storage_set(NAV_OPEN_KEY, if next { "open" } else { "closed" });
                     }
+                },
+                "☰"
+            }
+            div { class: "context-title",
+                small { "{workspace.name}" }
+                strong { "{name}" }
+            }
+            div { class: "context-status", role: "status",
+                span { class: "status-dot" }
+                span { if connected { "{factual_status(status)}" } else { "Reconnecting" } }
+            }
+            div { class: "mode-switch desktop-only", role: "group", aria_label: "Transcript mode",
+                button {
+                    class: if mode == TranscriptMode::Pretty { "selected" } else { "" },
+                    aria_pressed: mode == TranscriptMode::Pretty,
+                    onclick: {
+                        let key = mode_key.clone();
+                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Pretty); }
+                    },
+                    "Pretty"
                 }
-                if let Some(outcome) = state.last_outcome() {
-                    section { class: "item", strong { "Turn outcome" } pre { "{outcome:?}" } }
+                button {
+                    class: if mode == TranscriptMode::Raw { "selected" } else { "" },
+                    aria_pressed: mode == TranscriptMode::Raw,
+                    onclick: {
+                        let key = mode_key.clone();
+                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Raw); }
+                    },
+                    "Raw"
                 }
-                if let Some(turn) = state.active_turn() {
-                    if let Some(approval) = turn.pending_approval() {
-                        ApprovalForm {
-                            workspace: workspace.clone(),
-                            id: approval.id(),
-                            tool: approval.tool().to_owned(),
-                            arguments: serde_json::to_string_pretty(approval.arguments()).unwrap_or_default(),
-                            connected,
-                            error,
+            }
+            details { class: "header-menu",
+                summary { aria_label: "Thread and display actions", "•••" }
+                button {
+                    class: "mobile-only",
+                    onclick: {
+                        let key = mode_key.clone();
+                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Pretty); }
+                    },
+                    "Pretty"
+                }
+                button {
+                    class: "mobile-only",
+                    onclick: {
+                        let key = mode_key.clone();
+                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Raw); }
+                    },
+                    "Raw"
+                }
+                button {
+                    onclick: move |_| {
+                        utility_tab.set(UtilityTab::Thread);
+                        utility_open.set(true);
+                        storage_set(UTILITY_TAB_KEY, "thread");
+                        storage_set(UTILITY_OPEN_KEY, "open");
+                    },
+                    "Thread settings"
+                }
+                HeaderActionButton {
+                    workspace: workspace.workspace_id.clone(),
+                    thread,
+                    action: HeaderThreadAction::Continue,
+                    connected: connected && !matches!(status, Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)),
+                    controller: controller.clone(),
+                    pins,
+                    error,
+                }
+                HeaderActionButton {
+                    workspace: workspace.workspace_id.clone(),
+                    thread,
+                    action: HeaderThreadAction::Compact,
+                    connected: connected && !matches!(status, Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)),
+                    controller: controller.clone(),
+                    pins,
+                    error,
+                }
+                HeaderActionButton {
+                    workspace: workspace.workspace_id.clone(),
+                    thread,
+                    action: HeaderThreadAction::Checkpoint,
+                    connected,
+                    controller: controller.clone(),
+                    pins,
+                    error,
+                }
+            }
+            Inbox {
+                inbox,
+                route,
+            }
+            button {
+                class: "icon-button badge-button",
+                aria_label: if unread > 0 { "Open utility panel, {unread} unread activities" } else { "Toggle utility panel" },
+                onclick: move |_| {
+                    if is_narrow_viewport() {
+                        utility_open.set(true);
+                        storage_set(UTILITY_OPEN_KEY, "open");
+                        if mobile_panel() == MobilePanel::Utility {
+                            mobile_panel.set(MobilePanel::None);
+                        } else {
+                            mobile_panel.set(MobilePanel::Utility);
                         }
+                    } else {
+                        mobile_panel.set(MobilePanel::None);
+                        let next = !utility_open();
+                        utility_open.set(next);
+                        storage_set(UTILITY_OPEN_KEY, if next { "open" } else { "closed" });
                     }
-                    if let Some(request) = turn.pending_question() {
-                        QuestionForm {
-                            workspace: workspace.clone(),
-                            request: request.clone(),
-                            connected,
-                            error,
-                        }
-                    }
+                },
+                "◫"
+            }
+            if route.read().detail.is_some() {
+                button {
+                    class: "live-link",
+                    onclick: {
+                        let workspace = workspace.workspace_id.clone();
+                        move |_| navigate(route, Route {
+                            workspace: Some(workspace.clone()),
+                            thread: Some(thread),
+                            detail: None,
+                        })
+                    },
+                    "Live"
                 }
             }
         }
-        form {
-            id: "composer",
-            onsubmit: move |event| {
-                event.prevent_default();
-                let message = draft();
-                if message.trim().is_empty() { return; }
-                let workspace = workspace_for_send.clone();
+    }
+}
+
+#[component]
+fn HeaderActionButton(
+    workspace: String,
+    thread: i64,
+    action: HeaderThreadAction,
+    connected: bool,
+    controller: ControllerState,
+    pins: Signal<Vec<Pin>>,
+    error: Signal<String>,
+) -> Element {
+    let mut pending = use_signal(|| false);
+    let label = match action {
+        HeaderThreadAction::Continue => "Continue",
+        HeaderThreadAction::Compact => "Compact history",
+        HeaderThreadAction::Checkpoint => "Create Checkpoint",
+    };
+    rsx! {
+        button {
+            disabled: !connected || pending(),
+            onclick: move |_| {
+                pending.set(true);
+                let workspace = workspace.clone();
+                let controller = controller.clone();
                 spawn(async move {
-                    match command(&workspace, &Command::ThreadSend {
-                        thread_id: ThreadId(thread),
-                        message: message.clone(),
-                        allow_questions: true,
-                    }).await {
+                    let next = match action {
+                        HeaderThreadAction::Continue => Command::ThreadContinue {
+                            thread_id: ThreadId(thread),
+                            allow_questions: true,
+                        },
+                        HeaderThreadAction::Compact => Command::ThreadCompact {
+                            thread_id: ThreadId(thread),
+                            allow_questions: true,
+                        },
+                        HeaderThreadAction::Checkpoint => Command::ThreadCheckpointCreate {
+                            thread_id: ThreadId(thread),
+                        },
+                    };
+                    match command(&workspace, &next).await {
                         Ok(_) => {
-                            save_sent_message(&workspace, &message);
-                            storage_set(&draft_key(&workspace, thread), "");
-                            draft.set(String::new());
+                            ensure_pin(pins, &workspace, ThreadId(thread), &controller);
+                            error.set(String::new());
                         }
                         Err(message) => error.set(message),
                     }
+                    pending.set(false);
                 });
             },
-            label { r#for: "message", "Message" }
-            textarea {
-                id: "message",
-                value: "{draft}",
-                oninput: move |event| {
-                    let value = event.value();
-                    storage_set(&draft_key(&workspace_for_draft, thread), &value);
-                    draft.set(value);
-                },
-                onkeydown: move |event| {
-                    if (event.modifiers().contains(Modifiers::CONTROL)
-                        || event.modifiers().contains(Modifiers::META))
-                        && event.key() == Key::Enter
-                    {
-                        event.prevent_default();
-                        if let Some(form) = web_sys::window()
-                            .and_then(|window| window.document())
-                            .and_then(|document| document.get_element_by_id("composer"))
-                            .and_then(|element| element.dyn_into::<web_sys::HtmlFormElement>().ok())
-                        {
-                            let _ = form.request_submit();
-                        }
-                    } else if event.key() == Key::Escape && connected {
-                        let workspace = workspace_for_shortcut.clone();
-                        spawn(async move {
-                            if let Err(message) = command(&workspace, &Command::ThreadCancel {
-                                thread_id: ThreadId(thread),
-                            }).await {
-                                error.set(message);
-                            }
-                        });
-                    }
-                }
-            }
-            div { class: "button-row",
-                button { r#type: "submit", disabled: !connected, "Send" }
-                if let Ok(history) = serde_json::from_str::<Vec<String>>(&storage_get(&history_key(&workspace))) {
-                    if let Some(last) = history.last() {
-                        button {
-                            r#type: "button",
-                            onclick: {
-                                let last = last.clone();
-                                move |_| draft.set(last.clone())
-                            },
-                            "Recall last sent"
-                        }
-                    }
-                }
-            }
+            if pending() { "Working…" } else { "{label}" }
         }
-        aside { class: "details",
-            h2 { "Thread details" }
-            if !error().is_empty() { p { role: "alert", "{error}" } }
-            if let Some(state) = state {
-                ThreadControls {
-                    workspace: workspace.clone(),
-                    thread,
-                    state: state.clone(),
-                    controller,
-                    connected,
-                    route,
-                    error,
+    }
+}
+
+#[component]
+fn Inbox(inbox: Signal<Vec<InboxItem>>, route: Signal<Route>) -> Element {
+    let unread = inbox.read().iter().filter(|item| !item.read).count();
+    rsx! {
+        details { class: "inbox-popover",
+            summary {
+                aria_label: "Activity Inbox, {unread} unread",
+                "◎"
+                if unread > 0 { span { class: "badge", "{unread}" } }
+            }
+            div { class: "popover-panel",
+                header {
+                    h2 { "Activity Inbox" }
+                    button {
+                        disabled: !inbox.read().iter().any(|item| item.read),
+                        onclick: move |_| {
+                            inbox.write().retain(|item| !item.read);
+                            save_json(INBOX_KEY, &*inbox.read());
+                        },
+                        "Clear all read"
+                    }
                 }
-                if let Some(detail) = detail {
-                    match detail {
-                        Detail::Checkpoint(checkpoint) => rsx! {
-                            CheckpointView {
-                                workspace: workspace.clone(),
-                                thread,
-                                checkpoint,
-                                connected,
-                                route,
-                                error,
-                            }
-                        },
-                        Detail::Process { runner, process } => rsx! {
-                            ProcessView {
-                                workspace: workspace.clone(),
-                                thread,
-                                runner,
-                                process,
-                                connected,
-                                error,
-                            }
-                        },
+                if inbox.read().is_empty() {
+                    p { class: "empty-copy", "No activity from other Threads." }
+                }
+                for item in inbox.read().clone() {
+                    article { class: if item.read { "inbox-item read" } else { "inbox-item" },
+                        button {
+                            class: "inbox-link",
+                            onclick: {
+                                let id = item.id.clone();
+                                let workspace = item.workspace.clone();
+                                move |_| {
+                                    if let Some(current) = inbox.write().iter_mut().find(|entry| entry.id == id) {
+                                        current.read = true;
+                                    }
+                                    save_json(INBOX_KEY, &*inbox.read());
+                                    navigate(route, Route {
+                                        workspace: Some(workspace.clone()),
+                                        thread: Some(item.thread),
+                                        detail: None,
+                                    });
+                                }
+                            },
+                            strong { "{item.kind} · {item.thread_name}" }
+                            small { "{item.workspace_name} · {item.summary}" }
+                        }
+                        button {
+                            class: "icon-button",
+                            aria_label: "Dismiss {item.kind} for {item.thread_name}",
+                            onclick: {
+                                let id = item.id.clone();
+                                move |_| {
+                                    inbox.write().retain(|entry| entry.id != id);
+                                    save_json(INBOX_KEY, &*inbox.read());
+                                }
+                            },
+                            "×"
+                        }
                     }
                 }
             }
@@ -718,93 +1606,931 @@ fn ThreadView(
 }
 
 #[component]
-fn ThreadControls(
+fn Transcript(
+    store: ThreadStore,
+    mode: TranscriptMode,
     workspace: String,
     thread: i64,
-    state: ThreadState,
-    controller: Option<ControllerState>,
-    connected: bool,
-    route: Signal<Route>,
+    dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
+    scroll_positions: Signal<HashMap<String, i32>>,
 ) -> Element {
-    let metadata = state.metadata().clone();
-    let workspace_for_rename = workspace.clone();
-    let workspace_for_delete = workspace.clone();
-    let workspace_for_model = workspace.clone();
-    let mut selected_model = use_signal(|| format!("{}\n{}", metadata.provider, metadata.model));
-    let mut reasoning = use_signal(|| metadata.reasoning_effort.clone());
-    let models = controller
-        .as_ref()
-        .map(|controller| {
-            controller
-                .providers()
-                .iter()
-                .flat_map(|provider| provider.models().iter().cloned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let selected_model_value = selected_model();
-    let efforts = models
-        .iter()
-        .find(|model| format!("{}\n{}", model.provider, model.id) == selected_model_value)
-        .map(|model| model.supported_reasoning_efforts.clone())
-        .unwrap_or_else(|| vec![reasoning()]);
-    let models_for_change = models.clone();
+    let mut following = use_signal(|| true);
+    let mut has_latest = use_signal(|| false);
+    let mut restored_mode = use_signal(|| None::<TranscriptMode>);
+    let remote = if mode == TranscriptMode::Pretty {
+        store.read_transcript_structure()
+    } else {
+        store.read_raw_transcript()
+    };
+    if !remote.is_loaded() {
+        return rsx! { LoadingState { label: "Loading Transcript…" } };
+    }
+    let turns = remote.turn_keys();
+    let raw_keys = (mode == TranscriptMode::Raw).then(|| remote.raw_keys());
+    let turns_empty = turns.is_empty();
+    let scroll_key = format!("{workspace}:{thread}:{mode:?}");
+
+    use_effect(use_reactive((&mode,), {
+        let key = scroll_key.clone();
+        move |(mode,)| {
+            if mode == TranscriptMode::Pretty {
+                store.track_pretty_transcript_content();
+            } else {
+                store.track_raw_transcript_content();
+            }
+            if let Some(window) = web_sys::window()
+                && let Some(document) = window.document()
+                && let Some(element) = document.get_element_by_id("transcript-scroll")
+            {
+                if restored_mode.peek().as_ref() != Some(&mode) {
+                    if let Some(saved) = scroll_positions.peek().get(&key).copied() {
+                        element.set_scroll_top(saved);
+                        following.set(transcript_is_near_bottom(
+                            element.scroll_height(),
+                            element.scroll_top(),
+                            element.client_height(),
+                        ));
+                    } else {
+                        element.set_scroll_top(element.scroll_height());
+                        following.set(true);
+                    }
+                    has_latest.set(false);
+                    restored_mode.set(Some(mode));
+                } else if *following.peek() {
+                    element.set_scroll_top(element.scroll_height());
+                    has_latest.set(false);
+                } else {
+                    has_latest.set(true);
+                }
+            }
+        }
+    }));
 
     rsx! {
-        p { "{metadata.provider} / {metadata.model} / {metadata.reasoning_effort}" }
-        div { class: "button-row",
-            button {
-                disabled: !connected,
-                onclick: move |_| {
-                    if let Some(name) = prompt(
-                        "Thread name",
-                        metadata.display_name.as_deref().unwrap_or(""),
-                    ) {
-                        let workspace = workspace_for_rename.clone();
-                        spawn(async move {
-                            if let Err(message) = command(&workspace, &Command::ThreadRename {
-                                thread_id: ThreadId(thread),
-                                display_name: name,
-                            }).await {
-                                error.set(message);
+        main {
+            id: "transcript-scroll",
+            class: "transcript transcript-scroll",
+            aria_live: "polite",
+            onscroll: {
+                let key = scroll_key.clone();
+                move |_| {
+                    if let Some(window) = web_sys::window()
+                        && let Some(document) = window.document()
+                        && let Some(element) = document.get_element_by_id("transcript-scroll")
+                    {
+                        scroll_positions.write().insert(key.clone(), element.scroll_top());
+                        let near_bottom = transcript_is_near_bottom(
+                            element.scroll_height(),
+                            element.scroll_top(),
+                            element.client_height(),
+                        );
+                        following.set(near_bottom);
+                        if near_bottom {
+                            has_latest.set(false);
+                        }
+                    }
+                }
+            },
+            div { class: "reading-column",
+                if mode == TranscriptMode::Pretty {
+                    if turns_empty {
+                        section { class: "empty-transcript",
+                            h2 { "No conversation yet" }
+                            p { "Use the composer below to start this Thread." }
+                        }
+                    }
+                    for turn_key in turns {
+                        TurnCard {
+                            key: "{turn_key}",
+                            store,
+                            turn_key,
+                            dialog,
+                        }
+                    }
+                    InteractionPanel {
+                        store,
+                        workspace: workspace.clone(),
+                        error,
+                    }
+                } else if let Some(raw_keys) = raw_keys {
+                    section { class: "raw-events",
+                        for (index, raw_key) in raw_keys.into_iter().enumerate() {
+                            RawEventRow {
+                                key: "{raw_key}",
+                                store,
+                                raw_key,
+                                index,
                             }
-                        });
+                        }
+                    }
+                }
+            }
+        }
+        if has_latest() {
+            button {
+                class: "latest-button",
+                r#type: "button",
+                onclick: {
+                    let key = scroll_key.clone();
+                    move |_| {
+                        if let Some(window) = web_sys::window()
+                            && let Some(document) = window.document()
+                            && let Some(element) = document.get_element_by_id("transcript-scroll")
+                        {
+                            element.set_scroll_top(element.scroll_height());
+                            scroll_positions
+                                .write()
+                                .insert(key.clone(), element.scroll_top());
+                        }
+                        following.set(true);
+                        has_latest.set(false);
                     }
                 },
-                "Rename"
+                "Latest"
             }
+        }
+    }
+}
+
+#[component]
+fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogState>>) -> Element {
+    let mut group_open = use_signal(|| false);
+    let mut activity_auto_expanded = use_signal(|| false);
+    let connection = store.read_connection();
+    let connected = connection.connected();
+    let turn_read = store.read_turn(turn_key);
+    let Some(turn) = turn_read.value() else {
+        return rsx! {};
+    };
+    let prompt_html = render_markdown(turn.prompt());
+    let prompt_sequence = turn.prompt_sequence();
+    let answer = turn
+        .answer()
+        .map(|(sequence, answer)| (sequence, render_markdown(answer)));
+    let active = turn.is_active();
+    let activities = turn.activity_keys();
+
+    if active && !*activity_auto_expanded.peek() {
+        activity_auto_expanded.set(true);
+        group_open.set(true);
+    }
+
+    let summary = turn_read.activity_summary(&activities);
+    rsx! {
+        article {
+            class: if active { "turn turn-card active-turn" } else { "turn turn-card" },
+            section { class: "turn-message user-message",
+                div {
+                    class: "turn-prose markdown",
+                    dangerous_inner_html: "{prompt_html}",
+                }
+                div { class: "turn-actions",
+                    TurnCopyButton { store, turn_key, target: TurnCopyTarget::Prompt }
+                    if let Some(sequence) = prompt_sequence {
+                        button {
+                            disabled: active || !connected,
+                            onclick: {
+                                move |_| dialog.set(Some(DialogState::Rewind {
+                                    checkpoint: None,
+                                    sequence,
+                                }))
+                            },
+                            "Rewind"
+                        }
+                    }
+                }
+            }
+            if !activities.is_empty() {
+                section { class: "activity-group",
+                    button {
+                        class: "activity-summary",
+                        aria_expanded: group_open(),
+                        onclick: move |_| {
+                            let next = !group_open();
+                            group_open.set(next);
+                        },
+                        span { class: "chevron", if group_open() { "⌄" } else { "›" } }
+                        span { "{summary}" }
+                        if active { small { "Running" } }
+                    }
+                    if group_open() {
+                        div { class: "activity-list",
+                            for activity_key in activities {
+                                ActivityRow {
+                                    key: "{activity_key}",
+                                    store,
+                                    turn_key,
+                                    activity_key,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((sequence, answer_html)) = answer {
+                section { class: "turn-message assistant-message",
+                    div {
+                        class: "turn-prose markdown",
+                        dangerous_inner_html: "{answer_html}",
+                    }
+                    div { class: "turn-actions",
+                        TurnCopyButton { store, turn_key, target: TurnCopyTarget::Answer }
+                        button {
+                            disabled: active || !connected,
+                            onclick: {
+                                move |_| dialog.set(Some(DialogState::Rewind {
+                                    checkpoint: None,
+                                    sequence,
+                                }))
+                            },
+                            "Rewind"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RawEventRow(store: ThreadStore, raw_key: RawKey, index: usize) -> Element {
+    let item = store.read_raw_item(raw_key);
+    let Some(json) = item.value() else {
+        return rsx! {};
+    };
+    rsx! {
+        pre {
+            "data-event-index": "{index}",
+            "{json}"
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TurnCopyTarget {
+    Prompt,
+    Answer,
+}
+
+#[component]
+fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget) -> Element {
+    let mut copied = use_signal(|| false);
+    let mut generation = use_signal(|| 0_u64);
+    let aria_label = match target {
+        TurnCopyTarget::Prompt => "Copy prompt",
+        TurnCopyTarget::Answer => "Copy response",
+    };
+
+    rsx! {
+        button {
+            aria_label,
+            onclick: move |_| {
+                let value = {
+                    let turn = store.peek_turn(turn_key);
+                    turn.value().and_then(|turn| match target {
+                        TurnCopyTarget::Prompt => Some(turn.prompt().to_owned()),
+                        TurnCopyTarget::Answer => {
+                            turn.answer().map(|(_, answer)| answer.to_owned())
+                        }
+                    })
+                };
+                let Some(value) = value else {
+                    return;
+                };
+                let current = generation.peek().wrapping_add(1);
+                generation.set(current);
+                spawn(async move {
+                    if !copy_text(value).await {
+                        if *generation.peek() == current {
+                            copied.set(false);
+                        }
+                        return;
+                    }
+                    if *generation.peek() != current {
+                        return;
+                    }
+                    copied.set(true);
+                    TimeoutFuture::new(2_000).await;
+                    if *generation.peek() == current {
+                        copied.set(false);
+                    }
+                });
+            },
+            if copied() { "Copied" } else { "Copy" }
+        }
+    }
+}
+
+#[component]
+fn ActivityRow(store: ThreadStore, turn_key: TurnKey, activity_key: ActivityKey) -> Element {
+    let mut open = use_signal(|| matches!(activity_key, ActivityKey::Active(_)));
+    let activity_read = store.read_activity(turn_key, activity_key.clone());
+    let Some(activity) = activity_read.value() else {
+        return rsx! {};
+    };
+    let title = activity.title;
+    let body = activity.body;
+    let kind = activity.kind;
+    let active = activity.active;
+    let markdown = open().then(|| {
+        matches!(kind, ActivityKind::Commentary | ActivityKind::Todo)
+            .then(|| render_markdown(&body))
+    });
+
+    rsx! {
+        article { class: "activity-row",
             button {
-                class: "danger",
-                disabled: !connected,
-                onclick: move |_| {
-                    if !confirm("Delete this Thread and its descendants?") { return; }
-                    let workspace = workspace_for_delete.clone();
+                class: "activity-row-summary",
+                aria_expanded: open(),
+                onclick: move |_| open.set(!open()),
+                span { class: "activity-icon",
+                    {match kind {
+                        ActivityKind::Tool => "⌘",
+                        ActivityKind::Search => "⌕",
+                        ActivityKind::Reasoning => "◌",
+                        ActivityKind::Commentary => "…",
+                        ActivityKind::Todo => "✓",
+                        ActivityKind::Skill => "◇",
+                        ActivityKind::Marker => "·",
+                    }}
+                }
+                strong { "{title}" }
+                if active { small { "Running" } }
+            }
+            if open() && !body.is_empty() {
+                if let Some(Some(html)) = markdown {
+                    div {
+                        class: "activity-prose markdown",
+                        dangerous_inner_html: "{html}",
+                    }
+                } else {
+                    pre { class: "activity-output", "{body}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Composer(
+    workspace: String,
+    thread: i64,
+    store: ThreadStore,
+    controller: ControllerState,
+    connected: bool,
+    pins: Signal<Vec<Pin>>,
+    error: Signal<String>,
+) -> Element {
+    let active_turn = store.read_active_turn();
+    let metadata_read = store.read_metadata();
+    let diagnostics_read = store.read_diagnostics();
+    if !active_turn.is_loaded() {
+        return rsx! {};
+    }
+    let mut draft = use_signal(|| storage_get(&draft_key(&workspace, thread)));
+    let mut pending = use_signal(|| false);
+    let mut history_index = use_signal(|| None::<usize>);
+    let mut saved_draft = use_signal(String::new);
+    let mut composing = use_signal(|| false);
+    let history = storage_json::<Vec<String>>(&history_key(&workspace, thread));
+    let active = active_turn.is_active();
+    let awaiting = active_turn.is_awaiting_interaction();
+    let diagnostics = diagnostics_read.value().unwrap_or_default();
+    let Some(metadata) = metadata_read.metadata().cloned() else {
+        return rsx! {};
+    };
+    let workspace_for_input = workspace.clone();
+    let workspace_for_submit = workspace.clone();
+
+    rsx! {
+        div { class: "composer-region",
+            if awaiting {
+                button {
+                    class: "attention-bar",
+                    onclick: move |_| {
+                        if let Some(element) = web_sys::window()
+                            .and_then(|window| window.document())
+                            .and_then(|document| document.query_selector(".interaction").ok().flatten())
+                        {
+                            element.scroll_into_view();
+                        }
+                    },
+                    "Input is required in the Transcript ↑"
+                }
+            }
+            form {
+                id: "composer",
+                class: "composer",
+                onsubmit: move |event| {
+                    event.prevent_default();
+                    let message = draft();
+                    if message.trim().is_empty() || active || awaiting || pending() {
+                        return;
+                    }
+                    let workspace = workspace_for_submit.clone();
+                    let controller = controller.clone();
+                    pending.set(true);
                     spawn(async move {
-                        match command(&workspace, &Command::ThreadDeleteRecursive {
+                        match command(&workspace, &Command::ThreadSend {
                             thread_id: ThreadId(thread),
+                            message: message.clone(),
+                            allow_questions: true,
                         }).await {
-                            Ok(_) => navigate(route, Route {
-                                workspace: Some(workspace),
-                                thread: None,
-                                detail: None,
-                            }),
+                            Ok(_) => {
+                                save_sent_message(&workspace, thread, &message);
+                                storage_set(&draft_key(&workspace, thread), "");
+                                draft.set(String::new());
+                                history_index.set(None);
+                                ensure_pin(pins, &workspace, ThreadId(thread), &controller);
+                                error.set(String::new());
+                            }
                             Err(message) => error.set(message),
                         }
+                        pending.set(false);
                     });
                 },
-                "Delete"
+                div { class: "composer-box",
+                label { class: "sr-only", r#for: "message", "Message" }
+                textarea {
+                    id: "message",
+                    aria_label: "Message",
+                    placeholder: "Message Atra…",
+                    value: "{draft}",
+                    oncompositionstart: move |_| composing.set(true),
+                    oncompositionend: move |_| composing.set(false),
+                    oninput: move |event| {
+                        let value = event.value();
+                        storage_set(&draft_key(&workspace_for_input, thread), &value);
+                        draft.set(value);
+                        history_index.set(None);
+                    },
+                    onkeydown: move |event| {
+                        if (event.modifiers().contains(Modifiers::CONTROL)
+                            || event.modifiers().contains(Modifiers::META))
+                            && event.key() == Key::Enter
+                        {
+                            event.prevent_default();
+                            if let Some(form) = web_sys::window()
+                                .and_then(|window| window.document())
+                                .and_then(|document| document.get_element_by_id("composer"))
+                                .and_then(|element| element.dyn_into::<HtmlFormElement>().ok())
+                            {
+                                let _ = form.request_submit();
+                            }
+                            return;
+                        }
+                        if composing() || !matches!(event.key(), Key::ArrowUp | Key::ArrowDown) {
+                            return;
+                        }
+                        let Some(textarea) = web_sys::window()
+                            .and_then(|window| window.document())
+                            .and_then(|document| document.get_element_by_id("message"))
+                            .and_then(|element| element.dyn_into::<HtmlTextAreaElement>().ok())
+                        else {
+                            return;
+                        };
+                        let start = textarea.selection_start().ok().flatten().unwrap_or(0) as usize;
+                        let end = textarea.selection_end().ok().flatten().unwrap_or(0) as usize;
+                        if start != end {
+                            return;
+                        }
+                        let value = draft();
+                        let at_first = !value[..start.min(value.len())].contains('\n');
+                        let at_last = !value[start.min(value.len())..].contains('\n');
+                        if event.key() == Key::ArrowUp && at_first && !history.is_empty() {
+                            event.prevent_default();
+                            let next = history_index().map(|index| index.saturating_sub(1)).unwrap_or_else(|| {
+                                saved_draft.set(value);
+                                history.len() - 1
+                            });
+                            history_index.set(Some(next));
+                            draft.set(history[next].clone());
+                        } else if event.key() == Key::ArrowDown
+                            && at_last
+                            && let Some(index) = history_index()
+                        {
+                            event.prevent_default();
+                            if index + 1 < history.len() {
+                                history_index.set(Some(index + 1));
+                                draft.set(history[index + 1].clone());
+                            } else {
+                                history_index.set(None);
+                                draft.set(saved_draft());
+                            }
+                        }
+                    }
+                }
+                if active {
+                    button {
+                        class: "primary stop-button",
+                        r#type: "button",
+                        disabled: !connected || pending(),
+                        onclick: {
+                            let workspace = workspace.clone();
+                            move |_| {
+                                pending.set(true);
+                                let workspace = workspace.clone();
+                                spawn(async move {
+                                    if let Err(message) = command(&workspace, &Command::ThreadCancel {
+                                        thread_id: ThreadId(thread),
+                                    }).await {
+                                        error.set(message);
+                                    }
+                                    pending.set(false);
+                                });
+                            }
+                        },
+                        "Stop"
+                    }
+                } else {
+                    button {
+                        class: "primary",
+                        r#type: "submit",
+                        disabled: !connected || awaiting || pending() || draft().trim().is_empty(),
+                        if pending() { "Sending…" } else { "Send" }
+                    }
+                }
+                }
+                div { class: "composer-status",
+                    span { class: "composer-model", "{metadata.model} ({metadata.reasoning_effort})" }
+                    span { title: "{diagnostics.usage_raw.clone().unwrap_or_default()}", "{diagnostics.composer_context}" }
+                    span { title: "{diagnostics.usage_raw.clone().unwrap_or_default()}", "{diagnostics.composer_cache}" }
+                    for summary in diagnostics.composer_quotas {
+                        span { title: "{diagnostics.limits_raw.clone().unwrap_or_default()}", "{summary}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn InteractionPanel(store: ThreadStore, workspace: String, error: Signal<String>) -> Element {
+    let remote = store.read_interaction();
+    let Some(interaction) = remote.value() else {
+        return rsx! {};
+    };
+    match interaction {
+        atra_protocol::PendingInteraction::Approval(approval) => rsx! {
+            ApprovalForm {
+                key: "approval-{approval.id().0}",
+                store,
+                workspace,
+                id: approval.id(),
+                error,
+            }
+        },
+        atra_protocol::PendingInteraction::Questions(request) => rsx! {
+            QuestionForm {
+                key: "questions-{request.id.0}",
+                store,
+                workspace,
+                id: request.id,
+                error,
+            }
+        },
+    }
+}
+
+#[component]
+fn ApprovalForm(
+    store: ThreadStore,
+    workspace: String,
+    id: InteractionId,
+    error: Signal<String>,
+) -> Element {
+    let remote = store.read_interaction();
+    let Some(approval) = remote
+        .value()
+        .and_then(|interaction| match interaction {
+            PendingInteraction::Approval(approval) => Some(approval),
+            PendingInteraction::Questions(_) => None,
+        })
+        .filter(|approval| approval.id() == id)
+    else {
+        return rsx! {};
+    };
+    let tool = approval.tool();
+    let operation = approval.operation_label().unwrap_or("Approval");
+    let arguments = serde_json::to_string_pretty(approval.arguments()).unwrap_or_default();
+    let connected = store.read_connection().connected();
+    let mut reason = use_signal(String::new);
+    let mut pending = use_signal(|| false);
+    rsx! {
+        section { class: "interaction", role: "group", aria_label: "Approval required",
+            header {
+                div {
+                    h3 { "Approval required" }
+                    p { "{operation} · {tool}" }
+                }
+            }
+            details {
+                summary { "Complete arguments" }
+                pre { "{arguments}" }
+            }
+            label {
+                "Denial reason (optional)"
+                textarea { value: "{reason}", oninput: move |event| reason.set(event.value()) }
+            }
+            div { class: "equal-actions",
+                button {
+                    disabled: !connected || pending(),
+                    onclick: {
+                        let workspace = workspace.clone();
+                        move |_| {
+                            pending.set(true);
+                            let workspace = workspace.clone();
+                            spawn(async move {
+                                if let Err(message) = command(&workspace, &Command::ApprovalAllow { approval_id: id }).await {
+                                    error.set(message);
+                                } else {
+                                    error.set(String::new());
+                                }
+                                pending.set(false);
+                            });
+                        }
+                    },
+                    "Allow"
+                }
+                button {
+                    disabled: !connected || pending(),
+                    onclick: move |_| {
+                        pending.set(true);
+                        let workspace = workspace.clone();
+                        let reason = reason();
+                        spawn(async move {
+                            if let Err(message) = command(&workspace, &Command::ApprovalDeny {
+                                approval_id: id,
+                                reason: if reason.trim().is_empty() { None } else { Some(reason) },
+                            }).await {
+                                error.set(message);
+                            } else {
+                                error.set(String::new());
+                            }
+                            pending.set(false);
+                        });
+                    },
+                    "Deny"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QuestionForm(
+    store: ThreadStore,
+    workspace: String,
+    id: InteractionId,
+    error: Signal<String>,
+) -> Element {
+    let remote = store.read_interaction();
+    let Some(request) = remote
+        .value()
+        .and_then(|interaction| match interaction {
+            PendingInteraction::Questions(request) => Some(request),
+            PendingInteraction::Approval(_) => None,
+        })
+        .filter(|request| request.id == id)
+    else {
+        return rsx! {};
+    };
+    let request_id = request.id;
+    let question_count = request.questions.len();
+    let connected = store.read_connection().connected();
+    let mut pending = use_signal(|| false);
+    let mut answers = use_signal(move || {
+        (0..question_count)
+            .map(|_| QuestionAnswer {
+                selected_option: None,
+                note: String::new(),
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut touched = use_signal(move || vec![false; question_count]);
+    rsx! {
+        form {
+            class: "interaction question-form",
+            onsubmit: move |event| {
+                event.prevent_default();
+                pending.set(true);
+                let workspace = workspace.clone();
+                let values = answers();
+                spawn(async move {
+                    if let Err(message) = command(&workspace, &Command::QuestionAnswer {
+                        request_id,
+                        answers: values,
+                    }).await {
+                        error.set(message);
+                    } else {
+                        error.set(String::new());
+                    }
+                    pending.set(false);
+                });
+            },
+            h3 { "Questions" }
+            for (index, question) in request.questions.iter().enumerate() {
+                fieldset {
+                    legend { "{question.question}" }
+                    for option in question.options.iter() {
+                        label { class: "radio-card",
+                            input {
+                                r#type: "radio",
+                                name: "question-{index}",
+                                value: "{option.label}",
+                                checked: answers.read()[index].selected_option.as_deref() == Some(&option.label),
+                                onchange: {
+                                    let label = option.label.clone();
+                                    move |_| {
+                                        answers.write()[index].selected_option = Some(label.clone());
+                                        touched.write()[index] = true;
+                                    }
+                                },
+                            }
+                            span {
+                                strong { "{option.label}" }
+                                if question.recommended_options.contains(&option.label) {
+                                    small { class: "recommended", "Recommended" }
+                                }
+                                small { "{option.description}" }
+                            }
+                        }
+                    }
+                    label { class: "radio-card",
+                        input {
+                            r#type: "radio",
+                            name: "question-{index}",
+                            value: "",
+                            checked: touched.read()[index] && answers.read()[index].selected_option.is_none(),
+                            onchange: move |_| {
+                                answers.write()[index].selected_option = None;
+                                touched.write()[index] = true;
+                            },
+                        }
+                        span {
+                            strong { "None of these" }
+                            small { "Provide another answer in the note if useful." }
+                        }
+                    }
+                    label {
+                        "Optional note"
+                        textarea {
+                            value: "{answers.read()[index].note}",
+                            oninput: move |event| answers.write()[index].note = event.value(),
+                        }
+                    }
+                }
+            }
+            button {
+                class: "primary",
+                r#type: "submit",
+                disabled: !connected || pending() || touched.read().iter().any(|selected| !selected),
+                if pending() { "Submitting…" } else { "Submit answers" }
+            }
+        }
+    }
+}
+
+#[component]
+fn UtilityPanel(
+    workspace: String,
+    thread: i64,
+    store: ThreadStore,
+    controller: ControllerState,
+    connected: bool,
+    route: Signal<Route>,
+    utility_open: Signal<bool>,
+    utility_tab: Signal<UtilityTab>,
+    mobile_panel: Signal<MobilePanel>,
+    dialog: Signal<Option<DialogState>>,
+    error: Signal<String>,
+) -> Element {
+    rsx! {
+        aside {
+            class: if mobile_panel() == MobilePanel::Utility { "utility drawer-open" } else { "utility" },
+            aria_label: "Utility panel",
+            header { class: "utility-header",
+                h2 { "{utility_tab().label()}" }
+                button {
+                    class: "icon-button",
+                    aria_label: "Close utility panel",
+                    onclick: move |_| {
+                        utility_open.set(false);
+                        mobile_panel.set(MobilePanel::None);
+                        storage_set(UTILITY_OPEN_KEY, "closed");
+                    },
+                    "×"
+                }
+            }
+            div { class: "utility-tabs", role: "tablist",
+                for tab in [UtilityTab::Thread, UtilityTab::Children, UtilityTab::Checkpoints, UtilityTab::Processes] {
+                    button {
+                        role: "tab",
+                        aria_selected: utility_tab() == tab,
+                        class: if utility_tab() == tab { "selected" } else { "" },
+                        onclick: move |_| {
+                            utility_tab.set(tab);
+                            storage_set(UTILITY_TAB_KEY, &format!("{tab:?}").to_lowercase());
+                        },
+                        "{tab.label()}"
+                    }
+                }
+            }
+            div { class: "utility-content",
+                match utility_tab() {
+                    UtilityTab::Thread => rsx! {
+                        ThreadUtility {
+                            workspace: workspace.clone(),
+                            thread,
+                            store,
+                            controller: controller.clone(),
+                            connected,
+                            dialog,
+                            error,
+                        }
+                    },
+                    UtilityTab::Children => rsx! {
+                        ChildrenUtility { workspace: workspace.clone(), thread, controller: controller.clone(), route }
+                    },
+                    UtilityTab::Checkpoints => rsx! {
+                        CheckpointsUtility { workspace: workspace.clone(), thread, store, route }
+                    },
+                    UtilityTab::Processes => rsx! {
+                        ProcessesUtility {
+                            workspace: workspace.clone(),
+                            thread,
+                            store,
+                            focused: route.read().detail.clone(),
+                            connected,
+                            route,
+                            dialog,
+                            error,
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ThreadUtility(
+    workspace: String,
+    thread: i64,
+    store: ThreadStore,
+    controller: ControllerState,
+    connected: bool,
+    dialog: Signal<Option<DialogState>>,
+    error: Signal<String>,
+) -> Element {
+    let metadata_read = store.read_metadata();
+    let diagnostics_read = store.read_diagnostics();
+    let Some(metadata) = metadata_read.metadata().cloned() else {
+        return rsx! {};
+    };
+    let mut selected_model = use_signal(|| format!("{}\n{}", metadata.provider, metadata.model));
+    let mut reasoning = use_signal(|| metadata.reasoning_effort.clone());
+    let mut pending = use_signal(|| false);
+    let models = controller
+        .providers()
+        .iter()
+        .flat_map(|provider| provider.models().iter().cloned())
+        .collect::<Vec<_>>();
+    let efforts = models
+        .iter()
+        .find(|model| format!("{}\n{}", model.provider, model.id) == selected_model())
+        .map(|model| model.supported_reasoning_efforts.clone())
+        .unwrap_or_else(|| vec![reasoning()]);
+    let diagnostics = diagnostics_read.value().unwrap_or_default();
+    let rename_metadata = metadata.clone();
+    let delete_metadata = metadata.clone();
+    rsx! {
+        section { class: "utility-section",
+            h3 { "Identity" }
+            dl { class: "metadata-list",
+                dt { "Name" } dd { "{thread_name(&metadata)}" }
+                dt { "Provider" } dd { "{metadata.provider}" }
+                dt { "Model" } dd { "{metadata.model}" }
+                dt { "Effort" } dd { "{metadata.reasoning_effort}" }
+            }
+            button {
+                disabled: !connected,
+                onclick: move |_| dialog.set(Some(DialogState::Rename { current: thread_name(&rename_metadata) })),
+                "Rename Thread"
             }
         }
         if !models.is_empty() {
             form {
-                class: "settings-form",
+                class: "utility-section",
                 onsubmit: move |event| {
                     event.prevent_default();
-                    let Some((provider, model)) = selected_model().split_once('\n').map(|(a, b)| (a.to_owned(), b.to_owned())) else {
-                        return;
-                    };
-                    let workspace = workspace_for_model.clone();
+                    let Some((provider, model)) = selected_model()
+                        .split_once('\n')
+                        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+                    else { return; };
+                    pending.set(true);
+                    let workspace = workspace.clone();
                     let effort = reasoning();
                     spawn(async move {
                         if let Err(message) = command(&workspace, &Command::ThreadSetModel {
@@ -814,23 +2540,19 @@ fn ThreadControls(
                             reasoning_effort: effort,
                         }).await {
                             error.set(message);
+                        } else {
+                            error.set(String::new());
                         }
+                        pending.set(false);
                     });
                 },
+                h3 { "Model" }
                 label {
-                    "Model"
+                    "Provider and model"
                     select {
                         value: "{selected_model}",
-                        onchange: move |event| {
-                            let value = event.value();
-                            if let Some(model) = models_for_change.iter().find(|model| {
-                                format!("{}\n{}", model.provider, model.id) == value
-                            }) {
-                                reasoning.set(model.default_reasoning_effort.clone());
-                            }
-                            selected_model.set(value);
-                        },
-                        for model in models.iter() {
+                        onchange: move |event| selected_model.set(event.value()),
+                        for model in &models {
                             option {
                                 value: "{model.provider}\n{model.id}",
                                 "{model.display_name} ({model.provider})"
@@ -848,44 +2570,99 @@ fn ThreadControls(
                         }
                     }
                 }
-                button { disabled: !connected, r#type: "submit", "Apply model" }
+                button { r#type: "submit", disabled: !connected || pending(), "Apply model" }
             }
         }
-        div { class: "button-row",
-            ActionButton {
-                workspace: workspace.clone(),
-                command_value: Command::ThreadCancel { thread_id: ThreadId(thread) },
-                label: "Cancel turn",
-                disabled: !connected,
-                error,
-            }
-            ActionButton {
-                workspace: workspace.clone(),
-                command_value: Command::ThreadContinue { thread_id: ThreadId(thread), allow_questions: true },
-                label: "Continue",
-                disabled: !connected,
-                error,
-            }
-            ActionButton {
-                workspace: workspace.clone(),
-                command_value: Command::ThreadCompact { thread_id: ThreadId(thread), allow_questions: true },
-                label: "Compact",
-                disabled: !connected,
-                error,
-            }
-            ActionButton {
-                workspace: workspace.clone(),
-                command_value: Command::ThreadCheckpointCreate { thread_id: ThreadId(thread) },
-                label: "Create checkpoint",
-                disabled: !connected,
-                error,
+        if diagnostics.usage_raw.is_some() || diagnostics.limits_raw.is_some() {
+            section { class: "utility-section",
+                h3 { "Diagnostics" }
+                if let Some(summary) = diagnostics.token_summary.clone() {
+                    p { class: "diagnostic-summary", "{summary}" }
+                }
+                if let Some(summary) = diagnostics.context_summary.clone() {
+                    p { class: "diagnostic-summary", "{summary}" }
+                }
+                if let Some(summary) = diagnostics.cache_summary.clone() {
+                    p { class: "diagnostic-summary", "{summary}" }
+                }
+                for summary in diagnostics.quota_windows.clone() {
+                    p { class: "diagnostic-summary", "{summary}" }
+                }
+                if let Some(value) = diagnostics.usage_raw.clone() {
+                    details { summary { "Latest token usage" } pre { "{value}" } }
+                }
+                if let Some(value) = diagnostics.limits_raw.clone() {
+                    details { summary { "Rate limits" } pre { "{value}" } }
+                }
             }
         }
-        h3 { "Checkpoints" }
-        for checkpoint in state.checkpoints().iter() {
-            div { class: "item",
+        section { class: "utility-section danger-zone",
+            h3 { "Danger zone" }
+            p { "Deleting removes this Thread and all descendants." }
+            button {
+                class: "danger",
+                disabled: !connected,
+                onclick: move |_| dialog.set(Some(DialogState::Delete { name: thread_name(&delete_metadata) })),
+                "Delete Thread"
+            }
+        }
+    }
+}
+
+#[component]
+fn ChildrenUtility(
+    workspace: String,
+    thread: i64,
+    controller: ControllerState,
+    route: Signal<Route>,
+) -> Element {
+    let family = family_threads(&controller, ThreadId(thread));
+    rsx! {
+        section { class: "family-tree",
+            if family.len() <= 1 {
+                p { class: "empty-copy", "This Thread has no children." }
+            }
+            for item in family {
                 button {
-                    class: "link-button",
+                    class: if item.id.0 == thread { "family-row current" } else { "family-row" },
+                    aria_current: if item.id.0 == thread { "page" } else { "false" },
+                    style: if item.parent_thread_id.is_some() { "margin-inline-start: 1.25rem" } else { "" },
+                    onclick: {
+                        let workspace = workspace.clone();
+                        move |_| navigate(route, Route {
+                            workspace: Some(workspace.clone()),
+                            thread: Some(item.id.0),
+                            detail: None,
+                        })
+                    },
+                    strong { "{thread_name(&item)}" }
+                    small { "{factual_status(controller.thread_status(item.id))}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CheckpointsUtility(
+    workspace: String,
+    thread: i64,
+    store: ThreadStore,
+    route: Signal<Route>,
+) -> Element {
+    let remote = store.read_checkpoints();
+    let Some(checkpoints) = remote.value() else {
+        return rsx! {};
+    };
+    rsx! {
+        section {
+            if checkpoints.is_empty() {
+                p { class: "empty-copy", "No Checkpoints yet. Create one from Thread actions." }
+            }
+            for checkpoint in checkpoints {
+                button {
+                    class: "checkpoint-row",
+                    aria_current: if route.read().detail == Some(Detail::Checkpoint(checkpoint.id.0)) { "page" } else { "false" },
                     onclick: {
                         let workspace = workspace.clone();
                         let id = checkpoint.id.0;
@@ -895,80 +2672,9 @@ fn ThreadControls(
                             detail: Some(Detail::Checkpoint(id)),
                         })
                     },
-                    "Checkpoint {checkpoint.id.0}"
-                }
-                p { "{checkpoint.reason}" }
-            }
-        }
-        h3 { "Processes" }
-        for process in state.processes().iter() {
-            div { class: "item",
-                button {
-                    class: "link-button",
-                    onclick: {
-                        let workspace = workspace.clone();
-                        let runner = process.locator().runner().to_owned();
-                        let process_id = process.locator().process_id().0.clone();
-                        move |_| navigate(route, Route {
-                            workspace: Some(workspace.clone()),
-                            thread: Some(thread),
-                            detail: Some(Detail::Process {
-                                runner: runner.clone(),
-                                process: process_id.clone(),
-                            }),
-                        })
-                    },
-                    code { "{process.command()}" }
-                }
-                small { " {process.status():?}" }
-            }
-        }
-    }
-}
-
-#[component]
-fn ApprovalForm(
-    workspace: String,
-    id: InteractionId,
-    tool: String,
-    arguments: String,
-    connected: bool,
-    error: Signal<String>,
-) -> Element {
-    let mut reason = use_signal(String::new);
-    rsx! {
-        section { class: "interaction", role: "alert",
-            h3 { "Approval required" }
-            strong { "{tool}" }
-            pre { "{arguments}" }
-            label {
-                "Denial reason (optional)"
-                input { value: "{reason}", oninput: move |event| reason.set(event.value()) }
-            }
-            div { class: "button-row",
-                ActionButton {
-                    workspace: workspace.clone(),
-                    command_value: Command::ApprovalAllow { approval_id: id },
-                    label: "Allow",
-                    disabled: !connected,
-                    error,
-                }
-                button {
-                    class: "danger",
-                    disabled: !connected,
-                    onclick: move |_| {
-                        let workspace = workspace.clone();
-                        let reason = reason();
-                        spawn(async move {
-                            if let Err(message) = command(&workspace, &Command::ApprovalDeny {
-                                approval_id: id,
-                                reason: if reason.trim().is_empty() { None } else { Some(reason) },
-                            }).await {
-                                error.set(message);
-                            }
-                        });
-                    },
-                    "Deny"
+                    strong { "Checkpoint {checkpoint.id.0}" }
+                    span { "{checkpoint.reason}" }
+                    small { "{checkpoint.created_at_ms}" }
                 }
             }
         }
@@ -976,84 +2682,20 @@ fn ApprovalForm(
 }
 
 #[component]
-fn QuestionForm(
-    workspace: String,
-    request: atra_protocol::PendingQuestionRequest,
-    connected: bool,
-    error: Signal<String>,
-) -> Element {
-    let request_id = request.id;
-    let mut answers = use_signal(|| {
-        request
-            .questions
-            .iter()
-            .map(|question| QuestionAnswer {
-                selected_option: question
-                    .recommended_options
-                    .first()
-                    .cloned()
-                    .or_else(|| question.options.first().map(|option| option.label.clone())),
-                note: String::new(),
-            })
-            .collect::<Vec<_>>()
-    });
-
-    rsx! {
-        form {
-            class: "interaction",
-            onsubmit: move |event| {
-                event.prevent_default();
-                let workspace = workspace.clone();
-                let values = answers();
-                spawn(async move {
-                    if let Err(message) = command(&workspace, &Command::QuestionAnswer {
-                        request_id,
-                        answers: values,
-                    }).await {
-                        error.set(message);
-                    }
-                });
-            },
-            h3 { "Questions" }
-            for (index, question) in request.questions.iter().enumerate() {
-                fieldset {
-                    legend { "{question.question}" }
-                    select {
-                        value: "{answers.read()[index].selected_option.clone().unwrap_or_default()}",
-                        onchange: move |event| {
-                            answers.write()[index].selected_option = if event.value().is_empty() {
-                                None
-                            } else {
-                                Some(event.value())
-                            };
-                        },
-                        option { value: "", "None of these" }
-                        for option in question.options.iter() {
-                            option { value: "{option.label}", "{option.label} — {option.description}" }
-                        }
-                    }
-                    input {
-                        placeholder: "Optional note",
-                        value: "{answers.read()[index].note}",
-                        oninput: move |event| answers.write()[index].note = event.value(),
-                    }
-                }
-            }
-            button { r#type: "submit", disabled: !connected, "Submit answers" }
-        }
-    }
-}
-
-#[component]
-fn CheckpointView(
+fn CheckpointPreview(
     workspace: String,
     thread: i64,
     checkpoint: i64,
+    metadata: atra_protocol::Thread,
     connected: bool,
+    mode: TranscriptMode,
     route: Signal<Route>,
+    dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
+    scroll_positions: Signal<HashMap<String, i32>>,
 ) -> Element {
-    let mut remote = use_signal(RemoteState::<CheckpointState>::default);
+    let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
+    let mut checkpoint_metadata = use_signal(|| None::<atra_protocol::ThreadCheckpoint>);
     let workspace_for_stream = workspace.clone();
     let _stream = use_hook(move || {
         connect_sse(
@@ -1061,120 +2703,211 @@ fn CheckpointView(
                 "/api/workspaces/{workspace_for_stream}/threads/{thread}/checkpoints/{checkpoint}/events"
             ),
             move |data| match serde_json::from_str::<CheckpointSubscriptionMessage>(&data) {
-                Ok(message) => remote.write().apply(message),
+                Ok(CheckpointSubscriptionMessage::Snapshot { state }) => {
+                    let (checkpoint, events) = state.into_parts();
+                    match ThreadState::materialize(metadata.clone(), events, Vec::new(), Vec::new())
+                    {
+                        Ok(state) => {
+                            checkpoint_metadata.set(Some(checkpoint));
+                            store.apply(ThreadSubscriptionMessage::Snapshot { state });
+                        }
+                        Err(materialize_error) => error.set(materialize_error.to_string()),
+                    }
+                }
+                Ok(CheckpointSubscriptionMessage::Terminal { terminal }) => {
+                    store.apply(ThreadSubscriptionMessage::Terminal { terminal });
+                }
                 Err(parse_error) => error.set(parse_error.to_string()),
             },
-            move |is_connected| {
-                if !is_connected {
-                    remote.write().connected = false;
-                }
-            },
+            move |connected| store.set_connected(connected),
         )
     });
-    let state = remote.read().value.clone();
+    let snapshot = store.read_snapshot();
+    let loaded = snapshot.is_loaded();
+    let sequence = snapshot.last_event_sequence();
 
     rsx! {
-        section { class: "detail-view",
-            h3 { "Checkpoint {checkpoint}" }
-            if let Some(state) = state {
-                p { "{state.metadata().reason}" }
-                p { "{state.events().len()} events" }
-                if let Some(sequence) = state.events().last().map(|event| event.sequence) {
-                    div { class: "button-row",
-                        button {
-                            disabled: !connected,
-                            onclick: {
-                                let workspace = workspace.clone();
-                                move |_| {
-                                    let workspace = workspace.clone();
-                                    spawn(async move {
-                                        match command(&workspace, &Command::ThreadFork {
-                                            thread_id: ThreadId(thread),
-                                            checkpoint_id: Some(CheckpointId(checkpoint)),
-                                            sequence,
-                                            display_name: None,
-                                        }).await {
-                                            Ok(CommandResult::ThreadForked { thread_id }) => navigate(route, Route {
-                                                workspace: Some(workspace),
-                                                thread: Some(thread_id.0),
-                                                detail: None,
-                                            }),
-                                            Ok(_) => error.set("Controller returned an unexpected result".to_owned()),
-                                            Err(message) => error.set(message),
-                                        }
-                                    });
-                                }
-                            },
-                            "Fork"
-                        }
-                        button {
-                            class: "danger",
-                            disabled: !connected,
-                            onclick: {
-                                let workspace = workspace.clone();
-                                move |_| {
-                                    if !confirm("Rewind this Thread to the checkpoint's last message?") { return; }
-                                    let workspace = workspace.clone();
-                                    spawn(async move {
-                                        if let Err(message) = command(&workspace, &Command::ThreadReplaceHistory {
-                                            thread_id: ThreadId(thread),
-                                            target: HistoryTarget::Message {
-                                                checkpoint_id: Some(CheckpointId(checkpoint)),
-                                                sequence,
-                                            },
-                                        }).await {
-                                            error.set(message);
-                                        }
-                                    });
-                                }
-                            },
-                            "Rewind"
-                        }
+        section { class: "checkpoint-preview-header",
+            div {
+                small { "Checkpoint preview" }
+                h2 { "Checkpoint {checkpoint}" }
+                if let Some(state) = checkpoint_metadata.as_ref() { p { "{state.reason}" } }
+            }
+            if let Some(sequence) = sequence {
+                div { class: "button-row",
+                    button {
+                        class: "primary",
+                        disabled: !connected,
+                        onclick: move |_| dialog.set(Some(DialogState::Fork {
+                            checkpoint: Some(checkpoint),
+                            sequence,
+                        })),
+                        "Fork"
+                    }
+                    button {
+                        class: "warning",
+                        disabled: !connected,
+                        onclick: move |_| dialog.set(Some(DialogState::Restore { checkpoint })),
+                        "Restore"
+                    }
+                    button {
+                        class: "warning",
+                        disabled: !connected,
+                        onclick: move |_| dialog.set(Some(DialogState::Rewind {
+                            checkpoint: Some(checkpoint),
+                            sequence,
+                        })),
+                        "Rewind"
                     }
                 }
-                button {
-                    class: "danger",
-                    disabled: !connected,
-                    onclick: move |_| {
-                        if !confirm("Restore this checkpoint and replace current Thread history?") { return; }
-                        let workspace = workspace.clone();
-                        spawn(async move {
-                            if let Err(message) = command(&workspace, &Command::ThreadReplaceHistory {
-                                thread_id: ThreadId(thread),
-                                target: HistoryTarget::Checkpoint { checkpoint_id: CheckpointId(checkpoint) },
-                            }).await {
-                                error.set(message);
-                            }
-                        });
-                    },
-                    "Restore checkpoint"
-                }
-                details {
-                    summary { "Checkpoint transcript" }
-                    for item in state.events().iter() {
-                        pre { class: "item", "{serde_json::to_string_pretty(item).unwrap_or_default()}" }
-                    }
-                }
-            } else {
-                p { "Loading checkpoint…" }
+            }
+        }
+        if loaded {
+            Transcript {
+                store,
+                mode,
+                workspace: workspace.clone(),
+                thread,
+                dialog,
+                error,
+                scroll_positions,
+            }
+        } else {
+            LoadingState { label: "Loading Checkpoint…" }
+        }
+        div { class: "preview-bar",
+            span { "Viewing a read-only Checkpoint. Composer is unavailable." }
+            button {
+                onclick: move |_| navigate(route, Route {
+                    workspace: Some(workspace.clone()),
+                    thread: Some(thread),
+                    detail: None,
+                }),
+                "Return to live"
             }
         }
     }
 }
 
 #[component]
-fn ProcessView(
+fn ProcessesUtility(
+    workspace: String,
+    thread: i64,
+    store: ThreadStore,
+    focused: Option<Detail>,
+    connected: bool,
+    route: Signal<Route>,
+    dialog: Signal<Option<DialogState>>,
+    error: Signal<String>,
+) -> Element {
+    let remote = store.read_processes();
+    let Some(processes) = remote.value() else {
+        return rsx! {};
+    };
+    let mut expanded = use_signal(HashSet::<String>::new);
+    let focused_for_effect = focused.clone();
+    use_effect(move || {
+        if let Some(Detail::Process { runner, process }) = focused_for_effect.clone() {
+            expanded.write().insert(format!("{runner}:{process}"));
+        }
+    });
+    let mut groups = HashMap::<String, Vec<_>>::new();
+    for process in processes {
+        groups
+            .entry(process.locator().runner().to_owned())
+            .or_default()
+            .push(process);
+    }
+    let mut runners = groups.into_iter().collect::<Vec<_>>();
+    runners.sort_by(|left, right| left.0.cmp(&right.0));
+    rsx! {
+        section {
+            if runners.is_empty() {
+                p { class: "empty-copy", "No managed Processes for this Thread." }
+            }
+            for (runner, mut processes) in runners {
+                {
+                    processes.sort_by(|left, right| {
+                        let left_running = matches!(left.status(), ProcessStatus::Running);
+                        let right_running = matches!(right.status(), ProcessStatus::Running);
+                        right_running.cmp(&left_running).then_with(|| right.locator().process_id().0.cmp(&left.locator().process_id().0))
+                    });
+                    rsx! {
+                        section { class: "process-group",
+                            h3 { "{runner}" }
+                            for process in processes {
+                                {
+                                    let process_id = process.locator().process_id().0.clone();
+                                    let key = format!("{runner}:{process_id}");
+                                    let open = expanded.read().contains(&key);
+                                    let detail_process_id = process_id.clone();
+                                    rsx! {
+                                        article { class: if focused == Some(Detail::Process { runner: runner.clone(), process: process_id.clone() }) { "process-row focused" } else { "process-row" },
+                                            button {
+                                                class: "process-summary",
+                                                aria_expanded: open,
+                                                onclick: {
+                                                    let key = key.clone();
+                                                    let workspace = workspace.clone();
+                                                    let runner = runner.clone();
+                                                    let process_id = process_id.clone();
+                                                    move |_| {
+                                                        if !expanded.write().insert(key.clone()) {
+                                                            expanded.write().remove(&key);
+                                                        } else {
+                                                            navigate(route, Route {
+                                                                workspace: Some(workspace.clone()),
+                                                                thread: Some(thread),
+                                                                detail: Some(Detail::Process {
+                                                                    runner: runner.clone(),
+                                                                    process: process_id.clone(),
+                                                                }),
+                                                            });
+                                                        }
+                                                    }
+                                                },
+                                                code { "{process.command()}" }
+                                                small { "{process.status():?}" }
+                                            }
+                                            if open {
+                                                ProcessDetail {
+                                                    workspace: workspace.clone(),
+                                                    thread,
+                                                    runner: runner.clone(),
+                                                    process: detail_process_id,
+                                                    connected,
+                                                    dialog,
+                                                    error,
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProcessDetail(
     workspace: String,
     thread: i64,
     runner: String,
     process: String,
     connected: bool,
+    dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
 ) -> Element {
     let mut remote = use_signal(RemoteState::<ProcessState>::default);
     let workspace_for_stream = workspace.clone();
     let runner_for_stream = runner.clone();
     let process_for_stream = process.clone();
+    let output_id = format!("process-output-{runner}-{process}");
+    let output_for_effect = output_id.clone();
     let _stream = use_hook(move || {
         connect_sse(
             &format!(
@@ -1184,74 +2917,267 @@ fn ProcessView(
                 Ok(message) => remote.write().apply(message),
                 Err(parse_error) => error.set(parse_error.to_string()),
             },
-            move |is_connected| {
-                if !is_connected {
-                    remote.write().connected = false;
-                }
-            },
+            move |connected| remote.write().connected = connected,
         )
     });
-    let state = remote.read().value.clone();
-
+    let output_len = remote
+        .read()
+        .value
+        .as_ref()
+        .map(|state| state.output_tail().len())
+        .unwrap_or(0);
+    use_effect(move || {
+        let _ = output_len;
+        if let Some(element) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id(&output_for_effect))
+        {
+            let distance = element.scroll_height() - element.scroll_top() - element.client_height();
+            if distance < 80 {
+                element.set_scroll_top(element.scroll_height());
+            }
+        }
+    });
     rsx! {
-        section { class: "detail-view",
-            h3 { "Process {process}" }
-            if let Some(state) = state {
-                p { code { "{state.process().command()}" } }
-                p { "{state.process().status():?}" }
+        div { class: "process-detail",
+            if let Some(state) = remote.read().value.clone() {
                 if state.omitted_bytes() > 0 {
                     small { "{state.omitted_bytes()} earlier bytes omitted" }
                 }
-                pre { class: "process-output", "{state.output_tail()}" }
-                button {
-                    class: "danger",
-                    disabled: !connected,
-                    onclick: move |_| {
-                        if !confirm("Stop this managed process?") { return; }
-                        let workspace = workspace.clone();
-                        let locator = atra_protocol::ProcessLocator::new(
-                            ThreadId(thread),
-                            runner.clone(),
-                            ProcessId(process.clone()),
-                        );
-                        spawn(async move {
-                            if let Err(message) = command(&workspace, &Command::StopProcess {
-                                process: locator,
-                            }).await {
-                                error.set(message);
-                            }
-                        });
-                    },
-                    "Stop process"
+                pre { id: "{output_id}", class: "process-output", "{state.output_tail()}" }
+                if matches!(state.process().status(), ProcessStatus::Running) {
+                    button {
+                        class: "warning",
+                        disabled: !connected,
+                        onclick: move |_| dialog.set(Some(DialogState::StopProcess {
+                            runner: runner.clone(),
+                            process: process.clone(),
+                        })),
+                        "Stop"
+                    }
                 }
             } else {
-                p { "Loading process…" }
+                p { class: "muted", "Loading output…" }
             }
         }
     }
 }
 
 #[component]
-fn ActionButton(
+fn AppDialog(
     workspace: String,
-    command_value: Command,
-    label: &'static str,
-    disabled: bool,
+    thread: i64,
+    state: DialogState,
+    controller: ControllerState,
+    connected: bool,
+    dialog: Signal<Option<DialogState>>,
+    route: Signal<Route>,
+    pins: Signal<Vec<Pin>>,
     error: Signal<String>,
 ) -> Element {
-    rsx! {
-        button {
-            disabled,
-            onclick: move |_| {
-                let workspace = workspace.clone();
-                let command_value = command_value.clone();
-                spawn(async move {
-                    if let Err(message) = command(&workspace, &command_value).await {
-                        error.set(message);
-                    }
-                });
-            },
-            "{label}"
+    let initial = match &state {
+        DialogState::Rename { current } => current.clone(),
+        _ => String::new(),
+    };
+    let mut value = use_signal(|| initial);
+    let mut pending = use_signal(|| false);
+    use_effect(move || {
+        if let Some(element) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("atra-dialog"))
+            .and_then(|element| element.dyn_into::<HtmlDialogElement>().ok())
+        {
+            let _ = element.show_modal();
         }
+    });
+    let (title, description, label, severity, submit) = match &state {
+        DialogState::Rename { .. } => (
+            "Rename Thread",
+            "Choose a clear name for this Thread.",
+            Some("Thread name"),
+            "",
+            "Rename",
+        ),
+        DialogState::Fork { .. } => (
+            "Fork from here",
+            "Create a new child Thread from the selected point.",
+            Some("New Thread name (optional)"),
+            "",
+            "Fork",
+        ),
+        DialogState::Rewind { .. } => (
+            "Replace Thread history?",
+            "Atra first saves the current history as a Checkpoint, then replaces it with the selected point.",
+            None,
+            "warning",
+            "Rewind",
+        ),
+        DialogState::Restore { .. } => (
+            "Restore Checkpoint?",
+            "Atra first saves the current history as a Checkpoint, then restores the selected Checkpoint.",
+            None,
+            "warning",
+            "Restore",
+        ),
+        DialogState::Delete { .. } => (
+            "Delete Thread?",
+            "This removes the Thread and all descendants. This action is destructive.",
+            None,
+            "danger",
+            "Delete",
+        ),
+        DialogState::StopProcess { .. } => (
+            "Stop Process?",
+            "Request immediate termination of this managed Process.",
+            None,
+            "warning",
+            "Stop",
+        ),
+    };
+    rsx! {
+        dialog {
+            id: "atra-dialog",
+            class: "app-dialog",
+            aria_labelledby: "dialog-title",
+            oncancel: move |event| {
+                event.prevent_default();
+                if !pending() {
+                    dialog.set(None);
+                }
+            },
+                h2 { id: "dialog-title", "{title}" }
+                p { "{description}" }
+                if let Some(label) = label {
+                    label {
+                        "{label}"
+                        input {
+                            autofocus: true,
+                            value: "{value}",
+                            oninput: move |event| value.set(event.value()),
+                        }
+                    }
+                }
+                div { class: "dialog-actions",
+                    button {
+                        onclick: move |_| dialog.set(None),
+                        disabled: pending(),
+                        "Cancel"
+                    }
+                    button {
+                        class: "{severity}",
+                        disabled: !connected || pending() || matches!(state, DialogState::Rename { .. }) && value().trim().is_empty(),
+                        onclick: {
+                            let workspace = workspace.clone();
+                            let state = state.clone();
+                            let controller = controller.clone();
+                            move |_| {
+                                pending.set(true);
+                                let workspace = workspace.clone();
+                                let state = state.clone();
+                                let controller = controller.clone();
+                                let name = value().trim().to_owned();
+                                spawn(async move {
+                                    let action = state.clone();
+                                    let result = match &state {
+                                        DialogState::Rename { .. } => command(&workspace, &Command::ThreadRename {
+                                            thread_id: ThreadId(thread),
+                                            display_name: name,
+                                        }).await.map(|_| None),
+                                        DialogState::Fork { checkpoint, sequence } => command(&workspace, &Command::ThreadFork {
+                                            thread_id: ThreadId(thread),
+                                            checkpoint_id: checkpoint.map(CheckpointId),
+                                            sequence: *sequence,
+                                            display_name: if name.is_empty() { None } else { Some(name) },
+                                        }).await.map(|result| match result {
+                                            CommandResult::ThreadForked { thread_id } => Some(thread_id),
+                                            _ => None,
+                                        }),
+                                        DialogState::Rewind { checkpoint, sequence } => command(&workspace, &Command::ThreadReplaceHistory {
+                                            thread_id: ThreadId(thread),
+                                            target: HistoryTarget::Message {
+                                                checkpoint_id: checkpoint.map(CheckpointId),
+                                                sequence: *sequence,
+                                            },
+                                        }).await.map(|_| None),
+                                        DialogState::Restore { checkpoint } => command(&workspace, &Command::ThreadReplaceHistory {
+                                            thread_id: ThreadId(thread),
+                                            target: HistoryTarget::Checkpoint { checkpoint_id: CheckpointId(*checkpoint) },
+                                        }).await.map(|_| None),
+                                        DialogState::Delete { .. } => command(&workspace, &Command::ThreadDeleteRecursive {
+                                            thread_id: ThreadId(thread),
+                                        }).await.map(|_| None),
+                                        DialogState::StopProcess { runner, process } => command(&workspace, &Command::StopProcess {
+                                            process: atra_protocol::ProcessLocator::new(
+                                                ThreadId(thread),
+                                                runner.clone(),
+                                                ProcessId(process.clone()),
+                                            ),
+                                        }).await.map(|_| None),
+                                    };
+                                    match result {
+                                        Ok(forked) => {
+                                            error.set(String::new());
+                                            dialog.set(None);
+                                            match action {
+                                                DialogState::Fork { .. } => {
+                                                    if let Some(thread_id) = forked {
+                                                        ensure_pin(pins, &workspace, ThreadId(thread), &controller);
+                                                        navigate(route, Route {
+                                                            workspace: Some(workspace),
+                                                            thread: Some(thread_id.0),
+                                                            detail: None,
+                                                        });
+                                                    }
+                                                }
+                                                DialogState::Delete { .. } => {
+                                                    let root = root_id(controller.threads(), ThreadId(thread)).0;
+                                                    if root == thread {
+                                                        pins.write().retain(|pin| !(pin.workspace == workspace && pin.thread == root));
+                                                        save_json(PINS_KEY, &*pins.read());
+                                                    }
+                                                    navigate(route, Route {
+                                                        workspace: Some(workspace),
+                                                        thread: None,
+                                                        detail: None,
+                                                    });
+                                                }
+                                                DialogState::Restore { .. } | DialogState::Rewind { .. } => navigate(route, Route {
+                                                    workspace: Some(workspace),
+                                                    thread: Some(thread),
+                                                    detail: None,
+                                                }),
+                                                DialogState::Rename { .. } | DialogState::StopProcess { .. } => {}
+                                            }
+                                        }
+                                        Err(message) => error.set(message),
+                                    }
+                                    pending.set(false);
+                                });
+                            }
+                        },
+                        if pending() { "Working…" } else { "{submit}" }
+                    }
+                }
+        }
+    }
+}
+
+fn transcript_is_near_bottom(scroll_height: i32, scroll_top: i32, client_height: i32) -> bool {
+    scroll_height - scroll_top - client_height <= 80
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_follows_when_viewport_is_near_the_bottom() {
+        assert!(transcript_is_near_bottom(1_000, 325, 600));
+        assert!(transcript_is_near_bottom(1_000, 320, 600));
+    }
+
+    #[test]
+    fn transcript_stops_following_when_viewport_moves_away_from_the_bottom() {
+        assert!(!transcript_is_near_bottom(1_000, 319, 600));
     }
 }

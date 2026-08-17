@@ -58,7 +58,7 @@ impl TranscriptState {
 
     pub(crate) fn apply_change(&mut self, state: &ThreadState, change: &ThreadChange) {
         match change {
-            ThreadChange::Event(sequence) => {
+            ThreadChange::EventAppended(sequence) => {
                 if let Some(event) = state
                     .events()
                     .iter()
@@ -67,13 +67,14 @@ impl TranscriptState {
                     self.append_event(event);
                 }
             }
-            ThreadChange::ActiveItem(id) => match state
+            ThreadChange::ActiveItemAdded(id) | ThreadChange::ActiveItemUpdated(id) => match state
                 .active_turn()
                 .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))
             {
                 Some(item) => self.synchronize_active(*id, item.data()),
                 None => self.remove_active(*id, state),
             },
+            ThreadChange::ActiveItemRemoved(id) => self.remove_active(*id, state),
             ThreadChange::ActiveItemFinalized {
                 active_id,
                 sequence,
@@ -87,8 +88,8 @@ impl TranscriptState {
                     self.append_event(event);
                 }
             }
-            ThreadChange::HistoryReplaced => self.rebuild(state),
-            ThreadChange::Interaction => {
+            ThreadChange::EventsReplaced => self.rebuild(state),
+            ThreadChange::InteractionUpdated => {
                 if let Some(approval) = state.active_turn().and_then(|turn| turn.pending_approval())
                 {
                     self.set_pending_approval(approval.operation_index());
@@ -103,10 +104,11 @@ impl TranscriptState {
                 }
                 self.set_pending_approval(None);
             }
-            ThreadChange::Metadata
-            | ThreadChange::Phase
-            | ThreadChange::Checkpoint(_)
-            | ThreadChange::Process(_) => {}
+            ThreadChange::MetadataUpdated
+            | ThreadChange::ActiveTurnStarted
+            | ThreadChange::ActiveTurnStateUpdated
+            | ThreadChange::CheckpointAdded(_)
+            | ThreadChange::ProcessUpdated(_) => {}
         }
     }
 

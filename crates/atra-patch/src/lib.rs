@@ -13,7 +13,10 @@ const DELETE: &str = "*** Delete File: ";
 const UPDATE: &str = "*** Update File: ";
 const MOVE: &str = "*** Move to: ";
 
-pub use atra_patch_types::{ApplyPatchResult, DiffHunk, DiffLine, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult};
+pub use atra_patch_types::{
+    ApplyPatchResult, DiffHunk, DiffLine, DiffLineKind, FileDiff, PatchOperationOutcome,
+    PatchOperationResult,
+};
 
 pub fn apply(patch: &str, cwd: &Path) -> ApplyPatchResult {
     let operations = match parse(patch) {
@@ -144,7 +147,9 @@ fn apply_operation(operation: Operation, cwd: &Path) -> PatchOperationResult {
 fn outcome(result: Result<FileDiff>) -> PatchOperationOutcome {
     match result {
         Ok(diff) => PatchOperationOutcome::Applied { diff: Ok(diff) },
-        Err(error) => PatchOperationOutcome::Failed { error: format!("{error:#}") },
+        Err(error) => PatchOperationOutcome::Failed {
+            error: format!("{error:#}"),
+        },
     }
 }
 
