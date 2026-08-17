@@ -79,7 +79,8 @@ pub(super) struct TurnRef<'a> {
     state: &'a ThreadState,
     start: usize,
     end: usize,
-    key: TurnKey,
+    prompt: &'a str,
+    prompt_sequence: Option<EventSequence>,
 }
 
 pub(super) struct ActivityDisplay<'a> {
@@ -124,9 +125,14 @@ pub(super) fn raw_item(state: &ThreadState, key: &RawKey) -> Option<String> {
 
 pub(super) fn turn<'a>(state: &'a ThreadState, key: TurnKey) -> Option<TurnRef<'a>> {
     let start = event_index(state, key.sequence())?;
-    if !is_turn_boundary(&state.events()[start].data) {
-        return None;
-    }
+    let (prompt, prompt_sequence) = match &state.events()[start].data {
+        ThreadEventData::UserMessage(message) => (
+            message.content.as_str(),
+            Some(state.events()[start].sequence),
+        ),
+        ThreadEventData::Compaction(_) => ("Compacted history", None),
+        _ => return None,
+    };
     let end = state.events()[start + 1..]
         .iter()
         .position(|event| is_turn_boundary(&event.data))
@@ -135,7 +141,8 @@ pub(super) fn turn<'a>(state: &'a ThreadState, key: TurnKey) -> Option<TurnRef<'
         state,
         start,
         end,
-        key,
+        prompt,
+        prompt_sequence,
     })
 }
 
@@ -150,19 +157,11 @@ pub(super) fn turn_key_for_event(state: &ThreadState, sequence: EventSequence) -
 
 impl<'a> TurnRef<'a> {
     pub fn prompt(&self) -> &'a str {
-        match &self.state.events()[self.start].data {
-            ThreadEventData::UserMessage(message) => &message.content,
-            ThreadEventData::Compaction(_) => "Compacted history",
-            _ => unreachable!("turn start was validated"),
-        }
+        self.prompt
     }
 
     pub fn prompt_sequence(&self) -> Option<EventSequence> {
-        matches!(
-            self.state.events()[self.start].data,
-            ThreadEventData::UserMessage(_)
-        )
-        .then_some(self.key.sequence())
+        self.prompt_sequence
     }
 
     pub fn answer(&self) -> Option<(EventSequence, &'a str)> {

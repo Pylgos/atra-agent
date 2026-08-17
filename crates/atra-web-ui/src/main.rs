@@ -825,28 +825,30 @@ fn Navigation(
                             }
                             details { class: "row-menu",
                                 summary { aria_label: "Pin actions for {thread_name(&thread)}", "•••" }
-                                button {
-                                    disabled: index == 0,
-                                    onclick: move |_| move_pin(pins, index, 0),
-                                    "Move to top"
+                                div { class: "row-menu-panel",
+                                    button {
+                                        disabled: index == 0,
+                                        onclick: move |_| move_pin(pins, index, 0),
+                                        "Move to top"
+                                    }
+                                    button {
+                                        disabled: index == 0,
+                                        onclick: move |_| move_pin(pins, index, index.saturating_sub(1)),
+                                        "Move up"
+                                    }
+                                    button {
+                                        disabled: index + 1 >= pins.read().len(),
+                                        onclick: move |_| move_pin(pins, index, index + 1),
+                                        "Move down"
+                                    }
                                 }
-                                button {
-                                    disabled: index == 0,
-                                    onclick: move |_| move_pin(pins, index, index.saturating_sub(1)),
-                                    "Move up"
-                                }
-                                button {
-                                    disabled: index + 1 >= pins.read().len(),
-                                    onclick: move |_| move_pin(pins, index, index + 1),
-                                    "Move down"
-                                }
-                                button {
-                                    onclick: move |_| {
-                                        pins.write().remove(index);
-                                        save_json(PINS_KEY, &*pins.read());
-                                    },
-                                    "Unpin"
-                                }
+                            }
+                            PinButton {
+                                pins,
+                                workspace: pin.workspace.clone(),
+                                thread: pin.thread,
+                                name: thread_name(&thread),
+                                pinned: true,
                             }
                         }
                     } else {
@@ -864,6 +866,13 @@ fn Navigation(
                                 },
                                 span { class: "row-title", "Thread {pin.thread}" }
                                 small { "{pin.workspace} · Offline" }
+                            }
+                            PinButton {
+                                pins,
+                                workspace: pin.workspace.clone(),
+                                thread: pin.thread,
+                                name: format!("Thread {}", pin.thread),
+                                pinned: true,
                             }
                         }
                     }
@@ -913,26 +922,37 @@ fn Navigation(
                                 .and_then(|remote| remote.value.clone())
                             {
                                 for thread in root_threads(&controller) {
-                                    button {
-                                        class: "navigation-link root-thread",
-                                        aria_current: if selected_workspace.as_deref() == Some(&workspace.workspace_id)
-                                            && route.read().thread.is_some_and(|selected| {
-                                                root_id(controller.threads(), ThreadId(selected)) == thread.id
-                                            }) { "page" } else { "false" },
-                                        onclick: {
-                                            let workspace_id = workspace.workspace_id.clone();
-                                            move |_| {
-                                                navigate(route, Route {
-                                                    workspace: Some(workspace_id.clone()),
-                                                    thread: Some(thread.id.0),
-                                                    detail: None,
-                                                });
-                                                mobile_panel.set(MobilePanel::None);
+                                    div { class: "navigation-row workspace-thread-row",
+                                        button {
+                                            class: "navigation-link root-thread",
+                                            aria_current: if selected_workspace.as_deref() == Some(&workspace.workspace_id)
+                                                && route.read().thread.is_some_and(|selected| {
+                                                    root_id(controller.threads(), ThreadId(selected)) == thread.id
+                                                }) { "page" } else { "false" },
+                                            onclick: {
+                                                let workspace_id = workspace.workspace_id.clone();
+                                                move |_| {
+                                                    navigate(route, Route {
+                                                        workspace: Some(workspace_id.clone()),
+                                                        thread: Some(thread.id.0),
+                                                        detail: None,
+                                                    });
+                                                    mobile_panel.set(MobilePanel::None);
+                                                }
+                                            },
+                                            span { class: "row-title", "{thread_name(&thread)}" }
+                                            small {
+                                                "{factual_status(controller.thread_status(thread.id))} · {child_count(controller.threads(), thread.id)} children"
                                             }
-                                        },
-                                        span { class: "row-title", "{thread_name(&thread)}" }
-                                        small {
-                                            "{factual_status(controller.thread_status(thread.id))} · {child_count(controller.threads(), thread.id)} children"
+                                        }
+                                        PinButton {
+                                            pins,
+                                            workspace: workspace.workspace_id.clone(),
+                                            thread: thread.id.0,
+                                            name: thread_name(&thread),
+                                            pinned: pins.read().iter().any(|pin| {
+                                                pin.workspace == workspace.workspace_id && pin.thread == thread.id.0
+                                            }),
                                         }
                                     }
                                 }
@@ -1027,6 +1047,51 @@ fn move_pin(mut pins: Signal<Vec<Pin>>, from: usize, to: usize) {
     let pin = pins.write().remove(from);
     pins.write().insert(to, pin);
     save_json(PINS_KEY, &*pins.read());
+}
+
+fn set_pin(mut pins: Signal<Vec<Pin>>, workspace: &str, thread: i64, pinned: bool) {
+    let index = pins
+        .read()
+        .iter()
+        .position(|pin| pin.workspace == workspace && pin.thread == thread);
+    match (index, pinned) {
+        (None, true) => pins.write().insert(
+            0,
+            Pin {
+                workspace: workspace.to_owned(),
+                thread,
+            },
+        ),
+        (Some(index), false) => {
+            pins.write().remove(index);
+        }
+        _ => return,
+    }
+    save_json(PINS_KEY, &*pins.read());
+}
+
+#[component]
+fn PinButton(
+    pins: Signal<Vec<Pin>>,
+    workspace: String,
+    thread: i64,
+    name: String,
+    pinned: bool,
+) -> Element {
+    rsx! {
+        button {
+            class: if pinned { "icon-button pin-button pinned" } else { "icon-button pin-button" },
+            aria_label: if pinned { "Unpin {name}" } else { "Pin {name}" },
+            title: if pinned { "Unpin" } else { "Pin" },
+            onclick: move |_| set_pin(pins, &workspace, thread, !pinned),
+            svg {
+                class: "pin-icon",
+                view_box: "0 0 24 24",
+                path { d: "M9 3h6l-1 6 3 3v2H7v-2l3-3-1-6Z" }
+                path { d: "M12 14v7" }
+            }
+        }
+    }
 }
 
 #[component]

@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 
 test("critical Thread workflow uses streamed snapshots and forwards commands", async ({ page }) => {
+  const pageErrors: Error[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
   const workspace = {
     workspace_id: "workspace-1",
     name: "workspace",
@@ -181,6 +183,31 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   let sentCommand: unknown;
   await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
     sentCommand = route.request().postDataJSON();
+    if ((sentCommand as { method?: string }).method === "thread_send") {
+      await page.evaluate(() => {
+        const source = (window as any).__atraEventSources.get(
+          "/api/workspaces/workspace-1/threads/1/events"
+        );
+        source.emit({
+          message: "operation",
+          operation: {
+            operation: "event_appended",
+            event: {
+              sequence: 7,
+              kind: "user_message",
+              payload: { content: "Sent from browser" }
+            }
+          }
+        });
+        source.emit({
+          message: "operation",
+          operation: {
+            operation: "active_turn_started",
+            phase: "running"
+          }
+        });
+      });
+    }
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({ result: "accepted" })
@@ -188,7 +215,27 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   });
 
   await page.goto("/");
-  await page.getByRole("button", { name: /Web Thread/ }).click();
+  const workspaceRow = page.locator(".workspace-thread-row");
+  const workspaceRowBox = await workspaceRow.boundingBox();
+  const workspaceLinkBox = await workspaceRow.locator(".navigation-link").boundingBox();
+  expect(workspaceRowBox).not.toBeNull();
+  expect(workspaceLinkBox).not.toBeNull();
+  expect(workspaceLinkBox!.width).toBeGreaterThan(workspaceRowBox!.width - 50);
+
+  await page.getByRole("button", { name: "Pin Web Thread" }).click();
+  const pinnedRow = page.locator(".pinned-section .pin-row");
+  await expect(pinnedRow).toBeVisible();
+  const pinRowHeight = await pinnedRow.evaluate((element) => element.getBoundingClientRect().height);
+  await pinnedRow.getByLabel("Pin actions for Web Thread").click();
+  await expect(pinnedRow.getByRole("button", { name: "Move to top" })).toBeVisible();
+  await expect(pinnedRow.getByRole("button", { name: "Unpin" })).toHaveCount(1);
+  await expect(pinnedRow.locator(".row-menu").getByRole("button", { name: "Unpin" })).toHaveCount(0);
+  expect(await pinnedRow.evaluate((element) => element.getBoundingClientRect().height))
+    .toBe(pinRowHeight);
+  await pinnedRow.getByRole("button", { name: "Unpin Web Thread" }).click();
+  await expect(pinnedRow).toHaveCount(0);
+
+  await workspaceRow.locator(".navigation-link").click();
 
   await expect(page.getByText("Existing prompt")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Result" })).toBeVisible();
@@ -327,6 +374,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     allow_questions: true
   });
   await expect(page.locator(".pinned-section .navigation-link")).toContainText("Web Thread");
+  expect(pageErrors).toEqual([]);
 
   await page.setViewportSize({ width: 1024, height: 480 });
   await expect(page.locator("#composer")).toBeVisible();
