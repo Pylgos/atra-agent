@@ -33,7 +33,9 @@ web-sys = { version = "0.3.83", features = [
     "Clipboard",
     "Document",
     "Element",
+    "Selection",
     "HtmlElement",
     "Storage",
+    "TouchEvent",
     "Window",
 ] }

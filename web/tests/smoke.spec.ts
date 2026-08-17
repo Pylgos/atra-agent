@@ -4,6 +4,9 @@ test("embedded Web Client is responsive and reports its connection", async ({ pa
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Atra" })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Workspaces" })).toBeVisible();
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await expect(page.locator(".app-shell")).toHaveCSS("display", "block");
+  await expect(page.locator(".navigation")).toHaveCSS("position", "fixed");
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("heading", { name: "Choose a Workspace" })).toBeVisible();
   await expect(page.locator(".app-shell")).toHaveCSS("display", "block");

@@ -15,6 +15,7 @@ use atra_protocol::{
     ProcessSubscriptionMessage, QuestionAnswer, ThreadId, ThreadState, ThreadSubscriptionMessage,
 };
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
@@ -29,7 +30,8 @@ use transcript_view::{ActivityKey, ActivityKind, RawKey, TurnKey};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event, EventSource, HtmlDialogElement, HtmlFormElement, HtmlTextAreaElement, MessageEvent,
+    Event as WebEvent, EventSource, HtmlDialogElement, HtmlFormElement, HtmlTextAreaElement,
+    MessageEvent,
 };
 
 type Controllers = HashMap<String, RemoteState<ControllerState>>;
@@ -41,8 +43,8 @@ fn main() {
 struct SseConnection {
     source: EventSource,
     _message: Closure<dyn FnMut(MessageEvent)>,
-    _open: Closure<dyn FnMut(Event)>,
-    _error: Closure<dyn FnMut(Event)>,
+    _open: Closure<dyn FnMut(WebEvent)>,
+    _error: Closure<dyn FnMut(WebEvent)>,
 }
 
 impl Drop for SseConnection {
@@ -66,11 +68,12 @@ fn connect_sse(
     let status = Rc::new(RefCell::new(status));
     let open_status = Rc::clone(&status);
     let on_open = Closure::wrap(
-        Box::new(move |_event: Event| (open_status.borrow_mut())(true)) as Box<dyn FnMut(Event)>,
+        Box::new(move |_event: WebEvent| (open_status.borrow_mut())(true))
+            as Box<dyn FnMut(WebEvent)>,
     );
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     let on_error = Closure::wrap(
-        Box::new(move |_event: Event| (status.borrow_mut())(false)) as Box<dyn FnMut(Event)>
+        Box::new(move |_event: WebEvent| (status.borrow_mut())(false)) as Box<dyn FnMut(WebEvent)>,
     );
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     Some(Rc::new(SseConnection {
@@ -82,14 +85,13 @@ fn connect_sse(
 }
 
 struct PopstateListener {
-    _callback: Closure<dyn FnMut(Event)>,
+    _callback: Closure<dyn FnMut(WebEvent)>,
 }
 
 impl PopstateListener {
     fn new(mut route: Signal<Route>) -> Self {
-        let callback = Closure::wrap(
-            Box::new(move |_event: Event| route.set(browser_route())) as Box<dyn FnMut(Event)>
-        );
+        let callback = Closure::wrap(Box::new(move |_event: WebEvent| route.set(browser_route()))
+            as Box<dyn FnMut(WebEvent)>);
         if let Some(window) = web_sys::window() {
             window.set_onpopstate(Some(callback.as_ref().unchecked_ref()));
         }
@@ -249,7 +251,7 @@ fn is_narrow_viewport() -> bool {
     web_sys::window()
         .and_then(|window| window.inner_width().ok())
         .and_then(|width| width.as_f64())
-        .is_some_and(|width| width <= 980.0)
+        .is_some_and(|width| width <= 1180.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +259,50 @@ enum MobilePanel {
     None,
     Navigation,
     Utility,
+}
+
+#[derive(Clone, Copy)]
+struct SwipeStart {
+    x: f64,
+    y: f64,
+}
+
+fn swipe_start_allowed(event: &Event<TouchData>) -> bool {
+    let Some(target) = event
+        .data()
+        .try_as_web_event()
+        .and_then(|event| event.target())
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+    else {
+        return false;
+    };
+    if target
+        .closest(
+            ".drawer-backdrop, .activity-row-summary, \
+             .navigation-row > .navigation-link",
+        )
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+    let blocks_swipe = target
+        .closest(
+            "button, a, input, textarea, select, summary, pre, code, table, \
+             [contenteditable='true'], .composer-region, .process-output",
+        )
+        .ok()
+        .flatten()
+        .is_some();
+    let has_selection = web_sys::window()
+        .and_then(|window| window.get_selection().ok().flatten())
+        .is_some_and(|selection| !selection.is_collapsed());
+    !blocks_swipe && !has_selection
+}
+
+fn open_mobile_navigation(mut mobile_panel: Signal<MobilePanel>) {
+    mobile_panel.set(MobilePanel::Navigation);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,7 +353,7 @@ fn App() -> Element {
     let pins = use_signal(|| storage_json::<Vec<Pin>>(PINS_KEY));
     let inbox = use_signal(|| storage_json::<Vec<InboxItem>>(INBOX_KEY));
     let nav_open = use_signal(|| storage_get(NAV_OPEN_KEY) != "closed");
-    let utility_open = use_signal(|| storage_get(UTILITY_OPEN_KEY) != "closed");
+    let mut utility_open = use_signal(|| storage_get(UTILITY_OPEN_KEY) != "closed");
     let utility_tab = use_signal(|| match storage_get(UTILITY_TAB_KEY).as_str() {
         "children" => UtilityTab::Children,
         "checkpoints" => UtilityTab::Checkpoints,
@@ -320,6 +366,7 @@ fn App() -> Element {
     let modes = use_signal(HashMap::<String, TranscriptMode>::new);
     let scroll_positions = use_signal(HashMap::<String, i32>::new);
     let mut route_notice = use_signal(String::new);
+    let mut swipe_start = use_signal(|| None::<SwipeStart>);
     let _workspace_stream = use_hook(move || {
         connect_sse(
             "/api/workspaces/events",
@@ -454,6 +501,14 @@ fn App() -> Element {
         nav_width().clamp(224, 420),
         utility_width().clamp(272, 520),
     );
+    let has_thread_header = current.workspace.as_ref().is_some_and(|workspace| {
+        current.thread.is_some()
+            && controllers
+                .read()
+                .get(workspace)
+                .and_then(|remote| remote.value.as_ref())
+                .is_some()
+    });
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
@@ -461,6 +516,55 @@ fn App() -> Element {
             class: "{shell_class}",
             style: "{shell_style}",
             "data-theme": "{theme}",
+            ontouchstart: move |event: Event<TouchData>| {
+                if is_narrow_viewport()
+                    && swipe_start_allowed(&event)
+                    && event.touches().len() == 1
+                {
+                    let coordinates = event.touches()[0].client_coordinates();
+                    swipe_start.set(Some(SwipeStart { x: coordinates.x, y: coordinates.y }));
+                }
+            },
+            ontouchmove: move |event: Event<TouchData>| {
+                let Some(start) = swipe_start() else {
+                    return;
+                };
+                let touches = event.touches();
+                if touches.len() != 1 || !is_narrow_viewport() {
+                    swipe_start.set(None);
+                    return;
+                }
+                let coordinates = touches[0].client_coordinates();
+                let dx = coordinates.x - start.x;
+                let dy = coordinates.y - start.y;
+                if dx.abs() <= dy.abs() * 1.25 {
+                    return;
+                }
+                event.prevent_default();
+                if dx.abs() < 72.0 {
+                    return;
+                }
+                swipe_start.set(None);
+                match mobile_panel() {
+                    MobilePanel::None if dx > 0.0 => {
+                        open_mobile_navigation(mobile_panel);
+                    }
+                    MobilePanel::None if route.read().thread.is_some() => {
+                        utility_open.set(true);
+                        storage_set(UTILITY_OPEN_KEY, "open");
+                        mobile_panel.set(MobilePanel::Utility);
+                    }
+                    MobilePanel::Navigation if dx < 0.0 => {
+                        mobile_panel.set(MobilePanel::None);
+                    }
+                    MobilePanel::Utility if dx > 0.0 => {
+                        mobile_panel.set(MobilePanel::None);
+                    }
+                    _ => {}
+                }
+            },
+            ontouchend: move |_| swipe_start.set(None),
+            ontouchcancel: move |_| swipe_start.set(None),
             for workspace in workspaces.read().workspaces.clone() {
                 ControllerMonitor {
                     key: "{workspace.workspace_id}",
@@ -492,7 +596,11 @@ fn App() -> Element {
                     storage_key: NAV_WIDTH_KEY,
                 }
             }
-            section { class: "main-thread",
+            section {
+                class: "main-thread",
+                if !has_thread_header {
+                    MobileShellHeader { mobile_panel }
+                }
                 if let Some(workspace_id) = current.workspace.clone() {
                     if let Some(remote) = controllers.read().get(&workspace_id).cloned() {
                         if let Some(controller) = remote.value {
@@ -1162,6 +1270,21 @@ fn Landing(connected: bool) -> Element {
 }
 
 #[component]
+fn MobileShellHeader(mobile_panel: Signal<MobilePanel>) -> Element {
+    rsx! {
+        header { class: "mobile-shell-header",
+            button {
+                class: "icon-button",
+                aria_label: "Open navigation",
+                onclick: move |_| open_mobile_navigation(mobile_panel),
+                "☰"
+            }
+            strong { "Atra" }
+        }
+    }
+}
+
+#[component]
 fn LoadingState(label: &'static str) -> Element {
     rsx! {
         section { class: "loading-state", aria_busy: "true",
@@ -1338,20 +1461,18 @@ fn ThreadPage(
                     error,
                 }
             }
-            if utility_open() && (!is_narrow_viewport() || mobile_panel() == MobilePanel::Utility) {
-                UtilityPanel {
-                    workspace: workspace_id.clone(),
-                    thread,
-                    store,
-                    controller: controller.clone(),
-                    connected,
-                    route,
-                    utility_open,
-                    utility_tab,
-                    mobile_panel,
-                    dialog,
-                    error,
-                }
+            UtilityPanel {
+                workspace: workspace_id.clone(),
+                thread,
+                store,
+                controller: controller.clone(),
+                connected,
+                route,
+                utility_open,
+                utility_tab,
+                mobile_panel,
+                dialog,
+                error,
             }
             if utility_open() && !is_narrow_viewport() {
                 ResizeHandle {

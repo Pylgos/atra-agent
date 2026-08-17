@@ -1,4 +1,31 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+async function swipe(
+  page: Page,
+  from: { x: number; y: number },
+  to: { x: number; y: number }
+) {
+  const client = await page.context().newCDPSession(page);
+  await client.send("Emulation.setTouchEmulationEnabled", {
+    enabled: true,
+    maxTouchPoints: 1
+  });
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ ...from, id: 1 }]
+  });
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ ...to, id: 1 }]
+  });
+  await client.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: []
+  });
+  await page.waitForTimeout(50);
+  await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+  await client.detach();
+}
 
 test("critical Thread workflow uses streamed snapshots and forwards commands", async ({ page }) => {
   const pageErrors: Error[] = [];
@@ -214,7 +241,36 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
 
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Choose a Workspace" })).toBeVisible();
+
+  await swipe(page, { x: 30, y: 420 }, { x: 150, y: 425 });
+  await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  const initialThreadLink = page.locator(".workspace-thread-row .navigation-link");
+  const initialThreadLinkBox = await initialThreadLink.boundingBox();
+  expect(initialThreadLinkBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: initialThreadLinkBox!.x + initialThreadLinkBox!.width - 20,
+      y: initialThreadLinkBox!.y + initialThreadLinkBox!.height / 2
+    },
+    {
+      x: initialThreadLinkBox!.x + initialThreadLinkBox!.width - 160,
+      y: initialThreadLinkBox!.y + initialThreadLinkBox!.height / 2 + 5
+    }
+  );
+  await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+  await expect(page.getByRole("heading", { name: "Choose a Workspace" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  await page.locator(".workspace-thread-row .navigation-link").click();
+  await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+  await expect(page.getByText("Existing prompt")).toBeVisible();
+
+  await page.setViewportSize({ width: 1280, height: 720 });
   const workspaceRow = page.locator(".workspace-thread-row");
   const workspaceRowBox = await workspaceRow.boundingBox();
   const workspaceLinkBox = await workspaceRow.locator(".navigation-link").boundingBox();
@@ -376,16 +432,16 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".pinned-section .navigation-link")).toContainText("Web Thread");
   expect(pageErrors).toEqual([]);
 
-  await page.setViewportSize({ width: 1024, height: 480 });
+  await page.setViewportSize({ width: 1280, height: 480 });
   await expect(page.locator("#composer")).toBeVisible();
   const desktopComposer = await page.locator("#composer").boundingBox();
   expect(desktopComposer).not.toBeNull();
   expect(desktopComposer!.y + desktopComposer!.height).toBeLessThanOrEqual(480);
 
   await page.getByRole("button", { name: "Toggle utility panel" }).click();
-  await expect(page.locator(".utility")).toHaveCount(0);
+  await expect(page.locator(".app-shell")).toHaveClass(/utility-closed/);
   await page.getByRole("button", { name: "Toggle utility panel" }).click();
-  await expect(page.locator(".utility")).toHaveCount(1);
+  await expect(page.locator(".app-shell")).not.toHaveClass(/utility-closed/);
 
   await page.getByRole("button", { name: "Toggle navigation" }).click();
   await expect(page.locator(".app-shell")).toHaveClass(/navigation-closed/);
@@ -394,19 +450,56 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".app-shell")).not.toHaveClass(/navigation-closed/);
 
   await page.setViewportSize({ width: 390, height: 844 });
+  const initialMobileTranscript = await page.locator("#transcript-scroll").boundingBox();
+  expect(initialMobileTranscript).not.toBeNull();
+  expect(initialMobileTranscript!.width).toBeGreaterThan(370);
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+  await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
+
   await page.getByRole("button", { name: "Toggle navigation" }).click();
   await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
   await expect(page.locator(".drawer-backdrop")).toBeVisible();
-  await page.locator(".drawer-backdrop").click({ position: { x: 380, y: 420 } });
+  await swipe(page, { x: 380, y: 420 }, { x: 240, y: 425 });
   await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
   await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+
+  const activity = page.locator(".activity-row-summary").first();
+  await activity.scrollIntoViewIfNeeded();
+  const activityBox = await activity.boundingBox();
+  expect(activityBox).not.toBeNull();
+  await swipe(
+    page,
+    { x: activityBox!.x + activityBox!.width - 20, y: activityBox!.y + activityBox!.height / 2 },
+    { x: activityBox!.x + activityBox!.width - 160, y: activityBox!.y + activityBox!.height / 2 + 5 }
+  );
+  await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
+  await swipe(page, { x: 10, y: 420 }, { x: 150, y: 425 });
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+  await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
+
+  const composerInput = page.locator("#composer textarea");
+  await composerInput.scrollIntoViewIfNeeded();
+  const composerInputBox = await composerInput.boundingBox();
+  expect(composerInputBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: composerInputBox!.x + composerInputBox!.width - 20,
+      y: composerInputBox!.y + composerInputBox!.height / 2
+    },
+    {
+      x: composerInputBox!.x + composerInputBox!.width - 160,
+      y: composerInputBox!.y + composerInputBox!.height / 2 + 5
+    }
+  );
+  await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Toggle utility panel" }).click();
   await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
   await expect(page.locator(".drawer-backdrop")).toBeVisible();
   await page.locator(".drawer-backdrop").click({ position: { x: 10, y: 420 } });
   await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
-  await expect(page.locator(".utility")).toHaveCount(0);
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
   await expect(page.locator("#composer")).toBeVisible();
   const mobileComposer = await page.locator("#composer").boundingBox();
   expect(mobileComposer).not.toBeNull();
