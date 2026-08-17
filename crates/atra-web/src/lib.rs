@@ -395,16 +395,6 @@ fn check_command_headers(authority: &str, headers: &HeaderMap) -> Result<(), Api
             "Host does not match the Web daemon origin",
         ));
     }
-    let expected_origin = format!("http://{authority}");
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    if origin != Some(expected_origin.as_str()) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "Origin does not match the Web daemon origin",
-        ));
-    }
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
@@ -508,31 +498,32 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn command_security_requires_exact_same_origin() {
+    fn command_security_requires_exact_host_and_json() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "127.0.0.1:2872".parse().unwrap());
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        assert!(check_command_headers("127.0.0.1:2872", &headers).is_err());
-        headers.insert(header::ORIGIN, "http://127.0.0.1:2872".parse().unwrap());
         assert!(check_command_headers("127.0.0.1:2872", &headers).is_ok());
-        headers.insert(header::ORIGIN, "http://localhost:2872".parse().unwrap());
+        headers.insert(header::HOST, "localhost:2872".parse().unwrap());
+        assert!(check_command_headers("127.0.0.1:2872", &headers).is_err());
+        headers.insert(header::HOST, "127.0.0.1:2872".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
         assert!(check_command_headers("127.0.0.1:2872", &headers).is_err());
     }
 
     #[tokio::test]
-    async fn command_endpoint_rejects_cross_origin_requests() {
+    async fn command_endpoint_accepts_a_public_origin_from_a_loopback_proxy() {
         let runtime = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(serve(listener, runtime.path().to_owned()));
         let response = reqwest::Client::new()
             .post(format!("http://{address}/api/workspaces/missing/commands"))
-            .header("origin", "http://attacker.invalid")
+            .header(header::ORIGIN, "https://atra.example.com")
             .json(&Command::Shutdown)
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         task.abort();
     }
 
