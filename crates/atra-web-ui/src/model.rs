@@ -159,6 +159,7 @@ pub enum TranscriptMode {
 #[serde(rename_all = "snake_case")]
 pub enum UtilityTab {
     Thread,
+    Activity,
     Children,
     Checkpoints,
     Processes,
@@ -168,6 +169,7 @@ impl UtilityTab {
     pub fn label(self) -> &'static str {
         match self {
             Self::Thread => "Thread",
+            Self::Activity => "Activity",
             Self::Children => "Children",
             Self::Checkpoints => "Checkpoints",
             Self::Processes => "Processes",

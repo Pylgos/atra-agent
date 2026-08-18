@@ -1400,6 +1400,7 @@ fn ThreadPage(
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut error = use_signal(String::new);
     let dialog = use_signal(|| None::<DialogState>);
+    let selected_activity = use_signal(|| None::<(TurnKey, ActivityKey)>);
     let workspace_id = workspace.workspace_id.clone();
     let workspace_for_stream = workspace_id.clone();
     let _thread_stream = use_hook(move || {
@@ -1458,6 +1459,17 @@ fn ThreadPage(
             storage_set(UTILITY_TAB_KEY, &format!("{tab:?}").to_lowercase());
         }
     });
+    use_effect({
+        let selected_activity = selected_activity.clone();
+        move || {
+            if selected_activity().is_some() {
+                utility_tab.set(UtilityTab::Activity);
+                utility_open.set(true);
+                storage_set(UTILITY_OPEN_KEY, "open");
+                storage_set(UTILITY_TAB_KEY, "activity");
+            }
+        }
+    });
 
     rsx! {
         ContextHeader {
@@ -1506,6 +1518,7 @@ fn ThreadPage(
                     dialog,
                     error,
                     scroll_positions,
+                    selected_activity,
                 }
             } else {
                 Transcript {
@@ -1516,6 +1529,7 @@ fn ThreadPage(
                     dialog,
                     error,
                     scroll_positions,
+                    selected_activity,
                 }
                 Composer {
                     workspace: workspace_id.clone(),
@@ -1539,6 +1553,7 @@ fn ThreadPage(
                 mobile_panel,
                 dialog,
                 error,
+                selected_activity,
             }
             if utility_open() && !is_narrow_viewport() {
                 ResizeHandle {
@@ -1794,6 +1809,7 @@ fn Transcript(
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
     scroll_positions: Signal<HashMap<String, i32>>,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
     let mut following = use_signal(|| true);
     let mut has_latest = use_signal(|| false);
@@ -1886,6 +1902,7 @@ fn Transcript(
                             store,
                             turn_key,
                             dialog,
+                            selected_activity,
                         }
                     }
                     InteractionPanel {
@@ -1934,7 +1951,12 @@ fn Transcript(
 }
 
 #[component]
-fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogState>>) -> Element {
+fn TurnCard(
+    store: ThreadStore,
+    turn_key: TurnKey,
+    dialog: Signal<Option<DialogState>>,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+) -> Element {
     let mut group_open = use_signal(|| false);
     let mut activity_auto_expanded = use_signal(|| false);
     let connection = store.read_connection();
@@ -1999,6 +2021,7 @@ fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogS
                                         store,
                                         turn_key,
                                         activity_key,
+                                        selected_activity,
                                     }
                                 }
                             }
@@ -2126,8 +2149,13 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
 }
 
 #[component]
-fn ActivityRow(store: ThreadStore, turn_key: TurnKey, activity_key: ActivityKey) -> Element {
-    let activity_read = store.read_activity(turn_key, activity_key);
+fn ActivityRow(
+    store: ThreadStore,
+    turn_key: TurnKey,
+    activity_key: ActivityKey,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+) -> Element {
+    let activity_read = store.read_activity(turn_key, activity_key.clone());
     let Some(activity) = activity_read.value() else {
         return rsx! {};
     };
@@ -2155,94 +2183,46 @@ fn ActivityRow(store: ThreadStore, turn_key: TurnKey, activity_key: ActivityKey)
                 .unwrap_or("Plan complete");
             let compact = format!("{current} · {completed}/{}", items.len());
             rsx! {
-                Collapsible {
-                    class: "activity-todo",
-                    active: false,
-                    compact: rsx! {
-                        span { "{compact}" }
-                    },
-                    expanded: rsx! {
-                        div { class: "todo-progress",
-                            span { "{completed}/{items.len()}" }
-                            progress { value: completed as f64, max: items.len() as f64 }
-                        }
-                        ul {
-                            for item in items {
-                                li {
-                                    class: match item.status {
-                                        atra_protocol::TodoStatus::Completed => "completed",
-                                        atra_protocol::TodoStatus::InProgress => "in-progress",
-                                        atra_protocol::TodoStatus::Pending => "pending",
-                                    },
-                                    span { class: "todo-state", aria_hidden: "true" }
-                                    span { "{item.step}" }
-                                }
-                            }
-                        }
-                    },
+                button {
+                    class: "collapsible-compact activity-todo",
+                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    span { "{compact}" }
                 }
             }
         }
-        ActivityDisplay::Reasoning { summary, active } => {
+        ActivityDisplay::Reasoning { summary, .. } => {
             let headline = summary.lines().next().unwrap_or("Thinking…").to_owned();
             rsx! {
-                Collapsible {
-                    class: "activity-reasoning",
-                    active,
-                    compact: rsx! {
-                        span { "{headline}" }
-                    },
-                    expanded: rsx! {
-                        div {
-                            class: "reasoning-detail markdown",
-                            dangerous_inner_html: "{render_markdown(&summary)}",
-                        }
-                    },
+                button {
+                    class: "collapsible-compact activity-reasoning",
+                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    span { "{headline}" }
                 }
             }
-        },
+        }
         ActivityDisplay::Command(display) => rsx! {
-            Collapsible {
-                class: "activity-command",
-                active: display.active,
-                compact: rsx! {
-                    span { class: "command-summary-text", "{display.summary}" }
+            button {
+                class: if display.active {
+                    "collapsible-compact activity-command running"
+                } else {
+                    "collapsible-compact activity-command"
                 },
-                expanded: rsx! {
-                    CommandOperations { display }
-                },
+                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                span { class: "command-summary-text", "{display.summary}" }
             }
         },
-        ActivityDisplay::Search {
-            summary,
-            detail,
-            active,
-        } => rsx! {
-            Collapsible {
-                class: "activity-search",
-                active,
-                compact: rsx! {
-                    span { "{summary}" }
-                },
-                expanded: rsx! {
-                    if !detail.is_empty() {
-                        pre { class: "search-detail", "{detail}" }
-                    }
-                },
+        ActivityDisplay::Search { summary, .. } => rsx! {
+            button {
+                class: "collapsible-compact activity-search",
+                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                span { "{summary}" }
             }
         },
-        ActivityDisplay::Question { summary, detail } => rsx! {
-            Collapsible {
-                class: "activity-question",
-                active: false,
-                compact: rsx! {
-                    span { "{summary}" }
-                },
-                expanded: rsx! {
-                    if !detail.is_empty() {
-                        pre { class: "question-detail", "{detail}" }
-                    }
-                },
+        ActivityDisplay::Question { summary, .. } => rsx! {
+            button {
+                class: "collapsible-compact activity-question",
+                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                span { "{summary}" }
             }
         },
         ActivityDisplay::Approval { allowed, reason } => rsx! {
@@ -2295,32 +2275,130 @@ fn ActivityRow(store: ThreadStore, turn_key: TurnKey, activity_key: ActivityKey)
 }
 
 #[component]
-fn Collapsible(
-    active: bool,
-    class: &'static str,
-    compact: Element,
-    expanded: Element,
+fn ActivityDetail(
+    store: ThreadStore,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
-    let mut open = use_signal(|| active);
-    rsx! {
-        article { class: if active { "collapsible {class} running" } else { "collapsible {class}" },
-            if open() {
-                div { class: "collapsible-expanded",
-                    button {
-                        class: "collapse-bar",
-                        aria_label: "Collapse",
-                        onclick: move |_| open.set(false),
+    let Some((turn_key, activity_key)) = selected_activity.read().clone() else {
+        return rsx! {
+            div { class: "activity-detail-placeholder",
+                "Select an activity in the transcript to inspect it here."
+            }
+        };
+    };
+    let activity_read = store.read_activity(turn_key, activity_key);
+    let Some(activity) = activity_read.value() else {
+        return rsx! {
+            div { class: "activity-detail-placeholder",
+                "This activity is no longer available."
+            }
+        };
+    };
+    match activity {
+        ActivityDisplay::Commentary { markdown } => rsx! {
+            div {
+                class: "activity-commentary markdown",
+                dangerous_inner_html: "{render_markdown(markdown)}",
+            }
+        },
+        ActivityDisplay::Todo { items } => {
+            let completed = items
+                .iter()
+                .filter(|item| matches!(item.status, atra_protocol::TodoStatus::Completed))
+                .count();
+            rsx! {
+                div { class: "activity-todo",
+                    div { class: "todo-progress",
+                        span { "{completed}/{items.len()}" }
+                        progress { value: completed as f64, max: items.len() as f64 }
                     }
-                    {expanded}
-                }
-            } else {
-                button {
-                    class: "collapsible-compact",
-                    onclick: move |_| open.set(true),
-                    {compact}
+                    ul {
+                        for item in items {
+                            li {
+                                class: match item.status {
+                                    atra_protocol::TodoStatus::Completed => "completed",
+                                    atra_protocol::TodoStatus::InProgress => "in-progress",
+                                    atra_protocol::TodoStatus::Pending => "pending",
+                                },
+                                span { class: "todo-state", aria_hidden: "true" }
+                                span { "{item.step}" }
+                            }
+                        }
+                    }
                 }
             }
         }
+        ActivityDisplay::Reasoning { summary, .. } => rsx! {
+            div { class: "activity-reasoning",
+                div {
+                    class: "reasoning-detail markdown",
+                    dangerous_inner_html: "{render_markdown(&summary)}",
+                }
+            }
+        },
+        ActivityDisplay::Command(display) => rsx! {
+            CommandOperations { display }
+        },
+        ActivityDisplay::Search { detail, .. } => rsx! {
+            div { class: "activity-search",
+                if !detail.is_empty() {
+                    pre { class: "search-detail", "{detail}" }
+                }
+            }
+        },
+        ActivityDisplay::Question { detail, .. } => rsx! {
+            div { class: "activity-question",
+                if !detail.is_empty() {
+                    pre { class: "question-detail", "{detail}" }
+                }
+            }
+        },
+        ActivityDisplay::Approval { allowed, reason } => rsx! {
+            div {
+                class: if allowed { "activity-approval allowed" } else { "activity-approval denied" },
+                if allowed {
+                    "Allowed"
+                } else if let Some(reason) = reason {
+                    "Denied — {reason}"
+                } else {
+                    "Denied"
+                }
+            }
+        },
+        ActivityDisplay::Retry {
+            summary,
+            current,
+            max,
+        } => rsx! {
+            div { class: "activity-retry", "{summary} · attempt {current}/{max}" }
+        },
+        ActivityDisplay::Skill { name, path } => rsx! {
+            div { class: "activity-skill",
+                strong { "{name}" }
+                code { "{path}" }
+            }
+        },
+        ActivityDisplay::Compaction => rsx! {
+            div { class: "activity-compaction", "Compacting conversation history…" }
+        },
+        ActivityDisplay::Boundary => rsx! {
+            div { class: "activity-boundary", "Older context was compacted." }
+        },
+        ActivityDisplay::Failure { message } => {
+            let headline = message.lines().next().unwrap_or("Failed");
+            rsx! {
+                details { class: "activity-failure",
+                    summary { "{headline}" }
+                    pre { "{message}" }
+                }
+            }
+        },
+        ActivityDisplay::Cancelled => rsx! {
+            div { class: "activity-cancelled", "Cancelled" }
+        },
+        ActivityDisplay::Unsupported { summary } => rsx! {
+            div { class: "activity-unsupported", "{summary}" }
+        },
     }
 }
 
@@ -2809,6 +2887,7 @@ fn UtilityPanel(
     mobile_panel: Signal<MobilePanel>,
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
     rsx! {
         aside {
@@ -2828,7 +2907,7 @@ fn UtilityPanel(
                 }
             }
             div { class: "utility-tabs", role: "tablist",
-                for tab in [UtilityTab::Thread, UtilityTab::Children, UtilityTab::Checkpoints, UtilityTab::Processes] {
+                for tab in [UtilityTab::Thread, UtilityTab::Activity, UtilityTab::Children, UtilityTab::Checkpoints, UtilityTab::Processes] {
                     button {
                         role: "tab",
                         aria_selected: utility_tab() == tab,
@@ -2852,6 +2931,12 @@ fn UtilityPanel(
                             connected,
                             dialog,
                             error,
+                        }
+                    },
+                    UtilityTab::Activity => rsx! {
+                        ActivityDetail {
+                            store,
+                            selected_activity,
                         }
                     },
                     UtilityTab::Children => rsx! {
@@ -3097,6 +3182,7 @@ fn CheckpointPreview(
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
     scroll_positions: Signal<HashMap<String, i32>>,
+    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut checkpoint_metadata = use_signal(|| None::<atra_protocol::ThreadCheckpoint>);
@@ -3175,6 +3261,7 @@ fn CheckpointPreview(
                 dialog,
                 error,
                 scroll_positions,
+                selected_activity,
             }
         } else {
             LoadingState { label: "Loading Checkpoint…" }

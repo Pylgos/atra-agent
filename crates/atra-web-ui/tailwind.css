@@ -882,11 +882,21 @@ pre {
   width: 3px;
   flex-shrink: 0;
   align-self: stretch;
+  position: relative;
   padding: 0;
   border: 0;
   border-radius: 2px;
   background: var(--line);
   cursor: pointer;
+}
+
+.collapse-bar::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -0.6rem;
+  right: -0.6rem;
 }
 
 .collapse-bar:hover {
@@ -1394,6 +1404,12 @@ pre {
 .utility-section {
   padding: 0.75rem 0;
   border-bottom: 1px solid var(--line);
+}
+
+.activity-detail-placeholder {
+  padding: 0.75rem 0;
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 .utility-section:first-child {

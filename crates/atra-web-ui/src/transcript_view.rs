@@ -93,13 +93,11 @@ pub(super) enum ActivityDisplay<'a> {
     },
     Reasoning {
         summary: Cow<'a, str>,
-        active: bool,
     },
     Command(CommandDisplay),
     Search {
         summary: String,
         detail: String,
-        active: bool,
     },
     Question {
         summary: String,
@@ -404,7 +402,6 @@ pub(super) fn activity<'a>(
                 ThreadEventData::Reasoning(reasoning) => {
                     reasoning_summary(&reasoning.item).map(|summary| ActivityDisplay::Reasoning {
                         summary: Cow::Owned(summary),
-                        active: false,
                     })
                 }
                 ThreadEventData::WebSearch(search) => {
@@ -412,7 +409,6 @@ pub(super) fn activity<'a>(
                     Some(ActivityDisplay::Search {
                         summary,
                         detail,
-                        active: false,
                     })
                 }
                 ThreadEventData::SkillInvocation(skill) => Some(ActivityDisplay::Skill {
@@ -499,7 +495,6 @@ pub(super) fn activity<'a>(
             match item.data() {
                 ActiveItemData::Reasoning { content } => Some(ActivityDisplay::Reasoning {
                     summary: Cow::Borrowed(content),
-                    active: true,
                 }),
                 ActiveItemData::ToolCall {
                     name,
@@ -537,7 +532,6 @@ pub(super) fn activity<'a>(
                     Some(ActivityDisplay::Search {
                         summary,
                         detail,
-                        active: true,
                     })
                 }
                 ActiveItemData::RunnerTool { runner, update, .. } => {

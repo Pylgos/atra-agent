@@ -393,10 +393,11 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".activity-group-compact")).not.toContainText("Todo");
   await page.locator(".activity-group-compact").click();
   await expect(page.locator(".activity-commentary")).toContainText("Checking the existing result.");
-  await page.locator(".activity-todo .collapsible-compact").click();
-  await expect(page.locator(".activity-todo li")).toHaveCount(2);
-  await expect(page.locator(".activity-todo li.completed")).toContainText("Inspect the result");
-  await expect(page.locator(".activity-todo li.in-progress")).toContainText("Draft the response");
+  await page.locator(".activity-todo.collapsible-compact").click();
+  await expect(page.getByRole("tab", { name: "Activity" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".utility .activity-todo li")).toHaveCount(2);
+  await expect(page.locator(".utility .activity-todo li.completed")).toContainText("Inspect the result");
+  await expect(page.locator(".utility .activity-todo li.in-progress")).toContainText("Draft the response");
   await page.getByRole("button", { name: "Collapse activities" }).click();
   await expect(page.locator(".activity-commentary")).toHaveCount(0);
   await page.getByRole("button", { name: "Raw", exact: true }).click();
@@ -458,9 +459,10 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(page.locator(".activity-command.running")).toBeVisible();
-  await expect(page.locator(".command-source")).toContainText("echo hello");
-  await expect(page.locator(".command-operation header code")).toHaveText("sandbox");
-  await expect(page.locator(".command-output")).toContainText("hello");
+  await page.locator(".activity-command.running").click();
+  await expect(page.locator(".utility .command-source")).toContainText("echo hello");
+  await expect(page.locator(".utility .command-operation header code")).toHaveText("sandbox");
+  await expect(page.locator(".utility .command-output")).toContainText("hello");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
