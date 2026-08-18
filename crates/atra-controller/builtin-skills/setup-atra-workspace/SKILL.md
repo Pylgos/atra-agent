@@ -119,9 +119,12 @@ atra runner sandbox
   [--bwrap-arg ARG]...
 ```
 
-- `standard` hides the host HOME; `relaxed` exposes it read-only. Both keep the
-  writable `$HOME` at `/run/atra-home`. Inherited absolute `PATH` directories
-  hidden by the sandbox mounts are exposed individually as read-only.
+- `standard` replaces the host HOME path with the workspace's private writable
+  sandbox HOME. Keeping the same absolute HOME path stabilizes home-relative
+  paths across host and sandbox commands. `relaxed` exposes the host HOME
+  read-only and keeps its private writable `$HOME` at `/run/atra-home`.
+  Inherited absolute `PATH` directories hidden by sandbox mounts are exposed
+  individually as read-only.
 - `--mount-ro` and `--mount-rw` expose additional paths at their original
   absolute location.
 - `--bwrap-arg` appends a raw Bubblewrap argument after Atra's generated

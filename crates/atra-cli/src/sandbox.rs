@@ -15,7 +15,7 @@ use tokio::process::Command;
 
 use crate::{platform, workspace};
 
-const SANDBOX_HOME: &str = "/run/atra-home";
+const RELAXED_SANDBOX_HOME: &str = "/run/atra-home";
 const RUNNER_PATH: &str = "/run/atra-runner";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -45,9 +45,9 @@ pub(crate) struct SandboxOptions {
 struct SandboxContext {
     workspace: PathBuf,
     sandbox_home: PathBuf,
+    sandbox_home_destination: PathBuf,
     runner_binary: PathBuf,
     bwrap: PathBuf,
-    hidden_host_home: Option<PathBuf>,
     preserved_path_directories: Vec<ReadOnlyMount>,
     uid: u32,
     gid: u32,
@@ -72,18 +72,30 @@ pub(crate) async fn execute(options: SandboxOptions) -> Result<()> {
     let workspace = resolve_workspace(&options)?;
     let sandbox_home = workspace::sandbox_home(&workspace)?;
     let runner_binary = resolve_runner_binary(&options)?;
-    let hidden_host_home = match options.preset {
+    let host_home = match options.preset {
         SandboxPreset::Standard => Some(resolve_host_home(env::var_os("HOME"))?),
         SandboxPreset::Relaxed => None,
     };
     let preserved_path_directories =
-        preserved_path_directories(env::var_os("PATH"), &workspace, hidden_host_home.as_deref());
+        preserved_path_directories(env::var_os("PATH"), &workspace, host_home.as_deref());
+    let sandbox_home_destination = match &host_home {
+        Some(host_home) => {
+            prepare_standard_home(
+                &sandbox_home,
+                host_home,
+                &workspace,
+                &preserved_path_directories,
+            )?;
+            host_home.clone()
+        }
+        None => PathBuf::from(RELAXED_SANDBOX_HOME),
+    };
     let context = SandboxContext {
         workspace,
         sandbox_home,
+        sandbox_home_destination,
         runner_binary,
         bwrap,
-        hidden_host_home,
         preserved_path_directories,
         uid: getuid().as_raw(),
         gid: getgid().as_raw(),
@@ -170,13 +182,81 @@ fn canonicalize_mount(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve mount path {}", path.display()))
 }
 
+fn prepare_standard_home(
+    sandbox_home: &Path,
+    host_home: &Path,
+    workspace: &Path,
+    preserved_path_directories: &[ReadOnlyMount],
+) -> Result<()> {
+    if host_home.starts_with(workspace) {
+        bail!(
+            "standard sandbox requires the workspace to be outside the host HOME or a strict \
+             descendant of it; workspace {} contains host HOME {}",
+            workspace.display(),
+            host_home.display()
+        );
+    }
+
+    prepare_home_mount_point(sandbox_home, host_home, workspace)?;
+    for mount in preserved_path_directories {
+        prepare_home_mount_point(sandbox_home, host_home, &mount.destination)?;
+    }
+    Ok(())
+}
+
+fn prepare_home_mount_point(
+    sandbox_home: &Path,
+    host_home: &Path,
+    destination: &Path,
+) -> Result<()> {
+    if !is_strict_descendant(destination, host_home) {
+        return Ok(());
+    }
+    let relative = destination
+        .strip_prefix(host_home)
+        .expect("strict descendants have the root as a prefix");
+    let mut path = sandbox_home.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("strict descendants contain only normal components");
+        };
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                bail!(
+                    "sandbox HOME mount path {} is not a directory",
+                    path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&path).with_context(|| {
+                    format!(
+                        "failed to create sandbox HOME mount path {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect sandbox HOME mount path {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn preserved_path_directories(
     path: Option<OsString>,
     workspace: &Path,
-    hidden_host_home: Option<&Path>,
+    private_host_home: Option<&Path>,
 ) -> Vec<ReadOnlyMount> {
     let mut hidden_roots = vec![Path::new("/tmp"), Path::new("/run"), Path::new("/var/tmp")];
-    if let Some(home) = hidden_host_home {
+    if let Some(home) = private_host_home {
         hidden_roots.push(home);
     }
 
@@ -250,26 +330,16 @@ fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<Sandbo
     args.push(OsString::from("/sys"));
     args.push(OsString::from("/sys"));
 
-    // Preset visibility of the host HOME.
-    if let Some(home) = context.hidden_host_home {
-        args.push(OsString::from("--tmpfs"));
-        args.push(home.into_os_string());
-    }
-
-    // Persistent sandbox HOME.
+    // Persistent sandbox HOME. The standard preset places the private HOME at
+    // the host HOME path so home-relative absolute paths remain stable.
     args.push(OsString::from("--dir"));
-    args.push(OsString::from(SANDBOX_HOME));
+    args.push(context.sandbox_home_destination.clone().into_os_string());
     args.push(OsString::from("--bind"));
     args.push(context.sandbox_home.into_os_string());
-    args.push(OsString::from(SANDBOX_HOME));
-
-    // Canonical workspace at its original absolute path.
-    args.push(OsString::from("--bind"));
-    args.push(context.workspace.clone().into_os_string());
-    args.push(context.workspace.clone().into_os_string());
+    args.push(context.sandbox_home_destination.clone().into_os_string());
 
     // Preserve inherited PATH entries hidden by the temporary filesystems or
-    // host HOME masking without exposing their parent trees.
+    // private HOME without exposing their parent trees.
     for mount in context.preserved_path_directories {
         args.push(OsString::from("--dir"));
         args.push(mount.destination.clone().into_os_string());
@@ -277,6 +347,12 @@ fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<Sandbo
         args.push(mount.source.into_os_string());
         args.push(mount.destination.into_os_string());
     }
+
+    // Canonical workspace at its original absolute path. This follows preset
+    // mounts so a PATH mount that is an ancestor cannot cover the workspace.
+    args.push(OsString::from("--bind"));
+    args.push(context.workspace.clone().into_os_string());
+    args.push(context.workspace.clone().into_os_string());
 
     // Runner binary at a fixed private path.
     args.push(OsString::from("--ro-bind"));
@@ -300,7 +376,7 @@ fn build_plan(options: SandboxOptions, context: SandboxContext) -> Result<Sandbo
     // Environment overrides.
     args.push(OsString::from("--setenv"));
     args.push(OsString::from("HOME"));
-    args.push(OsString::from(SANDBOX_HOME));
+    args.push(context.sandbox_home_destination.into_os_string());
     for variable in ["TMPDIR", "TMP", "TEMP"] {
         args.push(OsString::from("--setenv"));
         args.push(OsString::from(variable));
@@ -347,9 +423,9 @@ mod tests {
         SandboxContext {
             workspace: PathBuf::from("/ws"),
             sandbox_home: PathBuf::from("/state/ws/sandbox/home"),
+            sandbox_home_destination: PathBuf::from("/home/user"),
             runner_binary: PathBuf::from("/platform/runner"),
             bwrap: PathBuf::from("/usr/bin/bwrap"),
-            hidden_host_home: Some(PathBuf::from("/home/user")),
             preserved_path_directories: Vec::new(),
             uid: 1000,
             gid: 1000,
@@ -382,12 +458,48 @@ mod tests {
             .unwrap_or_else(|| panic!("{needle:?} not found in {arguments:?}"))
     }
 
+    fn mount_position(
+        arguments: &[String],
+        flag: &str,
+        source: &Path,
+        destination: &Path,
+    ) -> usize {
+        let source = source.to_string_lossy();
+        let destination = destination.to_string_lossy();
+        arguments
+            .windows(3)
+            .position(|arguments| {
+                arguments[0] == flag && arguments[1] == source && arguments[2] == destination
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{flag} {} {} not found in {arguments:?}",
+                    source, destination
+                )
+            })
+    }
+
+    fn home_value(arguments: &[String]) -> &str {
+        arguments
+            .windows(3)
+            .find_map(|arguments| {
+                (arguments[0] == "--setenv" && arguments[1] == "HOME")
+                    .then_some(arguments[2].as_str())
+            })
+            .unwrap_or_else(|| panic!("HOME override not found in {arguments:?}"))
+    }
+
     #[test]
-    fn standard_hides_host_home() {
+    fn standard_mounts_private_home_at_the_host_home_path() {
         let plan = build_plan(options(), context()).unwrap();
         let arguments = args(&plan);
-        assert!(arguments.contains(&"--tmpfs".to_owned()));
-        assert!(arguments.contains(&"/home/user".to_owned()));
+        mount_position(
+            &arguments,
+            "--bind",
+            Path::new("/state/ws/sandbox/home"),
+            Path::new("/home/user"),
+        );
+        assert_eq!(home_value(&arguments), "/home/user");
     }
 
     #[test]
@@ -415,17 +527,31 @@ mod tests {
         let mut options = options();
         options.preset = SandboxPreset::Relaxed;
         let mut context = context();
-        context.hidden_host_home = None;
+        context.sandbox_home_destination = PathBuf::from(RELAXED_SANDBOX_HOME);
         let plan = build_plan(options, context).unwrap();
         let arguments = args(&plan);
         assert!(!arguments.contains(&"/home/user".to_owned()));
+        mount_position(
+            &arguments,
+            "--bind",
+            Path::new("/state/ws/sandbox/home"),
+            Path::new(RELAXED_SANDBOX_HOME),
+        );
+        assert_eq!(home_value(&arguments), RELAXED_SANDBOX_HOME);
     }
 
     #[test]
-    fn workspace_mount_comes_after_home_hiding() {
+    fn workspace_mount_comes_after_private_home() {
         let plan = build_plan(options(), context()).unwrap();
         let arguments = args(&plan);
-        assert!(position(&arguments, "/home/user") < position(&arguments, "/ws"));
+        let home = mount_position(
+            &arguments,
+            "--bind",
+            Path::new("/state/ws/sandbox/home"),
+            Path::new("/home/user"),
+        );
+        let workspace = mount_position(&arguments, "--bind", Path::new("/ws"), Path::new("/ws"));
+        assert!(home < workspace);
     }
 
     #[test]
@@ -471,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn preserved_path_mounts_follow_masking_and_precede_explicit_mounts() {
+    fn preserved_path_mounts_follow_home_and_precede_workspace_and_explicit_mounts() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         let destination = temporary.path().join("home/.nix-profile/bin");
@@ -483,35 +609,107 @@ mod tests {
             source: source.clone(),
             destination: destination.clone(),
         }];
+        let workspace_path = destination.parent().unwrap().join("workspace");
+        context.workspace = workspace_path.clone();
         let mut options = options();
         options.mount_ro = vec![explicit.clone()];
 
         let arguments = args(&build_plan(options, context).unwrap());
-        let hidden_home = position(&arguments, "/home/user");
-        let destination = position(&arguments, &destination.to_string_lossy());
-        let source = position(&arguments, &source.to_string_lossy());
+        let home = mount_position(
+            &arguments,
+            "--bind",
+            Path::new("/state/ws/sandbox/home"),
+            Path::new("/home/user"),
+        );
+        let preserved = mount_position(&arguments, "--ro-bind", &source, &destination);
+        let workspace = mount_position(&arguments, "--bind", &workspace_path, &workspace_path);
         let explicit = position(
             &arguments,
             &fs::canonicalize(explicit).unwrap().to_string_lossy(),
         );
 
-        assert!(hidden_home < destination);
-        assert_eq!(arguments[destination - 1], "--dir");
-        assert_eq!(arguments[source - 1], "--ro-bind");
-        assert!(source < explicit);
+        assert!(home < preserved);
+        assert!(preserved < workspace);
+        assert!(workspace < explicit);
     }
 
     #[test]
-    fn sandbox_home_mount_point_is_created_under_run_before_bind() {
-        let plan = build_plan(options(), context()).unwrap();
+    fn relaxed_sandbox_home_mount_point_is_created_under_run_before_bind() {
+        let mut context = context();
+        context.sandbox_home_destination = PathBuf::from(RELAXED_SANDBOX_HOME);
+        let plan = build_plan(options(), context).unwrap();
         let arguments = args(&plan);
-        let mount_point = position(&arguments, SANDBOX_HOME);
+        let mount_point = position(&arguments, RELAXED_SANDBOX_HOME);
         let persistent_home = position(&arguments, "/state/ws/sandbox/home");
-        assert_eq!(Path::new(SANDBOX_HOME).parent(), Some(Path::new("/run")));
+        assert_eq!(
+            Path::new(RELAXED_SANDBOX_HOME).parent(),
+            Some(Path::new("/run"))
+        );
         assert_eq!(arguments[mount_point - 1], "--dir");
         assert_eq!(arguments[persistent_home - 1], "--bind");
-        assert_eq!(arguments[persistent_home + 1], SANDBOX_HOME);
+        assert_eq!(arguments[persistent_home + 1], RELAXED_SANDBOX_HOME);
         assert!(mount_point < persistent_home);
+    }
+
+    #[test]
+    fn standard_rejects_workspace_that_contains_host_home() {
+        let error = prepare_standard_home(
+            Path::new("/private"),
+            Path::new("/home/user"),
+            Path::new("/home"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("contains host HOME"));
+    }
+
+    #[test]
+    fn standard_rejects_workspace_equal_to_host_home() {
+        let error = prepare_standard_home(
+            Path::new("/private"),
+            Path::new("/home/user"),
+            Path::new("/home/user"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("contains host HOME"));
+    }
+
+    #[test]
+    fn standard_prepares_nested_workspace_mount_point() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sandbox_home = temporary.path().join("private");
+        fs::create_dir(&sandbox_home).unwrap();
+
+        prepare_standard_home(
+            &sandbox_home,
+            Path::new("/home/user"),
+            Path::new("/home/user/src/project"),
+            &[],
+        )
+        .unwrap();
+
+        assert!(sandbox_home.join("src/project").is_dir());
+    }
+
+    #[test]
+    fn standard_rejects_symlink_in_nested_mount_point() {
+        let temporary = tempfile::tempdir().unwrap();
+        let sandbox_home = temporary.path().join("private");
+        let target = temporary.path().join("target");
+        fs::create_dir(&sandbox_home).unwrap();
+        fs::create_dir(&target).unwrap();
+        symlink(&target, sandbox_home.join("src")).unwrap();
+
+        let error = prepare_standard_home(
+            &sandbox_home,
+            Path::new("/home/user"),
+            Path::new("/home/user/src/project"),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("is not a directory"));
     }
 
     #[test]
