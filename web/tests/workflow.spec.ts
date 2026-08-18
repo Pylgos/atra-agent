@@ -493,8 +493,10 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(page.locator(".activity-command.running")).toBeVisible();
-  await page.locator(".activity-command.running").click();
+  await expect(
+    page.locator(".activity-command:has(.command-row-status .status-spinner)")
+  ).toBeVisible();
+  await page.locator(".activity-command:has(.command-row-status .status-spinner)").click();
   await expect(page.locator(".utility .command-source")).toContainText("echo hello");
   await expect(page.locator(".utility .command-operation header code")).toHaveText("sandbox");
   await expect(page.locator(".utility .command-output")).toContainText("hello");
@@ -531,9 +533,9 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await page.locator(".activity-command.running").click();
+  await page.locator(".activity-command:has(.command-row-status .status-spinner)").click();
   await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
-  await expect(page.locator(".utility .command-operation header span")).toContainText("running");
+  await expect(page.locator(".utility .command-operation header span")).toContainText("elapsed");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -559,7 +561,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(page.locator(".utility .command-operation header span")).toHaveText("Command");
+  await expect(page.locator(".utility .command-operation header span")).toHaveText("finished");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"

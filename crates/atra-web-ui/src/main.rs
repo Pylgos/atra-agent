@@ -29,7 +29,9 @@ use model::{
 };
 use syntax::{highlight, setup_markdown_highlighting};
 use thread_store::ThreadStore;
-use transcript_view::{ActivityDisplay, ActivityKey, CommandDisplay, RawKey, TurnKey};
+use transcript_view::{
+    ActivityDisplay, ActivityKey, CommandDisplay, OperationStatus, RawKey, TurnKey,
+};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -2190,12 +2192,11 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
     }
 }
 
-fn exit_code_class(status: &str) -> &'static str {
-    let trimmed = status.trim();
-    match trimmed.strip_prefix("exit ") {
-        Some("0") => "command-row-status ok",
-        Some(_) => "command-row-status fail",
-        None => "command-row-status",
+fn operation_status_class(status: &OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Finished { exit: Some(0) } => "command-row-status ok",
+        OperationStatus::Finished { exit: Some(_) } => "command-row-status fail",
+        _ => "command-row-status",
     }
 }
 
@@ -2253,14 +2254,9 @@ fn ActivityRow(
         }
         ActivityDisplay::Command(display) => {
             let operations = display.operations.clone();
-            let active = display.active;
             rsx! {
                 button {
-                    class: if active {
-                        "activity-command running"
-                    } else {
-                        "activity-command"
-                    },
+                    class: "activity-command",
                     onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
                     div { class: "command-row",
                         for operation in &operations {
@@ -2275,8 +2271,29 @@ fn ActivityRow(
                                 }
                                 div { class: "command-row-meta",
                                     span { class: "command-row-runner", "{operation.runner}" }
-                                    if !operation.status.is_empty() {
-                                        span { class: exit_code_class(&operation.status), "{operation.status}" }
+                                    span { class: operation_status_class(&operation.status),
+                                        match &operation.status {
+                                            OperationStatus::Queued => rsx! {
+                                                span { class: "status-dots", aria_hidden: "true",
+                                                    i {}
+                                                    i {}
+                                                    i {}
+                                                }
+                                            },
+                                            OperationStatus::Running {
+                                                elapsed_ms: Some(_),
+                                                remaining_ms: Some(_),
+                                            } => rsx! {
+                                                span { class: "status-spinner", aria_hidden: "true" }
+                                                "{operation.status}"
+                                            },
+                                            OperationStatus::Running { .. } => rsx! {
+                                                span { class: "status-spinner", aria_hidden: "true" }
+                                            },
+                                            OperationStatus::Finished { .. } => rsx! {
+                                                "{operation.status}"
+                                            }
+                                        }
                                     }
                                 }
                                 for change in &operation.file_changes {

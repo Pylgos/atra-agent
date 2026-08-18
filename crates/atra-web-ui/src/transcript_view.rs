@@ -131,7 +131,6 @@ pub(super) enum ActivityDisplay<'a> {
 pub(super) struct CommandDisplay {
     pub summary: String,
     pub operations: Vec<CommandOperationDisplay>,
-    pub active: bool,
     pub masked: bool,
     pub approvals: Vec<CommandApprovalDisplay>,
 }
@@ -147,10 +146,40 @@ pub(super) struct CommandOperationDisplay {
     pub runner: String,
     pub command: String,
     pub output: String,
-    pub status: String,
+    pub status: OperationStatus,
     pub omitted_bytes: usize,
     pub diffs: Vec<String>,
     pub file_changes: Vec<FileChangeSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum OperationStatus {
+    Queued,
+    Running {
+        elapsed_ms: Option<u64>,
+        remaining_ms: Option<u64>,
+    },
+    Finished { exit: Option<i32> },
+}
+
+impl std::fmt::Display for OperationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationStatus::Queued => f.write_str("queued"),
+            OperationStatus::Running {
+                elapsed_ms: Some(elapsed),
+                remaining_ms: Some(remaining),
+            } => write!(
+                f,
+                "{} elapsed · {} until detach",
+                format_duration(*elapsed),
+                format_duration(*remaining)
+            ),
+            OperationStatus::Running { .. } => f.write_str("running"),
+            OperationStatus::Finished { exit: Some(code) } => write!(f, "exit {code}"),
+            OperationStatus::Finished { exit: None } => f.write_str("finished"),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -791,7 +820,7 @@ fn command_display(
             runner: operation.runner().to_owned(),
             command: operation.command().to_owned(),
             output: String::new(),
-            status: "queued".to_owned(),
+            status: OperationStatus::Queued,
             omitted_bytes: 0,
             diffs: Vec::new(),
             file_changes: Vec::new(),
@@ -804,7 +833,6 @@ fn command_display(
         }
     }
 
-    let mut active = false;
     if let Some(identity) = identity
         && let Some(turn) = state.active_turn()
     {
@@ -821,7 +849,6 @@ fn command_display(
             if call_id != identity {
                 continue;
             }
-            active |= !matches!(update, RunnerOperationUpdate::Completed { .. });
             let index = operation_index.saturating_sub(1);
             if let Some(operation) = operations.get_mut(index) {
                 if let Some(runner) = runner {
@@ -859,7 +886,6 @@ fn command_display(
     CommandDisplay {
         summary,
         operations,
-        active,
         masked,
         approvals,
     }
@@ -892,10 +918,10 @@ fn tool_result_masked(result: &atra_protocol::ToolResultEvent) -> bool {
 fn apply_runner_update(update: &RunnerOperationUpdate, operation: &mut CommandOperationDisplay) {
     match update {
         RunnerOperationUpdate::CommandStarted { timer } => {
-            operation.status = format!(
-                "running · {}ms elapsed · {}ms until detach",
-                timer.elapsed_ms, timer.remaining_ms
-            );
+            operation.status = OperationStatus::Running {
+                elapsed_ms: Some(timer.elapsed_ms),
+                remaining_ms: Some(timer.remaining_ms),
+            };
         }
         RunnerOperationUpdate::CommandOutput {
             content,
@@ -904,14 +930,25 @@ fn apply_runner_update(update: &RunnerOperationUpdate, operation: &mut CommandOp
         } => {
             operation.output = strip_ansi(content);
             operation.omitted_bytes = *omitted_bytes;
-            operation.status = format!(
-                "running · {}ms elapsed · {}ms until detach",
-                timer.elapsed_ms, timer.remaining_ms
-            );
+            operation.status = OperationStatus::Running {
+                elapsed_ms: Some(timer.elapsed_ms),
+                remaining_ms: Some(timer.remaining_ms),
+            };
         }
         RunnerOperationUpdate::Completed { artifact } => {
             apply_operation_artifact(artifact, operation);
         }
+    }
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1000;
+    if seconds >= 60 * 60 {
+        format!("{}h{}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -920,14 +957,7 @@ fn apply_command_artifact(artifact: &ToolArtifact, operations: &mut [CommandOper
         ToolArtifact::RunnerOperation(runner) => {
             let index = runner.operation.saturating_sub(1);
             if let Some(operation) = operations.get_mut(index) {
-                operation.runner.clone_from(&runner.runner);
-                operation.status = runner.label.clone();
-                if let Some(result) = runner.result.as_str() {
-                    operation.output = strip_ansi(result);
-                }
-                for artifact in &runner.artifacts {
-                    apply_operation_artifact(artifact, operation);
-                }
+                apply_operation_artifact(artifact, operation);
             }
         }
         artifact if operations.len() == 1 => {
@@ -941,7 +971,10 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
     match artifact {
         ToolArtifact::CommandExecution(CommandExecutionArtifact::Started { runner }) => {
             operation.runner.clone_from(runner);
-            operation.status = "running".to_owned();
+            operation.status = OperationStatus::Running {
+                elapsed_ms: None,
+                remaining_ms: None,
+            };
         }
         ToolArtifact::CommandExecution(CommandExecutionArtifact::Running {
             output,
@@ -950,7 +983,10 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
         }) => {
             operation.runner.clone_from(runner);
             operation.output = strip_ansi(output);
-            operation.status = "running".to_owned();
+            operation.status = OperationStatus::Running {
+                elapsed_ms: None,
+                remaining_ms: None,
+            };
         }
         ToolArtifact::CommandExecution(CommandExecutionArtifact::Finished {
             output,
@@ -960,9 +996,7 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
         }) => {
             operation.runner.clone_from(runner);
             operation.output = strip_ansi(output);
-            operation.status = exit_code
-                .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| "finished".to_owned());
+            operation.status = OperationStatus::Finished { exit: *exit_code };
         }
         ToolArtifact::PatchOperations(patch) => {
             let mut diff = String::new();
@@ -973,12 +1007,18 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
         }
         ToolArtifact::RunnerOperation(runner) => {
             operation.runner.clone_from(&runner.runner);
-            operation.status = runner.label.clone();
             if let Some(result) = runner.result.as_str() {
                 operation.output = strip_ansi(result);
             }
+            let has_command_artifact = runner
+                .artifacts
+                .iter()
+                .any(|artifact| matches!(artifact, ToolArtifact::CommandExecution(_)));
             for artifact in &runner.artifacts {
                 apply_operation_artifact(artifact, operation);
+            }
+            if !has_command_artifact {
+                operation.status = OperationStatus::Finished { exit: None };
             }
         }
     }
@@ -1011,7 +1051,10 @@ fn orphan_runner_display(
         runner: runner.unwrap_or("unknown").to_owned(),
         command: String::new(),
         output: String::new(),
-        status: "running".to_owned(),
+        status: OperationStatus::Running {
+            elapsed_ms: None,
+            remaining_ms: None,
+        },
         omitted_bytes: 0,
         diffs: Vec::new(),
         file_changes: Vec::new(),
@@ -1020,7 +1063,6 @@ fn orphan_runner_display(
     ActivityDisplay::Command(CommandDisplay {
         summary: format!("{} — {}", operation.status, operation.runner),
         operations: vec![operation],
-        active: true,
         masked: false,
         approvals: Vec::new(),
     })
@@ -1731,7 +1773,10 @@ mod tests {
         let ActivityDisplay::Command(running) = activity(&state, &selected).unwrap() else {
             panic!("expected command display");
         };
-        assert!(running.active);
+        assert!(matches!(
+            running.operations[0].status,
+            OperationStatus::Running { .. }
+        ));
         assert_eq!(running.operations[0].output, "first\nsecond\n");
 
         ThreadOperation::ActiveRunnerOutputAppended {
@@ -1768,8 +1813,10 @@ mod tests {
         let ActivityDisplay::Command(completed) = activity(&state, &selected).unwrap() else {
             panic!("expected command display");
         };
-        assert!(!completed.active);
-        assert_eq!(completed.operations[0].status, "Command");
+        assert_eq!(
+            completed.operations[0].status,
+            OperationStatus::Finished { exit: None }
+        );
         assert_eq!(activity_type_label(&state, &selected), "command");
     }
 
@@ -1823,7 +1870,10 @@ mod tests {
         assert!(display.operations[0].output.contains("hello"));
         assert_eq!(display.operations[0].runner, "sandbox");
         assert_eq!(display.operations[0].command, "echo hello");
-        assert!(display.active);
+        assert!(matches!(
+            display.operations[0].status,
+            OperationStatus::Running { .. }
+        ));
     }
 
     #[test]
@@ -1921,7 +1971,7 @@ mod tests {
             runner: "sandbox".to_owned(),
             command: "atri patch".to_owned(),
             output: String::new(),
-            status: String::new(),
+            status: OperationStatus::Queued,
             omitted_bytes: 0,
             diffs: Vec::new(),
             file_changes: Vec::new(),
