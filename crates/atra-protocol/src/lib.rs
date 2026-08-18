@@ -5,8 +5,10 @@ use atra_tree::TreeManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod command;
 mod state;
 
+pub use command::{CommandParseError, RunnerCommand, parse_command_input};
 pub use state::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -205,6 +207,9 @@ pub enum ThreadEventData {
     ModelRequest(ModelRequestEvent),
     TokenUsage(TokenUsageEvent),
     RateLimits(RateLimitsEvent),
+    ApprovalDecision(ApprovalDecisionEvent),
+    Retry(RetryEvent),
+    TurnOutcome(TurnOutcome),
 }
 
 impl ThreadEventData {
@@ -227,8 +232,28 @@ impl ThreadEventData {
             Self::ModelRequest(_) => "model_request",
             Self::TokenUsage(_) => "token_usage",
             Self::RateLimits(_) => "rate_limits",
+            Self::ApprovalDecision(_) => "approval_decision",
+            Self::Retry(_) => "retry",
+            Self::TurnOutcome(_) => "turn_outcome",
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDecisionEvent {
+    pub interaction_id: InteractionId,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryEvent {
+    pub summary: String,
+    pub current: u64,
+    pub max: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

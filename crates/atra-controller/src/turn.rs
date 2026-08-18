@@ -1083,11 +1083,14 @@ impl State {
                     }
                     let mut results = Vec::new();
                     let mut artifacts = Vec::new();
-                    for (index, operation) in parse_command_input(&input)?.into_iter().enumerate() {
+                    for (index, operation) in atra_protocol::parse_command_input(&input)?
+                        .into_iter()
+                        .enumerate()
+                    {
                         let operation_index = index + 1;
                         let runner = operation.runner().to_owned();
-                        let operation_name = operation.name();
-                        let result_label = operation.result_label();
+                        let operation_name = "command";
+                        let result_label = "Command".to_owned();
                         let operation_context = OperationContext {
                             call_id: call_id.clone(),
                             index: operation_index,
@@ -1113,7 +1116,7 @@ impl State {
                         ));
                         let artifact = ToolArtifact::RunnerOperation(RunnerOperationArtifact {
                             operation: operation_index,
-                            runner,
+                            runner: runner.clone(),
                             label: result_label,
                             result: serde_json::Value::String(result),
                             artifacts: outcome.artifacts,
@@ -1121,6 +1124,7 @@ impl State {
                         send_operation_update(
                             Some(&operation_context),
                             updates,
+                            Some(&runner),
                             RunnerOperationUpdate::Completed {
                                 artifact: artifact.clone(),
                             },
@@ -1151,7 +1155,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         name: &str,
-        arguments: CommandArguments,
+        arguments: atra_protocol::RunnerCommand,
         operation: Option<&OperationContext>,
         updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
@@ -1212,14 +1216,14 @@ impl State {
     pub(super) async fn execute(
         &self,
         thread_id: ThreadId,
-        arguments: CommandArguments,
+        arguments: atra_protocol::RunnerCommand,
         operation: Option<&OperationContext>,
         updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
-        let runner_name = arguments.runner.clone();
-        let command = arguments.command.clone();
+        let runner_name = arguments.runner().to_owned();
+        let command = arguments.command().to_owned();
         let started_at_ms = checkpoint_time_ms();
-        let runner = self.runners.get(&arguments.runner).await?;
+        let runner = self.runners.get(arguments.runner()).await?;
         let active = self
             .turns
             .get(thread_id)
@@ -1239,7 +1243,7 @@ impl State {
         };
         let started = runner
             .start_command(
-                arguments.command,
+                arguments.command().to_owned(),
                 thread_id,
                 &process_id,
                 Some(execution_context),
@@ -1250,6 +1254,7 @@ impl State {
         send_operation_update(
             operation,
             updates,
+            Some(&runner_name),
             RunnerOperationUpdate::CommandStarted {
                 timer: command_timer_state(&started.timing),
             },
@@ -1275,6 +1280,7 @@ impl State {
                     send_operation_update(
                         operation,
                         updates,
+                        Some(&runner_name),
                         RunnerOperationUpdate::CommandOutput {
                             content: output.content.clone(),
                             omitted_bytes: output.omitted_bytes,

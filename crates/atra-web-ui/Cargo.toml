@@ -8,8 +8,10 @@ publish = false
 
 [dependencies]
 atra-protocol.workspace = true
+atra-patch-types.workspace = true
 ammonia = "4.1.2"
 dioxus = { version = "0.7.10", features = ["web"] }
+console_error_panic_hook.workspace = true
 gloo-net = { version = "0.6.0", features = ["json"] }
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 js-sys = "0.3.83"
@@ -19,6 +21,7 @@ serde_json.workspace = true
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4.56"
 web-sys = { version = "0.3.83", features = [
+    "ErrorEvent",
     "Event",
     "EventSource",
     "HtmlFormElement",
@@ -27,6 +30,7 @@ web-sys = { version = "0.3.83", features = [
     "History",
     "Location",
     "MessageEvent",
+    "PromiseRejectionEvent",
     "Notification",
     "NotificationPermission",
     "Navigator",

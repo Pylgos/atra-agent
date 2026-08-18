@@ -9,7 +9,7 @@ rm -rf "$dist"
 
 (
   cd "$ui"
-  dx build --release
+  dx build --release --debug-symbols false --keep-names
 )
 
 test -f "$dist/index.html"

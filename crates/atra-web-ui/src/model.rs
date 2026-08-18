@@ -181,23 +181,9 @@ pub struct Pin {
     pub thread: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct InboxItem {
-    pub id: String,
-    pub workspace: String,
-    pub workspace_name: String,
-    pub thread: i64,
-    pub thread_name: String,
-    pub kind: String,
-    pub summary: String,
-    pub observed_at_ms: i64,
-    pub read: bool,
-}
-
 pub const THEME_KEY: &str = "atra:theme";
 pub const NOTIFICATIONS_KEY: &str = "atra:notifications";
 pub const PINS_KEY: &str = "atra:pins";
-pub const INBOX_KEY: &str = "atra:inbox";
 pub const LAST_ROUTE_KEY: &str = "atra:last-route";
 pub const NAV_OPEN_KEY: &str = "atra:navigation-open";
 pub const UTILITY_OPEN_KEY: &str = "atra:utility-open";
@@ -234,13 +220,6 @@ pub fn root_id(threads: &[Thread], thread_id: ThreadId) -> ThreadId {
         current = parent;
     }
     current
-}
-
-pub fn child_count(threads: &[Thread], root: ThreadId) -> usize {
-    threads
-        .iter()
-        .filter(|thread| thread.id != root && root_id(threads, thread.id) == root)
-        .count()
 }
 
 pub fn root_threads(controller: &ControllerState) -> Vec<Thread> {
@@ -577,6 +556,7 @@ pub fn render_markdown(source: &str) -> String {
         "h5",
         "h6",
         "hr",
+        "input",
         "li",
         "ol",
         "p",
@@ -595,6 +575,8 @@ pub fn render_markdown(source: &str) -> String {
     let schemes = ["http", "https"].into_iter().collect::<HashSet<_>>();
     ammonia::Builder::new()
         .tags(tags)
+        .add_tag_attributes("input", ["type", "checked", "disabled"])
+        .add_tag_attributes("code", ["class"])
         .url_schemes(schemes)
         .url_relative(ammonia::UrlRelative::Deny)
         .set_tag_attribute_value("a", "target", "_blank")
@@ -643,6 +625,22 @@ mod tests {
         assert!(rendered.contains("href=\"https://example.com\""));
         assert!(rendered.contains("rel=\"noopener noreferrer\""));
         assert!(!rendered.contains("href=\"javascript:"));
+    }
+
+    #[test]
+    fn markdown_preserves_list_structure_and_safe_task_checkboxes() {
+        let rendered = render_markdown("- one\n  - two\n- [x] done\n1. first");
+        assert!(rendered.contains("<ul>"));
+        assert!(rendered.contains("<ol>"));
+        assert!(rendered.contains("<li>"));
+        assert!(rendered.contains("type=\"checkbox\""));
+        assert!(rendered.contains("disabled"));
+    }
+
+    #[test]
+    fn markdown_code_block_keeps_language_class() {
+        let rendered = render_markdown("```bash\necho hello\n```");
+        assert!(rendered.contains("language-bash"), "rendered: {rendered}");
     }
 
     #[test]

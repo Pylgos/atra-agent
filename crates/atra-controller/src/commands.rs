@@ -171,6 +171,16 @@ impl State {
             }
             Command::ApprovalAllow { approval_id } => {
                 let (thread_id, approval) = self.claim_approval(approval_id).await?;
+                persist_public_event(
+                    self,
+                    thread_id,
+                    ThreadEventData::ApprovalDecision(atra_protocol::ApprovalDecisionEvent {
+                        interaction_id: approval_id,
+                        allowed: true,
+                        reason: None,
+                    }),
+                )
+                .await?;
                 self.views
                     .resolve_interaction(thread_id, approval_id)
                     .await?;
@@ -182,6 +192,16 @@ impl State {
                 reason,
             } => {
                 let (thread_id, approval) = self.claim_approval(approval_id).await?;
+                persist_public_event(
+                    self,
+                    thread_id,
+                    ThreadEventData::ApprovalDecision(atra_protocol::ApprovalDecisionEvent {
+                        interaction_id: approval_id,
+                        allowed: false,
+                        reason: reason.clone(),
+                    }),
+                )
+                .await?;
                 self.views
                     .resolve_interaction(thread_id, approval_id)
                     .await?;
@@ -414,6 +434,12 @@ impl State {
                 thread_id,
                 state.handle_started_streaming(request, active, &updates),
                 move |outcome| async move {
+                    persist_public_event(
+                        &publish_state,
+                        thread_id,
+                        ThreadEventData::TurnOutcome(outcome.clone()),
+                    )
+                    .await?;
                     publish_state
                         .views
                         .apply_thread(thread_id, ThreadOperation::TurnFinished { outcome })
@@ -556,6 +582,16 @@ impl TurnProjector {
                 max,
             } => {
                 tracing::debug!(current, max, "model request retrying");
+                persist_public_event(
+                    &self.state,
+                    self.thread_id,
+                    ThreadEventData::Retry(atra_protocol::RetryEvent {
+                        summary: summary.clone(),
+                        current,
+                        max,
+                    }),
+                )
+                .await?;
                 projection.retrying = true;
                 ThreadOperation::RetryScheduled {
                     retry: RetryStatus::new(summary, current, max),
@@ -617,14 +653,15 @@ impl TurnProjector {
                 restore_running_phase(&self.state, self.thread_id, &mut projection).await?;
                 let id = projection.id();
                 projection.tool_calls.insert(item_id.clone(), id);
-                if let Some(call_id) = call_id {
-                    projection.tool_calls.insert(call_id, id);
+                if let Some(call_id) = &call_id {
+                    projection.tool_calls.insert(call_id.clone(), id);
                 }
                 ThreadOperation::ActiveItemAdded {
                     item: ActiveItem::new(
                         id,
                         ActiveItemData::ToolCall {
                             item_id,
+                            call_id,
                             name,
                             input: String::new(),
                         },
@@ -642,6 +679,7 @@ impl TurnProjector {
             ModelStreamEvent::RunnerOperationUpdate {
                 call_id,
                 operation_index,
+                runner,
                 update,
             } => {
                 let key = (call_id.clone(), operation_index);
@@ -656,6 +694,7 @@ impl TurnProjector {
                                 ActiveItemData::RunnerTool {
                                     call_id,
                                     operation_index,
+                                    runner,
                                     update,
                                 },
                             ),
@@ -707,6 +746,24 @@ impl TurnProjector {
             )
             .await
     }
+}
+
+async fn persist_public_event(
+    state: &State,
+    thread_id: atra_protocol::ThreadId,
+    data: ThreadEventData,
+) -> Result<()> {
+    let _mutation = state.lock_mutation().await?;
+    let sequence = state.store.append(thread_id, data.clone()).await?;
+    state
+        .views
+        .apply_thread(
+            thread_id,
+            ThreadOperation::EventAppended {
+                event: ThreadEvent { sequence, data },
+            },
+        )
+        .await
 }
 
 struct TurnProjection {

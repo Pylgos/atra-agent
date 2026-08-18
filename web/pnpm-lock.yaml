@@ -11,6 +11,9 @@ importers:
       '@playwright/test':
         specifier: 1.55.0
         version: 1.55.0
+      prismjs:
+        specifier: 1.30.0
+        version: 1.30.0
 
 packages:
 
@@ -34,6 +37,10 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  prismjs@1.30.0:
+    resolution: {integrity: sha512-DEvV2ZF2r2/63V+tK8hQvrR2ZGn10srHbXviTlcv7Kpzw8jWiNTqbVgjO3IY8RxrrOUF8VPMQQFysYYYv0YZxw==}
+    engines: {node: '>=6'}
+
 snapshots:
 
   '@playwright/test@1.55.0':
@@ -50,3 +57,5 @@ snapshots:
       playwright-core: 1.55.0
     optionalDependencies:
       fsevents: 2.3.2
+
+  prismjs@1.30.0: {}

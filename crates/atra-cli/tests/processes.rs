@@ -264,7 +264,8 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "tool_result",
             "model_request",
             "model_output",
-            "assistant_message"
+            "assistant_message",
+            "turn_outcome"
         ]
     );
     assert_eq!(
@@ -278,6 +279,10 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
         },
         "observed Operation 1 [one] Command:\nmodel-output"
     );
+    assert!(matches!(
+        events[11].data,
+        ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Completed)
+    ));
     let denied_events = system.events(denied_thread).await;
     assert_eq!(
         denied_events
@@ -292,14 +297,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "model_request",
             "model_output",
             "tool_call",
+            "approval_decision",
             "tool_result",
             "model_request",
             "model_output",
             "assistant_message",
+            "turn_outcome",
         ]
     );
     assert_eq!(
-        tool_result(&denied_events[7]),
+        tool_result(&denied_events[8]),
         serde_json::json!(
             "Operation 1 [two] Command:\nuser denied the tool call: not in this environment"
         )
@@ -318,14 +325,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "model_request",
             "model_output",
             "tool_call",
+            "approval_decision",
             "tool_result",
             "model_request",
             "model_output",
             "assistant_message",
+            "turn_outcome",
         ]
     );
     assert_eq!(
-        tool_result(&allowed_events[7]),
+        tool_result(&allowed_events[8]),
         serde_json::json!("Operation 1 [two] Command:\napproved-output")
     );
 }

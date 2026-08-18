@@ -609,40 +609,36 @@ fn runner_tool_lines(
     masked: bool,
     expanded: bool,
 ) -> Vec<(Option<char>, Line<'static>)> {
-    let input = input.lines().collect::<Vec<_>>();
-    let mut index = 0;
-    let mut operation = 0;
+    let Ok(operations) = atra_protocol::parse_command_input(input) else {
+        return vec![(
+            Some('!'),
+            Line::from(Span::styled(
+                "invalid command input",
+                Style::default().fg(Color::Red),
+            )),
+        )];
+    };
     let mut lines = Vec::new();
-    while index < input.len() {
-        if let Some(runner) = input[index].strip_prefix("*** Runner ") {
-            if operation > 0 {
-                lines.push((None, Line::default()));
-            }
-            lines.push((Some('┌'), Line::from(runner.to_owned())));
-            operation += 1;
-            separate_operation(&mut lines, operation);
-            lines.push(runner_operation_header(
-                '◆',
-                operation,
-                "Command",
-                pending_approval == Some(operation),
-            ));
-            index += 1;
-            let end = input[index..]
-                .iter()
-                .position(|line| line.starts_with("*** Runner "))
-                .map_or(input.len(), |offset| index + offset);
-            lines.extend(
-                bash_lines(&input[index..end].join("\n"))
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, line)| ((index == 0).then_some('$'), line)),
-            );
-            index = end;
-            append_runner_result(&mut lines, results.get(&operation), expanded);
-        } else {
-            index += 1;
+    for (index, command) in operations.iter().enumerate() {
+        let operation = index + 1;
+        if index > 0 {
+            lines.push((None, Line::default()));
         }
+        lines.push((Some('┌'), Line::from(command.runner().to_owned())));
+        separate_operation(&mut lines, operation);
+        lines.push(runner_operation_header(
+            '◆',
+            operation,
+            "Command",
+            pending_approval == Some(operation),
+        ));
+        lines.extend(
+            bash_lines(command.command())
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| ((index == 0).then_some('$'), line)),
+        );
+        append_runner_result(&mut lines, results.get(&operation), expanded);
     }
     if masked {
         lines.push((

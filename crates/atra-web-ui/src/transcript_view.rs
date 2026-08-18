@@ -1,24 +1,16 @@
 use std::fmt;
 use std::{borrow::Cow, collections::HashMap};
 
+use crate::model::pretty;
+use atra_patch_types::{
+    ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
+};
 use atra_protocol::{
-    ActiveItemData, ActiveItemId, AssistantMessagePhase, EventSequence, ThreadEvent,
-    ThreadEventData, ThreadState, TodoStatus,
+    ActiveItemData, ActiveItemId, AssistantMessagePhase, CommandExecutionArtifact, EventSequence,
+    RunnerOperationUpdate, ThreadEvent, ThreadEventData, ThreadState, TodoStatus, ToolArtifact,
+    ToolCallEvent,
 };
 use serde_json::Value;
-
-use crate::model::pretty;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ActivityKind {
-    Tool,
-    Search,
-    Reasoning,
-    Commentary,
-    Todo,
-    Skill,
-    Marker,
-}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) struct TurnKey(EventSequence);
@@ -41,12 +33,17 @@ pub(super) enum ActivityKey {
     Tool {
         call: EventSequence,
         result: Option<EventSequence>,
+        identity: Option<String>,
+        approvals: Vec<EventSequence>,
     },
     Todo {
         source: EventSequence,
-        index: usize,
     },
     Active(ActiveItemId),
+    StableActive {
+        id: ActiveItemId,
+        identity: String,
+    },
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -68,9 +65,13 @@ impl fmt::Display for ActivityKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Event(sequence) => write!(formatter, "event-{}", sequence.0),
-            Self::Tool { call, .. } => write!(formatter, "tool-{}", call.0),
-            Self::Todo { source, index } => write!(formatter, "todo-{}-{index}", source.0),
+            Self::Tool { call, identity, .. } => match identity {
+                Some(identity) => write!(formatter, "tool-{identity}"),
+                None => write!(formatter, "tool-{}", call.0),
+            },
+            Self::Todo { source } => write!(formatter, "todo-{}", source.0),
             Self::Active(id) => write!(formatter, "active-{}", id.0),
+            Self::StableActive { identity, .. } => write!(formatter, "tool-{identity}"),
         }
     }
 }
@@ -83,11 +84,74 @@ pub(super) struct TurnRef<'a> {
     prompt_sequence: Option<EventSequence>,
 }
 
-pub(super) struct ActivityDisplay<'a> {
-    pub title: Cow<'a, str>,
-    pub body: Cow<'a, str>,
-    pub kind: ActivityKind,
+pub(super) enum ActivityDisplay<'a> {
+    Commentary {
+        markdown: &'a str,
+    },
+    Todo {
+        items: &'a [atra_protocol::TodoItem],
+    },
+    Reasoning {
+        summary: Cow<'a, str>,
+        active: bool,
+    },
+    Command(CommandDisplay),
+    Search {
+        summary: String,
+        detail: String,
+        active: bool,
+    },
+    Question {
+        summary: String,
+        detail: String,
+    },
+    Approval {
+        allowed: bool,
+        reason: Option<&'a str>,
+    },
+    Retry {
+        summary: &'a str,
+        current: u64,
+        max: u64,
+    },
+    Skill {
+        name: &'a str,
+        path: &'a str,
+    },
+    Compaction,
+    Boundary,
+    Failure {
+        message: &'a str,
+    },
+    Cancelled,
+    Unsupported {
+        summary: String,
+    },
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct CommandDisplay {
+    pub summary: String,
+    pub operations: Vec<CommandOperationDisplay>,
     pub active: bool,
+    pub masked: bool,
+    pub approvals: Vec<CommandApprovalDisplay>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct CommandApprovalDisplay {
+    pub allowed: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct CommandOperationDisplay {
+    pub runner: String,
+    pub command: String,
+    pub output: String,
+    pub status: String,
+    pub omitted_bytes: usize,
+    pub diffs: Vec<String>,
 }
 
 pub(super) fn turn_keys(state: &ThreadState) -> Vec<TurnKey> {
@@ -164,16 +228,40 @@ impl<'a> TurnRef<'a> {
         self.prompt_sequence
     }
 
-    pub fn answer(&self) -> Option<(EventSequence, &'a str)> {
-        self.events()
+    pub fn answer(&self) -> Option<(Option<EventSequence>, &'a str)> {
+        if self.is_last()
+            && let Some(active) = self.state.active_turn()
+            && let Some(content) = active.items().iter().find_map(|item| match item.data() {
+                ActiveItemData::Assistant { content } => Some(content.as_str()),
+                _ => None,
+            })
+        {
+            return Some((None, content));
+        }
+        if let Some(answer) = self
+            .events()
             .iter()
             .rev()
             .find_map(|event| match &event.data {
                 ThreadEventData::AssistantMessage(message)
                     if message.phase != Some(AssistantMessagePhase::Commentary) =>
                 {
-                    Some((event.sequence, message.content.as_str()))
+                    Some((Some(event.sequence), message.content.as_str()))
                 }
+                _ => None,
+            })
+        {
+            return Some(answer);
+        }
+        None
+    }
+
+    pub fn outcome(&self) -> Option<&'a atra_protocol::TurnOutcome> {
+        self.events()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                ThreadEventData::TurnOutcome(outcome) => Some(outcome),
                 _ => None,
             })
     }
@@ -188,10 +276,10 @@ impl<'a> TurnRef<'a> {
                     if message.phase == Some(AssistantMessagePhase::Commentary) =>
                 {
                     activities.push(ActivityKey::Event(event.sequence));
-                    append_todo_keys(&mut activities, event.sequence, message.todos.len());
+                    append_todo_key(&mut activities, event.sequence, &message.todos);
                 }
                 ThreadEventData::AssistantMessage(message) => {
-                    append_todo_keys(&mut activities, event.sequence, message.todos.len());
+                    append_todo_key(&mut activities, event.sequence, &message.todos);
                 }
                 ThreadEventData::ToolCall(call) => {
                     let value = serde_json::to_value(call).unwrap_or(Value::Null);
@@ -199,6 +287,8 @@ impl<'a> TurnRef<'a> {
                     activities.push(ActivityKey::Tool {
                         call: event.sequence,
                         result: None,
+                        identity: call_key(&value),
+                        approvals: Vec::new(),
                     });
                     if let Some(key) = call_key(&value) {
                         pending_tools.insert(key, index);
@@ -218,9 +308,22 @@ impl<'a> TurnRef<'a> {
                 | ThreadEventData::WebSearch(_)
                 | ThreadEventData::SkillInvocation(_)
                 | ThreadEventData::Compaction(_)
-                | ThreadEventData::FrozenBoundary(_) => {
+                | ThreadEventData::FrozenBoundary(_)
+                | ThreadEventData::Retry(_) => {
                     activities.push(ActivityKey::Event(event.sequence));
                 }
+                ThreadEventData::ApprovalDecision(_) => {
+                    if let Some(ActivityKey::Tool { approvals, .. }) = activities
+                        .iter_mut()
+                        .rev()
+                        .find(|key| matches!(key, ActivityKey::Tool { result: None, .. }))
+                    {
+                        approvals.push(event.sequence);
+                    } else {
+                        activities.push(ActivityKey::Event(event.sequence));
+                    }
+                }
+                ThreadEventData::TurnOutcome(_) => {}
                 ThreadEventData::ThreadContext(_)
                 | ThreadEventData::WorkspaceInstructions(_)
                 | ThreadEventData::Skills(_)
@@ -236,12 +339,31 @@ impl<'a> TurnRef<'a> {
         if self.is_last()
             && let Some(active) = self.state.active_turn()
         {
-            activities.extend(
-                active
-                    .items()
-                    .iter()
-                    .map(|item| ActivityKey::Active(item.id())),
-            );
+            for item in active
+                .items()
+                .iter()
+                .filter(|item| !matches!(item.data(), ActiveItemData::Assistant { .. }))
+            {
+                if let ActiveItemData::RunnerTool { call_id, .. } = item.data()
+                    && activities
+                        .iter()
+                        .any(|key| activity_identity(key).as_deref() == Some(call_id))
+                {
+                    continue;
+                }
+                activities.push(match item.data() {
+                    ActiveItemData::ToolCall {
+                        item_id, call_id, ..
+                    } => call_id.clone().or_else(|| Some(item_id.clone())).map_or(
+                        ActivityKey::Active(item.id()),
+                        |identity| ActivityKey::StableActive {
+                            id: item.id(),
+                            identity,
+                        },
+                    ),
+                    _ => ActivityKey::Active(item.id()),
+                });
+            }
         }
 
         activities
@@ -272,232 +394,898 @@ pub(super) fn activity<'a>(
         ActivityKey::Event(sequence) => {
             let event = event(state, *sequence)?;
             match &event.data {
-                ThreadEventData::AssistantMessage(message) => Some(ActivityDisplay {
-                    title: Cow::Borrowed("Commentary"),
-                    body: Cow::Borrowed(&message.content),
-                    kind: ActivityKind::Commentary,
-                    active: false,
-                }),
-                ThreadEventData::ToolResult(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(Value::Null);
-                    Some(ActivityDisplay {
-                        title: Cow::Owned(
-                            value
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Tool result")
-                                .to_owned(),
-                        ),
-                        body: Cow::Owned(pretty(&value)),
-                        kind: ActivityKind::Tool,
+                ThreadEventData::AssistantMessage(message)
+                    if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                {
+                    Some(ActivityDisplay::Commentary {
+                        markdown: &message.content,
+                    })
+                }
+                ThreadEventData::Reasoning(reasoning) => {
+                    reasoning_summary(&reasoning.item).map(|summary| ActivityDisplay::Reasoning {
+                        summary: Cow::Owned(summary),
                         active: false,
                     })
                 }
-                ThreadEventData::Reasoning(reasoning) => Some(ActivityDisplay {
-                    title: Cow::Borrowed("Reasoned"),
-                    body: Cow::Owned(pretty(&reasoning.item)),
-                    kind: ActivityKind::Reasoning,
-                    active: false,
+                ThreadEventData::WebSearch(search) => {
+                    let (summary, detail) = search_display(&search.item);
+                    Some(ActivityDisplay::Search {
+                        summary,
+                        detail,
+                        active: false,
+                    })
+                }
+                ThreadEventData::SkillInvocation(skill) => Some(ActivityDisplay::Skill {
+                    name: &skill.name,
+                    path: &skill.path,
                 }),
-                ThreadEventData::WebSearch(search) => Some(ActivityDisplay {
-                    title: Cow::Borrowed("Web search"),
-                    body: Cow::Owned(pretty(&search.item)),
-                    kind: ActivityKind::Search,
-                    active: false,
+                ThreadEventData::Compaction(_) => Some(ActivityDisplay::Compaction),
+                ThreadEventData::FrozenBoundary(_) => Some(ActivityDisplay::Boundary),
+                ThreadEventData::ApprovalDecision(decision) => Some(ActivityDisplay::Approval {
+                    allowed: decision.allowed,
+                    reason: decision.reason.as_deref(),
                 }),
-                ThreadEventData::SkillInvocation(skill) => Some(ActivityDisplay {
-                    title: Cow::Owned(format!("Skill · {}", skill.name)),
-                    body: Cow::Borrowed(&skill.path),
-                    kind: ActivityKind::Skill,
-                    active: false,
+                ThreadEventData::Retry(retry) => Some(ActivityDisplay::Retry {
+                    summary: &retry.summary,
+                    current: retry.current,
+                    max: retry.max,
                 }),
-                ThreadEventData::Compaction(_) => Some(ActivityDisplay {
-                    title: Cow::Borrowed("History compacted"),
-                    body: Cow::Borrowed(""),
-                    kind: ActivityKind::Marker,
-                    active: false,
-                }),
-                ThreadEventData::FrozenBoundary(_) => Some(ActivityDisplay {
-                    title: Cow::Borrowed("History boundary"),
-                    body: Cow::Borrowed(""),
-                    kind: ActivityKind::Marker,
-                    active: false,
+                ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Failed { message }) => {
+                    Some(ActivityDisplay::Failure { message })
+                }
+                ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Cancelled) => {
+                    Some(ActivityDisplay::Cancelled)
+                }
+                ThreadEventData::ToolResult(_) => Some(ActivityDisplay::Unsupported {
+                    summary: "Unmatched tool result".to_owned(),
                 }),
                 _ => None,
             }
         }
-        ActivityKey::Tool { call, result } => {
-            let call = event(state, *call)?;
-            let ThreadEventData::ToolCall(call) = &call.data else {
-                return None;
+        ActivityKey::Tool {
+            call,
+            result,
+            identity,
+            approvals,
+        } => {
+            let call = match &event(state, *call)?.data {
+                ThreadEventData::ToolCall(call) => call,
+                _ => return None,
             };
-            let value = serde_json::to_value(call).unwrap_or(Value::Null);
-            let mut body = pretty(&value);
-            if let Some(result) = result.and_then(|sequence| event(state, sequence))
-                && let ThreadEventData::ToolResult(result) = &result.data
-            {
-                let value = serde_json::to_value(result).unwrap_or(Value::Null);
-                let visible = value
-                    .get("masked_result")
-                    .filter(|value| !value.is_null())
-                    .or_else(|| value.get("result"))
-                    .unwrap_or(&value);
-                body.push_str("\n\nResult\n");
-                body.push_str(&pretty(visible));
+            let result = result
+                .and_then(|sequence| event(state, sequence))
+                .and_then(|event| match &event.data {
+                    ThreadEventData::ToolResult(result) => Some(result),
+                    _ => None,
+                });
+            let name = tool_call_name(call);
+            match canonical_tool_name(name) {
+                "command" => Some(ActivityDisplay::Command(command_display(
+                    state,
+                    call,
+                    result,
+                    identity.as_deref(),
+                    approvals,
+                ))),
+                "question" => Some(question_display(call, result)),
+                _ => Some(ActivityDisplay::Unsupported {
+                    summary: tool_summary(call),
+                }),
             }
-            Some(ActivityDisplay {
-                title: Cow::Owned(
-                    value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Tool")
-                        .to_owned(),
-                ),
-                body: Cow::Owned(body),
-                kind: ActivityKind::Tool,
-                active: false,
-            })
-        }
-        ActivityKey::Todo { source, index } => {
-            let event = event(state, *source)?;
-            let ThreadEventData::AssistantMessage(message) = &event.data else {
-                return None;
-            };
-            let todo = message.todos.get(*index)?;
-            Some(ActivityDisplay {
-                title: Cow::Owned(format!(
-                    "Todo · {}",
-                    match todo.status {
-                        TodoStatus::Pending => "Pending",
-                        TodoStatus::InProgress => "In progress",
-                        TodoStatus::Completed => "Completed",
-                    }
-                )),
-                body: Cow::Borrowed(&todo.step),
-                kind: ActivityKind::Todo,
-                active: false,
-            })
-        }
-        ActivityKey::Active(id) => {
-            let item = state
-                .active_turn()?
-                .items()
-                .iter()
-                .find(|item| item.id() == *id)?;
-            let (title, body, kind) = match item.data() {
-                ActiveItemData::Assistant { content } => (
-                    Cow::Borrowed("Assistant response"),
-                    Cow::Borrowed(content.as_str()),
-                    ActivityKind::Commentary,
-                ),
-                ActiveItemData::Reasoning { content } => (
-                    Cow::Borrowed("Reasoning"),
-                    Cow::Borrowed(content.as_str()),
-                    ActivityKind::Reasoning,
-                ),
-                ActiveItemData::WebSearch { action, .. } => (
-                    Cow::Borrowed("Web search"),
-                    action
-                        .as_ref()
-                        .map(|action| Cow::Owned(pretty(action)))
-                        .unwrap_or_else(|| Cow::Borrowed("Searching…")),
-                    ActivityKind::Search,
-                ),
-                ActiveItemData::ToolCall { name, input, .. } => (
-                    Cow::Borrowed(name.as_str()),
-                    Cow::Borrowed(input.as_str()),
-                    ActivityKind::Tool,
-                ),
-                ActiveItemData::RunnerTool { update, .. } => (
-                    Cow::Borrowed("Runner operation"),
-                    Cow::Owned(pretty(update)),
-                    ActivityKind::Tool,
-                ),
-            };
-            Some(ActivityDisplay {
-                title,
-                body,
-                kind,
-                active: true,
-            })
-        }
-    }
-}
-
-pub(super) fn activity_summary(state: &ThreadState, keys: &[ActivityKey]) -> String {
-    let mut tools = 0;
-    let mut searches = 0;
-    let mut reasoning = 0;
-    let mut other = 0;
-    for key in keys {
-        if let Some(kind) = activity_kind(state, key) {
-            match kind {
-                ActivityKind::Tool => tools += 1,
-                ActivityKind::Search => searches += 1,
-                ActivityKind::Reasoning => reasoning += 1,
-                ActivityKind::Commentary
-                | ActivityKind::Todo
-                | ActivityKind::Skill
-                | ActivityKind::Marker => other += 1,
-            }
-        }
-    }
-    let mut parts = Vec::new();
-    if tools > 0 {
-        parts.push(format!("{tools} tool{}", if tools == 1 { "" } else { "s" }));
-    }
-    if searches > 0 {
-        parts.push(format!(
-            "{searches} search{}",
-            if searches == 1 { "" } else { "es" }
-        ));
-    }
-    if reasoning > 0 {
-        parts.push("Reasoned".to_owned());
-    }
-    if other > 0 {
-        parts.push(format!(
-            "{other} update{}",
-            if other == 1 { "" } else { "s" }
-        ));
-    }
-    if parts.is_empty() {
-        "No activity".to_owned()
-    } else {
-        parts.join(" · ")
-    }
-}
-
-fn activity_kind(state: &ThreadState, key: &ActivityKey) -> Option<ActivityKind> {
-    match key {
-        ActivityKey::Event(sequence) => match &event(state, *sequence)?.data {
-            ThreadEventData::AssistantMessage(_) => Some(ActivityKind::Commentary),
-            ThreadEventData::ToolResult(_) => Some(ActivityKind::Tool),
-            ThreadEventData::Reasoning(_) => Some(ActivityKind::Reasoning),
-            ThreadEventData::WebSearch(_) => Some(ActivityKind::Search),
-            ThreadEventData::SkillInvocation(_) => Some(ActivityKind::Skill),
-            ThreadEventData::Compaction(_) | ThreadEventData::FrozenBoundary(_) => {
-                Some(ActivityKind::Marker)
-            }
-            _ => None,
-        },
-        ActivityKey::Tool { .. } => Some(ActivityKind::Tool),
-        ActivityKey::Todo { .. } => Some(ActivityKind::Todo),
-        ActivityKey::Active(id) => {
-            let item = state
-                .active_turn()?
-                .items()
-                .iter()
-                .find(|item| item.id() == *id)?;
-            Some(match item.data() {
-                ActiveItemData::Assistant { .. } => ActivityKind::Commentary,
-                ActiveItemData::Reasoning { .. } => ActivityKind::Reasoning,
-                ActiveItemData::WebSearch { .. } => ActivityKind::Search,
-                ActiveItemData::ToolCall { .. } | ActiveItemData::RunnerTool { .. } => {
-                    ActivityKind::Tool
+            .map(|view| {
+                if approvals.is_empty() {
+                    view
+                } else {
+                    // Approval decisions are rendered by the command view from the same ToolCall.
+                    view
                 }
             })
         }
+        ActivityKey::Todo { source } => {
+            let message = match &event(state, *source)?.data {
+                ThreadEventData::AssistantMessage(message) => message,
+                _ => return None,
+            };
+            (!message.todos.is_empty()).then_some(ActivityDisplay::Todo {
+                items: &message.todos,
+            })
+        }
+        ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
+            let item = state
+                .active_turn()?
+                .items()
+                .iter()
+                .find(|item| item.id() == *id)?;
+            match item.data() {
+                ActiveItemData::Reasoning { content } => Some(ActivityDisplay::Reasoning {
+                    summary: Cow::Borrowed(content),
+                    active: true,
+                }),
+                ActiveItemData::ToolCall {
+                    name,
+                    input,
+                    call_id,
+                    item_id,
+                } => match canonical_tool_name(name) {
+                    "command" => {
+                        let call = ToolCallEvent::Custom {
+                            call_type: atra_protocol::CustomToolType::Custom,
+                            item_id: Some(item_id.clone()),
+                            name: name.clone(),
+                            input: input.clone(),
+                            call_id: call_id.clone().unwrap_or_else(|| item_id.clone()),
+                        };
+                        Some(ActivityDisplay::Command(command_display(
+                            state,
+                            &call,
+                            None,
+                            call_id.as_deref().or(Some(item_id)),
+                            &[],
+                        )))
+                    }
+                    "question" => Some(active_question_display(input)),
+                    _ => Some(ActivityDisplay::Unsupported {
+                        summary: meaningful_text(input)
+                            .unwrap_or_else(|| canonical_tool_name(name).to_owned()),
+                    }),
+                },
+                ActiveItemData::WebSearch { action, .. } => {
+                    let (summary, detail) = action
+                        .as_ref()
+                        .map(search_display)
+                        .unwrap_or_else(|| ("Searching…".to_owned(), String::new()));
+                    Some(ActivityDisplay::Search {
+                        summary,
+                        detail,
+                        active: true,
+                    })
+                }
+                ActiveItemData::RunnerTool { runner, update, .. } => {
+                    Some(orphan_runner_display(runner.as_deref(), update))
+                }
+                ActiveItemData::Assistant { content } => {
+                    Some(ActivityDisplay::Commentary { markdown: content })
+                }
+            }
+        }
+    }
+}
+
+fn canonical_tool_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+fn tool_call_name(call: &ToolCallEvent) -> &str {
+    match call {
+        ToolCallEvent::Custom { name, .. } | ToolCallEvent::Function { name, .. } => name,
+    }
+}
+
+fn tool_call_input(call: &ToolCallEvent) -> String {
+    match call {
+        ToolCallEvent::Custom { input, .. } => input.clone(),
+        ToolCallEvent::Function { arguments, .. } => arguments
+            .get("input")
+            .or_else(|| arguments.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+    }
+}
+
+fn tool_summary(call: &ToolCallEvent) -> String {
+    let name = canonical_tool_name(tool_call_name(call));
+    let input = tool_call_input(call);
+    meaningful_text(&input)
+        .map(|text| format!("{name}: {text}"))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+fn meaningful_text(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+fn reasoning_summary(item: &Value) -> Option<String> {
+    let parts = item.pointer("/summary")?.as_array()?;
+    let summary = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn search_display(item: &Value) -> (String, String) {
+    let query = item
+        .get("query")
+        .or_else(|| item.pointer("/action/query"))
+        .or_else(|| item.get("url"))
+        .and_then(Value::as_str);
+    let action = item
+        .get("type")
+        .or_else(|| item.get("action"))
+        .and_then(Value::as_str);
+    let summary = match (action, query) {
+        (Some(action), Some(query)) => format!("{action}: {query}"),
+        (None, Some(query)) => query.to_owned(),
+        (Some(action), None) => action.replace('_', " "),
+        (None, None) => "Searching…".to_owned(),
+    };
+    let detail = item
+        .get("results")
+        .or_else(|| item.get("result"))
+        .map(search_results_detail)
+        .unwrap_or_default();
+    (summary, detail)
+}
+
+fn search_results_detail(value: &Value) -> String {
+    let results = value.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    results
+        .iter()
+        .filter_map(|result| {
+            let title = result
+                .get("title")
+                .or_else(|| result.get("name"))
+                .and_then(Value::as_str);
+            let url = result.get("url").and_then(Value::as_str);
+            let snippet = result
+                .get("snippet")
+                .or_else(|| result.get("text"))
+                .and_then(Value::as_str);
+            if title.is_none() && url.is_none() && snippet.is_none() {
+                return None;
+            }
+            Some(
+                [title, url, snippet]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn question_display(
+    call: &ToolCallEvent,
+    result: Option<&atra_protocol::ToolResultEvent>,
+) -> ActivityDisplay<'static> {
+    let arguments = match call {
+        ToolCallEvent::Custom { input, .. } => serde_json::from_str(input).unwrap_or(Value::Null),
+        ToolCallEvent::Function { arguments, .. } => arguments.clone(),
+    };
+    let summary = arguments
+        .pointer("/questions/0/question")
+        .and_then(Value::as_str)
+        .unwrap_or("A question was asked")
+        .to_owned();
+    let mut detail = question_detail(&arguments);
+    if let Some(result) = result {
+        let value = tool_result_value(result);
+        if !detail.is_empty() {
+            detail.push_str("\n\n");
+        }
+        detail.push_str("Answer\n");
+        detail.push_str(&question_answer_detail(value));
+    }
+    ActivityDisplay::Question { summary, detail }
+}
+
+fn active_question_display(input: &str) -> ActivityDisplay<'static> {
+    let arguments = serde_json::from_str(input).unwrap_or(Value::Null);
+    let summary = arguments
+        .pointer("/questions/0/question")
+        .and_then(Value::as_str)
+        .unwrap_or("Preparing a question…")
+        .to_owned();
+    ActivityDisplay::Question {
+        summary,
+        detail: question_detail(&arguments),
+    }
+}
+
+fn question_detail(arguments: &Value) -> String {
+    arguments
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, question)| {
+            let prompt = question
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("label").and_then(Value::as_str))
+                .map(|label| format!("  • {label}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}. {prompt}\n{options}", index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn question_answer_detail(value: &Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|answer| {
+            let selected = answer
+                .get("selected_option")
+                .and_then(Value::as_str)
+                .unwrap_or("No listed option");
+            let note = answer
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if note.is_empty() {
+                selected.to_owned()
+            } else {
+                format!("{selected} — {note}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_result_value(result: &atra_protocol::ToolResultEvent) -> &Value {
+    match result {
+        atra_protocol::ToolResultEvent::Custom { result, .. }
+        | atra_protocol::ToolResultEvent::Function { result, .. } => result,
+    }
+}
+
+fn command_display(
+    state: &ThreadState,
+    call: &ToolCallEvent,
+    result: Option<&atra_protocol::ToolResultEvent>,
+    identity: Option<&str>,
+    approvals: &[EventSequence],
+) -> CommandDisplay {
+    let input = tool_call_input(call);
+    let parsed = atra_protocol::parse_command_input(&input).unwrap_or_else(|_| {
+        vec![atra_protocol::RunnerCommand::from_parts(
+            "unknown".to_owned(),
+            input.clone(),
+        )]
+    });
+    let mut operations = parsed
+        .into_iter()
+        .map(|operation| CommandOperationDisplay {
+            runner: operation.runner().to_owned(),
+            command: operation.command().to_owned(),
+            output: String::new(),
+            status: "queued".to_owned(),
+            omitted_bytes: 0,
+            diffs: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(result) = result {
+        for artifact in tool_result_artifacts(result) {
+            apply_command_artifact(artifact, &mut operations);
+        }
+    }
+
+    let mut active = false;
+    if let Some(identity) = identity
+        && let Some(turn) = state.active_turn()
+    {
+        for item in turn.items() {
+            let ActiveItemData::RunnerTool {
+                call_id,
+                operation_index,
+                runner,
+                update,
+            } = item.data()
+            else {
+                continue;
+            };
+            if call_id != identity {
+                continue;
+            }
+            active = true;
+            let index = operation_index.saturating_sub(1);
+            if let Some(operation) = operations.get_mut(index) {
+                if let Some(runner) = runner {
+                    operation.runner.clone_from(runner);
+                }
+                apply_runner_update(update, operation);
+            }
+        }
+    }
+
+    let summary = operations
+        .first()
+        .map(|operation| {
+            let command =
+                meaningful_text(&operation.command).unwrap_or_else(|| "command".to_owned());
+            let more = operations.len().saturating_sub(1);
+            if more == 0 {
+                format!("{command} — {}", operation.runner)
+            } else {
+                format!("{command} — {} · +{more}", operation.runner)
+            }
+        })
+        .unwrap_or_else(|| "Invalid command input".to_owned());
+    let masked = result.is_some_and(|result| tool_result_masked(result));
+    let approvals = approvals
+        .iter()
+        .filter_map(|sequence| match &event(state, *sequence)?.data {
+            ThreadEventData::ApprovalDecision(decision) => Some(CommandApprovalDisplay {
+                allowed: decision.allowed,
+                reason: decision.reason.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    CommandDisplay {
+        summary,
+        operations,
+        active,
+        masked,
+        approvals,
+    }
+}
+
+fn tool_result_artifacts(result: &atra_protocol::ToolResultEvent) -> &[ToolArtifact] {
+    match result {
+        atra_protocol::ToolResultEvent::Custom { artifacts, .. }
+        | atra_protocol::ToolResultEvent::Function { artifacts, .. } => artifacts,
+    }
+}
+
+fn tool_result_masked(result: &atra_protocol::ToolResultEvent) -> bool {
+    match result {
+        atra_protocol::ToolResultEvent::Custom {
+            result,
+            masked_result,
+            ..
+        }
+        | atra_protocol::ToolResultEvent::Function {
+            result,
+            masked_result,
+            ..
+        } => masked_result
+            .as_ref()
+            .is_some_and(|masked| masked != result),
+    }
+}
+
+fn apply_runner_update(update: &RunnerOperationUpdate, operation: &mut CommandOperationDisplay) {
+    match update {
+        RunnerOperationUpdate::CommandStarted { timer } => {
+            operation.status = format!(
+                "running · {}ms elapsed · {}ms until detach",
+                timer.elapsed_ms, timer.remaining_ms
+            );
+        }
+        RunnerOperationUpdate::CommandOutput {
+            content,
+            omitted_bytes,
+            timer,
+        } => {
+            operation.output = strip_ansi(content);
+            operation.omitted_bytes = *omitted_bytes;
+            operation.status = format!(
+                "running · {}ms elapsed · {}ms until detach",
+                timer.elapsed_ms, timer.remaining_ms
+            );
+        }
+        RunnerOperationUpdate::Completed { artifact } => {
+            apply_operation_artifact(artifact, operation);
+        }
+    }
+}
+
+fn apply_command_artifact(artifact: &ToolArtifact, operations: &mut [CommandOperationDisplay]) {
+    match artifact {
+        ToolArtifact::RunnerOperation(runner) => {
+            let index = runner.operation.saturating_sub(1);
+            if let Some(operation) = operations.get_mut(index) {
+                operation.runner.clone_from(&runner.runner);
+                operation.status = runner.label.clone();
+                if let Some(result) = runner.result.as_str() {
+                    operation.output = strip_ansi(result);
+                }
+                for artifact in &runner.artifacts {
+                    apply_operation_artifact(artifact, operation);
+                }
+            }
+        }
+        artifact if operations.len() == 1 => {
+            apply_operation_artifact(artifact, &mut operations[0]);
+        }
+        _ => {}
+    }
+}
+
+fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOperationDisplay) {
+    match artifact {
+        ToolArtifact::CommandExecution(CommandExecutionArtifact::Started { runner }) => {
+            operation.runner.clone_from(runner);
+            operation.status = "running".to_owned();
+        }
+        ToolArtifact::CommandExecution(CommandExecutionArtifact::Running {
+            output,
+            runner,
+            ..
+        }) => {
+            operation.runner.clone_from(runner);
+            operation.output = strip_ansi(output);
+            operation.status = "running".to_owned();
+        }
+        ToolArtifact::CommandExecution(CommandExecutionArtifact::Finished {
+            output,
+            exit_code,
+            runner,
+            ..
+        }) => {
+            operation.runner.clone_from(runner);
+            operation.output = strip_ansi(output);
+            operation.status = exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "finished".to_owned());
+        }
+        ToolArtifact::PatchOperations(patch) => {
+            let mut diff = String::new();
+            format_apply_patch(patch, &mut diff);
+            if !diff.is_empty() {
+                operation.diffs.push(diff);
+            }
+        }
+        ToolArtifact::RunnerOperation(runner) => {
+            operation.runner.clone_from(&runner.runner);
+            operation.status = runner.label.clone();
+            if let Some(result) = runner.result.as_str() {
+                operation.output = strip_ansi(result);
+            }
+            for artifact in &runner.artifacts {
+                apply_operation_artifact(artifact, operation);
+            }
+        }
+    }
+}
+
+fn format_apply_patch(patch: &ApplyPatchResult, output: &mut String) {
+    match patch {
+        ApplyPatchResult::ParseError { error } => {
+            output.push_str("Patch parse error: ");
+            output.push_str(error);
+            output.push('\n');
+        }
+        ApplyPatchResult::Operations { results } => {
+            for result in results {
+                format_patch_operation(result, output);
+            }
+        }
+    }
+}
+
+fn orphan_runner_display(
+    runner: Option<&str>,
+    update: &RunnerOperationUpdate,
+) -> ActivityDisplay<'static> {
+    let mut operation = CommandOperationDisplay {
+        runner: runner.unwrap_or("unknown").to_owned(),
+        command: String::new(),
+        output: String::new(),
+        status: "running".to_owned(),
+        omitted_bytes: 0,
+        diffs: Vec::new(),
+    };
+    apply_runner_update(update, &mut operation);
+    ActivityDisplay::Command(CommandDisplay {
+        summary: format!("{} — {}", operation.status, operation.runner),
+        operations: vec![operation],
+        active: true,
+        masked: false,
+        approvals: Vec::new(),
+    })
+}
+
+pub(super) fn activity_summary(state: &ThreadState, keys: &[ActivityKey]) -> String {
+    // While a turn is active, surface the current activity's summary for context.
+    if let Some((summary, _)) = keys
+        .iter()
+        .filter_map(|key| activity_header(state, key))
+        .find(|(_, active)| *active)
+    {
+        return summary;
+    }
+    // Completed turns collapse to a structural summary of what happened.
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for key in keys {
+        let label = activity_type_label(state, key);
+        match counts.iter_mut().find(|(existing, _)| *existing == label) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return "No activity".to_owned();
+    }
+    counts
+        .iter()
+        .map(|(label, count)| format_activity_count(label, *count))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn activity_type_label(state: &ThreadState, key: &ActivityKey) -> &'static str {
+    match key {
+        ActivityKey::Event(sequence) => {
+            let Some(event) = event(state, *sequence) else {
+                return "activity";
+            };
+            match &event.data {
+                ThreadEventData::AssistantMessage(message)
+                    if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                {
+                    "update"
+                }
+                ThreadEventData::Reasoning(_) => "reasoning",
+                ThreadEventData::WebSearch(_) => "search",
+                ThreadEventData::SkillInvocation(_) => "skill",
+                ThreadEventData::Compaction(_) => "compaction",
+                ThreadEventData::FrozenBoundary(_) => "boundary",
+                ThreadEventData::Retry(_) => "retry",
+                ThreadEventData::ApprovalDecision(_) => "approval",
+                ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Failed { .. }) => {
+                    "failure"
+                }
+                ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Cancelled) => "cancelled",
+                _ => "activity",
+            }
+        }
+        ActivityKey::Tool { call, .. } => {
+            let Some(call) = event(state, *call).and_then(|event| match &event.data {
+                ThreadEventData::ToolCall(call) => Some(call),
+                _ => None,
+            }) else {
+                return "activity";
+            };
+            match canonical_tool_name(tool_call_name(call)) {
+                "command" => "command",
+                "question" => "question",
+                _ => "tool",
+            }
+        }
+        ActivityKey::Todo { .. } => "todo",
+        ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
+            let Some(item) = state
+                .active_turn()
+                .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))
+            else {
+                return "activity";
+            };
+            match item.data() {
+                ActiveItemData::Reasoning { .. } => "reasoning",
+                ActiveItemData::ToolCall { name, .. } => match canonical_tool_name(name) {
+                    "command" => "command",
+                    "question" => "question",
+                    _ => "tool",
+                },
+                ActiveItemData::WebSearch { .. } => "search",
+                ActiveItemData::RunnerTool { .. } => "command",
+                ActiveItemData::Assistant { .. } => "update",
+            }
+        }
+    }
+}
+
+fn format_activity_count(label: &str, count: usize) -> String {
+    let plural = match label {
+        "command" => "commands",
+        "search" => "searches",
+        "todo" => "todos",
+        "update" => "updates",
+        "question" => "questions",
+        "approval" => "approvals",
+        "retry" => "retries",
+        "skill" => "skills",
+        "boundary" => "boundaries",
+        "failure" => "failures",
+        _ => label,
+    };
+    if count == 1 {
+        format!("1 {label}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bool)> {
+    match key {
+        ActivityKey::Event(sequence) => match &event(state, *sequence)?.data {
+            ThreadEventData::AssistantMessage(message)
+                if message.phase == Some(AssistantMessagePhase::Commentary) =>
+            {
+                Some((
+                    meaningful_text(&message.content).unwrap_or_else(|| "Update".to_owned()),
+                    false,
+                ))
+            }
+            ThreadEventData::Reasoning(reasoning) => {
+                reasoning_summary(&reasoning.item).map(|summary| {
+                    (
+                        meaningful_text(&summary).unwrap_or_else(|| "Thinking…".to_owned()),
+                        false,
+                    )
+                })
+            }
+            ThreadEventData::WebSearch(search) => {
+                let (summary, _) = search_display(&search.item);
+                Some((summary, false))
+            }
+            ThreadEventData::SkillInvocation(skill) => {
+                Some((format!("{} — {}", skill.name, skill.path), false))
+            }
+            ThreadEventData::Compaction(_) => {
+                Some(("Compacting conversation history".to_owned(), false))
+            }
+            ThreadEventData::FrozenBoundary(_) => {
+                Some(("Older context compacted".to_owned(), false))
+            }
+            ThreadEventData::Retry(retry) => Some((
+                format!(
+                    "{} · attempt {}/{}",
+                    retry.summary, retry.current, retry.max
+                ),
+                false,
+            )),
+            ThreadEventData::ApprovalDecision(decision) => Some((
+                if decision.allowed {
+                    "Approved".to_owned()
+                } else {
+                    decision
+                        .reason
+                        .as_deref()
+                        .map(|reason| format!("Denied — {reason}"))
+                        .unwrap_or_else(|| "Denied".to_owned())
+                },
+                false,
+            )),
+            _ => None,
+        },
+        ActivityKey::Tool { call, identity, .. } => {
+            let call = match &event(state, *call)?.data {
+                ThreadEventData::ToolCall(call) => call,
+                _ => return None,
+            };
+            let active = identity.as_deref().is_some_and(|identity| {
+                state.active_turn().is_some_and(|turn| {
+                    turn.items().iter().any(|item| {
+                        matches!(
+                            item.data(),
+                            ActiveItemData::RunnerTool { call_id, .. } if call_id == identity
+                        )
+                    })
+                })
+            });
+            Some((
+                if canonical_tool_name(tool_call_name(call)) == "command" {
+                    command_input_summary(&tool_call_input(call))
+                } else if canonical_tool_name(tool_call_name(call)) == "question" {
+                    match question_display(call, None) {
+                        ActivityDisplay::Question { summary, .. } => summary,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    tool_summary(call)
+                },
+                active,
+            ))
+        }
+        ActivityKey::Todo { source } => {
+            let message = match &event(state, *source)?.data {
+                ThreadEventData::AssistantMessage(message) => message,
+                _ => return None,
+            };
+            let completed = message
+                .todos
+                .iter()
+                .filter(|item| matches!(item.status, TodoStatus::Completed))
+                .count();
+            let current = message
+                .todos
+                .iter()
+                .find(|item| matches!(item.status, TodoStatus::InProgress))
+                .or_else(|| {
+                    message
+                        .todos
+                        .iter()
+                        .find(|item| matches!(item.status, TodoStatus::Pending))
+                })
+                .map(|item| item.step.as_str())
+                .unwrap_or("Plan complete");
+            Some((
+                format!("{current} · {completed}/{}", message.todos.len()),
+                false,
+            ))
+        }
+        ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
+            let item = state
+                .active_turn()?
+                .items()
+                .iter()
+                .find(|item| item.id() == *id)?;
+            match item.data() {
+                ActiveItemData::Reasoning { content } => Some((
+                    meaningful_text(content).unwrap_or_else(|| "Thinking…".to_owned()),
+                    true,
+                )),
+                ActiveItemData::ToolCall { name, input, .. }
+                    if canonical_tool_name(name) == "command" =>
+                {
+                    Some((command_input_summary(input), true))
+                }
+                ActiveItemData::ToolCall { name, input, .. }
+                    if canonical_tool_name(name) == "question" =>
+                {
+                    let summary = match active_question_display(input) {
+                        ActivityDisplay::Question { summary, .. } => summary,
+                        _ => unreachable!(),
+                    };
+                    Some((summary, true))
+                }
+                ActiveItemData::ToolCall { name, input, .. } => Some((
+                    meaningful_text(input).unwrap_or_else(|| canonical_tool_name(name).to_owned()),
+                    true,
+                )),
+                ActiveItemData::WebSearch { action, .. } => Some((
+                    action
+                        .as_ref()
+                        .map(search_display)
+                        .map(|(summary, _)| summary)
+                        .unwrap_or_else(|| "Searching…".to_owned()),
+                    true,
+                )),
+                ActiveItemData::RunnerTool { runner, .. } => Some((
+                    runner
+                        .as_deref()
+                        .map(|runner| format!("Running on {runner}"))
+                        .unwrap_or_else(|| "Running…".to_owned()),
+                    true,
+                )),
+                ActiveItemData::Assistant { content } => Some((
+                    meaningful_text(content).unwrap_or_else(|| "Writing…".to_owned()),
+                    true,
+                )),
+            }
+        }
+    }
+}
+
+fn command_input_summary(input: &str) -> String {
+    let Ok(operations) = atra_protocol::parse_command_input(input) else {
+        return meaningful_text(input).unwrap_or_else(|| "Preparing command…".to_owned());
+    };
+    let Some(operation) = operations.first() else {
+        return "Preparing command…".to_owned();
+    };
+    let command =
+        meaningful_text(operation.command()).unwrap_or_else(|| "Preparing command…".to_owned());
+    let more = operations.len().saturating_sub(1);
+    if more == 0 {
+        format!("{command} — {}", operation.runner())
+    } else {
+        format!("{command} — {} · +{more}", operation.runner())
     }
 }
 
@@ -512,8 +1300,14 @@ fn event_index(state: &ThreadState, sequence: EventSequence) -> Option<usize> {
         .ok()
 }
 
-fn append_todo_keys(keys: &mut Vec<ActivityKey>, source: EventSequence, count: usize) {
-    keys.extend((0..count).map(|index| ActivityKey::Todo { source, index }));
+fn append_todo_key(
+    keys: &mut Vec<ActivityKey>,
+    source: EventSequence,
+    todos: &[atra_protocol::TodoItem],
+) {
+    if !todos.is_empty() {
+        keys.push(ActivityKey::Todo { source });
+    }
 }
 
 fn call_key(value: &Value) -> Option<String> {
@@ -522,6 +1316,85 @@ fn call_key(value: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| value.get("item_id").and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
+    match key {
+        ActivityKey::Tool { identity, .. } => identity.clone(),
+        ActivityKey::StableActive { identity, .. } => Some(identity.clone()),
+        _ => None,
+    }
+}
+
+fn format_patch_operation(result: &PatchOperationResult, output: &mut String) {
+    let outcome = match result {
+        PatchOperationResult::Added { outcome, .. }
+        | PatchOperationResult::Deleted { outcome, .. }
+        | PatchOperationResult::Updated { outcome, .. }
+        | PatchOperationResult::Moved { outcome, .. } => outcome,
+    };
+    match outcome {
+        PatchOperationOutcome::Applied { diff: Ok(diff) } => format_file_diff(diff, output),
+        PatchOperationOutcome::Applied { diff: Err(error) }
+        | PatchOperationOutcome::Failed { error } => {
+            output.push_str("Patch failed: ");
+            output.push_str(error);
+            output.push('\n');
+        }
+    }
+}
+
+fn format_file_diff(diff: &FileDiff, output: &mut String) {
+    output.push_str("--- ");
+    output.push_str(
+        &diff
+            .old_path
+            .as_ref()
+            .map(|path| format!("a/{}", path.display()))
+            .unwrap_or_else(|| "/dev/null".to_owned()),
+    );
+    output.push_str("\n+++ ");
+    output.push_str(
+        &diff
+            .new_path
+            .as_ref()
+            .map(|path| format!("b/{}", path.display()))
+            .unwrap_or_else(|| "/dev/null".to_owned()),
+    );
+    output.push('\n');
+    for hunk in &diff.hunks {
+        output.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+        ));
+        for line in &hunk.lines {
+            output.push(match line.kind {
+                DiffLineKind::Context => ' ',
+                DiffLineKind::Added => '+',
+                DiffLineKind::Removed => '-',
+            });
+            output.push_str(&line.text);
+            output.push('\n');
+        }
+    }
+}
+
+fn strip_ansi(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        } else if !character.is_control() || matches!(character, '\n' | '\r' | '\t') {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn is_turn_boundary(data: &ThreadEventData) -> bool {
@@ -534,8 +1407,11 @@ fn is_turn_boundary(data: &ThreadEventData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atra_protocol::{ActiveItem, ThreadOperation, TurnPhase};
+    use atra_protocol::{
+        ActiveItem, CommandTimerState, RunnerOperationUpdate, ThreadOperation, TurnPhase,
+    };
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn event(sequence: i64, kind: &str, payload: Value) -> ThreadEvent {
         serde_json::from_value(json!({
@@ -590,14 +1466,13 @@ mod tests {
         );
         let first = turn(&state, TurnKey(EventSequence(1))).unwrap();
         assert_eq!(first.prompt(), "first");
-        assert_eq!(first.answer(), Some((EventSequence(3), "answer")));
+        assert_eq!(first.answer(), Some((Some(EventSequence(3)), "answer")));
         assert_eq!(
             first.activity_keys(),
             vec![
                 ActivityKey::Event(EventSequence(2)),
                 ActivityKey::Todo {
                     source: EventSequence(3),
-                    index: 0,
                 },
             ]
         );
@@ -629,12 +1504,14 @@ mod tests {
             vec![ActivityKey::Tool {
                 call: EventSequence(2),
                 result: Some(EventSequence(3)),
+                identity: Some("call-1".to_owned()),
+                approvals: Vec::new(),
             }]
         );
     }
 
     #[test]
-    fn active_items_attach_to_the_last_turn_by_id() {
+    fn active_assistant_streams_in_the_answer_position() {
         let mut state = state(vec![event(1, "user_message", json!({"content": "prompt"}))]);
         ThreadOperation::ActiveTurnStarted {
             phase: TurnPhase::Running,
@@ -653,13 +1530,165 @@ mod tests {
         .unwrap();
 
         let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
-        assert_eq!(
-            turn.activity_keys(),
-            vec![ActivityKey::Active(ActiveItemId(7))]
-        );
-        let activity = activity(&state, &ActivityKey::Active(ActiveItemId(7))).unwrap();
-        assert_eq!(activity.body, "streaming");
-        assert!(activity.active);
+        assert!(turn.activity_keys().is_empty());
+        assert_eq!(turn.answer(), Some((None, "streaming")));
+    }
+
+    #[test]
+    fn active_runner_output_is_grouped_under_its_tool_call() {
+        let mut state = state(vec![
+            event(1, "user_message", json!({"content": "run"})),
+            event(
+                2,
+                "tool_call",
+                json!({
+                    "name": "command",
+                    "call_id": "call-1",
+                    "arguments": {"command": "*** Runner sandbox\necho hello"}
+                }),
+            ),
+        ]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(8),
+                ActiveItemData::RunnerTool {
+                    call_id: "call-1".to_owned(),
+                    operation_index: 0,
+                    runner: Some("sandbox".to_owned()),
+                    update: RunnerOperationUpdate::CommandOutput {
+                        content: "hello\n".to_owned(),
+                        omitted_bytes: 0,
+                        timer: CommandTimerState {
+                            elapsed_ms: 10,
+                            remaining_ms: 0,
+                            paused: false,
+                        },
+                    },
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
+        assert_eq!(turn.activity_keys().len(), 1);
+        let display = activity(&state, &turn.activity_keys()[0]).unwrap();
+        let ActivityDisplay::Command(display) = display else {
+            panic!("expected command display");
+        };
+        assert!(display.operations[0].output.contains("hello"));
+        assert_eq!(display.operations[0].runner, "sandbox");
+        assert_eq!(display.operations[0].command, "echo hello");
+        assert!(display.active);
+    }
+
+    #[test]
+    fn reasoning_projection_exposes_only_summary_text() {
+        let state = state(vec![
+            event(1, "user_message", json!({"content": "think"})),
+            event(
+                2,
+                "reasoning",
+                json!({
+                    "item": {
+                        "summary": [
+                            {"type": "summary_text", "text": "Public summary"}
+                        ],
+                        "encrypted_content": "must-never-render",
+                        "provider_metadata": {"secret": true}
+                    }
+                }),
+            ),
+        ]);
+        let display = activity(&state, &ActivityKey::Event(EventSequence(2))).unwrap();
+        let ActivityDisplay::Reasoning { summary, .. } = display else {
+            panic!("expected reasoning");
+        };
+        assert_eq!(summary, "Public summary");
+        assert!(!summary.contains("must-never-render"));
+    }
+
+    #[test]
+    fn patch_diff_is_rendered_as_unified_diff() {
+        let diff = FileDiff {
+            old_path: Some(PathBuf::from("src/main.rs")),
+            new_path: Some(PathBuf::from("src/main.rs")),
+            hunks: vec![atra_patch_types::DiffHunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    atra_patch_types::DiffLine {
+                        kind: DiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        text: "old".to_owned(),
+                    },
+                    atra_patch_types::DiffLine {
+                        kind: DiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        text: "new".to_owned(),
+                    },
+                ],
+            }],
+        };
+        let mut rendered = String::new();
+        format_file_diff(&diff, &mut rendered);
+        assert!(rendered.contains("--- a/src/main.rs"));
+        assert!(rendered.contains("@@ -1,1 +1,1 @@"));
+        assert!(rendered.contains("-old\n+new"));
+    }
+
+    #[test]
+    fn nested_patch_artifact_is_attached_to_its_command_operation() {
+        let diff = FileDiff {
+            old_path: Some(PathBuf::from("src/main.rs")),
+            new_path: Some(PathBuf::from("src/main.rs")),
+            hunks: vec![atra_patch_types::DiffHunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![atra_patch_types::DiffLine {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    text: "new".to_owned(),
+                }],
+            }],
+        };
+        let artifact = ToolArtifact::RunnerOperation(atra_protocol::RunnerOperationArtifact {
+            operation: 1,
+            runner: "sandbox".to_owned(),
+            label: "Patch".to_owned(),
+            result: Value::Null,
+            artifacts: vec![ToolArtifact::PatchOperations(
+                ApplyPatchResult::Operations {
+                    results: vec![PatchOperationResult::Updated {
+                        path: PathBuf::from("src/main.rs"),
+                        outcome: PatchOperationOutcome::Applied { diff: Ok(diff) },
+                    }],
+                },
+            )],
+        });
+        let mut operations = vec![CommandOperationDisplay {
+            runner: "sandbox".to_owned(),
+            command: "atri patch".to_owned(),
+            output: String::new(),
+            status: String::new(),
+            omitted_bytes: 0,
+            diffs: Vec::new(),
+        }];
+        apply_command_artifact(&artifact, &mut operations);
+        assert_eq!(operations[0].diffs.len(), 1);
+        assert!(operations[0].diffs[0].contains("+++ b/src/main.rs"));
     }
 
     #[test]
@@ -748,5 +1777,66 @@ mod tests {
                 ActivityKey::Event(EventSequence(2))
             ]
         );
+    }
+
+    #[test]
+    fn completed_turn_collapses_to_a_structural_summary() {
+        let state = state(vec![
+            event(1, "user_message", json!({"content": "run"})),
+            event(
+                2,
+                "tool_call",
+                json!({
+                    "call_id": "call-1",
+                    "name": "command",
+                    "arguments": {"command": "*** Runner sandbox\necho hello"}
+                }),
+            ),
+            event(
+                3,
+                "tool_result",
+                json!({
+                    "call_id": "call-1",
+                    "name": "command",
+                    "result": {"output": "hello"},
+                    "artifacts": []
+                }),
+            ),
+            event(
+                4,
+                "assistant_message",
+                json!({"content": "working", "phase": "commentary"}),
+            ),
+        ]);
+        let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
+        let keys = turn.activity_keys();
+        assert_eq!(activity_summary(&state, &keys), "1 command · 1 update");
+    }
+
+    #[test]
+    fn active_turn_surfaces_the_current_activity_summary() {
+        let mut state = state(vec![event(1, "user_message", json!({"content": "run"}))]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(7),
+                ActiveItemData::ToolCall {
+                    item_id: "item-1".to_owned(),
+                    call_id: Some("call-1".to_owned()),
+                    name: "command".to_owned(),
+                    input: "*** Runner sandbox\necho hello".to_owned(),
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
+        let keys = turn.activity_keys();
+        assert_eq!(activity_summary(&state, &keys), "echo hello — sandbox");
     }
 }

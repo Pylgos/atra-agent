@@ -763,6 +763,9 @@ fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
             | ThreadEventData::ModelRequest(_)
             | ThreadEventData::TokenUsage(_)
             | ThreadEventData::RateLimits(_) => continue,
+            ThreadEventData::ApprovalDecision(_)
+            | ThreadEventData::Retry(_)
+            | ThreadEventData::TurnOutcome(_) => continue,
         };
         messages.push(message);
     }

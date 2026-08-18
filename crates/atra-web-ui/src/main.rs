@@ -1,4 +1,5 @@
 mod model;
+mod syntax;
 mod thread_store;
 mod transcript_view;
 
@@ -19,25 +20,64 @@ use dioxus::web::WebEventExt;
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
-    Detail, INBOX_KEY, InboxItem, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, NOTIFICATIONS_KEY,
-    PINS_KEY, Pin, RemoteState, Route, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY,
-    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
-    WorkspaceList, child_count, draft_key, factual_status, family_threads, history_key,
-    render_markdown, root_id, root_threads, thread_name,
+    Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, NOTIFICATIONS_KEY, PINS_KEY, Pin,
+    RemoteState, Route, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY, UTILITY_TAB_KEY,
+    UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace, WorkspaceList, draft_key,
+    factual_status, family_threads, history_key, render_markdown, root_id, root_threads,
+    thread_name,
 };
+use syntax::{highlight, setup_markdown_highlighting};
 use thread_store::ThreadStore;
-use transcript_view::{ActivityKey, ActivityKind, RawKey, TurnKey};
+use transcript_view::{ActivityDisplay, ActivityKey, CommandDisplay, RawKey, TurnKey};
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event as WebEvent, EventSource, HtmlDialogElement, HtmlFormElement, HtmlTextAreaElement,
-    MessageEvent,
+    ErrorEvent, Event as WebEvent, EventSource, HtmlDialogElement, HtmlFormElement,
+    HtmlTextAreaElement, MessageEvent, PromiseRejectionEvent,
 };
 
 type Controllers = HashMap<String, RemoteState<ControllerState>>;
+type ThreadAttention = HashMap<(String, i64), AgentStatus>;
 
 fn main() {
+    install_browser_diagnostics();
+    setup_markdown_highlighting();
     dioxus::launch(App);
+}
+
+fn install_browser_diagnostics() {
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(window) = web_sys::window()
+            && let Ok(location) = window.location().href()
+        {
+            web_sys::console::error_1(&format!("Atra context: {location}").into());
+        }
+        console_error_panic_hook::hook(info);
+    }));
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let error = Closure::<dyn FnMut(ErrorEvent)>::new(|event: ErrorEvent| {
+        web_sys::console::error_1(
+            &format!(
+                "Atra window error: {} ({}:{}:{})",
+                event.message(),
+                event.filename(),
+                event.lineno(),
+                event.colno()
+            )
+            .into(),
+        );
+    });
+    let _ = window.add_event_listener_with_callback("error", error.as_ref().unchecked_ref());
+    error.forget();
+    let rejection =
+        Closure::<dyn FnMut(PromiseRejectionEvent)>::new(|event: PromiseRejectionEvent| {
+            web_sys::console::error_2(&"Atra unhandled rejection".into(), &event.reason());
+        });
+    let _ = window
+        .add_event_listener_with_callback("unhandledrejection", rejection.as_ref().unchecked_ref());
+    rejection.forget();
 }
 
 struct SseConnection {
@@ -277,10 +317,7 @@ fn swipe_start_allowed(event: &Event<TouchData>) -> bool {
         return false;
     };
     if target
-        .closest(
-            ".drawer-backdrop, .activity-row-summary, \
-             .navigation-row > .navigation-link",
-        )
+        .closest(".drawer-backdrop, .navigation-row > .navigation-link")
         .ok()
         .flatten()
         .is_some()
@@ -351,7 +388,7 @@ fn App() -> Element {
     });
     let notifications = use_signal(|| storage_get(NOTIFICATIONS_KEY) == "enabled");
     let pins = use_signal(|| storage_json::<Vec<Pin>>(PINS_KEY));
-    let inbox = use_signal(|| storage_json::<Vec<InboxItem>>(INBOX_KEY));
+    let mut attention = use_signal(ThreadAttention::new);
     let nav_open = use_signal(|| storage_get(NAV_OPEN_KEY) != "closed");
     let mut utility_open = use_signal(|| storage_get(UTILITY_OPEN_KEY) != "closed");
     let utility_tab = use_signal(|| match storage_get(UTILITY_TAB_KEY).as_str() {
@@ -384,6 +421,12 @@ fn App() -> Element {
             .and_then(|document| document.document_element())
         {
             let _ = root.set_attribute("data-theme", &theme());
+        }
+    });
+    use_effect(move || {
+        let selected = route.read();
+        if let (Some(workspace), Some(thread)) = (&selected.workspace, selected.thread) {
+            attention.write().remove(&(workspace.clone(), thread));
         }
     });
 
@@ -512,6 +555,7 @@ fn App() -> Element {
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
+        document::Script { src: asset!("/assets/prism.min.js") }
         main {
             class: "{shell_class}",
             style: "{shell_style}",
@@ -571,7 +615,7 @@ fn App() -> Element {
                     workspace: workspace.clone(),
                     controllers,
                     route,
-                    inbox,
+                    attention,
                     notifications,
                 }
             }
@@ -580,6 +624,7 @@ fn App() -> Element {
                 controllers,
                 route,
                 pins,
+                attention,
                 nav_open,
                 nav_width,
                 mobile_panel,
@@ -624,7 +669,6 @@ fn App() -> Element {
                                     controller_connected: remote.connected,
                                     route,
                                     pins,
-                                    inbox,
                                     nav_open,
                                     utility_open,
                                     utility_tab,
@@ -678,7 +722,7 @@ fn ControllerMonitor(
     workspace: Workspace,
     controllers: Signal<Controllers>,
     route: Signal<Route>,
-    inbox: Signal<Vec<InboxItem>>,
+    mut attention: Signal<ThreadAttention>,
     notifications: Signal<bool>,
 ) -> Element {
     let workspace_id = workspace.workspace_id.clone();
@@ -692,7 +736,7 @@ fn ControllerMonitor(
                 else {
                     return;
                 };
-                let attention = match &message {
+                let status_update = match &message {
                     ControllerSubscriptionMessage::Operation {
                         operation: ControllerOperation::ThreadStatusUpdated { thread_id, status },
                     } => Some((*thread_id, *status)),
@@ -700,25 +744,26 @@ fn ControllerMonitor(
                 };
                 let mut states = controllers.write();
                 let remote = states.entry(workspace_id.clone()).or_default();
-                let previous = attention.and_then(|(thread, _)| {
+                let previous = status_update.and_then(|(thread, _)| {
                     remote
                         .value
                         .as_ref()
                         .and_then(|controller| controller.thread_status(thread))
                 });
                 remote.apply(message);
-                if let Some((thread_id, status)) = attention {
+                if let Some((thread_id, status)) = status_update {
                     if previous == Some(status)
                         || route.read().workspace.as_deref() == Some(&workspace_id)
                             && route.read().thread == Some(thread_id.0)
                     {
                         return;
                     }
-                    let (kind, summary) = match status {
-                        AgentStatus::AwaitingApproval => ("Approval", "Approval required"),
-                        AgentStatus::AwaitingQuestion => ("Question", "Questions require answers"),
-                        AgentStatus::Failed => ("Failed", "Turn failed"),
-                        AgentStatus::Completed => ("Completed", "Turn completed"),
+                    let summary = match status {
+                        AgentStatus::AwaitingApproval => "Approval required",
+                        AgentStatus::AwaitingQuestion => "Questions require answers",
+                        AgentStatus::Failed => "Turn failed",
+                        AgentStatus::Completed => "Turn completed",
+                        AgentStatus::Cancelled => "Turn cancelled",
                         _ => return,
                     };
                     let thread_name = remote
@@ -732,34 +777,9 @@ fn ControllerMonitor(
                         })
                         .map(thread_name)
                         .unwrap_or_else(|| format!("Thread {}", thread_id.0));
-                    let item = InboxItem {
-                        id: format!(
-                            "{}:{}:{}:{}",
-                            workspace_id,
-                            thread_id.0,
-                            kind,
-                            js_sys::Date::now() as i64
-                        ),
-                        workspace: workspace_id.clone(),
-                        workspace_name: workspace_name.clone(),
-                        thread: thread_id.0,
-                        thread_name: thread_name.clone(),
-                        kind: kind.to_owned(),
-                        summary: summary.to_owned(),
-                        observed_at_ms: js_sys::Date::now() as i64,
-                        read: false,
-                    };
-                    inbox.write().insert(0, item);
-                    let mut seen_read = 0;
-                    inbox.write().retain(|item| {
-                        if item.read {
-                            seen_read += 1;
-                            seen_read <= 100
-                        } else {
-                            true
-                        }
-                    });
-                    save_json(INBOX_KEY, &*inbox.read());
+                    attention
+                        .write()
+                        .insert((workspace_id.clone(), thread_id.0), status);
                     if notifications()
                         && matches!(
                             status,
@@ -854,6 +874,7 @@ fn Navigation(
     controllers: Signal<Controllers>,
     route: Signal<Route>,
     pins: Signal<Vec<Pin>>,
+    attention: Signal<ThreadAttention>,
     nav_open: Signal<bool>,
     nav_width: Signal<i32>,
     mobile_panel: Signal<MobilePanel>,
@@ -892,11 +913,14 @@ fn Navigation(
                     p { class: "muted compact", "Threads you use appear here." }
                 }
                 for (index, pin) in pins.read().clone().into_iter().enumerate() {
-                    if let Some((workspace_name, thread, status, children)) =
+                    if let Some((workspace_name, thread, status)) =
                         find_pin(&workspaces, &controllers.read(), &pin)
                     {
                         div {
                             class: "navigation-row pin-row",
+                            draggable: "true",
+                            ondragstart: move |_| dragging_pin.set(Some(index)),
+                            ondragend: move |_| dragging_pin.set(None),
                             ondragover: move |event| event.prevent_default(),
                             ondrop: move |_| {
                                 if let Some(from) = dragging_pin() {
@@ -904,15 +928,6 @@ fn Navigation(
                                 }
                                 dragging_pin.set(None);
                             },
-                            button {
-                                class: "drag-handle",
-                                aria_label: "Reorder {thread_name(&thread)}",
-                                title: "Drag to reorder",
-                                draggable: "true",
-                                ondragstart: move |_| dragging_pin.set(Some(index)),
-                                ondragend: move |_| dragging_pin.set(None),
-                                "⠿"
-                            }
                             button {
                                 class: "navigation-link",
                                 aria_current: if selected_workspace.as_deref() == Some(&pin.workspace)
@@ -928,28 +943,17 @@ fn Navigation(
                                         mobile_panel.set(MobilePanel::None);
                                     }
                                 },
-                                span { class: "row-title", "{thread_name(&thread)}" }
-                                small { "{workspace_name} · {factual_status(status)} · {children} children" }
-                            }
-                            details { class: "row-menu",
-                                summary { aria_label: "Pin actions for {thread_name(&thread)}", "•••" }
-                                div { class: "row-menu-panel",
-                                    button {
-                                        disabled: index == 0,
-                                        onclick: move |_| move_pin(pins, index, 0),
-                                        "Move to top"
+                                div { class: "thread-title-line",
+                                    ThreadStatusIndicator {
+                                        status,
+                                        attention: attention
+                                            .read()
+                                            .get(&(pin.workspace.clone(), pin.thread))
+                                            .copied(),
                                     }
-                                    button {
-                                        disabled: index == 0,
-                                        onclick: move |_| move_pin(pins, index, index.saturating_sub(1)),
-                                        "Move up"
-                                    }
-                                    button {
-                                        disabled: index + 1 >= pins.read().len(),
-                                        onclick: move |_| move_pin(pins, index, index + 1),
-                                        "Move down"
-                                    }
+                                    span { class: "row-title", "{thread_name(&thread)}" }
                                 }
+                                small { "{workspace_name}" }
                             }
                             PinButton {
                                 pins,
@@ -961,7 +965,16 @@ fn Navigation(
                         }
                     } else {
                         div { class: "navigation-row pin-row offline",
-                            span { class: "drag-handle", "⠿" }
+                            draggable: "true",
+                            ondragstart: move |_| dragging_pin.set(Some(index)),
+                            ondragend: move |_| dragging_pin.set(None),
+                            ondragover: move |event| event.prevent_default(),
+                            ondrop: move |_| {
+                                if let Some(from) = dragging_pin() {
+                                    move_pin(pins, from, index);
+                                }
+                                dragging_pin.set(None);
+                            },
                             button {
                                 class: "navigation-link",
                                 onclick: {
@@ -972,7 +985,9 @@ fn Navigation(
                                         detail: None,
                                     })
                                 },
-                                span { class: "row-title", "Thread {pin.thread}" }
+                                div { class: "thread-title-line",
+                                    span { class: "row-title", "Thread {pin.thread}" }
+                                }
                                 small { "{pin.workspace} · Offline" }
                             }
                             PinButton {
@@ -1048,9 +1063,15 @@ fn Navigation(
                                                     mobile_panel.set(MobilePanel::None);
                                                 }
                                             },
-                                            span { class: "row-title", "{thread_name(&thread)}" }
-                                            small {
-                                                "{factual_status(controller.thread_status(thread.id))} · {child_count(controller.threads(), thread.id)} children"
+                                            div { class: "thread-title-line",
+                                                ThreadStatusIndicator {
+                                                    status: controller.thread_status(thread.id),
+                                                    attention: attention
+                                                        .read()
+                                                        .get(&(workspace.workspace_id.clone(), thread.id.0))
+                                                        .copied(),
+                                                }
+                                                span { class: "row-title", "{thread_name(&thread)}" }
                                             }
                                         }
                                         PinButton {
@@ -1130,7 +1151,7 @@ fn find_pin(
     workspaces: &[Workspace],
     controllers: &Controllers,
     pin: &Pin,
-) -> Option<(String, atra_protocol::Thread, Option<AgentStatus>, usize)> {
+) -> Option<(String, atra_protocol::Thread, Option<AgentStatus>)> {
     let workspace = workspaces
         .iter()
         .find(|item| item.workspace_id == pin.workspace)?;
@@ -1144,8 +1165,41 @@ fn find_pin(
         workspace.name.clone(),
         thread.clone(),
         controller.thread_status(thread.id),
-        child_count(controller.threads(), thread.id),
     ))
+}
+
+#[component]
+fn ThreadStatusIndicator(status: Option<AgentStatus>, attention: Option<AgentStatus>) -> Element {
+    if matches!(
+        status,
+        Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)
+    ) {
+        return rsx! {
+            span {
+                class: "thread-status-indicator spinner",
+                role: "img",
+                aria_label: "{factual_status(status)}",
+                title: "{factual_status(status)}",
+            }
+        };
+    }
+
+    let (class, label) = match attention {
+        Some(AgentStatus::Completed) => ("completed", "Completed"),
+        Some(AgentStatus::AwaitingQuestion) => ("question", "Question required"),
+        Some(AgentStatus::AwaitingApproval) => ("approval", "Approval required"),
+        Some(AgentStatus::Failed) => ("failed", "Failed"),
+        Some(AgentStatus::Cancelled) => ("cancelled", "Cancelled"),
+        _ => return rsx! {},
+    };
+    rsx! {
+        span {
+            class: "thread-status-indicator {class}",
+            role: "img",
+            aria_label: "{label}",
+            title: "{label}",
+        }
+    }
 }
 
 fn move_pin(mut pins: Signal<Vec<Pin>>, from: usize, to: usize) {
@@ -1321,7 +1375,6 @@ fn ThreadPage(
     controller_connected: bool,
     route: Signal<Route>,
     pins: Signal<Vec<Pin>>,
-    inbox: Signal<Vec<InboxItem>>,
     nav_open: Signal<bool>,
     utility_open: Signal<bool>,
     utility_tab: Signal<UtilityTab>,
@@ -1403,7 +1456,6 @@ fn ThreadPage(
             modes,
             route,
             thread,
-            inbox,
             nav_open,
             utility_open,
             utility_tab,
@@ -1514,7 +1566,6 @@ fn ContextHeader(
     modes: Signal<HashMap<String, TranscriptMode>>,
     route: Signal<Route>,
     thread: i64,
-    inbox: Signal<Vec<InboxItem>>,
     nav_open: Signal<bool>,
     utility_open: Signal<bool>,
     utility_tab: Signal<UtilityTab>,
@@ -1523,7 +1574,6 @@ fn ContextHeader(
     pins: Signal<Vec<Pin>>,
     error: Signal<String>,
 ) -> Element {
-    let unread = inbox.read().iter().filter(|item| !item.read).count();
     rsx! {
         header { class: "context-header",
             button {
@@ -1630,13 +1680,9 @@ fn ContextHeader(
                     error,
                 }
             }
-            Inbox {
-                inbox,
-                route,
-            }
             button {
-                class: "icon-button badge-button",
-                aria_label: if unread > 0 { "Open utility panel, {unread} unread activities" } else { "Toggle utility panel" },
+                class: "icon-button",
+                aria_label: "Toggle utility panel",
                 onclick: move |_| {
                     if is_narrow_viewport() {
                         utility_open.set(true);
@@ -1721,72 +1767,6 @@ fn HeaderActionButton(
                 });
             },
             if pending() { "Working…" } else { "{label}" }
-        }
-    }
-}
-
-#[component]
-fn Inbox(inbox: Signal<Vec<InboxItem>>, route: Signal<Route>) -> Element {
-    let unread = inbox.read().iter().filter(|item| !item.read).count();
-    rsx! {
-        details { class: "inbox-popover",
-            summary {
-                aria_label: "Activity Inbox, {unread} unread",
-                "◎"
-                if unread > 0 { span { class: "badge", "{unread}" } }
-            }
-            div { class: "popover-panel",
-                header {
-                    h2 { "Activity Inbox" }
-                    button {
-                        disabled: !inbox.read().iter().any(|item| item.read),
-                        onclick: move |_| {
-                            inbox.write().retain(|item| !item.read);
-                            save_json(INBOX_KEY, &*inbox.read());
-                        },
-                        "Clear all read"
-                    }
-                }
-                if inbox.read().is_empty() {
-                    p { class: "empty-copy", "No activity from other Threads." }
-                }
-                for item in inbox.read().clone() {
-                    article { class: if item.read { "inbox-item read" } else { "inbox-item" },
-                        button {
-                            class: "inbox-link",
-                            onclick: {
-                                let id = item.id.clone();
-                                let workspace = item.workspace.clone();
-                                move |_| {
-                                    if let Some(current) = inbox.write().iter_mut().find(|entry| entry.id == id) {
-                                        current.read = true;
-                                    }
-                                    save_json(INBOX_KEY, &*inbox.read());
-                                    navigate(route, Route {
-                                        workspace: Some(workspace.clone()),
-                                        thread: Some(item.thread),
-                                        detail: None,
-                                    });
-                                }
-                            },
-                            strong { "{item.kind} · {item.thread_name}" }
-                            small { "{item.workspace_name} · {item.summary}" }
-                        }
-                        button {
-                            class: "icon-button",
-                            aria_label: "Dismiss {item.kind} for {item.thread_name}",
-                            onclick: {
-                                let id = item.id.clone();
-                                move |_| {
-                                    inbox.write().retain(|entry| entry.id != id);
-                                    save_json(INBOX_KEY, &*inbox.read());
-                                }
-                            },
-                            "×"
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -1954,6 +1934,7 @@ fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogS
     let answer = turn
         .answer()
         .map(|(sequence, answer)| (sequence, render_markdown(answer)));
+    let outcome = turn.outcome().cloned();
     let active = turn.is_active();
     let activities = turn.activity_keys();
 
@@ -1967,6 +1948,7 @@ fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogS
         article {
             class: if active { "turn turn-card active-turn" } else { "turn turn-card" },
             section { class: "turn-message user-message",
+                div { class: "speaker-label", "You" }
                 div {
                     class: "turn-prose markdown",
                     dangerous_inner_html: "{prompt_html}",
@@ -1989,48 +1971,69 @@ fn TurnCard(store: ThreadStore, turn_key: TurnKey, dialog: Signal<Option<DialogS
             }
             if !activities.is_empty() {
                 section { class: "activity-group",
-                    button {
-                        class: "activity-summary",
-                        aria_expanded: group_open(),
-                        onclick: move |_| {
-                            let next = !group_open();
-                            group_open.set(next);
-                        },
-                        span { class: "chevron", if group_open() { "⌄" } else { "›" } }
-                        span { "{summary}" }
-                        if active { small { "Running" } }
-                    }
                     if group_open() {
-                        div { class: "activity-list",
-                            for activity_key in activities {
-                                ActivityRow {
-                                    key: "{activity_key}",
-                                    store,
-                                    turn_key,
-                                    activity_key,
+                        div { class: "collapsible-expanded",
+                            button {
+                                class: "collapse-bar",
+                                aria_label: "Collapse activities",
+                                onclick: move |_| group_open.set(false),
+                            }
+                            div { class: "activity-list",
+                                for activity_key in activities {
+                                    ActivityRow {
+                                        key: "{activity_key}",
+                                        store,
+                                        turn_key,
+                                        activity_key,
+                                    }
                                 }
                             }
+                        }
+                    } else {
+                        button {
+                            class: "collapsible-compact activity-group-compact",
+                            onclick: move |_| group_open.set(true),
+                            span { "{summary}" }
                         }
                     }
                 }
             }
             if let Some((sequence, answer_html)) = answer {
                 section { class: "turn-message assistant-message",
+                    div { class: "speaker-label", "Atra" }
                     div {
                         class: "turn-prose markdown",
                         dangerous_inner_html: "{answer_html}",
                     }
                     div { class: "turn-actions",
                         TurnCopyButton { store, turn_key, target: TurnCopyTarget::Answer }
-                        button {
-                            disabled: active || !connected,
-                            onclick: {
-                                move |_| dialog.set(Some(DialogState::Rewind {
-                                    checkpoint: None,
-                                    sequence,
-                                }))
-                            },
-                            "Rewind"
+                        if let Some(sequence) = sequence {
+                            button {
+                                disabled: active || !connected,
+                                onclick: {
+                                    move |_| dialog.set(Some(DialogState::Rewind {
+                                        checkpoint: None,
+                                        sequence,
+                                    }))
+                                },
+                                "Rewind"
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(outcome) = outcome {
+                if matches!(outcome, atra_protocol::TurnOutcome::Cancelled) {
+                    div { class: "turn-outcome cancelled", "Turn cancelled" }
+                }
+                if let atra_protocol::TurnOutcome::Failed { message } = outcome {
+                    {
+                        let summary = message.lines().next().unwrap_or("Turn failed");
+                        rsx! {
+                            details { class: "turn-outcome failed",
+                                summary { "Failed · {summary}" }
+                                pre { "{message}" }
+                            }
                         }
                     }
                 }
@@ -2110,49 +2113,249 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
 
 #[component]
 fn ActivityRow(store: ThreadStore, turn_key: TurnKey, activity_key: ActivityKey) -> Element {
-    let mut open = use_signal(|| matches!(activity_key, ActivityKey::Active(_)));
-    let activity_read = store.read_activity(turn_key, activity_key.clone());
+    let activity_read = store.read_activity(turn_key, activity_key);
     let Some(activity) = activity_read.value() else {
         return rsx! {};
     };
-    let title = activity.title;
-    let body = activity.body;
-    let kind = activity.kind;
-    let active = activity.active;
-    let markdown = open().then(|| {
-        matches!(kind, ActivityKind::Commentary | ActivityKind::Todo)
-            .then(|| render_markdown(&body))
-    });
-
-    rsx! {
-        article { class: "activity-row",
-            button {
-                class: "activity-row-summary",
-                aria_expanded: open(),
-                onclick: move |_| open.set(!open()),
-                span { class: "activity-icon",
-                    {match kind {
-                        ActivityKind::Tool => "⌘",
-                        ActivityKind::Search => "⌕",
-                        ActivityKind::Reasoning => "◌",
-                        ActivityKind::Commentary => "…",
-                        ActivityKind::Todo => "✓",
-                        ActivityKind::Skill => "◇",
-                        ActivityKind::Marker => "·",
-                    }}
-                }
-                strong { "{title}" }
-                if active { small { "Running" } }
+    match activity {
+        ActivityDisplay::Commentary { markdown } => rsx! {
+            article {
+                class: "activity-commentary markdown",
+                dangerous_inner_html: "{render_markdown(markdown)}",
             }
-            if open() && !body.is_empty() {
-                if let Some(Some(html)) = markdown {
-                    div {
-                        class: "activity-prose markdown",
-                        dangerous_inner_html: "{html}",
-                    }
-                } else {
-                    pre { class: "activity-output", "{body}" }
+        },
+        ActivityDisplay::Todo { items } => {
+            let completed = items
+                .iter()
+                .filter(|item| matches!(item.status, atra_protocol::TodoStatus::Completed))
+                .count();
+            let current = items
+                .iter()
+                .find(|item| matches!(item.status, atra_protocol::TodoStatus::InProgress))
+                .or_else(|| {
+                    items
+                        .iter()
+                        .find(|item| matches!(item.status, atra_protocol::TodoStatus::Pending))
+                })
+                .map(|item| item.step.as_str())
+                .unwrap_or("Plan complete");
+            let compact = format!("{current} · {completed}/{}", items.len());
+            rsx! {
+                Collapsible {
+                    class: "activity-todo",
+                    active: false,
+                    compact: rsx! {
+                        span { "{compact}" }
+                    },
+                    expanded: rsx! {
+                        div { class: "todo-progress",
+                            span { "{completed}/{items.len()}" }
+                            progress { value: completed as f64, max: items.len() as f64 }
+                        }
+                        ul {
+                            for item in items {
+                                li {
+                                    class: match item.status {
+                                        atra_protocol::TodoStatus::Completed => "completed",
+                                        atra_protocol::TodoStatus::InProgress => "in-progress",
+                                        atra_protocol::TodoStatus::Pending => "pending",
+                                    },
+                                    span { class: "todo-state", aria_hidden: "true" }
+                                    span { "{item.step}" }
+                                }
+                            }
+                        }
+                    },
                 }
+            }
+        }
+        ActivityDisplay::Reasoning { summary, active } => {
+            let headline = summary.lines().next().unwrap_or("Thinking…").to_owned();
+            rsx! {
+                Collapsible {
+                    class: "activity-reasoning",
+                    active,
+                    compact: rsx! {
+                        span { "{headline}" }
+                    },
+                    expanded: rsx! {
+                        div {
+                            class: "reasoning-detail markdown",
+                            dangerous_inner_html: "{render_markdown(&summary)}",
+                        }
+                    },
+                }
+            }
+        },
+        ActivityDisplay::Command(display) => rsx! {
+            Collapsible {
+                class: "activity-command",
+                active: display.active,
+                compact: rsx! {
+                    span { class: "command-summary-text", "{display.summary}" }
+                },
+                expanded: rsx! {
+                    CommandOperations { display }
+                },
+            }
+        },
+        ActivityDisplay::Search {
+            summary,
+            detail,
+            active,
+        } => rsx! {
+            Collapsible {
+                class: "activity-search",
+                active,
+                compact: rsx! {
+                    span { "{summary}" }
+                },
+                expanded: rsx! {
+                    if !detail.is_empty() {
+                        pre { class: "search-detail", "{detail}" }
+                    }
+                },
+            }
+        },
+        ActivityDisplay::Question { summary, detail } => rsx! {
+            Collapsible {
+                class: "activity-question",
+                active: false,
+                compact: rsx! {
+                    span { "{summary}" }
+                },
+                expanded: rsx! {
+                    if !detail.is_empty() {
+                        pre { class: "question-detail", "{detail}" }
+                    }
+                },
+            }
+        },
+        ActivityDisplay::Approval { allowed, reason } => rsx! {
+            div {
+                class: if allowed { "activity-approval allowed" } else { "activity-approval denied" },
+                if allowed {
+                    "Allowed"
+                } else if let Some(reason) = reason {
+                    "Denied — {reason}"
+                } else {
+                    "Denied"
+                }
+            }
+        },
+        ActivityDisplay::Retry {
+            summary,
+            current,
+            max,
+        } => rsx! {
+            div { class: "activity-retry", "{summary} · attempt {current}/{max}" }
+        },
+        ActivityDisplay::Skill { name, path } => rsx! {
+            div { class: "activity-skill",
+                strong { "{name}" }
+                code { "{path}" }
+            }
+        },
+        ActivityDisplay::Compaction => rsx! {
+            div { class: "activity-compaction", "Compacting conversation history…" }
+        },
+        ActivityDisplay::Boundary => rsx! {
+            div { class: "activity-boundary", "Older context was compacted." }
+        },
+        ActivityDisplay::Failure { message } => {
+            let headline = message.lines().next().unwrap_or("Failed");
+            rsx! {
+                details { class: "activity-failure",
+                    summary { "{headline}" }
+                    pre { "{message}" }
+                }
+            }
+        },
+        ActivityDisplay::Cancelled => rsx! {
+            div { class: "activity-cancelled", "Cancelled" }
+        },
+        ActivityDisplay::Unsupported { summary } => rsx! {
+            div { class: "activity-unsupported", "{summary}" }
+        },
+    }
+}
+
+#[component]
+fn Collapsible(
+    active: bool,
+    class: &'static str,
+    compact: Element,
+    expanded: Element,
+) -> Element {
+    let mut open = use_signal(|| active);
+    rsx! {
+        article { class: if active { "collapsible {class} running" } else { "collapsible {class}" },
+            if open() {
+                div { class: "collapsible-expanded",
+                    button {
+                        class: "collapse-bar",
+                        aria_label: "Collapse",
+                        onclick: move |_| open.set(false),
+                    }
+                    {expanded}
+                }
+            } else {
+                button {
+                    class: "collapsible-compact",
+                    onclick: move |_| open.set(true),
+                    {compact}
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CommandOperations(display: CommandDisplay) -> Element {
+    rsx! {
+        div { class: "command-operations",
+            for approval in &display.approvals {
+                div {
+                    class: if approval.allowed { "command-approval allowed" } else { "command-approval denied" },
+                    if approval.allowed {
+                        "Allowed"
+                    } else if let Some(reason) = &approval.reason {
+                        "Denied — {reason}"
+                    } else {
+                        "Denied"
+                    }
+                }
+            }
+            for operation in &display.operations {
+                section { class: "command-operation",
+                    header {
+                        code { "{operation.runner}" }
+                        span { "{operation.status}" }
+                    }
+                    if !operation.command.is_empty() {
+                        pre {
+                            class: "command-source highlighted",
+                            dangerous_inner_html: "{highlight(&operation.command, \"bash\")}",
+                        }
+                    }
+                    if !operation.output.is_empty() {
+                        pre { class: "command-output", "{operation.output}" }
+                    }
+                    if operation.omitted_bytes > 0 {
+                        div { class: "command-omitted",
+                            "… {operation.omitted_bytes} output bytes omitted"
+                        }
+                    }
+                    for diff in &operation.diffs {
+                        div {
+                            class: "command-diff highlighted diff-view",
+                            dangerous_inner_html: "{highlight(diff, \"diff\")}",
+                        }
+                    }
+                }
+            }
+            if display.masked {
+                div { class: "command-masked", "Model context uses masked output." }
             }
         }
     }

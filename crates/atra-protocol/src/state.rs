@@ -350,12 +350,14 @@ pub enum ActiveItemData {
     },
     ToolCall {
         item_id: String,
+        call_id: Option<String>,
         name: String,
         input: String,
     },
     RunnerTool {
         call_id: String,
         operation_index: usize,
+        runner: Option<String>,
         update: RunnerOperationUpdate,
     },
 }

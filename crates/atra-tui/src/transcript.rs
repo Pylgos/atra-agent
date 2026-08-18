@@ -117,6 +117,7 @@ impl TranscriptState {
             call_id,
             operation_index,
             update,
+            ..
         } = data
         {
             self.active_entries
@@ -215,6 +216,7 @@ impl TranscriptState {
                     call_id: current,
                     operation_index,
                     update,
+                    ..
                 } = item.data()
                     && current == call_id
                 {
@@ -630,6 +632,9 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
         | ThreadEventData::ModelRequest(_)
         | ThreadEventData::TokenUsage(_)
         | ThreadEventData::RateLimits(_) => None,
+        ThreadEventData::ApprovalDecision(_)
+        | ThreadEventData::Retry(_)
+        | ThreadEventData::TurnOutcome(_) => None,
     }
 }
 

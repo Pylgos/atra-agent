@@ -88,14 +88,18 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             kind: "assistant_message",
             payload: {
               content: "Checking the existing result.",
-              phase: "commentary"
+              phase: "commentary",
+              todos: [
+                { step: "Inspect the result", status: "completed" },
+                { step: "Draft the response", status: "in_progress" }
+              ]
             }
           },
           {
             sequence: 4,
             kind: "assistant_message",
             payload: {
-              content: "# Result\n<script>bad()</script>\n\n**Safe answer**"
+              content: "# Result\n<script>bad()</script>\n\n**Safe answer**\n\n```bash\necho hello\n```\n\n- one\n  - nested\n- [x] done"
             }
           },
           {
@@ -271,25 +275,89 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.getByText("Existing prompt")).toBeVisible();
 
   await page.setViewportSize({ width: 1280, height: 720 });
-  const workspaceRow = page.locator(".workspace-thread-row");
+  const workspaceRow = page.locator(".workspace-thread-row").filter({ hasText: "Web Thread" });
   const workspaceRowBox = await workspaceRow.boundingBox();
   const workspaceLinkBox = await workspaceRow.locator(".navigation-link").boundingBox();
   expect(workspaceRowBox).not.toBeNull();
   expect(workspaceLinkBox).not.toBeNull();
   expect(workspaceLinkBox!.width).toBeGreaterThan(workspaceRowBox!.width - 50);
+  await expect(workspaceRow).not.toContainText("Idle");
+  await expect(workspaceRow).not.toContainText("children");
+  await expect(workspaceRow.locator(".thread-status-indicator")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/controller/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "thread_status_updated",
+        thread_id: 1,
+        status: "running"
+      }
+    });
+  });
+  await expect(workspaceRow.getByRole("img", { name: "Running" })).toBeVisible();
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/controller/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "thread_status_updated",
+        thread_id: 1,
+        status: "completed"
+      }
+    });
+  });
+  await expect(workspaceRow.locator(".thread-status-indicator")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/controller/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "thread_added",
+        thread: {
+          id: 2,
+          parent_thread_id: null,
+          display_name: "Background Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        }
+      }
+    });
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "thread_status_updated",
+        thread_id: 2,
+        status: "completed"
+      }
+    });
+  });
+  const backgroundRow = page.locator(".workspace-thread-row").filter({ hasText: "Background Thread" });
+  await expect(backgroundRow.getByRole("img", { name: "Completed" })).toBeVisible();
+  await backgroundRow.locator(".navigation-link").click();
+  await expect(backgroundRow.locator(".thread-status-indicator")).toHaveCount(0);
+  await workspaceRow.locator(".navigation-link").click();
 
   await page.getByRole("button", { name: "Pin Web Thread" }).click();
   const pinnedRow = page.locator(".pinned-section .pin-row");
   await expect(pinnedRow).toBeVisible();
-  const pinRowHeight = await pinnedRow.evaluate((element) => element.getBoundingClientRect().height);
-  await pinnedRow.getByLabel("Pin actions for Web Thread").click();
-  await expect(pinnedRow.getByRole("button", { name: "Move to top" })).toBeVisible();
-  await expect(pinnedRow.getByRole("button", { name: "Unpin" })).toHaveCount(1);
-  await expect(pinnedRow.locator(".row-menu").getByRole("button", { name: "Unpin" })).toHaveCount(0);
-  expect(await pinnedRow.evaluate((element) => element.getBoundingClientRect().height))
-    .toBe(pinRowHeight);
+  await expect(pinnedRow).toHaveAttribute("draggable", "true");
+  await expect(pinnedRow.locator(".drag-handle")).toHaveCount(0);
+  await expect(pinnedRow.locator(".row-menu")).toHaveCount(0);
+  await expect(pinnedRow).not.toContainText("Completed");
+  await expect(pinnedRow).not.toContainText("children");
   await pinnedRow.getByRole("button", { name: "Unpin Web Thread" }).click();
   await expect(pinnedRow).toHaveCount(0);
+  await expect(page.getByLabel(/Activity Inbox/)).toHaveCount(0);
 
   await workspaceRow.locator(".navigation-link").click();
 
@@ -313,17 +381,24 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(utility.getByText("Context 6,567 / 128,000 (5.1%)")).toBeVisible();
   await expect(utility.getByText("Cache 3,456 / 6,567 (52.6%)")).toBeVisible();
   await expect(page.locator(".turn")).toHaveCount(1);
+  await expect(page.locator(".speaker-label", { hasText: "You" })).toBeVisible();
+  await expect(page.locator(".speaker-label", { hasText: "Atra" })).toBeVisible();
+  await expect(page.locator(".assistant-message ul li")).toHaveCount(3);
+  await expect(page.locator(".assistant-message .highlighted")).toHaveCount(1);
+  await expect(page.locator(".assistant-message .highlighted")).toContainText("echo hello");
   await expect(page.getByRole("button", { name: /Load .* previous turns/ })).toHaveCount(0);
   await expect(page.locator(".activity-list")).toHaveCount(0);
-  await page.locator(".activity-summary").click();
-  await expect(page.locator(".activity-row")).toHaveCount(1);
-  await expect(page.locator(".activity-prose")).toHaveCount(0);
-  await page.getByRole("button", { name: /Commentary/ }).click();
-  await expect(page.getByText("Checking the existing result.")).toBeVisible();
-  await page.getByRole("button", { name: /Commentary/ }).click();
-  await expect(page.locator(".activity-prose")).toHaveCount(0);
-  await page.locator(".activity-summary").click();
-  await expect(page.locator(".activity-row")).toHaveCount(0);
+  await expect(page.locator(".activity-group-compact")).toContainText("1 update · 1 todo");
+  await expect(page.locator(".activity-group-compact")).not.toContainText("Activity");
+  await expect(page.locator(".activity-group-compact")).not.toContainText("Todo");
+  await page.locator(".activity-group-compact").click();
+  await expect(page.locator(".activity-commentary")).toContainText("Checking the existing result.");
+  await page.locator(".activity-todo .collapsible-compact").click();
+  await expect(page.locator(".activity-todo li")).toHaveCount(2);
+  await expect(page.locator(".activity-todo li.completed")).toContainText("Inspect the result");
+  await expect(page.locator(".activity-todo li.in-progress")).toContainText("Draft the response");
+  await page.getByRole("button", { name: "Collapse activities" }).click();
+  await expect(page.locator(".activity-commentary")).toHaveCount(0);
   await page.getByRole("button", { name: "Raw", exact: true }).click();
   await expect(page.locator(".raw-events")).toContainText('"kind": "user_message"');
   await page.getByRole("button", { name: "Pretty", exact: true }).click();
@@ -339,6 +414,70 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
         phase: "running"
       }
     });
+  });
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_item_added",
+        item: {
+          id: 20,
+          data: {
+            kind: "tool_call",
+            item_id: "command-item",
+            call_id: "command-call",
+            name: "command",
+            input: "*** Runner sandbox\nset -e\necho hello"
+          }
+        }
+      }
+    });
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_item_added",
+        item: {
+          id: 21,
+          data: {
+            kind: "runner_tool",
+            call_id: "command-call",
+            operation_index: 1,
+            runner: "sandbox",
+            update: {
+              kind: "command_output",
+              content: "hello\n",
+              omitted_bytes: 0,
+              timer: { elapsed_ms: 12, remaining_ms: 0, paused: false }
+            }
+          }
+        }
+      }
+    });
+  });
+  await expect(page.locator(".activity-command.running")).toBeVisible();
+  await expect(page.locator(".command-source")).toContainText("echo hello");
+  await expect(page.locator(".command-operation header code")).toHaveText("sandbox");
+  await expect(page.locator(".command-output")).toContainText("hello");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: { operation: "active_item_discarded", id: 21 }
+    });
+    source.emit({
+      message: "operation",
+      operation: { operation: "active_item_discarded", id: 20 }
+    });
+  });
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
     source.emit({
       message: "operation",
       operation: {
@@ -350,12 +489,9 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(page.getByRole("button", { name: /Assistant response/ })).toBeVisible();
-  await expect(page.getByText("Streaming", { exact: true })).toBeVisible();
-  const activitySummary = page.locator(".activity-summary").last();
-  await expect(activitySummary).toHaveAttribute("aria-expanded", "true");
-  await activitySummary.click();
-  await expect(activitySummary).toHaveAttribute("aria-expanded", "false");
+  const streamingAnswer = page.locator(".assistant-message").last();
+  await expect(streamingAnswer).toContainText("Streaming");
+  await expect(page.locator(".turn").last().locator(".activity-list")).not.toContainText("Streaming");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -369,10 +505,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(activitySummary).toHaveAttribute("aria-expanded", "false");
-  await expect(page.getByText("Streaming update", { exact: true })).toHaveCount(0);
-  await activitySummary.click();
-  await expect(page.getByText("Streaming update", { exact: true })).toBeVisible();
+  await expect(streamingAnswer).toContainText("Streaming update");
 
   await page.locator(".turn-card").last().evaluate((element) => {
     (element as HTMLElement).style.minHeight = "1600px";
@@ -463,15 +596,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
   await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
 
-  const activity = page.locator(".activity-row-summary").first();
-  await activity.scrollIntoViewIfNeeded();
-  const activityBox = await activity.boundingBox();
-  expect(activityBox).not.toBeNull();
-  await swipe(
-    page,
-    { x: activityBox!.x + activityBox!.width - 20, y: activityBox!.y + activityBox!.height / 2 },
-    { x: activityBox!.x + activityBox!.width - 160, y: activityBox!.y + activityBox!.height / 2 + 5 }
-  );
+  await swipe(page, { x: 380, y: 520 }, { x: 220, y: 525 });
   await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
   await swipe(page, { x: 10, y: 420 }, { x: 150, y: 425 });
   await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);

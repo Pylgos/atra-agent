@@ -1,6 +1,7 @@
 use atra_protocol::{
-    ActiveItemId, EventSequence, PendingInteraction, ProcessLocator, ProcessSummary, Thread,
-    ThreadChange, ThreadCheckpoint, ThreadEventData, ThreadState, ThreadSubscriptionMessage,
+    ActiveItemData, ActiveItemId, EventSequence, PendingInteraction, ProcessLocator,
+    ProcessSummary, Thread, ThreadChange, ThreadCheckpoint, ThreadEventData, ThreadState,
+    ThreadSubscriptionMessage,
 };
 use dioxus::{
     prelude::{Readable, ReadableExt, ReadableRef, Store, WriteSignal},
@@ -59,10 +60,13 @@ pub(super) struct TurnRead {
     state: StateRead,
     _active_turn: Option<StateRead>,
     _active_items: Option<StateRead>,
+    _active_answer: Option<StateRead>,
     key: TurnKey,
 }
 pub(super) struct ActivityRead {
     state: StateRead,
+    _active_items: Option<StateRead>,
+    _related: Vec<StateRead>,
     key: ActivityKey,
 }
 pub(super) struct ActiveTurnRead(StateRead);
@@ -328,10 +332,23 @@ impl ThreadStore {
             .as_ref()
             .and_then(|state| transcript_view::turn(state, key))
             .is_some_and(|turn| turn.can_have_active());
+        let active_answer = can_have_active
+            .then(|| {
+                state
+                    .value
+                    .as_ref()?
+                    .active_turn()?
+                    .items()
+                    .iter()
+                    .find(|item| matches!(item.data(), ActiveItemData::Assistant { .. }))
+                    .map(|item| item.id())
+            })
+            .flatten();
         TurnRead {
             state,
             _active_turn: can_have_active.then(|| self.read(ThreadScope::ActiveTurnSlot)),
             _active_items: can_have_active.then(|| self.read(ThreadScope::ActiveItemList)),
+            _active_answer: active_answer.map(|id| self.read(ThreadScope::ActiveItem(id))),
             key,
         }
     }
@@ -341,16 +358,42 @@ impl ThreadStore {
             state: self.peek(ThreadScope::Turn(key.sequence())),
             _active_turn: None,
             _active_items: None,
+            _active_answer: None,
             key,
         }
     }
 
     pub(super) fn read_activity(self, turn: TurnKey, key: ActivityKey) -> ActivityRead {
         let state = match key {
-            ActivityKey::Active(id) => self.read(ThreadScope::ActiveItem(id)),
+            ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
+                self.read(ThreadScope::ActiveItem(id))
+            }
             _ => self.read(ThreadScope::Turn(turn.sequence())),
         };
-        ActivityRead { state, key }
+        let identity = transcript_view::activity_identity(&key);
+        let related = identity
+            .as_deref()
+            .and_then(|identity| {
+                state.value.as_ref()?.active_turn().map(|active| {
+                    active
+                        .items()
+                        .iter()
+                        .filter_map(|item| match item.data() {
+                            ActiveItemData::RunnerTool { call_id, .. } if call_id == identity => {
+                                Some(self.read(ThreadScope::ActiveItem(item.id())))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        ActivityRead {
+            state,
+            _active_items: identity.map(|_| self.read(ThreadScope::ActiveItemList)),
+            _related: related,
+            key,
+        }
     }
 
     pub(super) fn read_active_turn(self) -> ActiveTurnRead {
@@ -585,7 +628,10 @@ fn event_targets(state: &ThreadState, sequence: EventSequence) -> Vec<ThreadScop
         | ThreadEventData::WebSearch(_)
         | ThreadEventData::SkillInvocation(_)
         | ThreadEventData::Compaction(_)
-        | ThreadEventData::FrozenBoundary(_) => turn_key_for_event(state, sequence)
+        | ThreadEventData::FrozenBoundary(_)
+        | ThreadEventData::ApprovalDecision(_)
+        | ThreadEventData::Retry(_)
+        | ThreadEventData::TurnOutcome(_) => turn_key_for_event(state, sequence)
             .map(|key| ThreadScope::Turn(key.sequence()))
             .into_iter()
             .collect(),

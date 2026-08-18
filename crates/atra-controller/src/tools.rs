@@ -203,12 +203,6 @@ pub(super) fn parse_questions(
     Ok(arguments.questions)
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(super) struct CommandArguments {
-    pub(super) runner: String,
-    pub(super) command: String,
-}
-
 pub(super) fn parse_todo_annotation(content: String) -> (String, Vec<TodoItem>) {
     const OPEN: &str = "<todo>\n";
     const CLOSE: &str = "\n</todo>";
@@ -258,57 +252,6 @@ pub(super) fn parse_todo_annotation(content: String) -> (String, Vec<TodoItem>) 
 const FOREGROUND_TIMEOUT_SECONDS: u64 = 120;
 pub(super) const FOREGROUND_TIMEOUT_MS: u64 = FOREGROUND_TIMEOUT_SECONDS * 1000;
 
-impl CommandArguments {
-    pub(super) fn name(&self) -> &'static str {
-        "command"
-    }
-
-    pub(super) fn runner(&self) -> &str {
-        &self.runner
-    }
-
-    pub(super) fn result_label(&self) -> String {
-        "Command".to_owned()
-    }
-}
-
-pub(super) fn parse_command_input(input: &str) -> Result<Vec<CommandArguments>> {
-    let lines = input.lines().collect::<Vec<_>>();
-    let mut runner = None;
-    let mut command_start = 0;
-    let mut operations = Vec::new();
-
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(name) = line.strip_prefix("*** Runner ") {
-            if let Some(runner) = runner.replace(name.to_owned()) {
-                if command_start == index {
-                    bail!("runner group must contain a command");
-                }
-                operations.push(CommandArguments {
-                    runner,
-                    command: lines[command_start..index].join("\n"),
-                });
-            }
-            if name.is_empty() {
-                bail!("runner name cannot be empty");
-            }
-            command_start = index + 1;
-        } else if runner.is_none() {
-            bail!("command input must start with '*** Runner <runner>'");
-        }
-    }
-
-    let runner = runner.context("command input must contain at least one runner group")?;
-    if command_start == lines.len() {
-        bail!("runner group must contain a command");
-    }
-    operations.push(CommandArguments {
-        runner,
-        command: lines[command_start..].join("\n"),
-    });
-    Ok(operations)
-}
-
 pub(super) fn valid_process_id(process_id: &str) -> bool {
     process_id.len() <= 64
         && process_id
@@ -343,6 +286,7 @@ pub(super) struct OperationContext {
 pub(super) async fn send_operation_update(
     operation: Option<&OperationContext>,
     updates: Option<&TurnProjector>,
+    runner: Option<&str>,
     update: RunnerOperationUpdate,
 ) -> Result<()> {
     if let Some(operation) = operation {
@@ -351,6 +295,7 @@ pub(super) async fn send_operation_update(
             .apply_update(ModelStreamEvent::RunnerOperationUpdate {
                 call_id: operation.call_id.clone(),
                 operation_index: operation.index,
+                runner: runner.map(str::to_owned),
                 update,
             })
             .await?;
