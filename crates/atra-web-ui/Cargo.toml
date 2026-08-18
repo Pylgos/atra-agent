@@ -31,6 +31,8 @@ web-sys = { version = "0.3.83", features = [
     "Location",
     "MessageEvent",
     "PromiseRejectionEvent",
+    "ScrollBehavior",
+    "ScrollToOptions",
     "Notification",
     "NotificationPermission",
     "Navigator",

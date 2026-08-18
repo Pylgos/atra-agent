@@ -641,9 +641,13 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await page.locator("#transcript-scroll").evaluate((element) => {
     element.scrollTop = element.scrollHeight;
     element.dispatchEvent(new Event("scroll"));
-    element.scrollTop = 0;
+    element.scrollTop =
+      element.scrollHeight - element.clientHeight - 20;
     element.dispatchEvent(new Event("scroll"));
   });
+  const scrollTopBeforeUpdate = await page
+    .locator("#transcript-scroll")
+    .evaluate((element) => element.scrollTop);
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -658,11 +662,28 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(page.getByRole("button", { name: "Latest" })).toBeVisible();
-  await page.getByRole("button", { name: "Latest" }).click();
+  const latestButton = page.getByRole("button", { name: "Latest" });
+  await expect(latestButton).toBeVisible();
+  const [latestBox, transcriptBox, composerBox] = await Promise.all([
+    latestButton.boundingBox(),
+    page.locator(".transcript-region").boundingBox(),
+    page.locator(".composer-region").boundingBox()
+  ]);
+  expect(latestBox).not.toBeNull();
+  expect(transcriptBox).not.toBeNull();
+  expect(composerBox).not.toBeNull();
+  expect(latestBox!.x + latestBox!.width / 2).toBeCloseTo(
+    transcriptBox!.x + transcriptBox!.width / 2,
+    0
+  );
+  expect(latestBox!.y + latestBox!.height).toBeLessThan(composerBox!.y);
+  await expect.poll(() =>
+    page.locator("#transcript-scroll").evaluate((element) => element.scrollTop)
+  ).toBe(scrollTopBeforeUpdate);
+  await latestButton.click();
   await expect.poll(() => page.locator("#transcript-scroll").evaluate((element) =>
     element.scrollHeight - element.scrollTop - element.clientHeight
-  )).toBeLessThanOrEqual(80);
+  )).toBeLessThanOrEqual(1);
   await expect(page.getByText("Streaming answer again", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(

@@ -34,11 +34,17 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ErrorEvent, Event as WebEvent, EventSource, HtmlDialogElement, HtmlFormElement,
-    HtmlTextAreaElement, MessageEvent, PromiseRejectionEvent,
+    HtmlTextAreaElement, MessageEvent, PromiseRejectionEvent, ScrollBehavior, ScrollToOptions,
 };
 
 type Controllers = HashMap<String, RemoteState<ControllerState>>;
 type ThreadAttention = HashMap<(String, i64), AgentStatus>;
+
+#[derive(Clone, Copy)]
+struct TranscriptScrollState {
+    top: i32,
+    following: bool,
+}
 
 fn main() {
     install_browser_diagnostics();
@@ -416,7 +422,7 @@ fn App() -> Element {
     let utility_width = use_signal(|| storage_get(UTILITY_WIDTH_KEY).parse::<i32>().unwrap_or(352));
     let mut mobile_panel = use_signal(|| MobilePanel::None);
     let modes = use_signal(HashMap::<String, TranscriptMode>::new);
-    let scroll_positions = use_signal(HashMap::<String, i32>::new);
+    let scroll_positions = use_signal(HashMap::<String, TranscriptScrollState>::new);
     let mut route_notice = use_signal(String::new);
     let mut swipe_start = use_signal(|| None::<SwipeStart>);
     let _workspace_stream = use_hook(move || {
@@ -1396,7 +1402,7 @@ fn ThreadPage(
     utility_width: Signal<i32>,
     mobile_panel: Signal<MobilePanel>,
     modes: Signal<HashMap<String, TranscriptMode>>,
-    scroll_positions: Signal<HashMap<String, i32>>,
+    scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
 ) -> Element {
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut error = use_signal(String::new);
@@ -1809,11 +1815,12 @@ fn Transcript(
     thread: i64,
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
-    scroll_positions: Signal<HashMap<String, i32>>,
+    scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
     selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
     let mut following = use_signal(|| true);
     let mut has_latest = use_signal(|| false);
+    let mut last_scroll_top = use_signal(|| 0);
     let mut restored_mode = use_signal(|| None::<TranscriptMode>);
     let remote = if mode == TranscriptMode::Pretty {
         store.read_transcript_structure()
@@ -1842,20 +1849,29 @@ fn Transcript(
             {
                 if restored_mode.peek().as_ref() != Some(&mode) {
                     if let Some(saved) = scroll_positions.peek().get(&key).copied() {
-                        element.set_scroll_top(saved);
-                        following.set(transcript_is_near_bottom(
-                            element.scroll_height(),
-                            element.scroll_top(),
-                            element.client_height(),
-                        ));
+                        following.set(saved.following);
+                        if saved.following {
+                            scroll_transcript_to_bottom(&element);
+                        } else {
+                            element.set_scroll_top(saved.top);
+                        }
                     } else {
-                        element.set_scroll_top(element.scroll_height());
+                        scroll_transcript_to_bottom(&element);
                         following.set(true);
                     }
+                    last_scroll_top.set(element.scroll_top());
                     has_latest.set(false);
                     restored_mode.set(Some(mode));
                 } else if *following.peek() {
-                    element.set_scroll_top(element.scroll_height());
+                    scroll_transcript_to_bottom(&element);
+                    last_scroll_top.set(element.scroll_top());
+                    scroll_positions.write().insert(
+                        key.clone(),
+                        TranscriptScrollState {
+                            top: element.scroll_top(),
+                            following: true,
+                        },
+                    );
                     has_latest.set(false);
                 } else {
                     has_latest.set(true);
@@ -1865,87 +1881,112 @@ fn Transcript(
     }));
 
     rsx! {
-        main {
-            id: "transcript-scroll",
-            class: "transcript transcript-scroll",
-            aria_live: "polite",
-            onscroll: {
-                let key = scroll_key.clone();
-                move |_| {
-                    if let Some(window) = web_sys::window()
-                        && let Some(document) = window.document()
-                        && let Some(element) = document.get_element_by_id("transcript-scroll")
-                    {
-                        scroll_positions.write().insert(key.clone(), element.scroll_top());
-                        let near_bottom = transcript_is_near_bottom(
-                            element.scroll_height(),
-                            element.scroll_top(),
-                            element.client_height(),
-                        );
-                        following.set(near_bottom);
-                        if near_bottom {
-                            has_latest.set(false);
-                        }
-                    }
-                }
-            },
-            div { class: "reading-column",
-                if mode == TranscriptMode::Pretty {
-                    if turns_empty {
-                        section { class: "empty-transcript",
-                            h2 { "No conversation yet" }
-                            p { "Use the composer below to start this Thread." }
-                        }
-                    }
-                    for turn_key in turns {
-                        TurnCard {
-                            key: "{turn_key}",
-                            store,
-                            turn_key,
-                            dialog,
-                            selected_activity,
-                        }
-                    }
-                    InteractionPanel {
-                        store,
-                        workspace: workspace.clone(),
-                        error,
-                    }
-                } else if let Some(raw_keys) = raw_keys {
-                    section { class: "raw-events",
-                        for (index, raw_key) in raw_keys.into_iter().enumerate() {
-                            RawEventRow {
-                                key: "{raw_key}",
-                                store,
-                                raw_key,
-                                index,
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if has_latest() {
-            button {
-                class: "latest-button",
-                r#type: "button",
-                onclick: {
+        div { class: "transcript-region",
+            main {
+                id: "transcript-scroll",
+                class: "transcript transcript-scroll",
+                aria_live: "polite",
+                onscroll: {
                     let key = scroll_key.clone();
                     move |_| {
                         if let Some(window) = web_sys::window()
                             && let Some(document) = window.document()
                             && let Some(element) = document.get_element_by_id("transcript-scroll")
                         {
-                            element.set_scroll_top(element.scroll_height());
-                            scroll_positions
-                                .write()
-                                .insert(key.clone(), element.scroll_top());
+                            let scroll_top = element.scroll_top();
+                            let next_following = transcript_following_after_scroll(
+                                *following.peek(),
+                                *last_scroll_top.peek(),
+                                scroll_top,
+                                element.scroll_height(),
+                                element.client_height(),
+                            );
+                            last_scroll_top.set(scroll_top);
+                            following.set(next_following);
+                            scroll_positions.write().insert(
+                                key.clone(),
+                                TranscriptScrollState {
+                                    top: scroll_top,
+                                    following: next_following,
+                                },
+                            );
+                            if next_following && transcript_is_at_bottom(
+                                element.scroll_height(),
+                                scroll_top,
+                                element.client_height(),
+                            ) {
+                                has_latest.set(false);
+                            }
                         }
-                        following.set(true);
-                        has_latest.set(false);
                     }
                 },
-                "Latest"
+                div { class: "reading-column",
+                    if mode == TranscriptMode::Pretty {
+                        if turns_empty {
+                            section { class: "empty-transcript",
+                                h2 { "No conversation yet" }
+                                p { "Use the composer below to start this Thread." }
+                            }
+                        }
+                        for turn_key in turns {
+                            TurnCard {
+                                key: "{turn_key}",
+                                store,
+                                turn_key,
+                                dialog,
+                                selected_activity,
+                            }
+                        }
+                        InteractionPanel {
+                            store,
+                            workspace: workspace.clone(),
+                            error,
+                        }
+                    } else if let Some(raw_keys) = raw_keys {
+                        section { class: "raw-events",
+                            for (index, raw_key) in raw_keys.into_iter().enumerate() {
+                                RawEventRow {
+                                    key: "{raw_key}",
+                                    store,
+                                    raw_key,
+                                    index,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if has_latest() {
+                button {
+                    class: "latest-button",
+                    r#type: "button",
+                    aria_label: "Latest",
+                    title: "Jump to latest",
+                    onclick: {
+                        let key = scroll_key.clone();
+                        move |_| {
+                            following.set(true);
+                            if let Some(window) = web_sys::window()
+                                && let Some(document) = window.document()
+                                && let Some(element) = document.get_element_by_id("transcript-scroll")
+                            {
+                                scroll_transcript_to_bottom_smoothly(&element);
+                                scroll_positions.write().insert(
+                                    key.clone(),
+                                    TranscriptScrollState {
+                                        top: element.scroll_height(),
+                                        following: true,
+                                    },
+                                );
+                            }
+                            has_latest.set(false);
+                        }
+                    },
+                    svg {
+                        view_box: "0 0 24 24",
+                        path { d: "m6 9 6 6 6-6" }
+                    }
+                }
             }
         }
     }
@@ -3242,7 +3283,7 @@ fn CheckpointPreview(
     route: Signal<Route>,
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
-    scroll_positions: Signal<HashMap<String, i32>>,
+    scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
     selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
 ) -> Element {
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
@@ -3732,8 +3773,35 @@ fn reasoning_effort_for_model(models: &[Model], selection: &str, current: &str) 
     }
 }
 
-fn transcript_is_near_bottom(scroll_height: i32, scroll_top: i32, client_height: i32) -> bool {
-    scroll_height - scroll_top - client_height <= 80
+fn scroll_transcript_to_bottom(element: &web_sys::Element) {
+    element.set_scroll_top(element.scroll_height());
+}
+
+fn scroll_transcript_to_bottom_smoothly(element: &web_sys::Element) {
+    let options = ScrollToOptions::new();
+    options.set_top(element.scroll_height().into());
+    options.set_behavior(ScrollBehavior::Smooth);
+    element.scroll_to_with_scroll_to_options(&options);
+}
+
+fn transcript_is_at_bottom(scroll_height: i32, scroll_top: i32, client_height: i32) -> bool {
+    scroll_height - scroll_top - client_height <= 1
+}
+
+fn transcript_following_after_scroll(
+    following: bool,
+    previous_scroll_top: i32,
+    scroll_top: i32,
+    scroll_height: i32,
+    client_height: i32,
+) -> bool {
+    if scroll_top < previous_scroll_top {
+        false
+    } else if transcript_is_at_bottom(scroll_height, scroll_top, client_height) {
+        true
+    } else {
+        following
+    }
 }
 
 #[cfg(test)]
@@ -3781,13 +3849,26 @@ mod tests {
     }
 
     #[test]
-    fn transcript_follows_when_viewport_is_near_the_bottom() {
-        assert!(transcript_is_near_bottom(1_000, 325, 600));
-        assert!(transcript_is_near_bottom(1_000, 320, 600));
+    fn transcript_stops_following_as_soon_as_the_viewport_moves_up() {
+        assert!(!transcript_following_after_scroll(
+            true, 400, 399, 1_000, 600
+        ));
     }
 
     #[test]
-    fn transcript_stops_following_when_viewport_moves_away_from_the_bottom() {
-        assert!(!transcript_is_near_bottom(1_000, 319, 600));
+    fn transcript_keeps_following_when_content_grows() {
+        assert!(transcript_following_after_scroll(
+            true, 400, 400, 1_100, 600
+        ));
+    }
+
+    #[test]
+    fn transcript_resumes_following_only_at_the_bottom() {
+        assert!(!transcript_following_after_scroll(
+            false, 300, 398, 1_000, 600
+        ));
+        assert!(transcript_following_after_scroll(
+            false, 398, 400, 1_000, 600
+        ));
     }
 }

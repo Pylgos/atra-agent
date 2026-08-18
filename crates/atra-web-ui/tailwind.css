@@ -227,7 +227,7 @@ pre {
 .context-header,
 .connection-banner,
 .toast,
-.transcript,
+.transcript-region,
 .composer-region,
 .checkpoint-preview-header,
 .preview-bar,
@@ -248,7 +248,7 @@ pre {
   grid-row: 2;
 }
 
-.transcript,
+.transcript-region,
 .loading-state {
   grid-row: 3;
 }
@@ -650,16 +650,21 @@ pre {
 }
 
 .transcript {
+  height: 100%;
   min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
+}
+
+.transcript-region {
+  position: relative;
+  min-height: 0;
 }
 
 .reading-column {
   width: min(100% - 2rem, 820px);
   margin: 0 auto;
-  padding: 1.5rem 0 50vh;
+  padding: 1.5rem 0 3rem;
 }
 
 .turn {
@@ -1337,11 +1342,32 @@ pre {
 
 .latest-button {
   position: absolute;
-  right: 1rem;
-  bottom: 150px;
+  bottom: 1rem;
+  left: 50%;
   z-index: 5;
+  display: grid;
+  width: 42px;
+  min-width: 42px;
+  height: 42px;
+  min-height: 42px;
+  padding: 0;
+  transform: translateX(-50%);
+  place-items: center;
   border-color: var(--accent);
+  border-radius: 50%;
+  color: var(--accent);
+  background: var(--panel);
   box-shadow: var(--shadow);
+}
+
+.latest-button svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .interaction {
