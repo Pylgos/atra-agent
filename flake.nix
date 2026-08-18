@@ -60,7 +60,7 @@
             # `hash = pkgs.lib.fakeHash;`, run `nix build .#atra`, then copy
             # the `got: sha256-...` value from the hash mismatch below.
             # hash = pkgs.lib.fakeHash;
-            hash = "sha256-mNlCwvJwbg5q+PZ0idjAHKaNIZjery/vR8eCbiD+GJQ=";
+            hash = "sha256-yDhDPbYWHK6SxvGzFRrKBQy9MUVd5tzDwK4WELmypvg=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"
