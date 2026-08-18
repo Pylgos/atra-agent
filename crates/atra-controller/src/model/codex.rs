@@ -17,7 +17,9 @@ use reqwest::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use atra_protocol::{InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent};
+use atra_protocol::{
+    AssistantMessagePhase, InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent,
+};
 
 use super::{
     ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
@@ -485,6 +487,7 @@ async fn stream_response_once(
     let mut saw_response = false;
     let mut completed = false;
     let mut has_response = false;
+    let mut assistant_phase = None;
 
     'stream: loop {
         let chunk = tokio::select! {
@@ -520,6 +523,7 @@ async fn stream_response_once(
                 &mut rate_limits,
                 emitted,
                 &mut has_response,
+                &mut assistant_phase,
             )
             .await?
             {
@@ -574,15 +578,21 @@ async fn handle_sse_event(
     rate_limits: &mut Vec<Value>,
     emitted: &mut bool,
     has_response: &mut bool,
+    assistant_phase: &mut Option<AssistantMessagePhase>,
 ) -> Result<bool> {
     let kind = event
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let update = match kind {
-        "response.output_text.delta" => event["delta"]
-            .as_str()
-            .map(|value| ModelStreamEvent::AssistantDelta(value.to_owned())),
+        "response.output_text.delta" => match event["delta"].as_str() {
+            Some(value) => Some(ModelStreamEvent::AssistantDelta {
+                content: value.to_owned(),
+                phase: (*assistant_phase)
+                    .context("assistant output delta arrived before its output item")?,
+            }),
+            None => None,
+        },
         "response.reasoning_summary_text.delta" => event["delta"]
             .as_str()
             .map(|value| ModelStreamEvent::ReasoningSummaryDelta(value.to_owned())),
@@ -596,6 +606,10 @@ async fn handle_sse_event(
         "response.output_item.added" => {
             let item = &event["item"];
             match item["type"].as_str() {
+                Some("message") => {
+                    *assistant_phase = Some(assistant_message_phase(item)?);
+                    None
+                }
                 Some("custom_tool_call") | Some("function_call") => {
                     Some(ModelStreamEvent::ToolCallStarted {
                         item_id: item["id"].as_str().unwrap_or_default().to_owned(),
@@ -631,6 +645,9 @@ async fn handle_sse_event(
     match kind {
         "response.output_item.done" => {
             let item = event["item"].clone();
+            if item["type"] == "message" {
+                *assistant_phase = None;
+            }
             if item["type"] == "web_search_call" {
                 *emitted = true;
                 sender
@@ -751,14 +768,7 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
             if content.is_empty() {
                 None
             } else {
-                let phase = match item["phase"].as_str() {
-                    Some("commentary") => atra_protocol::AssistantMessagePhase::Commentary,
-                    Some("final_answer") => atra_protocol::AssistantMessagePhase::FinalAnswer,
-                    Some(phase) => {
-                        anyhow::bail!("Codex returned unknown assistant message phase {phase}")
-                    }
-                    None => anyhow::bail!("Codex returned an assistant message without a phase"),
-                };
+                let phase = assistant_message_phase(item)?;
                 Some(ModelResponse::AssistantMessage { content, phase })
             }
         }
@@ -778,6 +788,15 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
         Some("reasoning") => Some(ModelResponse::Reasoning { item: item.clone() }),
         _ => None,
     })
+}
+
+fn assistant_message_phase(item: &Value) -> Result<AssistantMessagePhase> {
+    match item["phase"].as_str() {
+        Some("commentary") => Ok(AssistantMessagePhase::Commentary),
+        Some("final_answer") => Ok(AssistantMessagePhase::FinalAnswer),
+        Some(phase) => anyhow::bail!("Codex returned unknown assistant message phase {phase}"),
+        None => anyhow::bail!("Codex returned an assistant message without a phase"),
+    }
 }
 
 fn model_input(events: &[Event]) -> Result<Vec<Value>> {
@@ -1657,6 +1676,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut has_response,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1672,6 +1692,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut has_response,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1691,11 +1712,59 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut has_response,
+            &mut None,
         )
         .await
         .unwrap();
         assert!(!completed);
         assert_eq!(rate_limits[0]["primary"]["used_percent"], 42);
+    }
+
+    #[tokio::test]
+    async fn assistant_deltas_keep_the_output_item_phase() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut response_id = None;
+        let mut token_usage = None;
+        let mut rate_limits = Vec::new();
+        let mut emitted = false;
+        let mut has_response = false;
+        let mut assistant_phase = None;
+
+        handle_sse_event(
+            json!({
+                "type": "response.output_item.added",
+                "item": {"type": "message", "phase": "commentary"}
+            }),
+            &sender,
+            &mut response_id,
+            &mut token_usage,
+            &mut rate_limits,
+            &mut emitted,
+            &mut has_response,
+            &mut assistant_phase,
+        )
+        .await
+        .unwrap();
+        handle_sse_event(
+            json!({"type": "response.output_text.delta", "delta": "working"}),
+            &sender,
+            &mut response_id,
+            &mut token_usage,
+            &mut rate_limits,
+            &mut emitted,
+            &mut has_response,
+            &mut assistant_phase,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Ok(ModelEvent::Update(ModelStreamEvent::AssistantDelta {
+                content,
+                phase: AssistantMessagePhase::Commentary,
+            }))) if content == "working"
+        ));
     }
 
     #[tokio::test]
@@ -1715,6 +1784,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut has_response,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1759,6 +1829,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut has_response,
+            &mut None,
         )
         .await
         .unwrap();
@@ -1801,6 +1872,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut false,
+            &mut None,
         )
         .await
         .unwrap_err();
@@ -1833,6 +1905,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut false,
+            &mut None,
         )
         .await
         .unwrap_err();
@@ -1913,6 +1986,7 @@ mod tests {
         let mut token_usage = None;
         let mut rate_limits = Vec::new();
         let mut emitted = false;
+        let mut assistant_phase = Some(AssistantMessagePhase::FinalAnswer);
 
         let error = handle_sse_event(
             json!({"type": "response.output_text.delta", "delta": "hello"}),
@@ -1922,6 +1996,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut false,
+            &mut assistant_phase,
         )
         .await
         .unwrap_err();
@@ -1954,6 +2029,7 @@ mod tests {
             &mut rate_limits,
             &mut emitted,
             &mut false,
+            &mut None,
         )
         .await
         .unwrap();

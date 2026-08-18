@@ -2256,7 +2256,7 @@ fn ActivityRow(
                     }
                 }
             }
-        },
+        }
         ActivityDisplay::Search { summary, .. } => rsx! {
             button {
                 class: "collapsible-compact activity-search",

@@ -126,7 +126,7 @@ impl TranscriptState {
             return;
         }
         let item = match data {
-            ActiveItemData::Assistant { content } => TranscriptItem::Message {
+            ActiveItemData::Assistant { content, .. } => TranscriptItem::Message {
                 author: Author::Assistant,
                 text: sanitize(content),
                 todos: Vec::new(),
@@ -966,6 +966,7 @@ mod tests {
                 ActiveItemId(1),
                 ActiveItemData::Assistant {
                     content: "partial".to_owned(),
+                    phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
                 },
             ),
         }

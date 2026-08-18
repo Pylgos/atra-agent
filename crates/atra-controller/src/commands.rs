@@ -597,15 +597,15 @@ impl TurnProjector {
                     retry: RetryStatus::new(summary, current, max),
                 }
             }
-            ModelStreamEvent::AssistantDelta(content) => {
+            ModelStreamEvent::AssistantDelta { content, phase } => {
                 restore_running_phase(&self.state, self.thread_id, &mut projection).await?;
                 match projection.assistant {
-                    Some(id) => ThreadOperation::ActiveTextAppended { id, content },
+                    Some(id) => ThreadOperation::ActiveAssistantAppended { id, content, phase },
                     None => {
                         let id = projection.id();
                         projection.assistant = Some(id);
                         ThreadOperation::ActiveItemAdded {
-                            item: ActiveItem::new(id, ActiveItemData::Assistant { content }),
+                            item: ActiveItem::new(id, ActiveItemData::Assistant { content, phase }),
                         }
                     }
                 }
@@ -700,6 +700,25 @@ impl TurnProjector {
                             ),
                         }
                     }
+                }
+            }
+            ModelStreamEvent::RunnerOperationOutput {
+                call_id,
+                operation_index,
+                content,
+                omitted_bytes,
+                timer,
+            } => {
+                let id = projection
+                    .runner_tools
+                    .get(&(call_id, operation_index))
+                    .copied()
+                    .context("Runner output arrived before the operation started")?;
+                ThreadOperation::ActiveRunnerOutputAppended {
+                    id,
+                    content,
+                    omitted_bytes,
+                    timer,
                 }
             }
         };

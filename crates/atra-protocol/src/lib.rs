@@ -732,3 +732,5 @@ pub struct CommandOutput {
     pub omitted_bytes: usize,
     pub full_output_path: PathBuf,
 }
+
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 40_000;

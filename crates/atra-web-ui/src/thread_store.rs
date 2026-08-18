@@ -65,8 +65,8 @@ pub(super) struct TurnRead {
 }
 pub(super) struct ActivityRead {
     state: StateRead,
-    _active_items: Option<StateRead>,
-    _related: Vec<StateRead>,
+    active_items: Option<StateRead>,
+    related: Vec<StateRead>,
     key: ActivityKey,
 }
 pub(super) struct ActiveTurnRead(StateRead);
@@ -139,10 +139,17 @@ impl TurnRead {
 
 impl ActivityRead {
     pub fn value(&self) -> Option<ActivityDisplay<'_>> {
-        self.state
-            .value
-            .as_ref()
-            .and_then(|state| transcript_view::activity(state, &self.key))
+        self.related
+            .iter()
+            .rev()
+            .chain(self.active_items.iter())
+            .chain(std::iter::once(&self.state))
+            .find_map(|state| {
+                state
+                    .value
+                    .as_ref()
+                    .and_then(|state| transcript_view::activity(state, &self.key))
+            })
     }
 }
 
@@ -374,24 +381,31 @@ impl ThreadStore {
         let related = identity
             .as_deref()
             .and_then(|identity| {
-                state.value.as_ref()?.active_turn().map(|active| {
-                    active
-                        .items()
-                        .iter()
-                        .filter_map(|item| match item.data() {
-                            ActiveItemData::RunnerTool { call_id, .. } if call_id == identity => {
-                                Some(self.read(ThreadScope::ActiveItem(item.id())))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
+                self.inner
+                    .peek()
+                    .value
+                    .as_ref()?
+                    .active_turn()
+                    .map(|active| {
+                        active
+                            .items()
+                            .iter()
+                            .filter_map(|item| match item.data() {
+                                ActiveItemData::RunnerTool { call_id, .. }
+                                    if call_id == identity =>
+                                {
+                                    Some(self.read(ThreadScope::ActiveItem(item.id())))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
             })
             .unwrap_or_default();
         ActivityRead {
             state,
-            _active_items: identity.map(|_| self.read(ThreadScope::ActiveItemList)),
-            _related: related,
+            active_items: identity.map(|_| self.read(ThreadScope::ActiveItemList)),
+            related,
             key,
         }
     }
@@ -819,7 +833,7 @@ mod tests {
                         "phase": "running",
                         "items": [{
                             "id": 9,
-                            "data": {"kind": "assistant", "content": "Streaming"}
+                            "data": {"kind": "assistant", "content": "Streaming", "phase": "final_answer"}
                         }],
                         "pending_interaction": null
                     },
@@ -1090,7 +1104,7 @@ mod tests {
                     "operation": "active_item_added",
                     "item": {
                         "id": 9,
-                        "data": {"kind": "assistant", "content": "Streaming"}
+                        "data": {"kind": "assistant", "content": "Streaming", "phase": "final_answer"}
                     }
                 }
             })));

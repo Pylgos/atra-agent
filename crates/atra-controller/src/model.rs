@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use atra_protocol::{
-    ApprovalPolicy, AssistantMessagePhase, Model, Runner, RunnerOperationUpdate,
+    ApprovalPolicy, AssistantMessagePhase, CommandTimerState, Model, Runner, RunnerOperationUpdate,
     SkillInvocationEvent,
 };
 use futures_util::stream::BoxStream;
@@ -75,7 +75,10 @@ pub(crate) enum ModelStreamEvent {
         current: u64,
         max: u64,
     },
-    AssistantDelta(String),
+    AssistantDelta {
+        content: String,
+        phase: AssistantMessagePhase,
+    },
     ReasoningSummaryDelta(String),
     ReasoningSummaryPartAdded,
     WebSearchUpdate {
@@ -96,6 +99,13 @@ pub(crate) enum ModelStreamEvent {
         operation_index: usize,
         runner: Option<String>,
         update: RunnerOperationUpdate,
+    },
+    RunnerOperationOutput {
+        call_id: String,
+        operation_index: usize,
+        content: String,
+        omitted_bytes: usize,
+        timer: CommandTimerState,
     },
 }
 

@@ -504,11 +504,69 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     );
     source.emit({
       message: "operation",
-      operation: { operation: "active_item_discarded", id: 21 }
+      operation: {
+        operation: "active_item_finalized",
+        active_id: 20,
+        event: {
+          sequence: 8,
+          kind: "tool_call",
+          payload: {
+            type: "custom",
+            item_id: "command-item",
+            call_id: "command-call",
+            name: "command",
+            input: "*** Runner sandbox\nset -e\necho hello"
+          }
+        }
+      }
     });
     source.emit({
       message: "operation",
-      operation: { operation: "active_item_discarded", id: 20 }
+      operation: {
+        operation: "active_runner_output_appended",
+        id: 21,
+        content: "world\n",
+        omitted_bytes: 0,
+        timer: { elapsed_ms: 24, remaining_ms: 0, paused: false }
+      }
+    });
+  });
+  await page.locator(".activity-command.running").click();
+  await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
+  await expect(page.locator(".utility .command-operation header span")).toContainText("running");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_runner_updated",
+        id: 21,
+        update: {
+          kind: "completed",
+          artifact: {
+            kind: "runner_operation",
+            data: {
+              operation: 1,
+              runner: "sandbox",
+              label: "Command",
+              result: "hello\nworld\n",
+              artifacts: []
+            }
+          }
+        }
+      }
+    });
+  });
+  await expect(page.locator(".utility .command-operation header span")).toHaveText("Command");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: { operation: "active_item_discarded", id: 21 }
     });
   });
   await page.evaluate(() => {
@@ -521,14 +579,21 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
         operation: "active_item_added",
         item: {
           id: 9,
-          data: { kind: "assistant", content: "Streaming" }
+          data: {
+            kind: "assistant",
+            content: "Streaming commentary",
+            phase: "commentary"
+          }
         }
       }
     });
   });
-  const streamingAnswer = page.locator(".assistant-message").last();
-  await expect(streamingAnswer).toContainText("Streaming");
-  await expect(page.locator(".turn").last().locator(".activity-list")).not.toContainText("Streaming");
+  const currentTurn = page.locator(".turn").last();
+  const streamingCommentary = currentTurn.locator(".activity-commentary", {
+    hasText: "Streaming commentary"
+  });
+  await expect(currentTurn.locator(".assistant-message")).not.toContainText("Streaming commentary");
+  await expect(streamingCommentary).toContainText("Streaming commentary");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -536,13 +601,39 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     source.emit({
       message: "operation",
       operation: {
-        operation: "active_text_appended",
+        operation: "active_assistant_appended",
         id: 9,
-        content: " update"
+        content: " update",
+        phase: "commentary"
       }
     });
   });
-  await expect(streamingAnswer).toContainText("Streaming update");
+  await expect(streamingCommentary).toContainText("Streaming commentary update");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: { operation: "active_item_discarded", id: 9 }
+    });
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_item_added",
+        item: {
+          id: 10,
+          data: {
+            kind: "assistant",
+            content: "Streaming answer",
+            phase: "final_answer"
+          }
+        }
+      }
+    });
+  });
+  const streamingAnswer = page.locator(".assistant-message").last();
+  await expect(streamingAnswer).toContainText("Streaming answer");
 
   await page.locator(".turn-card").last().evaluate((element) => {
     (element as HTMLElement).style.minHeight = "1600px";
@@ -560,9 +651,10 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     source.emit({
       message: "operation",
       operation: {
-        operation: "active_text_appended",
-        id: 9,
-        content: " again"
+        operation: "active_assistant_appended",
+        id: 10,
+        content: " again",
+        phase: "final_answer"
       }
     });
   });
@@ -571,7 +663,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect.poll(() => page.locator("#transcript-scroll").evaluate((element) =>
     element.scrollHeight - element.scrollTop - element.clientHeight
   )).toBeLessThanOrEqual(80);
-  await expect(page.getByText("Streaming update again", { exact: true })).toBeVisible();
+  await expect(page.getByText("Streaming answer again", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"

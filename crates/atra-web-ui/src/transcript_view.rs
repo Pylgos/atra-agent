@@ -6,9 +6,9 @@ use atra_patch_types::{
     ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
 };
 use atra_protocol::{
-    ActiveItemData, ActiveItemId, AssistantMessagePhase, CommandExecutionArtifact, EventSequence,
-    RunnerOperationUpdate, ThreadEvent, ThreadEventData, ThreadState, TodoStatus, ToolArtifact,
-    ToolCallEvent,
+    ActiveItem, ActiveItemData, ActiveItemId, AssistantMessagePhase, CommandExecutionArtifact,
+    EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, ThreadState, TodoStatus,
+    ToolArtifact, ToolCallEvent,
 };
 use serde_json::Value;
 
@@ -239,7 +239,10 @@ impl<'a> TurnRef<'a> {
         if self.is_last()
             && let Some(active) = self.state.active_turn()
             && let Some(content) = active.items().iter().find_map(|item| match item.data() {
-                ActiveItemData::Assistant { content } => Some(content.as_str()),
+                ActiveItemData::Assistant {
+                    content,
+                    phase: AssistantMessagePhase::FinalAnswer,
+                } => Some(content.as_str()),
                 _ => None,
             })
         {
@@ -346,11 +349,15 @@ impl<'a> TurnRef<'a> {
         if self.is_last()
             && let Some(active) = self.state.active_turn()
         {
-            for item in active
-                .items()
-                .iter()
-                .filter(|item| !matches!(item.data(), ActiveItemData::Assistant { .. }))
-            {
+            for item in active.items().iter().filter(|item| {
+                !matches!(
+                    item.data(),
+                    ActiveItemData::Assistant {
+                        phase: AssistantMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+            }) {
                 if let ActiveItemData::RunnerTool { call_id, .. } = item.data()
                     && activities
                         .iter()
@@ -492,58 +499,75 @@ pub(super) fn activity<'a>(
                 items: &message.todos,
             })
         }
-        ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
+        ActivityKey::Active(id) => {
             let item = state
                 .active_turn()?
                 .items()
                 .iter()
                 .find(|item| item.id() == *id)?;
-            match item.data() {
-                ActiveItemData::Reasoning { content } => Some(ActivityDisplay::Reasoning {
-                    summary: Cow::Borrowed(content),
-                }),
-                ActiveItemData::ToolCall {
-                    name,
-                    input,
-                    call_id,
-                    item_id,
-                } => match canonical_tool_name(name) {
-                    "command" => {
-                        let call = ToolCallEvent::Custom {
-                            call_type: atra_protocol::CustomToolType::Custom,
-                            item_id: Some(item_id.clone()),
-                            name: name.clone(),
-                            input: input.clone(),
-                            call_id: call_id.clone().unwrap_or_else(|| item_id.clone()),
-                        };
-                        Some(ActivityDisplay::Command(command_display(
-                            state,
-                            &call,
-                            None,
-                            call_id.as_deref().or(Some(item_id)),
-                            &[],
-                        )))
-                    }
-                    "question" => Some(active_question_display(input)),
-                    _ => Some(ActivityDisplay::Unsupported {
-                        summary: meaningful_text(input)
-                            .unwrap_or_else(|| canonical_tool_name(name).to_owned()),
-                    }),
-                },
-                ActiveItemData::WebSearch { action, .. } => {
-                    let (summary, detail) = action
-                        .as_ref()
-                        .map(search_display)
-                        .unwrap_or_else(|| ("Searching…".to_owned(), String::new()));
-                    Some(ActivityDisplay::Search { summary, detail })
-                }
-                ActiveItemData::RunnerTool { runner, update, .. } => {
-                    Some(orphan_runner_display(runner.as_deref(), update))
-                }
-                ActiveItemData::Assistant { content } => {
-                    Some(ActivityDisplay::Commentary { markdown: content })
-                }
+            active_activity(state, item)
+        }
+        ActivityKey::StableActive { id, identity } => {
+            if let Some(item) = state
+                .active_turn()
+                .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))
+            {
+                return active_activity(state, item);
             }
+            let key = finalized_tool_key(state, identity)?;
+            activity(state, &key)
+        }
+    }
+}
+
+fn active_activity<'a>(
+    state: &'a ThreadState,
+    item: &'a ActiveItem,
+) -> Option<ActivityDisplay<'a>> {
+    match item.data() {
+        ActiveItemData::Reasoning { content } => Some(ActivityDisplay::Reasoning {
+            summary: Cow::Borrowed(content),
+        }),
+        ActiveItemData::ToolCall {
+            name,
+            input,
+            call_id,
+            item_id,
+        } => match canonical_tool_name(name) {
+            "command" => {
+                let call = ToolCallEvent::Custom {
+                    call_type: atra_protocol::CustomToolType::Custom,
+                    item_id: Some(item_id.clone()),
+                    name: name.clone(),
+                    input: input.clone(),
+                    call_id: call_id.clone().unwrap_or_else(|| item_id.clone()),
+                };
+                Some(ActivityDisplay::Command(command_display(
+                    state,
+                    &call,
+                    None,
+                    call_id.as_deref().or(Some(item_id)),
+                    &[],
+                )))
+            }
+            "question" => Some(active_question_display(input)),
+            _ => Some(ActivityDisplay::Unsupported {
+                summary: meaningful_text(input)
+                    .unwrap_or_else(|| canonical_tool_name(name).to_owned()),
+            }),
+        },
+        ActiveItemData::WebSearch { action, .. } => {
+            let (summary, detail) = action
+                .as_ref()
+                .map(search_display)
+                .unwrap_or_else(|| ("Searching…".to_owned(), String::new()));
+            Some(ActivityDisplay::Search { summary, detail })
+        }
+        ActiveItemData::RunnerTool { runner, update, .. } => {
+            Some(orphan_runner_display(runner.as_deref(), update))
+        }
+        ActiveItemData::Assistant { content, .. } => {
+            Some(ActivityDisplay::Commentary { markdown: content })
         }
     }
 }
@@ -797,7 +821,7 @@ fn command_display(
             if call_id != identity {
                 continue;
             }
-            active = true;
+            active |= !matches!(update, RunnerOperationUpdate::Completed { .. });
             let index = operation_index.saturating_sub(1);
             if let Some(operation) = operations.get_mut(index) {
                 if let Some(runner) = runner {
@@ -1031,6 +1055,14 @@ pub(super) fn activity_summary(state: &ThreadState, keys: &[ActivityKey]) -> Str
 }
 
 fn activity_type_label(state: &ThreadState, key: &ActivityKey) -> &'static str {
+    if let ActivityKey::StableActive { id, identity } = key
+        && state
+            .active_turn()
+            .is_none_or(|turn| turn.items().iter().all(|item| item.id() != *id))
+        && let Some(key) = finalized_tool_key(state, identity)
+    {
+        return activity_type_label(state, &key);
+    }
     match key {
         ActivityKey::Event(sequence) => {
             let Some(event) = event(state, *sequence) else {
@@ -1114,6 +1146,14 @@ fn format_activity_count(label: &str, count: usize) -> String {
 }
 
 fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bool)> {
+    if let ActivityKey::StableActive { id, identity } = key
+        && state
+            .active_turn()
+            .is_none_or(|turn| turn.items().iter().all(|item| item.id() != *id))
+        && let Some(key) = finalized_tool_key(state, identity)
+    {
+        return activity_header(state, &key);
+    }
     match key {
         ActivityKey::Event(sequence) => match &event(state, *sequence)?.data {
             ThreadEventData::AssistantMessage(message)
@@ -1266,7 +1306,7 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
                         .unwrap_or_else(|| "Running…".to_owned()),
                     true,
                 )),
-                ActiveItemData::Assistant { content } => Some((
+                ActiveItemData::Assistant { content, .. } => Some((
                     meaningful_text(content).unwrap_or_else(|| "Writing…".to_owned()),
                     true,
                 )),
@@ -1329,6 +1369,22 @@ pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
     }
 }
 
+fn finalized_tool_key(state: &ThreadState, identity: &str) -> Option<ActivityKey> {
+    turn_keys(state)
+        .into_iter()
+        .filter_map(|key| turn(state, key))
+        .flat_map(|turn| turn.activity_keys())
+        .find(|key| {
+            matches!(
+                key,
+                ActivityKey::Tool {
+                    identity: Some(current),
+                    ..
+                } if current == identity
+            )
+        })
+}
+
 fn format_patch_operation(
     result: &PatchOperationResult,
     output: &mut String,
@@ -1338,7 +1394,11 @@ fn format_patch_operation(
         PatchOperationResult::Added { path, outcome } => ("added", path, outcome),
         PatchOperationResult::Deleted { path, outcome } => ("deleted", path, outcome),
         PatchOperationResult::Updated { path, outcome } => ("updated", path, outcome),
-        PatchOperationResult::Moved { from: _, to, outcome } => ("moved", to, outcome),
+        PatchOperationResult::Moved {
+            from: _,
+            to,
+            outcome,
+        } => ("moved", to, outcome),
     };
     match outcome {
         PatchOperationOutcome::Applied { diff: Ok(diff) } => {
@@ -1443,7 +1503,8 @@ fn is_turn_boundary(data: &ThreadEventData) -> bool {
 mod tests {
     use super::*;
     use atra_protocol::{
-        ActiveItem, CommandTimerState, RunnerOperationUpdate, ThreadOperation, TurnPhase,
+        ActiveItem, CommandTimerState, RunnerOperationArtifact, RunnerOperationUpdate,
+        ThreadOperation, TurnPhase,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1558,6 +1619,7 @@ mod tests {
                 ActiveItemId(7),
                 ActiveItemData::Assistant {
                     content: "streaming".to_owned(),
+                    phase: AssistantMessagePhase::FinalAnswer,
                 },
             ),
         }
@@ -1567,6 +1629,148 @@ mod tests {
         let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
         assert!(turn.activity_keys().is_empty());
         assert_eq!(turn.answer(), Some((None, "streaming")));
+    }
+
+    #[test]
+    fn active_commentary_streams_inside_the_activity_group() {
+        let mut state = state(vec![event(1, "user_message", json!({"content": "prompt"}))]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(7),
+                ActiveItemData::Assistant {
+                    content: "working".to_owned(),
+                    phase: AssistantMessagePhase::Commentary,
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
+        assert_eq!(
+            turn.activity_keys(),
+            vec![ActivityKey::Active(ActiveItemId(7))]
+        );
+        assert_eq!(turn.answer(), None);
+        assert!(matches!(
+            activity(&state, &turn.activity_keys()[0]),
+            Some(ActivityDisplay::Commentary {
+                markdown: "working"
+            })
+        ));
+    }
+
+    #[test]
+    fn stable_command_selection_survives_finalization_and_runner_updates() {
+        let mut state = state(vec![event(1, "user_message", json!({"content": "run"}))]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(7),
+                ActiveItemData::ToolCall {
+                    item_id: "item-1".to_owned(),
+                    call_id: Some("call-1".to_owned()),
+                    name: "command".to_owned(),
+                    input: r#"{"command":"*** Runner sandbox\necho hello"}"#.to_owned(),
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let selected = ActivityKey::StableActive {
+            id: ActiveItemId(7),
+            identity: "call-1".to_owned(),
+        };
+        ThreadOperation::ActiveItemFinalized {
+            active_id: ActiveItemId(7),
+            event: event(
+                2,
+                "tool_call",
+                json!({
+                    "type": "custom",
+                    "item_id": "item-1",
+                    "name": "command",
+                    "input": "{\"command\":\"*** Runner sandbox\\necho hello\"}",
+                    "call_id": "call-1"
+                }),
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(8),
+                ActiveItemData::RunnerTool {
+                    call_id: "call-1".to_owned(),
+                    operation_index: 1,
+                    runner: Some("sandbox".to_owned()),
+                    update: RunnerOperationUpdate::CommandOutput {
+                        content: "first\nsecond\n".to_owned(),
+                        omitted_bytes: 0,
+                        timer: CommandTimerState {
+                            elapsed_ms: 10,
+                            remaining_ms: 20,
+                            paused: false,
+                        },
+                    },
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let ActivityDisplay::Command(running) = activity(&state, &selected).unwrap() else {
+            panic!("expected command display");
+        };
+        assert!(running.active);
+        assert_eq!(running.operations[0].output, "first\nsecond\n");
+
+        ThreadOperation::ActiveRunnerOutputAppended {
+            id: ActiveItemId(8),
+            content: "third\n".to_owned(),
+            omitted_bytes: 0,
+            timer: CommandTimerState {
+                elapsed_ms: 20,
+                remaining_ms: 10,
+                paused: false,
+            },
+        }
+        .apply(&mut state)
+        .unwrap();
+        let ActivityDisplay::Command(streaming) = activity(&state, &selected).unwrap() else {
+            panic!("expected command display");
+        };
+        assert_eq!(streaming.operations[0].output, "first\nsecond\nthird\n");
+
+        ThreadOperation::ActiveRunnerUpdated {
+            id: ActiveItemId(8),
+            update: RunnerOperationUpdate::Completed {
+                artifact: ToolArtifact::RunnerOperation(RunnerOperationArtifact {
+                    operation: 1,
+                    runner: "sandbox".to_owned(),
+                    label: "Command".to_owned(),
+                    result: Value::String("first\nsecond\nthird\n".to_owned()),
+                    artifacts: Vec::new(),
+                }),
+            },
+        }
+        .apply(&mut state)
+        .unwrap();
+        let ActivityDisplay::Command(completed) = activity(&state, &selected).unwrap() else {
+            panic!("expected command display");
+        };
+        assert!(!completed.active);
+        assert_eq!(completed.operations[0].status, "Command");
+        assert_eq!(activity_type_label(&state, &selected), "command");
     }
 
     #[test]
@@ -1753,6 +1957,7 @@ mod tests {
                 ActiveItemId(7),
                 ActiveItemData::Assistant {
                     content: "streaming".to_owned(),
+                    phase: AssistantMessagePhase::FinalAnswer,
                 },
             ),
         }

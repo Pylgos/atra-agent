@@ -491,6 +491,28 @@ pub(super) async fn send_operation_update(
     Ok(())
 }
 
+pub(super) async fn send_operation_output(
+    operation: Option<&OperationContext>,
+    updates: Option<&TurnProjector>,
+    content: String,
+    omitted_bytes: usize,
+    timer: CommandTimerState,
+) -> Result<()> {
+    if let Some(operation) = operation {
+        updates
+            .context("runner operation output requires a streaming turn")?
+            .apply_update(ModelStreamEvent::RunnerOperationOutput {
+                call_id: operation.call_id.clone(),
+                operation_index: operation.index,
+                content,
+                omitted_bytes,
+                timer,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) fn masked_tool_result(payload: &ToolResultEvent) -> Option<String> {
     let (original, artifacts, custom) = match payload {
         ToolResultEvent::Custom {
@@ -680,11 +702,12 @@ pub(super) fn append_command_output(collected: &mut Option<CommandOutput>, outpu
             collected.content.push_str(&output.content);
             collected.omitted_bytes += output.omitted_bytes;
             collected.full_output_path = output.full_output_path;
-            if collected.content.len() > MAX_TOOL_OUTPUT_BYTES {
-                let head_end = floor_char_boundary(&collected.content, MAX_TOOL_OUTPUT_BYTES / 2);
+            if collected.content.len() > MAX_COMMAND_OUTPUT_BYTES {
+                let head_end =
+                    floor_char_boundary(&collected.content, MAX_COMMAND_OUTPUT_BYTES / 2);
                 let tail_start = ceil_char_boundary(
                     &collected.content,
-                    collected.content.len() - MAX_TOOL_OUTPUT_BYTES / 2,
+                    collected.content.len() - MAX_COMMAND_OUTPUT_BYTES / 2,
                 )
                 .max(head_end);
                 collected.omitted_bytes += tail_start - head_end;
@@ -695,8 +718,6 @@ pub(super) fn append_command_output(collected: &mut Option<CommandOutput>, outpu
     }
 }
 
-const MAX_TOOL_OUTPUT_BYTES: usize = 40_000;
-
 pub(super) fn format_command_output(output: &CommandOutput) -> String {
     format_command_output_with_location(output, &output.full_output_path.display().to_string())
 }
@@ -705,20 +726,20 @@ pub(super) fn format_command_output_with_location(
     output: &CommandOutput,
     full_output_location: &str,
 ) -> String {
-    if output.omitted_bytes == 0 && output.content.len() <= MAX_TOOL_OUTPUT_BYTES {
+    if output.omitted_bytes == 0 && output.content.len() <= MAX_COMMAND_OUTPUT_BYTES {
         return output.content.clone();
     }
 
     let head_end = floor_char_boundary(
         &output.content,
-        (MAX_TOOL_OUTPUT_BYTES / 2).min(output.content.len()),
+        (MAX_COMMAND_OUTPUT_BYTES / 2).min(output.content.len()),
     );
     let tail_start = ceil_char_boundary(
         &output.content,
         output
             .content
             .len()
-            .saturating_sub(MAX_TOOL_OUTPUT_BYTES - MAX_TOOL_OUTPUT_BYTES / 2),
+            .saturating_sub(MAX_COMMAND_OUTPUT_BYTES - MAX_COMMAND_OUTPUT_BYTES / 2),
     )
     .max(head_end);
     let omitted_bytes = output.omitted_bytes + tail_start.saturating_sub(head_end);

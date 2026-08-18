@@ -451,13 +451,26 @@ impl OllamaStream {
                         ModelStreamEvent::ReasoningSummaryDelta(chunk.message.thinking),
                     )));
                 }
+                let started_tool_call =
+                    self.message.tool_calls.is_empty() && !chunk.message.tool_calls.is_empty();
+                self.message.tool_calls.extend(chunk.message.tool_calls);
                 if !chunk.message.content.is_empty() {
-                    self.message.content.push_str(&chunk.message.content);
+                    let content = chunk.message.content;
+                    self.message.content.push_str(&content);
                     self.pending.push_back(Ok(ModelEvent::Update(
-                        ModelStreamEvent::AssistantDelta(chunk.message.content),
+                        ModelStreamEvent::AssistantDelta {
+                            content,
+                            phase: assistant_phase(&self.message),
+                        },
+                    )));
+                } else if started_tool_call && !self.message.content.is_empty() {
+                    self.pending.push_back(Ok(ModelEvent::Update(
+                        ModelStreamEvent::AssistantDelta {
+                            content: String::new(),
+                            phase: AssistantMessagePhase::Commentary,
+                        },
                     )));
                 }
-                self.message.tool_calls.extend(chunk.message.tool_calls);
                 if chunk.done {
                     self.finish(chunk.prompt_eval_count, chunk.eval_count);
                 }
@@ -857,10 +870,7 @@ mod tests {
                 arguments: json!({"input": "echo"}),
             },
         });
-        assert_eq!(
-            assistant_phase(&message),
-            AssistantMessagePhase::Commentary
-        );
+        assert_eq!(assistant_phase(&message), AssistantMessagePhase::Commentary);
     }
 
     #[test]

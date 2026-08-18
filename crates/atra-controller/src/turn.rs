@@ -1332,19 +1332,18 @@ impl State {
                 } => {
                     self.register_spawned_processes(thread_id, &runner_name, spawned_processes)
                         .await?;
+                    let delta_content = output.content.clone();
+                    let delta_omitted_bytes = output.omitted_bytes;
+                    append_command_output(&mut collected, output);
                     let timer = command_timer_state(&timing);
-                    send_operation_update(
+                    send_operation_output(
                         operation,
                         updates,
-                        Some(&runner_name),
-                        RunnerOperationUpdate::CommandOutput {
-                            content: output.content.clone(),
-                            omitted_bytes: output.omitted_bytes,
-                            timer: timer.clone(),
-                        },
+                        delta_content,
+                        delta_omitted_bytes,
+                        timer.clone(),
                     )
                     .await?;
-                    append_command_output(&mut collected, output);
                     patch_results.extend(result_patch_results);
                     if timer.remaining_ms == 0 {
                         break WaitOutcome::Running {
