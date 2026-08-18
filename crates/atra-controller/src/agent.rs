@@ -1166,6 +1166,11 @@ mod tests {
             .lock()
             .unwrap()
             .insert("deleted-context".to_owned(), deleted);
+        let old_key = crate::runner_pool::ProcessKey {
+            thread_id: deleted,
+            runner: "stuck".to_owned(),
+            process_id: ProcessId("process".to_owned()),
+        };
 
         let delete_state = Arc::clone(&state);
         let deletion = tokio::spawn(async move {
@@ -1186,15 +1191,17 @@ mod tests {
         })
         .await
         .expect("delete did not commit before Runner cleanup");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.runners.process(&old_key).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted deletion did not detach the old process");
         assert!(
             !deletion.is_finished(),
             "fake Runner unexpectedly answered stop"
         );
-        let old_key = crate::runner_pool::ProcessKey {
-            thread_id: deleted,
-            runner: "stuck".to_owned(),
-            process_id: ProcessId("process".to_owned()),
-        };
         assert!(
             state.runners.process(&old_key).await.is_none(),
             "accepted deletion left the old process publicly reachable"
