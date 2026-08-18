@@ -12,8 +12,9 @@ use std::{
 use atra_protocol::{
     AgentStatus, CheckpointId, CheckpointSubscriptionMessage, Command, CommandResult,
     ControllerOperation, ControllerState, ControllerSubscriptionMessage, EventSequence,
-    HistoryTarget, InteractionId, PendingInteraction, ProcessId, ProcessState, ProcessStatus,
-    ProcessSubscriptionMessage, QuestionAnswer, ThreadId, ThreadState, ThreadSubscriptionMessage,
+    HistoryTarget, InteractionId, Model, PendingInteraction, ProcessId, ProcessState,
+    ProcessStatus, ProcessSubscriptionMessage, QuestionAnswer, ThreadId, ThreadState,
+    ThreadSubscriptionMessage,
 };
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -2970,6 +2971,7 @@ fn UtilityPanel(
                 match utility_tab() {
                     UtilityTab::Thread => rsx! {
                         ThreadUtility {
+                            key: "{thread}",
                             workspace: workspace.clone(),
                             thread,
                             store,
@@ -3037,6 +3039,7 @@ fn ThreadUtility(
         .find(|model| format!("{}\n{}", model.provider, model.id) == selected_model())
         .map(|model| model.supported_reasoning_efforts.clone())
         .unwrap_or_else(|| vec![reasoning()]);
+    let selectable_models = models.clone();
     let diagnostics = diagnostics_read.value().unwrap_or_default();
     let rename_metadata = metadata.clone();
     let delete_metadata = metadata.clone();
@@ -3085,11 +3088,20 @@ fn ThreadUtility(
                 label {
                     "Provider and model"
                     select {
-                        value: "{selected_model}",
-                        onchange: move |event| selected_model.set(event.value()),
+                        onchange: move |event| {
+                            let selection = event.value();
+                            let effort = reasoning_effort_for_model(
+                                &selectable_models,
+                                &selection,
+                                &reasoning(),
+                            );
+                            selected_model.set(selection);
+                            reasoning.set(effort);
+                        },
                         for model in &models {
                             option {
                                 value: "{model.provider}\n{model.id}",
+                                selected: format!("{}\n{}", model.provider, model.id) == selected_model(),
                                 "{model.display_name} ({model.provider})"
                             }
                         }
@@ -3098,10 +3110,13 @@ fn ThreadUtility(
                 label {
                     "Reasoning effort"
                     select {
-                        value: "{reasoning}",
                         onchange: move |event| reasoning.set(event.value()),
                         for effort in efforts {
-                            option { value: "{effort}", "{effort}" }
+                            option {
+                                value: "{effort}",
+                                selected: effort == reasoning(),
+                                "{effort}"
+                            }
                         }
                     }
                 }
@@ -3699,6 +3714,24 @@ fn AppDialog(
     }
 }
 
+fn reasoning_effort_for_model(models: &[Model], selection: &str, current: &str) -> String {
+    let Some(model) = models
+        .iter()
+        .find(|model| format!("{}\n{}", model.provider, model.id) == selection)
+    else {
+        return current.to_owned();
+    };
+    if model
+        .supported_reasoning_efforts
+        .iter()
+        .any(|effort| effort == current)
+    {
+        current.to_owned()
+    } else {
+        model.default_reasoning_effort.clone()
+    }
+}
+
 fn transcript_is_near_bottom(scroll_height: i32, scroll_top: i32, client_height: i32) -> bool {
     scroll_height - scroll_top - client_height <= 80
 }
@@ -3706,6 +3739,46 @@ fn transcript_is_near_bottom(scroll_height: i32, scroll_top: i32, client_height:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model(
+        id: &str,
+        default_reasoning_effort: &str,
+        supported_reasoning_efforts: &[&str],
+    ) -> Model {
+        Model {
+            provider: "fake".to_owned(),
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            description: None,
+            default_reasoning_effort: default_reasoning_effort.to_owned(),
+            supported_reasoning_efforts: supported_reasoning_efforts
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect(),
+            context_window: None,
+            auto_compact_token_limit: None,
+        }
+    }
+
+    #[test]
+    fn model_selection_preserves_a_supported_reasoning_effort() {
+        let models = [model("test-model", "medium", &["low", "medium", "high"])];
+
+        assert_eq!(
+            reasoning_effort_for_model(&models, "fake\ntest-model", "high"),
+            "high"
+        );
+    }
+
+    #[test]
+    fn model_selection_uses_the_new_models_default_reasoning_effort() {
+        let models = [model("test-model", "high", &["high"])];
+
+        assert_eq!(
+            reasoning_effort_for_model(&models, "fake\ntest-model", "medium"),
+            "high"
+        );
+    }
 
     #[test]
     fn transcript_follows_when_viewport_is_near_the_bottom() {

@@ -63,6 +63,13 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             description: "No-provider test model",
             default_reasoning_effort: "medium",
             supported_reasoning_efforts: ["low", "medium", "high"]
+          }, {
+            provider: "fake",
+            id: "alternate-model",
+            display_name: "Alternate Model",
+            description: "Model with a different reasoning effort",
+            default_reasoning_effort: "high",
+            supported_reasoning_efforts: ["high"]
           }],
           rate_limits: null
         }],
@@ -149,6 +156,24 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             }
           }
         ],
+        active_turn: null,
+        last_outcome: null,
+        checkpoints: [],
+        processes: []
+      }
+    },
+    "/api/workspaces/workspace-1/threads/2/events": {
+      message: "snapshot",
+      state: {
+        metadata: {
+          id: 2,
+          parent_thread_id: null,
+          display_name: "Background Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        },
+        events: [],
         active_turn: null,
         last_outcome: null,
         checkpoints: [],
@@ -286,6 +311,13 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(workspaceRow).not.toContainText("children");
   await expect(workspaceRow.locator(".thread-status-indicator")).toHaveCount(0);
 
+  const modelSelector = page.getByLabel("Provider and model");
+  const reasoningSelector = page.getByLabel("Reasoning effort");
+  await expect(modelSelector).toHaveValue("fake\ntest-model");
+  await expect(reasoningSelector).toHaveValue("medium");
+  await modelSelector.selectOption("fake\nalternate-model");
+  await expect(reasoningSelector).toHaveValue("high");
+
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/controller/events"
@@ -345,6 +377,8 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   const backgroundRow = page.locator(".workspace-thread-row").filter({ hasText: "Background Thread" });
   await expect(backgroundRow.getByRole("img", { name: "Completed" })).toBeVisible();
   await backgroundRow.locator(".navigation-link").click();
+  await expect(modelSelector).toHaveValue("fake\ntest-model");
+  await expect(reasoningSelector).toHaveValue("medium");
   await expect(backgroundRow.locator(".thread-status-indicator")).toHaveCount(0);
   await workspaceRow.locator(".navigation-link").click();
 
