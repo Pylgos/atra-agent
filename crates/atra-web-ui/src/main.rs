@@ -214,6 +214,20 @@ fn save_sent_message(workspace: &str, thread: i64, message: &str) {
     save_json(&key, &history);
 }
 
+fn byte_index_at_utf16_offset(value: &str, offset: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (byte_index, character) in value.char_indices() {
+        if utf16_offset >= offset {
+            return byte_index;
+        }
+        utf16_offset += character.len_utf16();
+        if utf16_offset > offset {
+            return byte_index;
+        }
+    }
+    value.len()
+}
+
 fn request_notification_permission() {
     spawn(async {
         if let Ok(permission) = web_sys::Notification::request_permission() {
@@ -2485,8 +2499,9 @@ fn Composer(
                             return;
                         }
                         let value = draft();
-                        let at_first = !value[..start.min(value.len())].contains('\n');
-                        let at_last = !value[start.min(value.len())..].contains('\n');
+                        let start = byte_index_at_utf16_offset(&value, start);
+                        let at_first = !value[..start].contains('\n');
+                        let at_last = !value[start..].contains('\n');
                         if event.key() == Key::ArrowUp && at_first && !history.is_empty() {
                             event.prevent_default();
                             let next = history_index().map(|index| index.saturating_sub(1)).unwrap_or_else(|| {

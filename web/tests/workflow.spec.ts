@@ -549,6 +549,20 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   });
   await expect(page.getByRole("button", { name: /Assistant response/ })).toHaveCount(0);
 
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "atra:sent-history:workspace-1:1",
+      JSON.stringify(["Previous prompt"])
+    );
+  });
+  const composer = page.getByLabel("Message");
+  await composer.fill("aーb");
+  await composer.evaluate((element: HTMLTextAreaElement) => {
+    element.setSelectionRange(2, 2);
+  });
+  await composer.press("ArrowUp");
+  await expect(composer).toHaveValue("Previous prompt");
+
   await page.getByLabel("Message").fill("Sent from browser");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("atra:draft:workspace-1:1")))
     .toBe("Sent from browser");
