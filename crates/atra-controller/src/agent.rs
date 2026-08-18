@@ -641,9 +641,8 @@ fn render_report_events(
             ThreadEventData::AssistantMessage(message) => Some(format!(
                 "[assistant/{}]\n{}",
                 match message.phase {
-                    Some(AssistantMessagePhase::Commentary) => "commentary",
-                    Some(AssistantMessagePhase::FinalAnswer) => "final",
-                    None => "message",
+                    AssistantMessagePhase::Commentary => "commentary",
+                    AssistantMessagePhase::FinalAnswer => "final",
                 },
                 message.content
             )),
@@ -826,7 +825,11 @@ mod tests {
     async fn test_state() -> (Arc<State>, TempDir, ThreadId) {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("model.json");
-        fs::write(&script, r#"[{"assistant_message":{"content":"done"}}]"#).unwrap();
+        fs::write(
+            &script,
+            r#"[{"assistant_message":{"content":"done","phase":"final_answer"}}]"#,
+        )
+        .unwrap();
         let store = crate::storage::Store::open(&directory.path().join("state.db"))
             .await
             .unwrap();

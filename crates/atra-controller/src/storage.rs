@@ -1404,7 +1404,7 @@ mod tests {
     fn assistant(content: &str) -> ThreadEventData {
         ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
             content: content.to_owned(),
-            phase: Some(atra_protocol::AssistantMessagePhase::FinalAnswer),
+            phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
             todos: Vec::new(),
         })
     }
@@ -1766,7 +1766,7 @@ mod tests {
                     thread,
                     ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                         content: "two".to_owned(),
-                        phase: None,
+                        phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
                         todos: Vec::new(),
                     })
                 )
@@ -1796,7 +1796,7 @@ mod tests {
                     sequence: EventSequence(2),
                     data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                         content: "two".to_owned(),
-                        phase: None,
+                        phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
                         todos: Vec::new(),
                     }),
                 },

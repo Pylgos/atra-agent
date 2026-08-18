@@ -752,9 +752,12 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
                 None
             } else {
                 let phase = match item["phase"].as_str() {
-                    Some("commentary") => Some(atra_protocol::AssistantMessagePhase::Commentary),
-                    Some("final_answer") => Some(atra_protocol::AssistantMessagePhase::FinalAnswer),
-                    _ => None,
+                    Some("commentary") => atra_protocol::AssistantMessagePhase::Commentary,
+                    Some("final_answer") => atra_protocol::AssistantMessagePhase::FinalAnswer,
+                    Some(phase) => {
+                        anyhow::bail!("Codex returned unknown assistant message phase {phase}")
+                    }
+                    None => anyhow::bail!("Codex returned an assistant message without a phase"),
                 };
                 Some(ModelResponse::AssistantMessage { content, phase })
             }
@@ -1644,6 +1647,7 @@ mod tests {
                     "type": "message",
                     "id": "message-1",
                     "role": "assistant",
+                    "phase": "final_answer",
                     "content": [{"type": "output_text", "text": "done"}]
                 }
             }),
@@ -1961,6 +1965,39 @@ mod tests {
         assert!(matches!(
             receiver.recv().await.unwrap().unwrap(),
             ModelEvent::OutputItemDone { .. }
+        ));
+    }
+
+    #[test]
+    fn assistant_messages_require_a_known_phase() {
+        let message = |phase: Option<&str>| {
+            let mut item = json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            });
+            if let Some(phase) = phase {
+                item["phase"] = json!(phase);
+            }
+            item
+        };
+
+        let missing = response_from_item(&message(None)).unwrap_err();
+        assert!(missing.to_string().contains("without a phase"));
+
+        let unknown = response_from_item(&message(Some("other"))).unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("unknown assistant message phase")
+        );
+
+        assert!(matches!(
+            response_from_item(&message(Some("final_answer"))).unwrap(),
+            Some(ModelResponse::AssistantMessage {
+                phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
+                ..
+            })
         ));
     }
 }

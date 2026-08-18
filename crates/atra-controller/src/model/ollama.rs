@@ -8,7 +8,9 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use atra_protocol::{InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent};
+use atra_protocol::{
+    AssistantMessagePhase, InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent,
+};
 use futures_util::{StreamExt, stream};
 use rand::Rng;
 use reqwest::{RequestBuilder, Response, StatusCode};
@@ -493,11 +495,12 @@ impl OllamaStream {
             data: serde_json::to_value(vec![message.clone()]).expect("message serializes"),
         };
         if !message.content.is_empty() {
+            let phase = assistant_phase(&message);
             self.pending.push_back(Ok(ModelEvent::OutputItemDone {
                 output: stored,
                 response: Some(ModelResponse::AssistantMessage {
                     content: message.content,
-                    phase: None,
+                    phase,
                 }),
             }));
         } else {
@@ -548,6 +551,14 @@ impl OllamaStream {
             rate_limits: Vec::new(),
         }));
         self.finished = true;
+    }
+}
+
+fn assistant_phase(message: &Message) -> AssistantMessagePhase {
+    if message.tool_calls.is_empty() {
+        AssistantMessagePhase::FinalAnswer
+    } else {
+        AssistantMessagePhase::Commentary
     }
 }
 
@@ -811,6 +822,30 @@ mod tests {
         assert_eq!(think_value("medium"), json!("medium"));
         assert_eq!(think_value("enabled"), json!(true));
         assert_eq!(think_value("none"), json!(false));
+    }
+
+    #[test]
+    fn assistant_content_is_commentary_before_tools_and_final_without_tools() {
+        let mut message = Message {
+            content: "working".to_owned(),
+            ..Message::default()
+        };
+        assert_eq!(
+            assistant_phase(&message),
+            AssistantMessagePhase::FinalAnswer
+        );
+
+        message.tool_calls.push(ToolCall {
+            id: Some("call".to_owned()),
+            function: ToolFunction {
+                name: "command".to_owned(),
+                arguments: json!({"input": "echo"}),
+            },
+        });
+        assert_eq!(
+            assistant_phase(&message),
+            AssistantMessagePhase::Commentary
+        );
     }
 
     #[test]

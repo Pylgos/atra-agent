@@ -239,7 +239,7 @@ impl State {
                 | ThreadEventData::Compaction(_),
             ) => {}
             Some(ThreadEventData::AssistantMessage(message))
-                if message.phase == Some(AssistantMessagePhase::Commentary) => {}
+                if message.phase == AssistantMessagePhase::Commentary => {}
             Some(ThreadEventData::AssistantMessage(_)) => bail!("thread turn is already complete"),
             Some(ThreadEventData::ToolCall(_)) => unreachable!(),
             None => bail!("thread has no resumable history"),
@@ -996,7 +996,7 @@ impl State {
         while let Some(response) = responses.pop_front() {
             match response {
                 ModelResponse::AssistantMessage { content, phase } => {
-                    if phase != Some(AssistantMessagePhase::Commentary) {
+                    if phase == AssistantMessagePhase::FinalAnswer {
                         final_answer = Some(content);
                     }
                 }

@@ -99,7 +99,8 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             sequence: 4,
             kind: "assistant_message",
             payload: {
-              content: "# Result\n<script>bad()</script>\n\n**Safe answer**\n\n```bash\necho hello\n```\n\n- one\n  - nested\n- [x] done"
+              content: "# Result\n<script>bad()</script>\n\n**Safe answer**\n\n```bash\necho hello\n```\n\n- one\n  - nested\n- [x] done",
+              phase: "final_answer"
             }
           },
           {

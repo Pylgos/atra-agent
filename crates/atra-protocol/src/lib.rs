@@ -299,8 +299,7 @@ pub struct SkillInvocationEvent {
 #[serde(deny_unknown_fields)]
 pub struct AssistantMessageEvent {
     pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<AssistantMessagePhase>,
+    pub phase: AssistantMessagePhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<TodoItem>,
 }

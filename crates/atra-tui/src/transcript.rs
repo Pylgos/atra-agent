@@ -860,7 +860,7 @@ mod tests {
             sequence: EventSequence(1),
             data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
                 content: "body".to_owned(),
-                phase: None,
+                phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
                 todos: vec![TodoItem {
                     step: "safe\u{1b}]52;c;bad\u{7}".to_owned(),
                     status: atra_protocol::TodoStatus::Pending,

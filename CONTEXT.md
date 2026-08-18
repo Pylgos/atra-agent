@@ -27,3 +27,12 @@ _Avoid_: TUI
 **Web Client**:
 The browser-based Client that coexists with the TUI Client and supports the same user workflows.
 _Avoid_: Web UI, dashboard
+
+**Assistant Message**:
+A model-authored message classified as either Commentary or Final Answer.
+
+**Commentary**:
+An Assistant Message emitted while the current turn still requires further model or tool work.
+
+**Final Answer**:
+An Assistant Message that completes the current turn.

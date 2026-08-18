@@ -40,8 +40,7 @@ pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
 pub(crate) enum ModelResponse {
     AssistantMessage {
         content: String,
-        #[serde(default)]
-        phase: Option<AssistantMessagePhase>,
+        phase: AssistantMessagePhase,
     },
     WebSearch {
         item: serde_json::Value,

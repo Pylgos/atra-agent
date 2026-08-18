@@ -172,10 +172,10 @@ fn response_item(response: ModelResponse) -> Result<Value> {
             "type": "message",
             "role": "assistant",
             "content": [{"type": "output_text", "text": content}],
-            "phase": phase.map(|phase| match phase {
-                    AssistantMessagePhase::Commentary => MessagePhase::Commentary,
-                    AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
-            })
+            "phase": match phase {
+                AssistantMessagePhase::Commentary => MessagePhase::Commentary,
+                AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
+            }
         }),
         ModelResponse::WebSearch { item } | ModelResponse::Reasoning { item } => {
             anyhow::ensure!(

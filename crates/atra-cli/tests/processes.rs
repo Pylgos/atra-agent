@@ -404,7 +404,8 @@ impl TestSystem {
                 },
                 {
                     "assistant_message": {
-                        "content": "observed {{tool_output}}"
+                        "content": "observed {{tool_output}}",
+                        "phase": "final_answer"
                     }
                 },
                 {
@@ -417,7 +418,8 @@ impl TestSystem {
                 },
                 {
                     "assistant_message": {
-                        "content": "denied {{tool_output}}"
+                        "content": "denied {{tool_output}}",
+                        "phase": "final_answer"
                     }
                 },
                 {
@@ -430,7 +432,8 @@ impl TestSystem {
                 },
                 {
                     "assistant_message": {
-                        "content": "approved {{tool_output}}"
+                        "content": "approved {{tool_output}}",
+                        "phase": "final_answer"
                     }
                 }
             ]"#,

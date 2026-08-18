@@ -743,7 +743,7 @@ mod tests {
                 {
                     "sequence": 2,
                     "kind": "assistant_message",
-                    "payload": {"content": "answer"}
+                    "payload": {"content": "answer", "phase": "final_answer"}
                 },
                 {
                     "sequence": 3,

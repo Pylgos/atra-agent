@@ -242,7 +242,7 @@ impl<'a> TurnRef<'a> {
             .rev()
             .find_map(|event| match &event.data {
                 ThreadEventData::AssistantMessage(message)
-                    if message.phase != Some(AssistantMessagePhase::Commentary) =>
+                    if message.phase == AssistantMessagePhase::FinalAnswer =>
                 {
                     Some((Some(event.sequence), message.content.as_str()))
                 }
@@ -271,7 +271,7 @@ impl<'a> TurnRef<'a> {
         for event in self.events() {
             match &event.data {
                 ThreadEventData::AssistantMessage(message)
-                    if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                    if message.phase == AssistantMessagePhase::Commentary =>
                 {
                     activities.push(ActivityKey::Event(event.sequence));
                     append_todo_key(&mut activities, event.sequence, &message.todos);
@@ -393,7 +393,7 @@ pub(super) fn activity<'a>(
             let event = event(state, *sequence)?;
             match &event.data {
                 ThreadEventData::AssistantMessage(message)
-                    if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                    if message.phase == AssistantMessagePhase::Commentary =>
                 {
                     Some(ActivityDisplay::Commentary {
                         markdown: &message.content,
@@ -406,10 +406,7 @@ pub(super) fn activity<'a>(
                 }
                 ThreadEventData::WebSearch(search) => {
                     let (summary, detail) = search_display(&search.item);
-                    Some(ActivityDisplay::Search {
-                        summary,
-                        detail,
-                    })
+                    Some(ActivityDisplay::Search { summary, detail })
                 }
                 ThreadEventData::SkillInvocation(skill) => Some(ActivityDisplay::Skill {
                     name: &skill.name,
@@ -529,10 +526,7 @@ pub(super) fn activity<'a>(
                         .as_ref()
                         .map(search_display)
                         .unwrap_or_else(|| ("Searching…".to_owned(), String::new()));
-                    Some(ActivityDisplay::Search {
-                        summary,
-                        detail,
-                    })
+                    Some(ActivityDisplay::Search { summary, detail })
                 }
                 ActiveItemData::RunnerTool { runner, update, .. } => {
                     Some(orphan_runner_display(runner.as_deref(), update))
@@ -1029,7 +1023,7 @@ fn activity_type_label(state: &ThreadState, key: &ActivityKey) -> &'static str {
             };
             match &event.data {
                 ThreadEventData::AssistantMessage(message)
-                    if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                    if message.phase == AssistantMessagePhase::Commentary =>
                 {
                     "update"
                 }
@@ -1108,7 +1102,7 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
     match key {
         ActivityKey::Event(sequence) => match &event(state, *sequence)?.data {
             ThreadEventData::AssistantMessage(message)
-                if message.phase == Some(AssistantMessagePhase::Commentary) =>
+                if message.phase == AssistantMessagePhase::Commentary =>
             {
                 Some((
                     meaningful_text(&message.content).unwrap_or_else(|| "Update".to_owned()),
@@ -1447,7 +1441,7 @@ mod tests {
             event(
                 3,
                 "assistant_message",
-                json!({"content": "answer", "todos": [
+                json!({"content": "answer", "phase": "final_answer", "todos": [
                     {"step": "done", "status": "completed"}
                 ]}),
             ),

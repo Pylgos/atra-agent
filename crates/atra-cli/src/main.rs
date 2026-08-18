@@ -932,7 +932,7 @@ fn display_turn_outcome(
                 .rev()
                 .find_map(|event| match &event.data {
                     ThreadEventData::AssistantMessage(message)
-                        if message.phase != Some(AssistantMessagePhase::Commentary) =>
+                        if message.phase == AssistantMessagePhase::FinalAnswer =>
                     {
                         Some(message.content.as_str())
                     }

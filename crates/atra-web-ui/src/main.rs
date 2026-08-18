@@ -2264,7 +2264,7 @@ fn ActivityRow(
                     pre { "{message}" }
                 }
             }
-        },
+        }
         ActivityDisplay::Cancelled => rsx! {
             div { class: "activity-cancelled", "Cancelled" }
         },
@@ -2392,7 +2392,7 @@ fn ActivityDetail(
                     pre { "{message}" }
                 }
             }
-        },
+        }
         ActivityDisplay::Cancelled => rsx! {
             div { class: "activity-cancelled", "Cancelled" }
         },
