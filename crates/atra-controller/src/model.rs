@@ -54,12 +54,19 @@ pub(crate) enum ModelResponse {
     CustomToolCall {
         item_id: Option<String>,
         name: String,
-        input: String,
+        input: CustomToolInput,
         call_id: String,
     },
     Reasoning {
         item: serde_json::Value,
     },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum CustomToolInput {
+    Text(String),
+    Arguments(serde_json::Value),
 }
 
 pub(crate) enum ModelStreamEvent {

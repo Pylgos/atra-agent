@@ -771,7 +771,7 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
         Some("custom_tool_call") => Some(ModelResponse::CustomToolCall {
             item_id: item["id"].as_str().map(str::to_owned),
             name: string_field(item, "name")?,
-            input: string_field(item, "input")?,
+            input: super::CustomToolInput::Text(string_field(item, "input")?),
             call_id: string_field(item, "call_id")?,
         }),
         Some("web_search_call") => Some(ModelResponse::WebSearch { item: item.clone() }),

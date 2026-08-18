@@ -77,7 +77,14 @@ fn response_event(response: &mut ModelResponse) -> ThreadEventData {
             call_type: CustomToolType::Custom,
             item_id: item_id.clone(),
             name: name.clone(),
-            input: input.clone(),
+            input: match input {
+                model::CustomToolInput::Text(input) => input.clone(),
+                model::CustomToolInput::Arguments(arguments) => arguments
+                    .get("input")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| arguments.to_string()),
+            },
             call_id: call_id.clone(),
         }),
         ModelResponse::Reasoning { item } => {
@@ -1006,8 +1013,27 @@ impl State {
                     arguments,
                     call_id,
                 } => {
-                    if name == "question" && allow_questions {
-                        let questions = parse_questions(arguments)?;
+                    let validated = match crate::tools::validate_function_tool(
+                        &name,
+                        arguments.clone(),
+                        allow_questions,
+                    ) {
+                        Ok(validated) => validated,
+                        Err(error) => {
+                            needs_follow_up = true;
+                            self.save_tool_error(
+                                thread_id,
+                                &name,
+                                call_id.as_deref(),
+                                error.tool_result(&name),
+                                false,
+                                updates,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    if let crate::tools::ValidatedFunctionTool::Questions(questions) = validated {
                         let (request_id, answer) = self.turns.register_question(thread_id)?;
                         updates
                             .context("question requires a streaming turn")?
@@ -1078,15 +1104,24 @@ impl State {
                     ..
                 } => {
                     needs_follow_up = true;
-                    if name != "command" {
-                        bail!("model requested unsupported custom tool {name}");
-                    }
+                    let operations = match crate::tools::validate_custom_tool_input(&name, &input) {
+                        Ok(operations) => operations,
+                        Err(error) => {
+                            self.save_tool_error(
+                                thread_id,
+                                &name,
+                                Some(&call_id),
+                                error.tool_result(&name),
+                                true,
+                                updates,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     let mut results = Vec::new();
                     let mut artifacts = Vec::new();
-                    for (index, operation) in atra_protocol::parse_command_input(&input)?
-                        .into_iter()
-                        .enumerate()
-                    {
+                    for (index, operation) in operations.into_iter().enumerate() {
                         let operation_index = index + 1;
                         let runner = operation.runner().to_owned();
                         let operation_name = "command";
@@ -1149,6 +1184,27 @@ impl State {
             }
         }
         Ok(!needs_follow_up && final_answer.is_some())
+    }
+
+    async fn save_tool_error(
+        &self,
+        thread_id: ThreadId,
+        name: &str,
+        call_id: Option<&str>,
+        error: String,
+        custom: bool,
+        updates: Option<&TurnProjector>,
+    ) -> Result<()> {
+        self.save_tool_result(
+            thread_id,
+            name,
+            call_id,
+            ToolOutcome::text(error),
+            custom,
+            updates,
+        )
+        .await?;
+        Ok(())
     }
 
     pub(super) async fn approve_and_execute(

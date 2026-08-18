@@ -7,42 +7,7 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
         tools.push(model::ModelTool::Function {
             name: "question",
             description: "Ask the user one or more questions. Each question is answered with one option and an optional free-form note. recommended_options must contain option labels. The UI adds a final \"どれでもない\" option automatically, so do not provide it; that answer is returned with selected_option null. Use this when user input is required before continuing.",
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {"type": "string", "minLength": 1},
-                                "options": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {"type": "string", "minLength": 1},
-                                            "description": {"type": "string"}
-                                        },
-                                        "required": ["label", "description"],
-                                        "additionalProperties": false
-                                    }
-                                },
-                                "recommended_options": {
-                                    "type": "array",
-                                    "items": {"type": "string"}
-                                }
-                            },
-                            "required": ["question", "options", "recommended_options"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["questions"],
-                "additionalProperties": false
-            }),
+            parameters: question_parameters(),
         });
     }
     tools.extend([
@@ -152,6 +117,229 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
         },
     ]);
     tools
+}
+
+pub(super) fn question_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "minLength": 1},
+                        "options": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string", "minLength": 1},
+                                    "description": {"type": "string"}
+                                },
+                                "required": ["label", "description"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "recommended_options": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["question", "options", "recommended_options"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": false
+    })
+}
+
+pub(super) fn web_search_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 10}
+        },
+        "required": ["query"]
+    })
+}
+
+pub(super) fn web_fetch_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"]
+    })
+}
+
+pub(super) fn custom_tool_wrapper_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "The complete custom tool input."
+            }
+        },
+        "required": ["input"]
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct ToolInputError {
+    reason: String,
+    expected: Option<String>,
+}
+
+impl ToolInputError {
+    fn json(reason: impl Into<String>, schema: serde_json::Value) -> Self {
+        Self {
+            reason: reason.into(),
+            expected: Some(format!("Expected schema:\n{schema}")),
+        }
+    }
+
+    fn grammar(reason: impl Into<String>, syntax: &str, definition: &str) -> Self {
+        Self {
+            reason: reason.into(),
+            expected: Some(format!("Expected {syntax} grammar:\n{definition}")),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            reason: "tool is not available in this turn".to_owned(),
+            expected: None,
+        }
+    }
+
+    pub(super) fn tool_result(&self, name: &str) -> String {
+        let Some(expected) = &self.expected else {
+            return format!(
+                "Tool call rejected for `{name}`.\n\n\
+                 Error: {}.\n\n\
+                 Retry using one of the tools presented in this turn.",
+                self.reason
+            );
+        };
+        format!(
+            "Tool input schema violation for `{name}`.\n\n\
+             Error: {}.\n\n\
+             {expected}\n\n\
+             Retry the tool call using input that matches this definition.",
+            self.reason
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum ValidatedFunctionTool {
+    Questions(Vec<atra_protocol::Question>),
+    Provider,
+}
+
+#[derive(Deserialize)]
+struct WebSearchArguments {
+    #[serde(rename = "query")]
+    _query: String,
+    max_results: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct WebFetchArguments {
+    #[serde(rename = "url")]
+    _url: String,
+}
+
+pub(super) fn validate_function_tool(
+    name: &str,
+    arguments: serde_json::Value,
+    allow_questions: bool,
+) -> std::result::Result<ValidatedFunctionTool, ToolInputError> {
+    match name {
+        "question" if allow_questions => parse_questions(arguments)
+            .map(ValidatedFunctionTool::Questions)
+            .map_err(|error| ToolInputError::json(format!("{error:#}"), question_parameters())),
+        "web_search" => {
+            let arguments: WebSearchArguments =
+                serde_json::from_value(arguments).map_err(|error| {
+                    ToolInputError::json(error.to_string(), web_search_parameters())
+                })?;
+            if arguments
+                .max_results
+                .is_some_and(|value| !(1..=10).contains(&value))
+            {
+                return Err(ToolInputError::json(
+                    "property `max_results` must be an integer between 1 and 10",
+                    web_search_parameters(),
+                ));
+            }
+            Ok(ValidatedFunctionTool::Provider)
+        }
+        "web_fetch" => {
+            let _: WebFetchArguments = serde_json::from_value(arguments)
+                .map_err(|error| ToolInputError::json(error.to_string(), web_fetch_parameters()))?;
+            Ok(ValidatedFunctionTool::Provider)
+        }
+        _ => Err(ToolInputError::unavailable()),
+    }
+}
+
+pub(super) fn validate_custom_tool(
+    name: &str,
+    input: &str,
+) -> std::result::Result<Vec<atra_protocol::RunnerCommand>, ToolInputError> {
+    let Some(format) = model_tools(false).into_iter().find_map(|tool| match tool {
+        model::ModelTool::Custom {
+            name: candidate,
+            format,
+            ..
+        } if candidate == name => Some(format),
+        _ => None,
+    }) else {
+        return Err(ToolInputError::unavailable());
+    };
+    atra_protocol::parse_command_input(input).map_err(|error| {
+        ToolInputError::grammar(error.to_string(), format.syntax, format.definition)
+    })
+}
+
+pub(super) fn validate_custom_tool_input(
+    name: &str,
+    input: &model::CustomToolInput,
+) -> std::result::Result<Vec<atra_protocol::RunnerCommand>, ToolInputError> {
+    let input = match input {
+        model::CustomToolInput::Text(input) => input,
+        model::CustomToolInput::Arguments(arguments) => {
+            let arguments = arguments.as_object().ok_or_else(|| {
+                ToolInputError::json(
+                    "arguments must be an object",
+                    custom_tool_wrapper_parameters(),
+                )
+            })?;
+            match arguments.get("input") {
+                None => {
+                    return Err(ToolInputError::json(
+                        "required property `input` is missing",
+                        custom_tool_wrapper_parameters(),
+                    ));
+                }
+                Some(serde_json::Value::String(input)) => input,
+                Some(_) => {
+                    return Err(ToolInputError::json(
+                        "property `input` must be a string",
+                        custom_tool_wrapper_parameters(),
+                    ));
+                }
+            }
+        }
+    };
+    validate_custom_tool(name, input)
 }
 
 #[derive(Deserialize)]
@@ -692,5 +880,92 @@ mod tests {
         ] {
             assert!(parse_questions(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn invalid_function_tool_input_includes_the_presented_schema() {
+        let error = validate_function_tool("question", serde_json::json!({}), true).unwrap_err();
+        let result = error.tool_result("question");
+
+        assert!(result.contains("Tool input schema violation for `question`."));
+        assert!(result.contains("Error: invalid question arguments:"));
+        assert!(result.contains("Expected schema:"));
+        assert!(result.contains(r#""required":["questions"]"#));
+        assert!(result.contains("Retry the tool call"));
+    }
+
+    #[test]
+    fn invalid_web_search_input_is_rejected_before_provider_execution() {
+        let error = validate_function_tool(
+            "web_search",
+            serde_json::json!({"query": "atra", "max_results": 11}),
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .tool_result("web_search")
+                .contains("Error: property `max_results` must be an integer between 1 and 10.")
+        );
+    }
+
+    #[test]
+    fn invalid_custom_tool_input_includes_the_presented_grammar() {
+        let error = validate_custom_tool("command", "echo missing runner").unwrap_err();
+        let result = error.tool_result("command");
+
+        assert!(result.contains("Tool input schema violation for `command`."));
+        assert!(result.contains("Expected lark grammar:"));
+        assert!(result.contains("start: runner_script+"));
+    }
+
+    #[test]
+    fn wrapped_custom_tool_input_is_validated_by_the_controller() {
+        for (arguments, expected) in [
+            (
+                serde_json::json!({"command": "echo wrong field"}),
+                "Error: required property `input` is missing.",
+            ),
+            (
+                serde_json::json!({"input": {"runner": "sandbox"}}),
+                "Error: property `input` must be a string.",
+            ),
+        ] {
+            let error = validate_custom_tool_input(
+                "command",
+                &model::CustomToolInput::Arguments(arguments),
+            )
+            .unwrap_err();
+            let result = error.tool_result("command");
+            assert!(result.contains(expected));
+            assert!(result.contains("Expected schema:"));
+        }
+    }
+
+    #[test]
+    fn valid_wrapped_custom_tool_input_reaches_grammar_validation() {
+        let operations = validate_custom_tool_input(
+            "command",
+            &model::CustomToolInput::Arguments(serde_json::json!({
+                "input": "*** Runner sandbox\necho ok"
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].runner(), "sandbox");
+        assert_eq!(operations[0].command(), "echo ok");
+    }
+
+    #[test]
+    fn unknown_tool_is_returned_as_a_model_error() {
+        let error = validate_function_tool("unknown", serde_json::json!({}), true).unwrap_err();
+        assert_eq!(
+            error.tool_result("unknown"),
+            "Tool call rejected for `unknown`.\n\n\
+             Error: tool is not available in this turn.\n\n\
+             Retry using one of the tools presented in this turn."
+        );
     }
 }

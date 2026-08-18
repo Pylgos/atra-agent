@@ -517,16 +517,7 @@ impl OllamaStream {
                 )
             });
             let response = if call.function.name == "command" {
-                let input = call.function.arguments["input"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                ModelResponse::CustomToolCall {
-                    item_id: None,
-                    name: call.function.name,
-                    input,
-                    call_id,
-                }
+                custom_tool_response(call.function.name, call.function.arguments, call_id)
             } else {
                 ModelResponse::ToolCall {
                     name: call.function.name,
@@ -586,23 +577,12 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
                 definitions.push(function_tool(
                     "web_search",
                     "Search the web for current information.",
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "max_results": {"type": "integer", "minimum": 1, "maximum": 10}
-                        },
-                        "required": ["query"]
-                    }),
+                    crate::tools::web_search_parameters(),
                 ));
                 definitions.push(function_tool(
                     "web_fetch",
                     "Fetch the readable content of a web page.",
-                    json!({
-                        "type": "object",
-                        "properties": {"url": {"type": "string"}},
-                        "required": ["url"]
-                    }),
+                    crate::tools::web_fetch_parameters(),
                 ));
             }
             ModelTool::Function {
@@ -622,21 +602,21 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
                 definitions.push(function_tool(
                     name,
                     &description,
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "input": {
-                                "type": "string",
-                                "description": "The complete custom tool input."
-                            }
-                        },
-                        "required": ["input"]
-                    }),
+                    crate::tools::custom_tool_wrapper_parameters(),
                 ));
             }
         }
     }
     definitions
+}
+
+fn custom_tool_response(name: String, arguments: Value, call_id: String) -> ModelResponse {
+    ModelResponse::CustomToolCall {
+        item_id: None,
+        name,
+        input: super::CustomToolInput::Arguments(arguments),
+        call_id,
+    }
 }
 
 fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
@@ -815,6 +795,41 @@ mod tests {
         let command_description = definitions[3]["function"]["description"].as_str().unwrap();
         assert!(command_description.contains("lark grammar"));
         assert!(command_description.contains("add_line: \"+\""));
+        assert_eq!(
+            definitions[0]["function"]["parameters"],
+            crate::tools::web_search_parameters()
+        );
+        assert_eq!(
+            definitions[1]["function"]["parameters"],
+            crate::tools::web_fetch_parameters()
+        );
+        assert_eq!(
+            definitions[3]["function"]["parameters"],
+            crate::tools::custom_tool_wrapper_parameters()
+        );
+    }
+
+    #[test]
+    fn custom_tool_arguments_are_preserved_for_controller_validation() {
+        let arguments = json!({
+            "command": "echo wrong field",
+            "description": "Run a command"
+        });
+        let response =
+            custom_tool_response("command".to_owned(), arguments.clone(), "call-1".to_owned());
+
+        let ModelResponse::CustomToolCall {
+            name,
+            input: crate::model::CustomToolInput::Arguments(input),
+            call_id,
+            ..
+        } = response
+        else {
+            panic!("expected raw custom tool arguments");
+        };
+        assert_eq!(name, "command");
+        assert_eq!(input, arguments);
+        assert_eq!(call_id, "call-1");
     }
 
     #[test]
