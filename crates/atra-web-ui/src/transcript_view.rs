@@ -150,6 +150,15 @@ pub(super) struct CommandOperationDisplay {
     pub status: String,
     pub omitted_bytes: usize,
     pub diffs: Vec<String>,
+    pub file_changes: Vec<FileChangeSummary>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct FileChangeSummary {
+    pub path: String,
+    pub operation: String,
+    pub added: usize,
+    pub deleted: usize,
 }
 
 pub(super) fn turn_keys(state: &ThreadState) -> Vec<TurnKey> {
@@ -761,6 +770,7 @@ fn command_display(
             status: "queued".to_owned(),
             omitted_bytes: 0,
             diffs: Vec::new(),
+            file_changes: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -932,7 +942,7 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
         }
         ToolArtifact::PatchOperations(patch) => {
             let mut diff = String::new();
-            format_apply_patch(patch, &mut diff);
+            format_apply_patch(patch, &mut diff, &mut operation.file_changes);
             if !diff.is_empty() {
                 operation.diffs.push(diff);
             }
@@ -950,7 +960,11 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
     }
 }
 
-fn format_apply_patch(patch: &ApplyPatchResult, output: &mut String) {
+fn format_apply_patch(
+    patch: &ApplyPatchResult,
+    output: &mut String,
+    file_changes: &mut Vec<FileChangeSummary>,
+) {
     match patch {
         ApplyPatchResult::ParseError { error } => {
             output.push_str("Patch parse error: ");
@@ -959,7 +973,7 @@ fn format_apply_patch(patch: &ApplyPatchResult, output: &mut String) {
         }
         ApplyPatchResult::Operations { results } => {
             for result in results {
-                format_patch_operation(result, output);
+                format_patch_operation(result, output, file_changes);
             }
         }
     }
@@ -976,6 +990,7 @@ fn orphan_runner_display(
         status: "running".to_owned(),
         omitted_bytes: 0,
         diffs: Vec::new(),
+        file_changes: Vec::new(),
     };
     apply_runner_update(update, &mut operation);
     ActivityDisplay::Command(CommandDisplay {
@@ -1314,15 +1329,32 @@ pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
     }
 }
 
-fn format_patch_operation(result: &PatchOperationResult, output: &mut String) {
-    let outcome = match result {
-        PatchOperationResult::Added { outcome, .. }
-        | PatchOperationResult::Deleted { outcome, .. }
-        | PatchOperationResult::Updated { outcome, .. }
-        | PatchOperationResult::Moved { outcome, .. } => outcome,
+fn format_patch_operation(
+    result: &PatchOperationResult,
+    output: &mut String,
+    file_changes: &mut Vec<FileChangeSummary>,
+) {
+    let (operation, path, outcome) = match result {
+        PatchOperationResult::Added { path, outcome } => ("added", path, outcome),
+        PatchOperationResult::Deleted { path, outcome } => ("deleted", path, outcome),
+        PatchOperationResult::Updated { path, outcome } => ("updated", path, outcome),
+        PatchOperationResult::Moved { from: _, to, outcome } => ("moved", to, outcome),
     };
     match outcome {
-        PatchOperationOutcome::Applied { diff: Ok(diff) } => format_file_diff(diff, output),
+        PatchOperationOutcome::Applied { diff: Ok(diff) } => {
+            format_file_diff(diff, output);
+            let (added, deleted) = diff_stat(diff);
+            file_changes.push(FileChangeSummary {
+                path: diff
+                    .new_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string()),
+                operation: operation.to_owned(),
+                added,
+                deleted,
+            });
+        }
         PatchOperationOutcome::Applied { diff: Err(error) }
         | PatchOperationOutcome::Failed { error } => {
             output.push_str("Patch failed: ");
@@ -1330,6 +1362,21 @@ fn format_patch_operation(result: &PatchOperationResult, output: &mut String) {
             output.push('\n');
         }
     }
+}
+
+fn diff_stat(diff: &FileDiff) -> (usize, usize) {
+    let mut added = 0;
+    let mut deleted = 0;
+    for hunk in &diff.hunks {
+        for line in &hunk.lines {
+            match line.kind {
+                DiffLineKind::Added => added += 1,
+                DiffLineKind::Removed => deleted += 1,
+                DiffLineKind::Context => {}
+            }
+        }
+    }
+    (added, deleted)
 }
 
 fn format_file_diff(diff: &FileDiff, output: &mut String) {
@@ -1673,10 +1720,17 @@ mod tests {
             status: String::new(),
             omitted_bytes: 0,
             diffs: Vec::new(),
+            file_changes: Vec::new(),
         }];
         apply_command_artifact(&artifact, &mut operations);
         assert_eq!(operations[0].diffs.len(), 1);
         assert!(operations[0].diffs[0].contains("+++ b/src/main.rs"));
+        assert_eq!(operations[0].file_changes.len(), 1);
+        let change = &operations[0].file_changes[0];
+        assert_eq!(change.path, "src/main.rs");
+        assert_eq!(change.operation, "updated");
+        assert_eq!(change.added, 1);
+        assert_eq!(change.deleted, 0);
     }
 
     #[test]

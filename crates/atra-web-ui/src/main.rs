@@ -2148,6 +2148,15 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
     }
 }
 
+fn exit_code_class(status: &str) -> &'static str {
+    let trimmed = status.trim();
+    match trimmed.strip_prefix("exit ") {
+        Some("0") => "command-row-status ok",
+        Some(_) => "command-row-status fail",
+        None => "command-row-status",
+    }
+}
+
 #[component]
 fn ActivityRow(
     store: ThreadStore,
@@ -2200,15 +2209,51 @@ fn ActivityRow(
                 }
             }
         }
-        ActivityDisplay::Command(display) => rsx! {
-            button {
-                class: if display.active {
-                    "collapsible-compact activity-command running"
-                } else {
-                    "collapsible-compact activity-command"
-                },
-                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
-                span { class: "command-summary-text", "{display.summary}" }
+        ActivityDisplay::Command(display) => {
+            let operations = display.operations.clone();
+            let active = display.active;
+            rsx! {
+                button {
+                    class: if active {
+                        "activity-command running"
+                    } else {
+                        "activity-command"
+                    },
+                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    div { class: "command-row",
+                        for operation in &operations {
+                            div { class: "command-row-operation",
+                                div {
+                                    class: if operation.command.trim_end().lines().count() > 1 {
+                                        "command-row-source highlighted truncated"
+                                    } else {
+                                        "command-row-source highlighted"
+                                    },
+                                    dangerous_inner_html: "{highlight(&operation.command, \"bash\")}",
+                                }
+                                div { class: "command-row-meta",
+                                    span { class: "command-row-runner", "{operation.runner}" }
+                                    if !operation.status.is_empty() {
+                                        span { class: exit_code_class(&operation.status), "{operation.status}" }
+                                    }
+                                }
+                                for change in &operation.file_changes {
+                                    div { class: "command-row-file",
+                                        span { class: "command-row-file-path", "{change.path}" }
+                                        span { class: "command-row-file-delta",
+                                            if change.added > 0 {
+                                                span { class: "add", "+{change.added}" }
+                                            }
+                                            if change.deleted > 0 {
+                                                span { class: "del", "-{change.deleted}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         ActivityDisplay::Search { summary, .. } => rsx! {
@@ -2220,9 +2265,10 @@ fn ActivityRow(
         },
         ActivityDisplay::Question { summary, .. } => rsx! {
             button {
-                class: "collapsible-compact activity-question",
+                class: "activity-question",
                 onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
-                span { "{summary}" }
+                span { class: "question-badge", "Question" }
+                span { class: "question-summary", "{summary}" }
             }
         },
         ActivityDisplay::Approval { allowed, reason } => rsx! {

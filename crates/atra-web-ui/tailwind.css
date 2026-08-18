@@ -993,6 +993,12 @@ pre {
 
 .activity-reasoning .collapsible-compact {
   font-style: italic;
+  color: color-mix(in srgb, var(--muted) 62%, var(--panel));
+  font-size: 0.74rem;
+}
+
+.activity-reasoning .collapsible-compact:hover {
+  color: var(--muted);
 }
 
 .reasoning-detail {
@@ -1003,13 +1009,107 @@ pre {
 }
 
 .activity-command {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 0.3rem 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.activity-command:hover {
+  background: transparent;
+}
+
+.activity-command.running {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.command-row {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.command-row-operation {
   min-width: 0;
 }
 
-.activity-command .collapsible-compact {
+.command-row-source {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.command-row-source.truncated {
+  max-height: 3.0em;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+}
+
+.command-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: baseline;
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.command-row-runner {
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.command-row-status.ok {
+  color: var(--success);
+}
+
+.command-row-status.fail {
+  color: var(--danger);
+}
+
+.command-row-file {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: baseline;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.command-row-file-path {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-row-file-delta {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.command-row-file-delta .add {
+  color: var(--success);
+}
+
+.command-row-file-delta .del {
+  color: var(--danger);
 }
 
 .command-operations {
@@ -1088,7 +1188,38 @@ pre {
 
 .activity-search,
 .activity-question {
+  display: flex;
+  width: 100%;
+  gap: 0.5rem;
+  align-items: baseline;
+  min-height: 0;
+  padding: 0.3rem 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.activity-question:hover {
+  background: transparent;
+}
+
+.question-badge {
+  flex: none;
+  padding: 0.08rem 0.4rem;
+  border-radius: 5px;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.question-summary {
   min-width: 0;
+  line-height: 1.45;
+  color: var(--warning);
 }
 
 .search-detail,
