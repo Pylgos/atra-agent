@@ -216,19 +216,7 @@ impl OllamaProvider {
                 .and_then(|(_, value)| value.as_i64());
             let thinking = show.capabilities.iter().any(|value| value == "thinking");
             let (default_reasoning_effort, supported_reasoning_efforts) =
-                if tag.model.starts_with("gpt-oss:") {
-                    (
-                        "medium".to_owned(),
-                        ["low", "medium", "high"].map(str::to_owned).to_vec(),
-                    )
-                } else if thinking {
-                    (
-                        "enabled".to_owned(),
-                        ["disabled", "enabled"].map(str::to_owned).to_vec(),
-                    )
-                } else {
-                    ("none".to_owned(), vec!["none".to_owned()])
-                };
+                reasoning_efforts(&tag.model, thinking);
             let description = (!tag.details.parameter_size.is_empty())
                 .then(|| format!("{} parameters", tag.details.parameter_size));
             models.push(Model {
@@ -575,11 +563,40 @@ fn empty_output() -> ProviderOutput {
 
 fn think_value(effort: &str) -> Value {
     match effort {
-        "low" | "medium" | "high" => Value::String(effort.to_owned()),
+        "low" | "medium" | "high" | "max" => Value::String(effort.to_owned()),
         "enabled" => Value::Bool(true),
         "disabled" | "none" => Value::Bool(false),
         _ => Value::Bool(true),
     }
+}
+
+fn reasoning_efforts(model: &str, thinking: bool) -> (String, Vec<String>) {
+    if !thinking {
+        return ("none".to_owned(), vec!["none".to_owned()]);
+    }
+
+    let model = model.to_ascii_lowercase();
+    let (default, supported): (&str, &[&str]) = if model.starts_with("gpt-oss:") {
+        ("medium", &["low", "medium", "high"])
+    } else if model.starts_with("qwen3-vl")
+        || model.starts_with("kimi-k2-thinking")
+        || model.starts_with("minimax")
+    {
+        ("medium", &["low", "medium", "high", "max"])
+    } else if model.starts_with("qwen3") {
+        ("enabled", &["disabled", "enabled"])
+    } else if model.starts_with("glm-5.2") {
+        ("high", &["disabled", "high", "max"])
+    } else {
+        ("medium", &["disabled", "low", "medium", "high", "max"])
+    };
+    (
+        default.to_owned(),
+        supported
+            .iter()
+            .map(|effort| (*effort).to_owned())
+            .collect(),
+    )
 }
 
 fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
@@ -848,8 +865,55 @@ mod tests {
     #[test]
     fn thinking_efforts_map_to_ollama_values() {
         assert_eq!(think_value("medium"), json!("medium"));
+        assert_eq!(think_value("max"), json!("max"));
         assert_eq!(think_value("enabled"), json!(true));
         assert_eq!(think_value("none"), json!(false));
+    }
+
+    #[test]
+    fn reasoning_efforts_are_selected_for_model_families() {
+        assert_eq!(
+            reasoning_efforts("gpt-oss:120b-cloud", true),
+            efforts("medium", &["low", "medium", "high"])
+        );
+        assert_eq!(
+            reasoning_efforts("qwen3:235b-cloud", true),
+            efforts("enabled", &["disabled", "enabled"])
+        );
+        assert_eq!(
+            reasoning_efforts("qwen3-vl:235b-cloud", true),
+            efforts("medium", &["low", "medium", "high", "max"])
+        );
+        assert_eq!(
+            reasoning_efforts("glm-5.2:cloud", true),
+            efforts("high", &["disabled", "high", "max"])
+        );
+        assert_eq!(
+            reasoning_efforts("kimi-k2-thinking:cloud", true),
+            efforts("medium", &["low", "medium", "high", "max"])
+        );
+        assert_eq!(
+            reasoning_efforts("minimax-m2.1:cloud", true),
+            efforts("medium", &["low", "medium", "high", "max"])
+        );
+        assert_eq!(
+            reasoning_efforts("future-thinking-model:cloud", true),
+            efforts("medium", &["disabled", "low", "medium", "high", "max"])
+        );
+        assert_eq!(
+            reasoning_efforts("qwen3:235b-cloud", false),
+            efforts("none", &["none"])
+        );
+    }
+
+    fn efforts(default: &str, supported: &[&str]) -> (String, Vec<String>) {
+        (
+            default.to_owned(),
+            supported
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect(),
+        )
     }
 
     #[test]
