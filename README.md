@@ -1,8 +1,5 @@
 # atra-agent
 
-Development and test commands are documented in
-[`docs/testing.md`](docs/testing.md).
-
 ## Model providers
 
 Atra can use Codex and Ollama Cloud in the same controller. Authenticate each provider once:

@@ -192,6 +192,7 @@
               chromium
               dioxus-cli
               git
+              just
               mold
               nodejs
               openssl
