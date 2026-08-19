@@ -1,5 +1,78 @@
 import { expect, test, type Page } from "@playwright/test";
 
+async function installWebClientMocks(
+  page: Page,
+  snapshots: Record<string, unknown>
+) {
+  await page.addInitScript((snapshots) => {
+    class FakeEventSource {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readonly CONNECTING = 0;
+      readonly OPEN = 1;
+      readonly CLOSED = 2;
+      readyState = FakeEventSource.CONNECTING;
+      onopen: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      readonly url: string;
+      withCredentials = false;
+
+      constructor(url: string | URL) {
+        this.url = String(url);
+        queueMicrotask(() => {
+          this.readyState = FakeEventSource.OPEN;
+          this.onopen?.(new Event("open"));
+          const path = new URL(this.url, window.location.href).pathname;
+          const snapshot = snapshots[path];
+          if (snapshot !== undefined) {
+            this.onmessage?.(new MessageEvent("message", {
+              data: JSON.stringify(snapshot)
+            }));
+          }
+        });
+      }
+
+      addEventListener() {}
+      removeEventListener() {}
+      dispatchEvent() { return true; }
+      close() { this.readyState = FakeEventSource.CLOSED; }
+
+      emit(message: unknown) {
+        this.onmessage?.(new MessageEvent("message", {
+          data: JSON.stringify(message)
+        }));
+      }
+    }
+
+    const sources = new Map<string, FakeEventSource>();
+    Object.defineProperty(window, "EventSource", {
+      configurable: true,
+      value: class extends FakeEventSource {
+        constructor(url: string | URL) {
+          super(url);
+          sources.set(new URL(this.url, window.location.href).pathname, this);
+        }
+      }
+    });
+    Object.defineProperty(window, "__atraEventSources", { value: sources });
+    const notificationTitles: string[] = [];
+    Object.defineProperty(window, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "granted";
+        static requestPermission() { return Promise.resolve("granted"); }
+        constructor(title: string) { notificationTitles.push(title); }
+      }
+    });
+    Object.defineProperty(window, "__atraNotificationTitles", {
+      value: notificationTitles
+    });
+    localStorage.setItem("atra:notifications", "enabled");
+  }, snapshots);
+}
+
 async function swipe(
   page: Page,
   from: { x: number; y: number },
@@ -182,73 +255,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     }
   };
 
-  await page.addInitScript((snapshots) => {
-    class FakeEventSource {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSED = 2;
-      readonly CONNECTING = 0;
-      readonly OPEN = 1;
-      readonly CLOSED = 2;
-      readyState = FakeEventSource.CONNECTING;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      readonly url: string;
-      withCredentials = false;
-
-      constructor(url: string | URL) {
-        this.url = String(url);
-        queueMicrotask(() => {
-          this.readyState = FakeEventSource.OPEN;
-          this.onopen?.(new Event("open"));
-          const path = new URL(this.url, window.location.href).pathname;
-          const snapshot = snapshots[path];
-          if (snapshot !== undefined) {
-            this.onmessage?.(new MessageEvent("message", {
-              data: JSON.stringify(snapshot)
-            }));
-          }
-        });
-      }
-
-      addEventListener() {}
-      removeEventListener() {}
-      dispatchEvent() { return true; }
-      close() { this.readyState = FakeEventSource.CLOSED; }
-
-      emit(message: unknown) {
-        this.onmessage?.(new MessageEvent("message", {
-          data: JSON.stringify(message)
-        }));
-      }
-    }
-
-    const sources = new Map<string, FakeEventSource>();
-    Object.defineProperty(window, "EventSource", {
-      configurable: true,
-      value: class extends FakeEventSource {
-        constructor(url: string | URL) {
-          super(url);
-          sources.set(new URL(this.url, window.location.href).pathname, this);
-        }
-      }
-    });
-    Object.defineProperty(window, "__atraEventSources", { value: sources });
-    const notificationTitles: string[] = [];
-    Object.defineProperty(window, "Notification", {
-      configurable: true,
-      value: class {
-        static permission = "granted";
-        static requestPermission() { return Promise.resolve("granted"); }
-        constructor(title: string) { notificationTitles.push(title); }
-      }
-    });
-    Object.defineProperty(window, "__atraNotificationTitles", {
-      value: notificationTitles
-    });
-    localStorage.setItem("atra:notifications", "enabled");
-  }, messages);
+  await installWebClientMocks(page, messages);
 
   let sentCommand: unknown;
   await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
@@ -841,10 +848,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   });
   const composer = page.getByLabel("Message");
   await composer.fill("aーb");
-  await composer.evaluate((element: HTMLTextAreaElement) => {
-    element.setSelectionRange(2, 2);
-  });
-  await composer.press("ArrowUp");
+  await composer.press("Alt+ArrowUp");
   await expect(composer).toHaveValue("Previous prompt");
 
   await page.getByLabel("Message").fill("Sent from browser");
@@ -927,4 +931,162 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   const mobileComposer = await page.locator("#composer").boundingBox();
   expect(mobileComposer).not.toBeNull();
   expect(mobileComposer!.y + mobileComposer!.height).toBeLessThanOrEqual(844);
+});
+
+test("composer history navigation, stash, and rewind prefill", async ({ page }) => {
+  const pageErrors: Error[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  const snapshots: Record<string, unknown> = {
+    "/api/workspaces/events": {
+      workspaces: [{
+        workspace_id: "workspace-1",
+        name: "workspace",
+        path: "/tmp/workspace"
+      }]
+    },
+    "/api/workspaces/workspace-1/controller/events": {
+      message: "snapshot",
+      state: {
+        lifecycle: "running",
+        threads: [{
+          id: 1,
+          parent_thread_id: null,
+          display_name: "Web Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        }],
+        thread_statuses: [{ thread_id: 1, status: "idle" }],
+        providers: [{
+          id: "fake",
+          lifecycle: { status: "logged_in", account: null },
+          models: [{
+            provider: "fake",
+            id: "test-model",
+            display_name: "Test Model",
+            description: "No-provider test model",
+            default_reasoning_effort: "medium",
+            supported_reasoning_efforts: ["low", "medium", "high"]
+          }],
+          rate_limits: null
+        }],
+        runners: []
+      }
+    },
+    "/api/workspaces/workspace-1/threads/1/events": {
+      message: "snapshot",
+      state: {
+        metadata: {
+          id: 1,
+          parent_thread_id: null,
+          display_name: "Web Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        },
+        events: [
+          { sequence: 1, kind: "user_message", payload: { content: "Original prompt" } },
+          {
+            sequence: 2,
+            kind: "model_request",
+            payload: { kind: "response", context_window: 128000 }
+          },
+          {
+            sequence: 3,
+            kind: "assistant_message",
+            payload: { content: "The answer", phase: "final_answer" }
+          }
+        ],
+        active_turn: null,
+        last_outcome: null,
+        checkpoints: [],
+        processes: []
+      }
+    }
+  };
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "atra:sent-history:workspace-1:1",
+      JSON.stringify(["First prompt", "Second prompt"])
+    );
+  });
+  await installWebClientMocks(page, snapshots);
+
+  let sentCommand: unknown;
+  await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
+    sentCommand = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ result: "accepted" })
+    });
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Choose a Workspace" })).toBeVisible();
+  await page.locator(".workspace-thread-row .navigation-link").click();
+  await expect(page.getByText("Original prompt")).toBeVisible();
+  const composer = page.getByLabel("Message");
+  await expect(composer).toBeVisible();
+
+  await page.getByLabel("History", { exact: true }).click();
+  await expect(page.getByRole("button", { name: "Second prompt", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "First prompt", exact: true }).click();
+  await expect(composer).toHaveValue("First prompt");
+  await expect(page.getByRole("button", { name: "Second prompt", exact: true })).not.toBeVisible();
+  await expect.poll(() => page.evaluate(() =>
+    localStorage.getItem("atra:draft:workspace-1:1")
+  )).toBe("First prompt");
+
+  await page.getByLabel("History", { exact: true }).click();
+  await expect(page.getByRole("button", { name: "Second prompt", exact: true })).toBeVisible();
+  await page.getByText("Original prompt").click();
+  await expect(page.getByRole("button", { name: "Second prompt", exact: true })).not.toBeVisible();
+
+  await composer.press("Alt+ArrowUp");
+  await expect(composer).toHaveValue("Second prompt");
+  await expect.poll(() => page.evaluate(() =>
+    localStorage.getItem("atra:draft:workspace-1:1")
+  )).toBe("Second prompt");
+  await composer.press("Alt+ArrowDown");
+  await expect(composer).toHaveValue("First prompt");
+  await composer.press("Alt+ArrowDown");
+  await expect(composer).toHaveValue("First prompt");
+
+  await composer.fill("Stashed draft");
+  await composer.evaluate((element: HTMLTextAreaElement) => {
+    element.setSelectionRange(element.value.length, element.value.length);
+  });
+  await composer.press("Control+c");
+  await expect(composer).toHaveValue("");
+  await expect.poll(() => page.evaluate(() =>
+    localStorage.getItem("atra:sent-history:workspace-1:1")
+  )).toContain("Stashed draft");
+
+  await page.locator(".turn-actions").getByRole("button", { name: "Rewind" }).first().click();
+  await expect(page.getByRole("heading", { name: "Replace Thread history?" })).toBeVisible();
+  await page.getByRole("dialog").getByRole("button", { name: "Rewind" }).click();
+  await expect(composer).toHaveValue("Original prompt");
+  expect(sentCommand).toEqual({
+    method: "thread_replace_history",
+    thread_id: 1,
+    target: { kind: "message", checkpoint_id: null, sequence: 1 }
+  });
+
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "atra:sent-history:workspace-1:1",
+      JSON.stringify(Array.from({ length: 20 }, (_, index) => `Prompt ${index}`))
+    );
+  });
+  await composer.fill("x");
+  await page.getByLabel("History", { exact: true }).click();
+  const menu = page.locator(".composer-history-menu");
+  await expect(menu).toBeVisible();
+  const menuSize = await menu.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight
+  }));
+  expect(menuSize.scrollHeight).toBeGreaterThan(menuSize.clientHeight);
+
+  expect(pageErrors).toEqual([]);
 });

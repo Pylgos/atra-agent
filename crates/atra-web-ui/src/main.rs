@@ -158,6 +158,46 @@ impl Drop for PopstateListener {
     }
 }
 
+struct HistoryCloseListener {
+    _callback: Closure<dyn FnMut(WebEvent)>,
+}
+
+impl HistoryCloseListener {
+    fn new(mut open: Signal<bool>) -> Self {
+        let callback = Closure::wrap(Box::new(move |event: WebEvent| {
+            if !open() {
+                return;
+            }
+            let clicked_inside = event
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                .and_then(|element| element.closest(".composer-history").ok().flatten())
+                .is_some();
+            if !clicked_inside {
+                open.set(false);
+            }
+        }) as Box<dyn FnMut(WebEvent)>);
+        if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+            let _ = document
+                .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        }
+        Self {
+            _callback: callback,
+        }
+    }
+}
+
+impl Drop for HistoryCloseListener {
+    fn drop(&mut self) {
+        if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+            let _ = document.remove_event_listener_with_callback(
+                "click",
+                self._callback.as_ref().unchecked_ref(),
+            );
+        }
+    }
+}
+
 fn browser_route() -> Route {
     web_sys::window()
         .and_then(|window| window.location().pathname().ok())
@@ -213,28 +253,22 @@ fn save_json(key: &str, value: &impl serde::Serialize) {
     }
 }
 
-fn save_sent_message(workspace: &str, thread: i64, message: &str) {
+fn push_history_entry(workspace: &str, thread: i64, value: String) -> Vec<String> {
     let key = history_key(workspace, thread);
     let mut history = storage_json::<Vec<String>>(&key);
-    history.push(message.to_owned());
-    if history.len() > 100 {
-        history.drain(..history.len() - 100);
+    if history.last().map(String::as_str) != Some(value.as_str()) {
+        history.push(value);
+        if history.len() > 100 {
+            history.drain(..history.len() - 100);
+        }
+        save_json(&key, &history);
     }
-    save_json(&key, &history);
+    history
 }
 
-fn byte_index_at_utf16_offset(value: &str, offset: usize) -> usize {
-    let mut utf16_offset = 0;
-    for (byte_index, character) in value.char_indices() {
-        if utf16_offset >= offset {
-            return byte_index;
-        }
-        utf16_offset += character.len_utf16();
-        if utf16_offset > offset {
-            return byte_index;
-        }
-    }
-    value.len()
+fn set_draft(workspace: &str, thread: i64, mut draft: Signal<String>, value: String) {
+    storage_set(&draft_key(workspace, thread), &value);
+    draft.set(value);
 }
 
 fn request_notification_permission() {
@@ -384,6 +418,7 @@ enum DialogState {
     Rewind {
         checkpoint: Option<i64>,
         sequence: EventSequence,
+        composer: Option<String>,
     },
     Restore {
         checkpoint: i64,
@@ -1407,6 +1442,8 @@ fn ThreadPage(
     let dialog = use_signal(|| None::<DialogState>);
     let selected_activity = use_signal(|| None::<(TurnKey, ActivityKey)>);
     let workspace_id = workspace.workspace_id.clone();
+    let draft = use_signal(|| storage_get(&draft_key(&workspace_id, thread)));
+    let history_index = use_signal(|| None::<usize>);
     let workspace_for_stream = workspace_id.clone();
     let _thread_stream = use_hook(move || {
         connect_sse(
@@ -1544,6 +1581,8 @@ fn ThreadPage(
                     connected,
                     pins,
                     error,
+                    draft,
+                    history_index,
                 }
             }
             UtilityPanel {
@@ -1584,6 +1623,8 @@ fn ThreadPage(
                 route,
                 pins,
                 error,
+                draft,
+                history_index,
             }
         }
     }
@@ -2033,7 +2074,13 @@ fn TurnCard(
             div { class: "turn-actions",
                 TurnCopyButton { store, turn_key, target: TurnCopyTarget::Prompt }
                 if let Some(sequence) = prompt_sequence {
-                    TurnRewindButton { dialog, sequence, active, connected }
+                    TurnRewindButton {
+                        dialog,
+                        sequence,
+                        active,
+                        connected,
+                        composer: Some(turn.prompt().to_owned()),
+                    }
                 }
             }
             if !activities.is_empty() {
@@ -2077,7 +2124,7 @@ fn TurnCard(
                 div { class: "turn-actions",
                     TurnCopyButton { store, turn_key, target: TurnCopyTarget::Answer }
                     if let Some(sequence) = sequence {
-                        TurnRewindButton { dialog, sequence, active, connected }
+                        TurnRewindButton { dialog, sequence, active, connected, composer: None }
                     }
                 }
             }
@@ -2187,6 +2234,7 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
 fn TurnRewindButton(
     dialog: Signal<Option<DialogState>>,
     sequence: EventSequence,
+    composer: Option<String>,
     active: bool,
     connected: bool,
 ) -> Element {
@@ -2199,6 +2247,7 @@ fn TurnRewindButton(
             onclick: move |_| dialog.set(Some(DialogState::Rewind {
                 checkpoint: None,
                 sequence,
+                composer: composer.clone(),
             })),
             svg {
                 view_box: "0 0 24 24",
@@ -2584,6 +2633,8 @@ fn Composer(
     connected: bool,
     pins: Signal<Vec<Pin>>,
     error: Signal<String>,
+    draft: Signal<String>,
+    history_index: Signal<Option<usize>>,
 ) -> Element {
     let active_turn = store.read_active_turn();
     let metadata_read = store.read_metadata();
@@ -2591,11 +2642,11 @@ fn Composer(
     if !active_turn.is_loaded() {
         return rsx! {};
     }
-    let mut draft = use_signal(|| storage_get(&draft_key(&workspace, thread)));
     let mut pending = use_signal(|| false);
-    let mut history_index = use_signal(|| None::<usize>);
     let mut saved_draft = use_signal(String::new);
     let mut composing = use_signal(|| false);
+    let mut history_open = use_signal(|| false);
+    let _history_close = use_hook(move || Rc::new(HistoryCloseListener::new(history_open)));
     let history = storage_json::<Vec<String>>(&history_key(&workspace, thread));
     let active = active_turn.is_active();
     let awaiting = active_turn.is_awaiting_interaction();
@@ -2605,6 +2656,51 @@ fn Composer(
     };
     let workspace_for_input = workspace.clone();
     let workspace_for_submit = workspace.clone();
+    let mut stash = {
+        let workspace = workspace.clone();
+        move || {
+            let value = draft();
+            if value.trim().is_empty() {
+                return;
+            }
+            push_history_entry(&workspace, thread, value);
+            set_draft(&workspace, thread, draft, String::new());
+            history_index.set(None);
+        }
+    };
+    let mut previous_history = {
+        let workspace = workspace.clone();
+        move |history: &[String]| {
+            if history.is_empty() {
+                return;
+            }
+            let value = draft();
+            let next = history_index()
+                .map(|index| index.saturating_sub(1))
+                .unwrap_or_else(|| {
+                    saved_draft.set(value);
+                    history.len() - 1
+                });
+            history_index.set(Some(next));
+            set_draft(&workspace, thread, draft, history[next].clone());
+        }
+    };
+    let mut next_history = {
+        let workspace = workspace.clone();
+        move |history: &[String]| {
+            let Some(index) = history_index() else {
+                return;
+            };
+            if index + 1 < history.len() {
+                history_index.set(Some(index + 1));
+                set_draft(&workspace, thread, draft, history[index + 1].clone());
+            } else {
+                history_index.set(None);
+                set_draft(&workspace, thread, draft, saved_draft());
+            }
+        }
+    };
+    let history_entries = history.iter().rev().cloned().collect::<Vec<_>>();
 
     rsx! {
         div { class: "composer-region",
@@ -2641,9 +2737,8 @@ fn Composer(
                             allow_questions: true,
                         }).await {
                             Ok(_) => {
-                                save_sent_message(&workspace, thread, &message);
-                                storage_set(&draft_key(&workspace, thread), "");
-                                draft.set(String::new());
+                                push_history_entry(&workspace, thread, message.clone());
+                                set_draft(&workspace, thread, draft, String::new());
                                 history_index.set(None);
                                 ensure_pin(pins, &workspace, ThreadId(thread), &controller);
                                 error.set(String::new());
@@ -2664,63 +2759,96 @@ fn Composer(
                     oncompositionend: move |_| composing.set(false),
                     oninput: move |event| {
                         let value = event.value();
-                        storage_set(&draft_key(&workspace_for_input, thread), &value);
-                        draft.set(value);
+                        set_draft(&workspace_for_input, thread, draft, value);
                         history_index.set(None);
                     },
-                    onkeydown: move |event| {
-                        if (event.modifiers().contains(Modifiers::CONTROL)
-                            || event.modifiers().contains(Modifiers::META))
-                            && event.key() == Key::Enter
-                        {
-                            event.prevent_default();
-                            if let Some(form) = web_sys::window()
-                                .and_then(|window| window.document())
-                                .and_then(|document| document.get_element_by_id("composer"))
-                                .and_then(|element| element.dyn_into::<HtmlFormElement>().ok())
-                            {
-                                let _ = form.request_submit();
+                    onkeydown: {
+                        let history = history.clone();
+                        move |event| {
+                            let ctrl = event.modifiers().contains(Modifiers::CONTROL)
+                                || event.modifiers().contains(Modifiers::META);
+                            if ctrl && event.key() == Key::Enter {
+                                event.prevent_default();
+                                if let Some(form) = web_sys::window()
+                                    .and_then(|window| window.document())
+                                    .and_then(|document| document.get_element_by_id("composer"))
+                                    .and_then(|element| element.dyn_into::<HtmlFormElement>().ok())
+                                {
+                                    let _ = form.request_submit();
+                                }
+                                return;
                             }
-                            return;
+                            if ctrl
+                                && matches!(
+                                    &event.key(),
+                                    Key::Character(character) if character.eq_ignore_ascii_case("c")
+                                )
+                            {
+                                let has_selection = web_sys::window()
+                                    .and_then(|window| window.document())
+                                    .and_then(|document| document.get_element_by_id("message"))
+                                    .and_then(|element| element.dyn_into::<HtmlTextAreaElement>().ok())
+                                    .is_some_and(|textarea| {
+                                        let start = textarea.selection_start().ok().flatten().unwrap_or(0);
+                                        let end = textarea.selection_end().ok().flatten().unwrap_or(0);
+                                        start != end
+                                    });
+                                if !has_selection {
+                                    event.prevent_default();
+                                    stash();
+                                }
+                                return;
+                            }
+                            if event.modifiers().contains(Modifiers::ALT)
+                                && !composing()
+                                && matches!(event.key(), Key::ArrowUp | Key::ArrowDown)
+                            {
+                                event.prevent_default();
+                                match event.key() {
+                                    Key::ArrowUp => previous_history(&history),
+                                    _ => next_history(&history),
+                                }
+                                return;
+                            }
                         }
-                        if composing() || !matches!(event.key(), Key::ArrowUp | Key::ArrowDown) {
-                            return;
+                    }
+                }
+                div { class: "composer-history-controls",
+                    div { class: "composer-history",
+                        button {
+                            class: "composer-history-summary",
+                            r#type: "button",
+                            aria_label: "History",
+                            title: "History",
+                            aria_expanded: history_open(),
+                            onclick: move |_| history_open.set(!history_open()),
+                            svg {
+                                view_box: "0 0 24 24",
+                                circle { cx: "12", cy: "12", r: "9" }
+                                path { d: "M12 6v6l4 2" }
+                            }
                         }
-                        let Some(textarea) = web_sys::window()
-                            .and_then(|window| window.document())
-                            .and_then(|document| document.get_element_by_id("message"))
-                            .and_then(|element| element.dyn_into::<HtmlTextAreaElement>().ok())
-                        else {
-                            return;
-                        };
-                        let start = textarea.selection_start().ok().flatten().unwrap_or(0) as usize;
-                        let end = textarea.selection_end().ok().flatten().unwrap_or(0) as usize;
-                        if start != end {
-                            return;
-                        }
-                        let value = draft();
-                        let start = byte_index_at_utf16_offset(&value, start);
-                        let at_first = !value[..start].contains('\n');
-                        let at_last = !value[start..].contains('\n');
-                        if event.key() == Key::ArrowUp && at_first && !history.is_empty() {
-                            event.prevent_default();
-                            let next = history_index().map(|index| index.saturating_sub(1)).unwrap_or_else(|| {
-                                saved_draft.set(value);
-                                history.len() - 1
-                            });
-                            history_index.set(Some(next));
-                            draft.set(history[next].clone());
-                        } else if event.key() == Key::ArrowDown
-                            && at_last
-                            && let Some(index) = history_index()
-                        {
-                            event.prevent_default();
-                            if index + 1 < history.len() {
-                                history_index.set(Some(index + 1));
-                                draft.set(history[index + 1].clone());
-                            } else {
-                                history_index.set(None);
-                                draft.set(saved_draft());
+                        if history_open() {
+                            div { class: "composer-history-menu",
+                                if history_entries.is_empty() {
+                                    span { class: "composer-history-empty", "No history yet" }
+                                }
+                                for entry in history_entries {
+                                    button {
+                                        r#type: "button",
+                                        title: "{entry}",
+                                        onclick: {
+                                            let workspace = workspace.clone();
+                                            let entry = entry.clone();
+                                            move |_| {
+                                                set_draft(&workspace, thread, draft, entry.clone());
+                                                history_index.set(None);
+                                                history_open.set(false);
+                                            }
+                                        },
+                                        "{entry}"
+                                    }
+                                }
                             }
                         }
                     }
@@ -3401,6 +3529,7 @@ fn CheckpointPreview(
                         onclick: move |_| dialog.set(Some(DialogState::Rewind {
                             checkpoint: Some(checkpoint),
                             sequence,
+                            composer: None,
                         })),
                         "Rewind"
                     }
@@ -3620,6 +3749,8 @@ fn AppDialog(
     route: Signal<Route>,
     pins: Signal<Vec<Pin>>,
     error: Signal<String>,
+    draft: Signal<String>,
+    history_index: Signal<Option<usize>>,
 ) -> Element {
     let initial = match &state {
         DialogState::Rename { current } => current.clone(),
@@ -3738,7 +3869,7 @@ fn AppDialog(
                                             CommandResult::ThreadForked { thread_id } => Some(thread_id),
                                             _ => None,
                                         }),
-                                        DialogState::Rewind { checkpoint, sequence } => command(&workspace, &Command::ThreadReplaceHistory {
+                                        DialogState::Rewind { checkpoint, sequence, .. } => command(&workspace, &Command::ThreadReplaceHistory {
                                             thread_id: ThreadId(thread),
                                             target: HistoryTarget::Message {
                                                 checkpoint_id: checkpoint.map(CheckpointId),
@@ -3787,11 +3918,22 @@ fn AppDialog(
                                                         detail: None,
                                                     });
                                                 }
-                                                DialogState::Restore { .. } | DialogState::Rewind { .. } => navigate(route, Route {
+                                                DialogState::Restore { .. } => navigate(route, Route {
                                                     workspace: Some(workspace),
                                                     thread: Some(thread),
                                                     detail: None,
                                                 }),
+                                                DialogState::Rewind { composer, .. } => {
+                                                    if let Some(content) = composer {
+                                                        set_draft(&workspace, thread, draft, content);
+                                                        history_index.set(None);
+                                                    }
+                                                    navigate(route, Route {
+                                                        workspace: Some(workspace),
+                                                        thread: Some(thread),
+                                                        detail: None,
+                                                    });
+                                                }
                                                 DialogState::Rename { .. } | DialogState::StopProcess { .. } => {}
                                             }
                                         }
