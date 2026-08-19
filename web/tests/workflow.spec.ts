@@ -1015,9 +1015,12 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
   let sentCommand: unknown;
   await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
     sentCommand = route.request().postDataJSON();
+    const result = (sentCommand as { method?: string }).method === "skill_list"
+      ? { result: "skills_listed", skills: ["code-review", "setup-atra-workspace"] }
+      : { result: "accepted" };
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify({ result: "accepted" })
+      body: JSON.stringify(result)
     });
   });
 
@@ -1028,7 +1031,8 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
   const composer = page.getByLabel("Message");
   await expect(composer).toBeVisible();
 
-  await page.getByLabel("History", { exact: true }).click();
+  await page.getByLabel("Composer actions").click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
   await expect(page.getByRole("button", { name: "Second prompt", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "First prompt", exact: true }).click();
   await expect(composer).toHaveValue("First prompt");
@@ -1037,7 +1041,8 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
     localStorage.getItem("atra:draft:workspace-1:1")
   )).toBe("First prompt");
 
-  await page.getByLabel("History", { exact: true }).click();
+  await page.getByLabel("Composer actions").click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
   await expect(page.getByRole("button", { name: "Second prompt", exact: true })).toBeVisible();
   await page.getByText("Original prompt").click();
   await expect(page.getByRole("button", { name: "Second prompt", exact: true })).not.toBeVisible();
@@ -1051,6 +1056,20 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
   await expect(composer).toHaveValue("First prompt");
   await composer.press("Alt+ArrowDown");
   await expect(composer).toHaveValue("First prompt");
+
+  await composer.fill("A😀B");
+  await composer.evaluate((element: HTMLTextAreaElement) => {
+    element.setSelectionRange(3, 3);
+  });
+  await page.getByLabel("Composer actions").click();
+  await page.getByRole("button", { name: "Skills", exact: true }).click();
+  await expect(page.getByRole("button", { name: "$code-review", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "$code-review", exact: true }).click();
+  await expect(composer).toHaveValue("A😀$code-review B");
+  await expect(composer).toBeFocused();
+  await expect.poll(() => page.evaluate(() =>
+    localStorage.getItem("atra:draft:workspace-1:1")
+  )).toBe("A😀$code-review B");
 
   await composer.fill("Stashed draft");
   await composer.evaluate((element: HTMLTextAreaElement) => {
@@ -1079,8 +1098,9 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
     );
   });
   await composer.fill("x");
-  await page.getByLabel("History", { exact: true }).click();
-  const menu = page.locator(".composer-history-menu");
+  await page.getByLabel("Composer actions").click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  const menu = page.locator(".composer-menu-list");
   await expect(menu).toBeVisible();
   const menuSize = await menu.evaluate((element) => ({
     clientHeight: element.clientHeight,

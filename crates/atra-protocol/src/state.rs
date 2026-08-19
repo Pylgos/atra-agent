@@ -1303,6 +1303,7 @@ impl Error for ApplyError {}
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Shutdown,
+    SkillList,
     ThreadCreate {
         display_name: Option<String>,
     },
@@ -1392,6 +1393,7 @@ pub enum Command {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommandResult {
     Accepted,
+    SkillsListed { skills: Vec<String> },
     ThreadCreated { thread_id: ThreadId },
     ThreadForked { thread_id: ThreadId },
     ProcessStarted { process_id: ProcessId },

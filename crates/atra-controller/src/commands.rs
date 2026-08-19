@@ -22,6 +22,16 @@ impl State {
         self.views.ensure_running().await?;
         match command {
             Command::Shutdown => bail!("shutdown must be handled by the connection owner"),
+            Command::SkillList => {
+                let generation = self.collect_skill_generation().await?;
+                Ok(CommandResult::SkillsListed {
+                    skills: generation
+                        .skills
+                        .iter()
+                        .map(|skill| skill.name.clone())
+                        .collect(),
+                })
+            }
             Command::ThreadCreate { display_name } => {
                 let _mutation = self.lock_mutation().await?;
                 let thread_id = self

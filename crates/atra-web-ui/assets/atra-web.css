@@ -1577,7 +1577,7 @@ pre {
   border-color: var(--accent);
 }
 
-.composer-history-controls {
+.composer-menu-controls {
   display: flex;
   flex: none;
   align-items: center;
@@ -1585,11 +1585,11 @@ pre {
   gap: 0.15rem;
 }
 
-.composer-history {
+.composer-menu {
   position: relative;
 }
 
-.composer-history-summary {
+.composer-menu-summary {
   display: grid;
   width: 30px;
   height: 30px;
@@ -1601,13 +1601,13 @@ pre {
   color: var(--muted);
 }
 
-.composer-history-summary:hover,
-.composer-history-summary[aria-expanded="true"] {
+.composer-menu-summary:hover,
+.composer-menu-summary[aria-expanded="true"] {
   background: var(--surface);
   color: var(--text);
 }
 
-.composer-history-summary svg {
+.composer-menu-summary svg {
   width: 16px;
   height: 16px;
   fill: none;
@@ -1617,22 +1617,26 @@ pre {
   stroke-linejoin: round;
 }
 
-.composer-history-menu {
+.composer-menu-popover {
   position: absolute;
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 20;
-  min-width: 180px;
+  width: 220px;
   max-width: min(420px, calc(100vw - 2rem));
-  max-height: min(50vh, 400px);
-  overflow-y: auto;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 11px;
   background: var(--panel);
   box-shadow: var(--shadow);
 }
 
-.composer-history-menu > button {
-  display: block;
+.composer-menu-popover > button,
+.composer-menu-list > button {
+  display: flex;
   width: 100%;
+  align-items: center;
+  justify-content: space-between;
   padding: 0.45rem 0.7rem;
   overflow: hidden;
   border: 0;
@@ -1643,14 +1647,54 @@ pre {
   white-space: nowrap;
 }
 
-.composer-history-menu > button:hover {
+.composer-menu-popover > button:hover,
+.composer-menu-list > button:hover {
   background: var(--panel-subtle);
 }
 
-.composer-history-empty {
-  display: block;
-  padding: 0.55rem 0.7rem;
+.composer-menu-chevron {
   color: var(--muted);
+  font-size: 1.1rem;
+}
+
+.composer-menu-header {
+  display: grid;
+  grid-template-columns: 32px 1fr 32px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+
+.composer-menu-header button {
+  grid-column: 1;
+  min-width: 32px;
+  padding: 0.35rem;
+  border: 0;
+  background: transparent;
+  font-size: 1.2rem;
+}
+
+.composer-menu-header strong {
+  grid-column: 2;
+  text-align: center;
+}
+
+.composer-menu-list {
+  max-height: min(50vh, 400px);
+  overflow-y: auto;
+}
+
+.composer-menu-list code {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+}
+
+.composer-menu-empty {
+  display: block;
+  width: 100%;
+  padding: 0.7rem;
+  color: var(--muted);
+  text-align: center;
 }
 
 .composer textarea {

@@ -158,23 +158,32 @@ impl Drop for PopstateListener {
     }
 }
 
-struct HistoryCloseListener {
+#[derive(Clone, Copy, PartialEq)]
+enum ComposerMenuPage {
+    Root,
+    History,
+    Skills,
+}
+
+struct ComposerMenuCloseListener {
     _callback: Closure<dyn FnMut(WebEvent)>,
 }
 
-impl HistoryCloseListener {
-    fn new(mut open: Signal<bool>) -> Self {
+impl ComposerMenuCloseListener {
+    fn new(mut page: Signal<Option<ComposerMenuPage>>) -> Self {
         let callback = Closure::wrap(Box::new(move |event: WebEvent| {
-            if !open() {
+            if page().is_none() {
                 return;
             }
-            let clicked_inside = event
-                .target()
-                .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-                .and_then(|element| element.closest(".composer-history").ok().flatten())
-                .is_some();
+            let clicked_inside = event.composed_path().iter().any(|target| {
+                target
+                    .dyn_into::<web_sys::Element>()
+                    .ok()
+                    .and_then(|element| element.closest(".composer-menu").ok().flatten())
+                    .is_some()
+            });
             if !clicked_inside {
-                open.set(false);
+                page.set(None);
             }
         }) as Box<dyn FnMut(WebEvent)>);
         if let Some(document) = web_sys::window().and_then(|window| window.document()) {
@@ -187,7 +196,7 @@ impl HistoryCloseListener {
     }
 }
 
-impl Drop for HistoryCloseListener {
+impl Drop for ComposerMenuCloseListener {
     fn drop(&mut self) {
         if let Some(document) = web_sys::window().and_then(|window| window.document()) {
             let _ = document.remove_event_listener_with_callback(
@@ -268,6 +277,56 @@ fn push_history_entry(value: String) -> Vec<String> {
 fn set_draft(workspace: &str, thread: i64, mut draft: Signal<String>, value: String) {
     storage_set(&draft_key(workspace, thread), &value);
     draft.set(value);
+}
+
+fn utf16_offset_to_byte_index(value: &str, offset: u32) -> usize {
+    let mut units = 0;
+    for (index, character) in value.char_indices() {
+        if units >= offset {
+            return index;
+        }
+        units += character.len_utf16() as u32;
+        if units >= offset {
+            return index + character.len_utf8();
+        }
+    }
+    value.len()
+}
+
+fn insert_composer_text(workspace: &str, thread: i64, draft: Signal<String>, insertion: String) {
+    let current = draft();
+    let textarea = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("message"))
+        .and_then(|element| element.dyn_into::<HtmlTextAreaElement>().ok());
+    let end_offset = current.encode_utf16().count() as u32;
+    let start = textarea
+        .as_ref()
+        .and_then(|textarea| textarea.selection_start().ok().flatten())
+        .unwrap_or(end_offset);
+    let end = textarea
+        .as_ref()
+        .and_then(|textarea| textarea.selection_end().ok().flatten())
+        .unwrap_or(start);
+    let start_index = utf16_offset_to_byte_index(&current, start);
+    let end_index = utf16_offset_to_byte_index(&current, end);
+    let mut next = String::with_capacity(current.len() + insertion.len());
+    next.push_str(&current[..start_index]);
+    next.push_str(&insertion);
+    next.push_str(&current[end_index..]);
+    let caret = start + insertion.encode_utf16().count() as u32;
+    set_draft(workspace, thread, draft, next);
+    spawn(async move {
+        TimeoutFuture::new(0).await;
+        if let Some(textarea) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("message"))
+            .and_then(|element| element.dyn_into::<HtmlTextAreaElement>().ok())
+        {
+            let _ = textarea.focus();
+            let _ = textarea.set_selection_range(caret, caret);
+        }
+    });
 }
 
 fn request_notification_permission() {
@@ -2630,6 +2689,22 @@ fn CommandOperations(display: CommandDisplay) -> Element {
 }
 
 #[component]
+fn ComposerMenuHeader(title: &'static str, back: EventHandler<MouseEvent>) -> Element {
+    rsx! {
+        header { class: "composer-menu-header",
+            button {
+                r#type: "button",
+                aria_label: "Back",
+                title: "Back",
+                onclick: move |event| back.call(event),
+                "‹"
+            }
+            strong { "{title}" }
+        }
+    }
+}
+
+#[component]
 fn Composer(
     workspace: String,
     thread: i64,
@@ -2650,8 +2725,10 @@ fn Composer(
     let mut pending = use_signal(|| false);
     let mut saved_draft = use_signal(String::new);
     let mut composing = use_signal(|| false);
-    let mut history_open = use_signal(|| false);
-    let _history_close = use_hook(move || Rc::new(HistoryCloseListener::new(history_open)));
+    let mut menu_page = use_signal(|| None::<ComposerMenuPage>);
+    let mut skills = use_signal(Vec::<String>::new);
+    let mut skills_loading = use_signal(|| false);
+    let _menu_close = use_hook(move || Rc::new(ComposerMenuCloseListener::new(menu_page)));
     let history = storage_json::<Vec<String>>(SENT_HISTORY_KEY);
     let active = active_turn.is_active();
     let awaiting = active_turn.is_awaiting_interaction();
@@ -2818,41 +2895,138 @@ fn Composer(
                         }
                     }
                 }
-                div { class: "composer-history-controls",
-                    div { class: "composer-history",
+                div { class: "composer-menu-controls",
+                    div {
+                        class: "composer-menu",
+                        onkeydown: move |event| {
+                            if event.key() == Key::Escape {
+                                event.prevent_default();
+                                menu_page.set(None);
+                            }
+                        },
                         button {
-                            class: "composer-history-summary",
+                            class: "composer-menu-summary",
                             r#type: "button",
-                            aria_label: "History",
-                            title: "History",
-                            aria_expanded: history_open(),
-                            onclick: move |_| history_open.set(!history_open()),
+                            aria_label: "Composer actions",
+                            title: "Composer actions",
+                            aria_expanded: menu_page().is_some(),
+                            onclick: move |_| {
+                                menu_page.set(if menu_page().is_some() {
+                                    None
+                                } else {
+                                    Some(ComposerMenuPage::Root)
+                                });
+                            },
                             svg {
                                 view_box: "0 0 24 24",
-                                circle { cx: "12", cy: "12", r: "9" }
-                                path { d: "M12 6v6l4 2" }
+                                path { d: "M4 7h16M4 12h16M4 17h16" }
                             }
                         }
-                        if history_open() {
-                            div { class: "composer-history-menu",
-                                if history_entries.is_empty() {
-                                    span { class: "composer-history-empty", "No history yet" }
-                                }
-                                for entry in history_entries {
-                                    button {
-                                        r#type: "button",
-                                        title: "{entry}",
-                                        onclick: {
-                                            let workspace = workspace.clone();
-                                            let entry = entry.clone();
-                                            move |_| {
-                                                set_draft(&workspace, thread, draft, entry.clone());
-                                                history_index.set(None);
-                                                history_open.set(false);
+                        if let Some(page) = menu_page() {
+                            div { class: "composer-menu-popover",
+                                match page {
+                                    ComposerMenuPage::Root => rsx! {
+                                        button {
+                                            r#type: "button",
+                                            aria_label: "History",
+                                            onclick: move |event| {
+                                                event.stop_propagation();
+                                                menu_page.set(Some(ComposerMenuPage::History));
+                                            },
+                                            span { "History" }
+                                            span { class: "composer-menu-chevron", "›" }
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            aria_label: "Skills",
+                                            onclick: {
+                                                let workspace = workspace.clone();
+                                                move |event| {
+                                                    event.stop_propagation();
+                                                    menu_page.set(Some(ComposerMenuPage::Skills));
+                                                    skills_loading.set(true);
+                                                    let workspace = workspace.clone();
+                                                    spawn(async move {
+                                                        match command(&workspace, &Command::SkillList).await {
+                                                            Ok(CommandResult::SkillsListed { skills: available }) => {
+                                                                skills.set(available);
+                                                                error.set(String::new());
+                                                            }
+                                                            Ok(result) => error.set(format!(
+                                                                "unexpected skill list result: {result:?}"
+                                                            )),
+                                                            Err(message) => error.set(message),
+                                                        }
+                                                        skills_loading.set(false);
+                                                    });
+                                                }
+                                            },
+                                            span { "Skills" }
+                                            span { class: "composer-menu-chevron", "›" }
+                                        }
+                                    },
+                                    ComposerMenuPage::History => rsx! {
+                                        ComposerMenuHeader {
+                                            title: "History",
+                                            back: move |_| menu_page.set(Some(ComposerMenuPage::Root)),
+                                        }
+                                        div { class: "composer-menu-list",
+                                            if history_entries.is_empty() {
+                                                span { class: "composer-menu-empty", "No history yet" }
                                             }
-                                        },
-                                        "{entry}"
-                                    }
+                                            for entry in history_entries {
+                                                button {
+                                                    r#type: "button",
+                                                    title: "{entry}",
+                                                    onclick: {
+                                                        let workspace = workspace.clone();
+                                                        let entry = entry.clone();
+                                                        move |_| {
+                                                            set_draft(&workspace, thread, draft, entry.clone());
+                                                            history_index.set(None);
+                                                            menu_page.set(None);
+                                                        }
+                                                    },
+                                                    "{entry}"
+                                                }
+                                            }
+                                        }
+                                    },
+                                    ComposerMenuPage::Skills => rsx! {
+                                        ComposerMenuHeader {
+                                            title: "Skills",
+                                            back: move |_| menu_page.set(Some(ComposerMenuPage::Root)),
+                                        }
+                                        div { class: "composer-menu-list",
+                                            if skills_loading() {
+                                                span { class: "composer-menu-empty", "Loading skills…" }
+                                            } else if skills().is_empty() {
+                                                span { class: "composer-menu-empty", "No skills available" }
+                                            } else {
+                                                for skill in skills() {
+                                                    button {
+                                                        r#type: "button",
+                                                        title: "Insert ${skill}",
+                                                        onclick: {
+                                                            let workspace = workspace.clone();
+                                                            let skill = skill.clone();
+                                                            move |_| {
+                                                                insert_composer_text(
+                                                                    &workspace,
+                                                                    thread,
+                                                                    draft,
+                                                                    format!("${skill} "),
+                                                                );
+                                                                history_index.set(None);
+                                                                menu_page.set(None);
+                                                            }
+                                                        },
+                                                        code { "${skill}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -4046,6 +4220,18 @@ mod tests {
             reasoning_effort_for_model(&models, "fake\ntest-model", "medium"),
             "high"
         );
+    }
+
+    #[test]
+    fn utf16_offsets_map_to_utf8_boundaries() {
+        let value = "A😀日本B";
+
+        assert_eq!(utf16_offset_to_byte_index(value, 0), 0);
+        assert_eq!(utf16_offset_to_byte_index(value, 1), 1);
+        assert_eq!(utf16_offset_to_byte_index(value, 3), 5);
+        assert_eq!(utf16_offset_to_byte_index(value, 4), 8);
+        assert_eq!(utf16_offset_to_byte_index(value, 5), 11);
+        assert_eq!(utf16_offset_to_byte_index(value, 6), 12);
     }
 
     #[test]

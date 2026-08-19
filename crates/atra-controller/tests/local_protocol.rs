@@ -8,6 +8,21 @@ use tempfile::TempDir;
 use tokio::{io::AsyncWriteExt, net::UnixStream, task::JoinHandle};
 
 #[tokio::test]
+async fn skill_list_returns_available_skill_names() {
+    let controller = TestController::start().await;
+    let result = atra_client::Client::new(&controller.endpoint)
+        .command(Command::SkillList)
+        .await
+        .unwrap();
+
+    let CommandResult::SkillsListed { skills } = result else {
+        panic!("unexpected command result: {result:?}");
+    };
+    assert!(skills.iter().any(|skill| skill == "setup-atra-workspace"));
+    assert!(skills.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[tokio::test]
 async fn subscriptions_receive_snapshot_then_shared_operations() {
     let controller = TestController::start().await;
     let client = atra_client::Client::new(&controller.endpoint);
