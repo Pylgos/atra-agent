@@ -152,7 +152,7 @@ pub async fn run(
         .threads()
         .await
         .context("failed to materialize controller threads")?;
-    let controller_providers = provider_states(&providers).await;
+    let controller_providers = refreshing_provider_states(&providers);
     let public_state = atra_protocol::ControllerState::new(
         atra_protocol::ControllerLifecycle::Running,
         controller_threads,
@@ -180,6 +180,7 @@ pub async fn run(
         mutation: Arc::new(Mutex::new(())),
         views,
     });
+    spawn_provider_refreshes(&state.providers, &state.views);
 
     let (shutdown, mut shutdown_requested) = watch::channel(false);
     let mut callback_tasks = JoinSet::new();
@@ -262,16 +263,45 @@ enum WorkspaceInstructions {
     Removed,
 }
 
-async fn provider_states(
+fn refreshing_provider_states(
     providers: &HashMap<String, Arc<dyn ModelProvider>>,
 ) -> Vec<atra_protocol::ProviderState> {
     let mut ids = providers.keys().cloned().collect::<Vec<_>>();
     ids.sort_unstable();
-    let mut states = Vec::with_capacity(ids.len());
-    for id in ids {
-        states.push(provider_state(&id, &providers[&id]).await);
+    ids.into_iter()
+        .map(|id| {
+            atra_protocol::ProviderState::new(
+                id,
+                atra_protocol::ProviderLifecycle::Refreshing,
+                Vec::new(),
+                None,
+            )
+        })
+        .collect()
+}
+
+fn spawn_provider_refreshes(
+    providers: &HashMap<String, Arc<dyn ModelProvider>>,
+    views: &Arc<Views>,
+) {
+    for (id, provider) in providers {
+        let id = id.clone();
+        let provider = Arc::clone(provider);
+        let views = Arc::clone(views);
+        tokio::spawn(async move {
+            let provider = provider_state(&id, &provider).await;
+            if let Err(error) = views
+                .apply_controller(atra_protocol::ControllerOperation::ProviderUpdated { provider })
+                .await
+            {
+                tracing::error!(
+                    provider = id,
+                    error = %format!("{error:#}"),
+                    "failed to publish initial provider state"
+                );
+            }
+        });
     }
-    states
 }
 
 async fn provider_state(
@@ -746,5 +776,140 @@ struct SocketGuard<'a>(&'a Path);
 impl Drop for SocketGuard<'_> {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use atra_protocol::{
+        ControllerLifecycle, ControllerOperation, ControllerState, ControllerSubscriptionMessage,
+        Model, ProviderLifecycle,
+    };
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    struct BlockingProvider {
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for BlockingProvider {
+        fn id(&self) -> &'static str {
+            "blocking"
+        }
+
+        async fn models(&self) -> Result<Vec<Model>> {
+            Ok(vec![Model {
+                provider: self.id().to_owned(),
+                id: "test".to_owned(),
+                display_name: "Test".to_owned(),
+                description: None,
+                default_reasoning_effort: "medium".to_owned(),
+                supported_reasoning_efforts: vec!["medium".to_owned()],
+                context_window: None,
+                auto_compact_token_limit: None,
+            }])
+        }
+
+        async fn login(&self, _credential: Option<String>) -> Result<model::ProviderLoginStatus> {
+            unreachable!("login is not used by provider startup")
+        }
+
+        async fn login_status(&self) -> Result<model::ProviderLoginStatus> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(model::ProviderLoginStatus::LoggedIn(None))
+        }
+
+        async fn reload_auth(&self) -> Result<()> {
+            unreachable!("reload is not used by provider startup")
+        }
+
+        async fn logout(&self) -> Result<()> {
+            unreachable!("logout is not used by provider startup")
+        }
+
+        async fn rate_limits(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Array(Vec::new()))
+        }
+
+        async fn execute_tool(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>> {
+            unreachable!("tools are not used by provider startup")
+        }
+
+        async fn start_turn(&self, _session_id: &str) -> Result<Box<dyn model::ModelSession + '_>> {
+            unreachable!("turns are not used by provider startup")
+        }
+
+        fn context_tokens(&self, _events: &[storage::Event]) -> Result<usize> {
+            unreachable!("token counting is not used by provider startup")
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_does_not_block_initial_controller_state() {
+        let provider = Arc::new(BlockingProvider {
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let providers = HashMap::from([(
+            provider.id().to_owned(),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+        )]);
+        let initial = refreshing_provider_states(&providers);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].lifecycle(), &ProviderLifecycle::Refreshing);
+
+        let views = Arc::new(Views::new(ControllerState::new(
+            ControllerLifecycle::Running,
+            Vec::new(),
+            initial,
+            Vec::new(),
+        )));
+        let mut subscription = views.subscribe_controller().await;
+        let ControllerSubscriptionMessage::Snapshot { state } = subscription.recv().await.unwrap()
+        else {
+            panic!("subscription did not start with a snapshot");
+        };
+        assert_eq!(
+            state.providers()[0].lifecycle(),
+            &ProviderLifecycle::Refreshing
+        );
+
+        spawn_provider_refreshes(&providers, &views);
+        tokio::time::timeout(Duration::from_secs(1), provider.started.notified())
+            .await
+            .expect("provider refresh did not start");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), subscription.recv())
+                .await
+                .is_err(),
+            "provider updated before the blocking refresh completed"
+        );
+
+        provider.release.notify_one();
+        let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("provider refresh did not publish an update")
+            .expect("controller subscription ended");
+        let ControllerSubscriptionMessage::Operation {
+            operation: ControllerOperation::ProviderUpdated { provider: updated },
+        } = message
+        else {
+            panic!("provider refresh published an unexpected message");
+        };
+        assert_eq!(
+            updated.lifecycle(),
+            &ProviderLifecycle::LoggedIn { account: None }
+        );
+        assert_eq!(updated.models().len(), 1);
     }
 }

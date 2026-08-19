@@ -848,7 +848,13 @@ mod tests {
         let controller = ControllerState::new(
             ControllerLifecycle::Running,
             threads,
-            crate::provider_states(&providers).await,
+            vec![
+                crate::provider_state(
+                    crate::model::FAKE_PROVIDER,
+                    &providers[crate::model::FAKE_PROVIDER],
+                )
+                .await,
+            ],
             Vec::new(),
         );
         let views = Arc::new(crate::views::Views::new(controller));
