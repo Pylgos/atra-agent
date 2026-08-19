@@ -781,7 +781,7 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
         Some("custom_tool_call") => Some(ModelResponse::CustomToolCall {
             item_id: item["id"].as_str().map(str::to_owned),
             name: string_field(item, "name")?,
-            input: super::CustomToolInput::Text(string_field(item, "input")?),
+            input: string_field(item, "input")?,
             call_id: string_field(item, "call_id")?,
         }),
         Some("web_search_call") => Some(ModelResponse::WebSearch { item: item.clone() }),
@@ -948,23 +948,31 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
         .iter()
         .map(|tool| match tool {
             ModelTool::WebSearch => json!({"type": "web_search", "external_web_access": true}),
-            ModelTool::Function {
-                name,
-                description,
-                parameters,
-            } => json!({
-                "type": "function",
-                "name": name,
-                "description": description,
-                "parameters": parameters,
-                "strict": true,
-            }),
-            ModelTool::Custom { name, description, format } => json!({
-                "type": "custom",
-                "name": name,
-                "description": description,
-                "format": {"type": "grammar", "syntax": format.syntax, "definition": format.definition}
-            }),
+            ModelTool::Tool { name, json, custom } => {
+                if let Some(custom) = custom {
+                    json!({
+                        "type": "custom",
+                        "name": name,
+                        "description": custom.description,
+                        "format": {
+                            "type": "grammar",
+                            "syntax": custom.format.syntax,
+                            "definition": custom.format.definition,
+                        }
+                    })
+                } else {
+                    let json_interface = json
+                        .as_ref()
+                        .expect("model tool must expose a Codex-compatible interface");
+                    json!({
+                        "type": "function",
+                        "name": name,
+                        "description": json_interface.description,
+                        "parameters": json_interface.parameters,
+                        "strict": true,
+                    })
+                }
+            }
         })
         .collect()
 }
@@ -2076,4 +2084,28 @@ mod tests {
             })
         ));
     }
+}
+#[test]
+fn codex_prefers_the_command_custom_interface() {
+    let definitions = tool_definitions(&crate::tools::model_tools(true));
+    let command = definitions
+        .iter()
+        .find(|definition| definition["name"] == "command")
+        .unwrap();
+
+    assert_eq!(command["type"], "custom");
+    assert_eq!(command["format"]["syntax"], "lark");
+    assert!(
+        command["description"]
+            .as_str()
+            .unwrap()
+            .contains("*** Runner")
+    );
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|definition| definition["name"] == "question")
+            .unwrap()["type"],
+        "function"
+    );
 }

@@ -4,77 +4,94 @@ use indoc::indoc;
 pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
     let mut tools = vec![model::ModelTool::WebSearch];
     if allow_questions {
-        tools.push(model::ModelTool::Function {
+        tools.push(model::ModelTool::Tool {
             name: "question",
-            description: "Ask the user one or more questions. Each question is answered with one option and an optional free-form note. recommended_options must contain option labels. The UI adds a final \"どれでもない\" option automatically, so do not provide it; that answer is returned with selected_option null. Use this when user input is required before continuing.",
-            parameters: question_parameters(),
+            json: Some(model::ModelJsonToolInterface {
+                description: "Ask the user one or more questions. Each question is answered with one option and an optional free-form note. recommended_options must contain option labels. The UI adds a final \"どれでもない\" option automatically, so do not provide it; that answer is returned with selected_option null. Use this when user input is required before continuing.".to_owned(),
+                parameters: question_parameters(),
+            }),
+            custom: None,
         });
     }
+    let command_description = indoc! {"
+        Execute Bash scripts on named Atra Runners.
+        Scripts run with `bash -lc` without implicit `set -e`.
+        Use `set -e`, `&&`, or `|| exit 1` when later commands must not run after a failure.
+
+        Processes:
+        Each command waits up to 120 seconds. If it is still running, it is detached and returned as a managed process.
+        Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
+        A process ID reported after a foreground timeout can be passed directly to `atri proc wait` or `atri proc stop`; do not rerun the command.
+        Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
+        Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 120 seconds and has no configured maximum.
+        While `atri proc wait` is running, the calling command's detach timer stops. It resumes with its remaining time when the wait ends.
+        Run `atri proc stop <process-id>...` to stop named processes.
+        These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
+
+        Subagents:
+        `atri agent create --name <name> [--model <provider>/<model>] [--effort <effort>] [--allow-delegation]` creates an empty child thread without copying this conversation.
+        Omit `--model` and `--effort` normally; omitted values are inherited from the parent thread. Override them only when explicitly required by the user or applicable instructions.
+        `--allow-delegation` permits that child to create its own children. A child without this permission is rejected by the Controller if it attempts `agent create`.
+        Use `atri agent send <thread-id> [<message>]`, `atri agent wait [--timeout <seconds>] <thread-id>@<after-sequence>...`, `atri agent list`, `atri agent cancel [--recursive] <thread-id>...`, and `atri agent delete [--recursive] <thread-id>...`.
+        Automated child turns cannot ask questions, remain alive independently of the parent turn, and are limited to eight concurrently running descendants per root.
+        For the first `wait` after `send`, use the `after_sequence` returned by `send`. For subsequent waits, use the `through` returned by the previous `wait`. Use `-1` only when intentionally reading the thread from its beginning.
+        Before completing the parent turn, stop every descendant that is still running.
+
+        Patches:
+        Run `atri patch` and pass the patch on standard input to add, update, delete, or move files.
+        Use a quoted Bash heredoc ending the command line with `atri patch <<'PATCH'` and terminate it with `PATCH` on its own line.
+        Preceding and following commands may be joined to `atri patch` with shell operators. A typical invocation is:
+        `atri patch <<'PATCH'`
+        `*** Begin Patch`
+        `...`
+        `*** End Patch`
+        `PATCH`
+        Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>` and may omit change lines when the contents are unchanged.
+        Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
+        Paths in patches are relative to the command's working directory unless absolute.
+        Use line ranges for large deletions or replacements when the line numbers are already known.
+        When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
+        Use ordinary diff lines for small changes.
+        Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
+
+        Replacements:
+        Run `atri replace <path>` and pass exact old and new text on standard input:
+        `atri replace path/to/file <<'REPLACE'`
+        `--- Old`
+        `old text`
+        `--- New`
+        `new text`
+        `REPLACE`
+        The replacement fails without changing the file unless the old text occurs exactly once.
+        Use `atri replace --all <path>` to replace every occurrence.
+
+        Use a separate tool call when a result is needed to decide the next operation.
+    "};
     tools.extend([
-        model::ModelTool::Custom {
+        model::ModelTool::Tool {
             name: "command",
-            description: indoc! {"
-                Execute one or more Bash scripts on named Atra Runners.
-                Start each script with `*** Runner <runner>`; repeat it to run another script or switch Runners.
-                A script ends at the next `*** Runner <runner>` line or the end of the tool input.
-                Scripts run with `bash -lc` without implicit `set -e`.
-                Use `set -e`, `&&`, or `|| exit 1` when later commands must not run after a failure.
-                Runner scripts execute sequentially; a non-zero exit status does not prevent later Runner scripts from running.
-
-                Processes:
-                Each command waits up to 120 seconds. If it is still running, it is detached and returned as a managed process.
-                Process IDs are local to each Runner within the current conversation and must match `[a-z][a-z0-9_-]{0,63}`.
-                A process ID reported after a foreground timeout can be passed directly to `atri proc wait` or `atri proc stop`; do not rerun the command.
-                Run `atri proc spawn <process-id> '<command>'` to start a named managed process without waiting.
-                Run `atri proc wait <process-id>... [--timeout <seconds>]` to wait for all named processes. The timeout defaults to 120 seconds and has no configured maximum.
-                While `atri proc wait` is running, the calling command's detach timer stops. It resumes with its remaining time when the wait ends.
-                Run `atri proc stop <process-id>...` to stop named processes.
-                These commands report every process in argument order. A wait timeout reports processes as running and does not fail.
-
-                Subagents:
-                `atri agent create --name <name> [--model <provider>/<model>] [--effort <effort>] [--allow-delegation]` creates an empty child thread without copying this conversation.
-                Omit `--model` and `--effort` normally; omitted values are inherited from the parent thread. Override them only when explicitly required by the user or applicable instructions.
-                `--allow-delegation` permits that child to create its own children. A child without this permission is rejected by the Controller if it attempts `agent create`.
-                Use `atri agent send <thread-id> [<message>]`, `atri agent wait [--timeout <seconds>] <thread-id>@<after-sequence>...`, `atri agent list`, `atri agent cancel [--recursive] <thread-id>...`, and `atri agent delete [--recursive] <thread-id>...`.
-                Automated child turns cannot ask questions, remain alive independently of the parent turn, and are limited to eight concurrently running descendants per root.
-                For the first `wait` after `send`, use the `after_sequence` returned by `send`. For subsequent waits, use the `through` returned by the previous `wait`. Use `-1` only when intentionally reading the thread from its beginning.
-                Before completing the parent turn, stop every descendant that is still running.
-
-                Patches:
-                Run `atri patch` and pass the patch on standard input to add, update, delete, or move files.
-                Use a quoted Bash heredoc ending the command line with `atri patch <<'PATCH'` and terminate it with `PATCH` on its own line.
-                Preceding and following commands may be joined to `atri patch` with shell operators. A typical invocation is:
-                `atri patch <<'PATCH'`
-                `*** Begin Patch`
-                `...`
-                `*** End Patch`
-                `PATCH`
-                Patch hunks start with `*** Add File: <path>`, `*** Update File: <path>`, or `*** Delete File: <path>`; a move follows an update header with `*** Move to: <path>` and may omit change lines when the contents are unchanged.
-                Enclose the hunks with `*** Begin Patch` and `*** End Patch` on their own lines.
-                Paths in patches are relative to the command's working directory unless absolute.
-                Use line ranges for large deletions or replacements when the line numbers are already known.
-                When inspecting a file is otherwise necessary, obtain line numbers as part of that inspection.
-                Use ordinary diff lines for small changes.
-                Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
-
-                Replacements:
-                Run `atri replace <path>` and pass exact old and new text on standard input:
-                `atri replace path/to/file <<'REPLACE'`
-                `--- Old`
-                `old text`
-                `--- New`
-                `new text`
-                `REPLACE`
-                The replacement fails without changing the file unless the old text occurs exactly once.
-                Use `atri replace --all <path>` to replace every occurrence.
-
-                Commands in one tool call execute sequentially, and their results are returned together after all commands have finished.
-                Use a separate tool call when a result is needed to decide the next operation.
-            "},
-            format: model::ModelToolFormat {
-                syntax: "lark",
-                // Codex's Lark parser does not support regex lookaround such as `(?!...)`.
-                definition: indoc! {r#"
+            json: Some(model::ModelJsonToolInterface {
+                description: interface_description(
+                    command_description,
+                    "Execute exactly one Bash script. Set `runner` to the Runner name and `command` to the complete script.",
+                ),
+                parameters: command_parameters(),
+            }),
+            custom: Some(model::ModelCustomToolInterface {
+                description: interface_description(
+                    command_description,
+                    indoc! {"
+                        Execute one or more Bash scripts.
+                        Start each script with `*** Runner <runner>`; repeat it to run another script or switch Runners.
+                        A script ends at the next `*** Runner <runner>` line or the end of the tool input.
+                        Runner scripts execute sequentially; a non-zero exit status does not prevent later Runner scripts from running.
+                        Their results are returned together after all scripts have finished.
+                    "},
+                ),
+                format: model::ModelToolFormat {
+                    syntax: "lark",
+                    // Codex's Lark parser does not support regex lookaround such as `(?!...)`.
+                    definition: indoc! {r#"
                     start: runner_script+
                     runner_script: runner command_item+
                     runner: "*** Runner " name LF
@@ -112,11 +129,16 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
 
                     %import common.INT
                     %import common.LF
-                "#},
-            },
+                    "#},
+                },
+            }),
         },
     ]);
     tools
+}
+
+fn interface_description(description: &str, instructions: &str) -> String {
+    format!("{}\n\n{}", description.trim_end(), instructions.trim())
 }
 
 pub(super) fn question_parameters() -> serde_json::Value {
@@ -158,6 +180,26 @@ pub(super) fn question_parameters() -> serde_json::Value {
     })
 }
 
+fn command_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "runner": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The name of the Atra Runner that executes the script."
+            },
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The complete Bash script to execute with `bash -lc`."
+            }
+        },
+        "required": ["runner", "command"],
+        "additionalProperties": false
+    })
+}
+
 pub(super) fn web_search_parameters() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -174,19 +216,6 @@ pub(super) fn web_fetch_parameters() -> serde_json::Value {
         "type": "object",
         "properties": {"url": {"type": "string"}},
         "required": ["url"]
-    })
-}
-
-pub(super) fn custom_tool_wrapper_parameters() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "input": {
-                "type": "string",
-                "description": "The complete custom tool input."
-            }
-        },
-        "required": ["input"]
     })
 }
 
@@ -240,7 +269,15 @@ impl ToolInputError {
 #[derive(Debug)]
 pub(super) enum ValidatedFunctionTool {
     Questions(Vec<atra_protocol::Question>),
+    Command(atra_protocol::RunnerCommand),
     Provider,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandArguments {
+    runner: String,
+    command: String,
 }
 
 #[derive(Deserialize)]
@@ -265,6 +302,25 @@ pub(super) fn validate_function_tool(
         "question" if allow_questions => parse_questions(arguments)
             .map(ValidatedFunctionTool::Questions)
             .map_err(|error| ToolInputError::json(format!("{error:#}"), question_parameters())),
+        "command" => {
+            let arguments: CommandArguments = serde_json::from_value(arguments)
+                .map_err(|error| ToolInputError::json(error.to_string(), command_parameters()))?;
+            if arguments.runner.trim().is_empty() {
+                return Err(ToolInputError::json(
+                    "property `runner` must not be empty",
+                    command_parameters(),
+                ));
+            }
+            if arguments.command.trim().is_empty() {
+                return Err(ToolInputError::json(
+                    "property `command` must not be empty",
+                    command_parameters(),
+                ));
+            }
+            Ok(ValidatedFunctionTool::Command(
+                atra_protocol::RunnerCommand::from_parts(arguments.runner, arguments.command),
+            ))
+        }
         "web_search" => {
             let arguments: WebSearchArguments =
                 serde_json::from_value(arguments).map_err(|error| {
@@ -295,11 +351,11 @@ pub(super) fn validate_custom_tool(
     input: &str,
 ) -> std::result::Result<Vec<atra_protocol::RunnerCommand>, ToolInputError> {
     let Some(format) = model_tools(false).into_iter().find_map(|tool| match tool {
-        model::ModelTool::Custom {
+        model::ModelTool::Tool {
             name: candidate,
-            format,
+            custom: Some(custom),
             ..
-        } if candidate == name => Some(format),
+        } if candidate == name => Some(custom.format),
         _ => None,
     }) else {
         return Err(ToolInputError::unavailable());
@@ -307,39 +363,6 @@ pub(super) fn validate_custom_tool(
     atra_protocol::parse_command_input(input).map_err(|error| {
         ToolInputError::grammar(error.to_string(), format.syntax, format.definition)
     })
-}
-
-pub(super) fn validate_custom_tool_input(
-    name: &str,
-    input: &model::CustomToolInput,
-) -> std::result::Result<Vec<atra_protocol::RunnerCommand>, ToolInputError> {
-    let input = match input {
-        model::CustomToolInput::Text(input) => input,
-        model::CustomToolInput::Arguments(arguments) => {
-            let arguments = arguments.as_object().ok_or_else(|| {
-                ToolInputError::json(
-                    "arguments must be an object",
-                    custom_tool_wrapper_parameters(),
-                )
-            })?;
-            match arguments.get("input") {
-                None => {
-                    return Err(ToolInputError::json(
-                        "required property `input` is missing",
-                        custom_tool_wrapper_parameters(),
-                    ));
-                }
-                Some(serde_json::Value::String(input)) => input,
-                Some(_) => {
-                    return Err(ToolInputError::json(
-                        "property `input` must be a string",
-                        custom_tool_wrapper_parameters(),
-                    ));
-                }
-            }
-        }
-    };
-    validate_custom_tool(name, input)
 }
 
 #[derive(Deserialize)]
@@ -796,14 +819,15 @@ mod tests {
     fn question_tool_is_only_available_for_interactive_turns() {
         assert!(model_tools(true).iter().any(|tool| matches!(
             tool,
-            model::ModelTool::Function {
+            model::ModelTool::Tool {
                 name: "question",
+                json: Some(_),
                 ..
             }
         )));
         assert!(model_tools(false).iter().all(|tool| !matches!(
             tool,
-            model::ModelTool::Function {
+            model::ModelTool::Tool {
                 name: "question",
                 ..
             }
@@ -942,22 +966,30 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_custom_tool_input_is_validated_by_the_controller() {
+    fn json_command_input_is_validated_by_the_controller() {
         for (arguments, expected) in [
             (
-                serde_json::json!({"command": "echo wrong field"}),
-                "Error: required property `input` is missing.",
+                serde_json::json!({"command": "echo missing runner"}),
+                "missing field `runner`",
             ),
             (
-                serde_json::json!({"input": {"runner": "sandbox"}}),
-                "Error: property `input` must be a string.",
+                serde_json::json!({
+                    "runner": "sandbox",
+                    "command": "echo ok",
+                    "description": "unknown field"
+                }),
+                "unknown field `description`",
+            ),
+            (
+                serde_json::json!({"runner": " ", "command": "echo ok"}),
+                "property `runner` must not be empty",
+            ),
+            (
+                serde_json::json!({"runner": "sandbox", "command": "\n"}),
+                "property `command` must not be empty",
             ),
         ] {
-            let error = validate_custom_tool_input(
-                "command",
-                &model::CustomToolInput::Arguments(arguments),
-            )
-            .unwrap_err();
+            let error = validate_function_tool("command", arguments, false).unwrap_err();
             let result = error.tool_result("command");
             assert!(result.contains(expected));
             assert!(result.contains("Expected schema:"));
@@ -965,18 +997,22 @@ mod tests {
     }
 
     #[test]
-    fn valid_wrapped_custom_tool_input_reaches_grammar_validation() {
-        let operations = validate_custom_tool_input(
+    fn valid_json_command_input_produces_one_runner_command() {
+        let validated = validate_function_tool(
             "command",
-            &model::CustomToolInput::Arguments(serde_json::json!({
-                "input": "*** Runner sandbox\necho ok"
-            })),
+            serde_json::json!({
+                "runner": "sandbox",
+                "command": "echo ok"
+            }),
+            false,
         )
         .unwrap();
 
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].runner(), "sandbox");
-        assert_eq!(operations[0].command(), "echo ok");
+        let ValidatedFunctionTool::Command(command) = validated else {
+            panic!("expected a command");
+        };
+        assert_eq!(command.runner(), "sandbox");
+        assert_eq!(command.command(), "echo ok");
     }
 
     #[test]

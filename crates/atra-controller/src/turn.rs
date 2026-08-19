@@ -77,14 +77,7 @@ fn response_event(response: &mut ModelResponse) -> ThreadEventData {
             call_type: CustomToolType::Custom,
             item_id: item_id.clone(),
             name: name.clone(),
-            input: match input {
-                model::CustomToolInput::Text(input) => input.clone(),
-                model::CustomToolInput::Arguments(arguments) => arguments
-                    .get("input")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| arguments.to_string()),
-            },
+            input: input.clone(),
             call_id: call_id.clone(),
         }),
         ModelResponse::Reasoning { item } => {
@@ -1033,35 +1026,56 @@ impl State {
                             continue;
                         }
                     };
-                    if let crate::tools::ValidatedFunctionTool::Questions(questions) = validated {
-                        let (request_id, answer) = self.turns.register_question(thread_id)?;
-                        updates
-                            .context("question requires a streaming turn")?
-                            .interaction_requested(atra_protocol::PendingInteraction::Questions(
-                                atra_protocol::PendingQuestionRequest {
-                                    id: request_id,
-                                    questions,
+                    match validated {
+                        crate::tools::ValidatedFunctionTool::Questions(questions) => {
+                            let (request_id, answer) = self.turns.register_question(thread_id)?;
+                            updates
+                                .context("question requires a streaming turn")?
+                                .interaction_requested(
+                                    atra_protocol::PendingInteraction::Questions(
+                                        atra_protocol::PendingQuestionRequest {
+                                            id: request_id,
+                                            questions,
+                                        },
+                                    ),
+                                )
+                                .await?;
+                            let answers = answer
+                                .await
+                                .context("question was removed before it was answered")?;
+                            needs_follow_up = true;
+                            self.save_tool_result(
+                                thread_id,
+                                &name,
+                                call_id.as_deref(),
+                                ToolOutcome {
+                                    result: serde_json::to_value(&answers)
+                                        .context("failed to encode question answers")?,
+                                    artifacts: Vec::new(),
                                 },
-                            ))
+                                false,
+                                updates,
+                            )
                             .await?;
-                        let answers = answer
-                            .await
-                            .context("question was removed before it was answered")?;
-                        needs_follow_up = true;
-                        self.save_tool_result(
-                            thread_id,
-                            &name,
-                            call_id.as_deref(),
-                            ToolOutcome {
-                                result: serde_json::to_value(&answers)
-                                    .context("failed to encode question answers")?,
-                                artifacts: Vec::new(),
-                            },
-                            false,
-                            updates,
-                        )
-                        .await?;
-                        continue;
+                            continue;
+                        }
+                        crate::tools::ValidatedFunctionTool::Command(command) => {
+                            let outcome = self
+                                .approve_and_execute(thread_id, &name, command, None, updates)
+                                .await?;
+                            needs_follow_up = true;
+                            self.save_tool_result(
+                                thread_id,
+                                &name,
+                                call_id.as_deref(),
+                                outcome,
+                                false,
+                                updates,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        crate::tools::ValidatedFunctionTool::Provider => {}
                     }
                     let result = provider
                         .execute_tool(&name, &arguments)
@@ -1104,7 +1118,7 @@ impl State {
                     ..
                 } => {
                     needs_follow_up = true;
-                    let operations = match crate::tools::validate_custom_tool_input(&name, &input) {
+                    let operations = match crate::tools::validate_custom_tool(&name, &input) {
                         Ok(operations) => operations,
                         Err(error) => {
                             self.save_tool_error(

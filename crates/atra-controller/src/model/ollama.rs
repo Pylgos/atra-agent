@@ -517,14 +517,10 @@ impl OllamaStream {
                     rand::rng().random::<u64>() ^ super::text_tokens(&self.session_id) as u64
                 )
             });
-            let response = if call.function.name == "command" {
-                custom_tool_response(call.function.name, call.function.arguments, call_id)
-            } else {
-                ModelResponse::ToolCall {
-                    name: call.function.name,
-                    arguments: call.function.arguments,
-                    call_id: Some(call_id),
-                }
+            let response = ModelResponse::ToolCall {
+                name: call.function.name,
+                arguments: call.function.arguments,
+                call_id: Some(call_id),
             };
             self.pending.push_back(Ok(ModelEvent::OutputItemDone {
                 output: empty_output(),
@@ -615,38 +611,19 @@ fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
                     crate::tools::web_fetch_parameters(),
                 ));
             }
-            ModelTool::Function {
-                name,
-                description,
-                parameters,
-            } => definitions.push(function_tool(name, description, parameters.clone())),
-            ModelTool::Custom {
-                name,
-                description,
-                format,
-            } => {
-                let description = format!(
-                    "{description}\n\nThe complete input must conform to this {} grammar:\n\n{}",
-                    format.syntax, format.definition
-                );
+            ModelTool::Tool { name, json, .. } => {
+                let json_interface = json
+                    .as_ref()
+                    .expect("model tool must expose an Ollama-compatible interface");
                 definitions.push(function_tool(
                     name,
-                    &description,
-                    crate::tools::custom_tool_wrapper_parameters(),
+                    &json_interface.description,
+                    json_interface.parameters.clone(),
                 ));
             }
         }
     }
     definitions
-}
-
-fn custom_tool_response(name: String, arguments: Value, call_id: String) -> ModelResponse {
-    ModelResponse::CustomToolCall {
-        item_id: None,
-        name,
-        input: super::CustomToolInput::Arguments(arguments),
-        call_id,
-    }
 }
 
 fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
@@ -823,8 +800,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["web_search", "web_fetch", "question", "command"]);
         let command_description = definitions[3]["function"]["description"].as_str().unwrap();
-        assert!(command_description.contains("lark grammar"));
-        assert!(command_description.contains("add_line: \"+\""));
+        assert!(command_description.contains("Execute exactly one Bash script"));
+        assert!(!command_description.contains("*** Runner"));
         assert_eq!(
             definitions[0]["function"]["parameters"],
             crate::tools::web_search_parameters()
@@ -833,33 +810,6 @@ mod tests {
             definitions[1]["function"]["parameters"],
             crate::tools::web_fetch_parameters()
         );
-        assert_eq!(
-            definitions[3]["function"]["parameters"],
-            crate::tools::custom_tool_wrapper_parameters()
-        );
-    }
-
-    #[test]
-    fn custom_tool_arguments_are_preserved_for_controller_validation() {
-        let arguments = json!({
-            "command": "echo wrong field",
-            "description": "Run a command"
-        });
-        let response =
-            custom_tool_response("command".to_owned(), arguments.clone(), "call-1".to_owned());
-
-        let ModelResponse::CustomToolCall {
-            name,
-            input: crate::model::CustomToolInput::Arguments(input),
-            call_id,
-            ..
-        } = response
-        else {
-            panic!("expected raw custom tool arguments");
-        };
-        assert_eq!(name, "command");
-        assert_eq!(input, arguments);
-        assert_eq!(call_id, "call-1");
     }
 
     #[test]
@@ -931,7 +881,7 @@ mod tests {
             id: Some("call".to_owned()),
             function: ToolFunction {
                 name: "command".to_owned(),
-                arguments: json!({"input": "echo"}),
+                arguments: json!({"runner": "sandbox", "command": "echo"}),
             },
         });
         assert_eq!(assistant_phase(&message), AssistantMessagePhase::Commentary);

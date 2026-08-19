@@ -54,19 +54,12 @@ pub(crate) enum ModelResponse {
     CustomToolCall {
         item_id: Option<String>,
         name: String,
-        input: CustomToolInput,
+        input: String,
         call_id: String,
     },
     Reasoning {
         item: serde_json::Value,
     },
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum CustomToolInput {
-    Text(String),
-    Arguments(serde_json::Value),
 }
 
 pub(crate) enum ModelStreamEvent {
@@ -151,16 +144,21 @@ pub(crate) struct ModelRequest<'a> {
 
 pub(crate) enum ModelTool {
     WebSearch,
-    Function {
+    Tool {
         name: &'static str,
-        description: &'static str,
-        parameters: serde_json::Value,
+        json: Option<ModelJsonToolInterface>,
+        custom: Option<ModelCustomToolInterface>,
     },
-    Custom {
-        name: &'static str,
-        description: &'static str,
-        format: ModelToolFormat,
-    },
+}
+
+pub(crate) struct ModelJsonToolInterface {
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+pub(crate) struct ModelCustomToolInterface {
+    pub description: String,
+    pub format: ModelToolFormat,
 }
 
 pub(crate) struct ModelToolFormat {

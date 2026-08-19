@@ -205,10 +205,7 @@ fn response_item(response: ModelResponse) -> Result<Value> {
             "status": "completed",
             "call_id": call_id,
             "name": name,
-            "input": match input {
-                super::CustomToolInput::Text(input) => input.clone(),
-                super::CustomToolInput::Arguments(arguments) => arguments.to_string(),
-            },
+            "input": input,
         }),
     })
 }
