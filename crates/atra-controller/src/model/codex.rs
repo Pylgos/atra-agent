@@ -776,7 +776,7 @@ fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
             name: string_field(item, "name")?,
             arguments: serde_json::from_str(&string_field(item, "arguments")?)
                 .context("Codex returned invalid tool arguments")?,
-            call_id: item["call_id"].as_str().map(str::to_owned),
+            call_id: string_field(item, "call_id")?,
         }),
         Some("custom_tool_call") => Some(ModelResponse::CustomToolCall {
             item_id: item["id"].as_str().map(str::to_owned),
@@ -895,15 +895,11 @@ fn model_input(events: &[Event]) -> Result<Vec<Value>> {
                     })
                 })
             }
-            ThreadEventData::ToolResult(ToolResultEvent::Function { call_id, .. }) => {
-                call_id.as_ref().map(|call_id| {
-                    json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": tool_result_text(projected_tool_result(event, &masked))
-                    })
-                })
-            }
+            ThreadEventData::ToolResult(ToolResultEvent::Function { call_id, .. }) => Some(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": tool_result_text(projected_tool_result(event, &masked))
+            })),
             _ => None,
         };
         if let Some(item) = item {
@@ -1438,6 +1434,18 @@ fn backoff(attempt: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_call_requires_call_id() {
+        let error = response_from_item(&json!({
+            "type": "function_call",
+            "name": "question",
+            "arguments": "{}"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("has no call_id"));
+    }
 
     #[test]
     fn completion_request_contains_exact_context_and_omits_observer_events() {

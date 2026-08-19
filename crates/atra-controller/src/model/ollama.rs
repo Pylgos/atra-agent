@@ -520,7 +520,7 @@ impl OllamaStream {
             let response = ModelResponse::ToolCall {
                 name: call.function.name,
                 arguments: call.function.arguments,
-                call_id: Some(call_id),
+                call_id,
             };
             self.pending.push_back(Ok(ModelEvent::OutputItemDone {
                 output: empty_output(),
@@ -925,7 +925,7 @@ mod tests {
                 data: ThreadEventData::ToolResult(ToolResultEvent::Function {
                     call_type: None,
                     name: "web_search".to_owned(),
-                    call_id: Some("call".to_owned()),
+                    call_id: "call".to_owned(),
                     result: json!({"results": []}),
                     artifacts: Vec::<ToolArtifact>::new(),
                     masked_result: None,

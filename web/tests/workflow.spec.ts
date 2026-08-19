@@ -528,8 +528,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(
     page.locator(".activity-command:has(.command-row-status .status-dots)")
   ).toBeVisible();
-  await page.locator(".activity-command:has(.command-row-status .status-dots)").click();
-  await expect(page.locator(".utility .command-operation header span")).toHaveText("queued");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -577,6 +575,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(
     page.locator(".activity-command:has(.command-row-status .status-spinner)")
   ).toBeVisible();
+  await page.locator(".activity-command:has(.command-row-status .status-spinner)").click();
   await expect(page.locator(".utility .command-source")).toContainText("echo hello");
   await expect(page.locator(".utility .command-operation header code")).toHaveText("sandbox");
   await expect(page.locator(".utility .command-output")).toContainText("hello");
@@ -645,7 +644,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
                 operation: 1,
                 runner: "sandbox",
                 label: "Command",
-                result: "hello\nworld\n",
+                result: "persisted\n",
                 artifacts: []
               }
             }]
@@ -656,7 +655,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(page.locator(".utility .command-operation header span")).toHaveText("finished");
-  await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
+  await expect(page.locator(".utility .command-output")).toContainText("persisted");
   await expect(page.locator(".utility .command-operation header span")).not.toHaveText("queued");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(

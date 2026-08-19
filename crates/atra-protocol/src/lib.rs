@@ -355,7 +355,7 @@ pub enum ToolCallEvent {
     Function {
         name: String,
         arguments: Value,
-        call_id: Option<String>,
+        call_id: String,
     },
 }
 
@@ -382,7 +382,7 @@ pub enum ToolResultEvent {
         #[serde(rename = "type")]
         call_type: Option<CustomToolType>,
         name: String,
-        call_id: Option<String>,
+        call_id: String,
         result: Value,
         artifacts: Vec<ToolArtifact>,
         #[serde(skip_serializing_if = "Option::is_none")]

@@ -281,10 +281,10 @@ impl State {
         for call in pending {
             let (name, call_id, custom) = match &call {
                 ToolCallEvent::Custom { name, call_id, .. } => {
-                    (name.as_str(), Some(call_id.as_str()), true)
+                    (name.as_str(), call_id.as_str(), true)
                 }
                 ToolCallEvent::Function { name, call_id, .. } => {
-                    (name.as_str(), call_id.as_deref(), false)
+                    (name.as_str(), call_id.as_str(), false)
                 }
             };
             self.save_tool_result(
@@ -1017,7 +1017,7 @@ impl State {
                             self.save_tool_error(
                                 thread_id,
                                 &name,
-                                call_id.as_deref(),
+                                &call_id,
                                 error.tool_result(&name),
                                 false,
                                 updates,
@@ -1047,7 +1047,7 @@ impl State {
                             self.save_tool_result(
                                 thread_id,
                                 &name,
-                                call_id.as_deref(),
+                                &call_id,
                                 ToolOutcome {
                                     result: serde_json::to_value(&answers)
                                         .context("failed to encode question answers")?,
@@ -1065,12 +1065,7 @@ impl State {
                                 .await?;
                             needs_follow_up = true;
                             self.save_tool_result(
-                                thread_id,
-                                &name,
-                                call_id.as_deref(),
-                                outcome,
-                                false,
-                                updates,
+                                thread_id, &name, &call_id, outcome, false, updates,
                             )
                             .await?;
                             continue;
@@ -1101,7 +1096,7 @@ impl State {
                     self.save_tool_result(
                         thread_id,
                         &name,
-                        call_id.as_deref(),
+                        &call_id,
                         ToolOutcome {
                             result,
                             artifacts: Vec::new(),
@@ -1124,7 +1119,7 @@ impl State {
                             self.save_tool_error(
                                 thread_id,
                                 &name,
-                                Some(&call_id),
+                                &call_id,
                                 error.tool_result(&name),
                                 true,
                                 updates,
@@ -1184,7 +1179,7 @@ impl State {
                     self.save_tool_result(
                         thread_id,
                         &name,
-                        Some(&call_id),
+                        &call_id,
                         ToolOutcome {
                             result: serde_json::Value::String(results.join("\n\n")),
                             artifacts,
@@ -1204,7 +1199,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         name: &str,
-        call_id: Option<&str>,
+        call_id: &str,
         error: String,
         custom: bool,
         updates: Option<&TurnProjector>,
@@ -1452,7 +1447,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         name: &str,
-        call_id: Option<&str>,
+        call_id: &str,
         outcome: ToolOutcome,
         custom: bool,
         updates: Option<&TurnProjector>,
@@ -1461,7 +1456,7 @@ impl State {
             ThreadEventData::ToolResult(ToolResultEvent::Custom {
                 call_type: CustomToolType::Custom,
                 name: name.to_owned(),
-                call_id: call_id.map(str::to_owned),
+                call_id: Some(call_id.to_owned()),
                 result: outcome.result,
                 artifacts: outcome.artifacts,
                 masked_result: None,
@@ -1470,7 +1465,7 @@ impl State {
             ThreadEventData::ToolResult(ToolResultEvent::Function {
                 call_type: None,
                 name: name.to_owned(),
-                call_id: call_id.map(str::to_owned),
+                call_id: call_id.to_owned(),
                 result: outcome.result,
                 artifacts: outcome.artifacts,
                 masked_result: None,

@@ -48,8 +48,7 @@ pub(crate) enum ModelResponse {
     ToolCall {
         name: String,
         arguments: serde_json::Value,
-        #[serde(default)]
-        call_id: Option<String>,
+        call_id: String,
     },
     CustomToolCall {
         item_id: Option<String>,

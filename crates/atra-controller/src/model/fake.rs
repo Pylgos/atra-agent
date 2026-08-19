@@ -70,14 +70,6 @@ impl FakeProvider {
         {
             *content = content.replace("{{tool_output}}", output);
         }
-        if let ModelResponse::ToolCall { call_id, .. } = &mut response
-            && call_id.is_none()
-        {
-            *call_id = Some(format!(
-                "fake_call_{}",
-                atra_id::generate().replace(' ', "_")
-            ));
-        }
         let output = response_item(response.clone())?;
         let output = ProviderOutput {
             provider: PROVIDER_ID.to_owned(),
@@ -192,7 +184,7 @@ fn response_item(response: ModelResponse) -> Result<Value> {
             "type": "function_call",
             "name": name,
             "arguments": arguments.to_string(),
-            "call_id": call_id.expect("fake function tool call ID was assigned"),
+            "call_id": call_id,
         }),
         ModelResponse::CustomToolCall {
             item_id,

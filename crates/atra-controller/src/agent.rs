@@ -1354,12 +1354,12 @@ mod tests {
         let call = ToolCallEvent::Function {
             name: "command".to_owned(),
             arguments: json!({"cmd": "false"}),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
             call_type: None,
             name: "command".to_owned(),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
             result: json!({"success": true, "large": "body must not be shown"}),
             artifacts: vec![ToolArtifact::CommandExecution(
                 CommandExecutionArtifact::Finished {
@@ -1396,12 +1396,12 @@ mod tests {
         let call = ToolCallEvent::Function {
             name: "lookup".to_owned(),
             arguments: json!({"target": "record"}),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
             call_type: None,
             name: "lookup".to_owned(),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
             result: json!({"secret_result_body": "omitted"}),
             artifacts: vec![],
             masked_result: None,
@@ -1428,12 +1428,12 @@ mod tests {
         let call = ToolCallEvent::Function {
             name: "command".to_owned(),
             arguments: json!({"cmd": "printf error"}),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
             call_type: None,
             name: "command".to_owned(),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
             result: json!("error is expected output"),
             artifacts: vec![ToolArtifact::CommandExecution(
                 CommandExecutionArtifact::Finished {
@@ -1514,12 +1514,12 @@ mod tests {
         let call = ToolCallEvent::Function {
             name: "lookup".to_owned(),
             arguments: json!({"query": "検索".repeat(400)}),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
             call_type: None,
             name: "lookup".to_owned(),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
             result: json!({"body": "omitted"}),
             artifacts: vec![],
             masked_result: None,
@@ -1539,82 +1539,6 @@ mod tests {
         assert_eq!(rendered[0].lines().count(), 3);
         assert!(rendered[0].ends_with("status=ok"));
         assert!(rendered[0].chars().count() <= 512);
-    }
-
-    #[test]
-    fn tool_report_pairs_multiple_idless_function_calls_in_event_order() {
-        let call = |name: &str, sequence| crate::storage::Event {
-            sequence: EventSequence(sequence),
-            data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                name: name.to_owned(),
-                arguments: json!({"name": name}),
-                call_id: None,
-            }),
-        };
-        let result = |name: &str, sequence, success| crate::storage::Event {
-            sequence: EventSequence(sequence),
-            data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                call_type: None,
-                name: name.to_owned(),
-                call_id: None,
-                result: json!({"success": success, "error": "injected"}),
-                artifacts: vec![],
-                masked_result: None,
-            }),
-        };
-        let events = vec![
-            call("first", 0),
-            call("second", 1),
-            result("first-result-name-is-not-used", 2, true),
-            result("second-result-name-is-not-used", 3, false),
-        ];
-
-        let rendered = render_report_events(&events, &events);
-        assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].starts_with("[tool first]"));
-        assert!(rendered[0].contains("status=ok"));
-        assert!(rendered[1].starts_with("[tool second]"));
-        assert!(rendered[1].contains("status=ok"));
-    }
-
-    #[test]
-    fn tool_report_keeps_idless_and_identified_pairing_independent() {
-        let events = vec![
-            crate::storage::Event {
-                sequence: EventSequence(0),
-                data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                    name: "idless".to_owned(),
-                    arguments: json!({}),
-                    call_id: None,
-                }),
-            },
-            crate::storage::Event {
-                sequence: EventSequence(1),
-                data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                    name: "identified".to_owned(),
-                    arguments: json!({}),
-                    call_id: Some("call-9".to_owned()),
-                }),
-            },
-            crate::storage::Event {
-                sequence: EventSequence(2),
-                data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                    call_type: None,
-                    name: "identified".to_owned(),
-                    call_id: Some("call-9".to_owned()),
-                    result: json!({"success": true}),
-                    artifacts: vec![],
-                    masked_result: None,
-                }),
-            },
-        ];
-
-        let rendered = render_report_events(&events, &events);
-        assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].starts_with("[tool idless]"));
-        assert!(rendered[0].contains("status=pending"));
-        assert!(rendered[1].starts_with("[tool identified]"));
-        assert!(rendered[1].contains("status=ok"));
     }
 
     #[test]

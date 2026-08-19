@@ -944,10 +944,7 @@ impl ThreadOperation {
                             call_id: Some(call_id),
                             ..
                         }
-                        | ToolResultEvent::Function {
-                            call_id: Some(call_id),
-                            ..
-                        },
+                        | ToolResultEvent::Function { call_id, .. },
                     ) => call_id,
                     ThreadEventData::ToolResult(_) => {
                         return Err(ApplyError::new(
@@ -1585,7 +1582,7 @@ mod tests {
             data: ThreadEventData::ToolResult(ToolResultEvent::Function {
                 call_type: None,
                 name: "command".to_owned(),
-                call_id: Some("call-1".to_owned()),
+                call_id: "call-1".to_owned(),
                 result: serde_json::json!("done"),
                 artifacts: Vec::new(),
                 masked_result: None,

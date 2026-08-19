@@ -211,7 +211,7 @@ impl TranscriptState {
                     call_id: current,
                     ..
                 } | ToolCallEvent::Function {
-                    call_id: Some(current),
+                    call_id: current,
                     ..
                 }) if current == call_id
             )
@@ -587,7 +587,7 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     name,
                     arguments,
                     call_id,
-                } => (name, arguments, call_id),
+                } => (name, arguments, Some(call_id)),
             };
             let name = sanitize(&name);
             let arguments = sanitize_value(arguments);
@@ -668,20 +668,26 @@ pub(crate) fn merge_runner_tool_result(
             artifacts,
             masked_result,
             ..
-        }
-        | ToolResultEvent::Function {
+        } => (name, call_id.as_deref(), result, artifacts, masked_result),
+        ToolResultEvent::Function {
             name,
             call_id,
             result,
             artifacts,
             masked_result,
             ..
-        } => (name, call_id, result, artifacts, masked_result),
+        } => (
+            name,
+            Some(call_id.as_str()),
+            result,
+            artifacts,
+            masked_result,
+        ),
     };
     if name != "command" {
         return false;
     }
-    let Some(call_id) = call_id.as_deref() else {
+    let Some(call_id) = call_id else {
         return false;
     };
     let Some(entry) = transcript.iter_mut().rev().find(|entry| {
@@ -726,18 +732,18 @@ fn merge_question_tool_result(transcript: &mut [TranscriptEntry], event: &Thread
             call_id,
             result,
             ..
-        }
-        | ToolResultEvent::Function {
+        } => (name, call_id.as_deref(), result),
+        ToolResultEvent::Function {
             name,
             call_id,
             result,
             ..
-        } => (name, call_id, result),
+        } => (name, Some(call_id.as_str()), result),
     };
     if name != "question" {
         return false;
     }
-    let Some(call_id) = call_id.as_deref() else {
+    let Some(call_id) = call_id else {
         return false;
     };
     let Some(entry) = transcript.iter_mut().rev().find(|entry| {
@@ -919,7 +925,7 @@ mod tests {
                         "recommended_options": []
                     }]
                 }),
-                call_id: Some("question-1".to_owned()),
+                call_id: "question-1".to_owned(),
             }),
         };
         let result = ThreadEvent {
@@ -927,7 +933,7 @@ mod tests {
             data: ThreadEventData::ToolResult(ToolResultEvent::Function {
                 call_type: None,
                 name: "question".to_owned(),
-                call_id: Some("question-1".to_owned()),
+                call_id: "question-1".to_owned(),
                 result: serde_json::json!([{
                     "selected_option": "A",
                     "note": "details"

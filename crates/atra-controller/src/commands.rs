@@ -896,15 +896,14 @@ fn take_first(values: &mut HashMap<String, ActiveItemId>) -> Option<ActiveItemId
 fn tool_call_key(call: &ToolCallEvent) -> Option<&str> {
     match call {
         ToolCallEvent::Custom { item_id, .. } => item_id.as_deref(),
-        ToolCallEvent::Function { call_id, .. } => call_id.as_deref(),
+        ToolCallEvent::Function { call_id, .. } => Some(call_id),
     }
 }
 
 fn tool_result_call_id(result: &ToolResultEvent) -> Option<&str> {
     match result {
-        ToolResultEvent::Custom { call_id, .. } | ToolResultEvent::Function { call_id, .. } => {
-            call_id.as_deref()
-        }
+        ToolResultEvent::Custom { call_id, .. } => call_id.as_deref(),
+        ToolResultEvent::Function { call_id, .. } => Some(call_id),
     }
 }
 

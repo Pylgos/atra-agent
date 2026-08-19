@@ -8,7 +8,7 @@ use atra_patch_types::{
 use atra_protocol::{
     ActiveItem, ActiveItemData, ActiveItemId, AssistantMessagePhase, CommandExecutionArtifact,
     EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, ThreadState, TodoStatus,
-    ToolArtifact, ToolCallEvent,
+    ToolArtifact, ToolCallEvent, ToolResultEvent,
 };
 use serde_json::Value;
 
@@ -32,9 +32,7 @@ pub(super) enum ActivityKey {
     Event(EventSequence),
     Tool {
         call: EventSequence,
-        result: Option<EventSequence>,
         identity: Option<String>,
-        approvals: Vec<EventSequence>,
     },
     Todo {
         source: EventSequence,
@@ -65,7 +63,7 @@ impl fmt::Display for ActivityKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Event(sequence) => write!(formatter, "event-{}", sequence.0),
-            Self::Tool { call, identity, .. } => match identity {
+            Self::Tool { call, identity } => match identity {
                 Some(identity) => write!(formatter, "tool-{identity}"),
                 None => write!(formatter, "tool-{}", call.0),
             },
@@ -310,6 +308,7 @@ impl<'a> TurnRef<'a> {
     pub fn activity_keys(&self) -> Vec<ActivityKey> {
         let mut activities = Vec::new();
         let mut pending_tools = HashMap::<String, usize>::new();
+        let mut pending_tool_indices = Vec::new();
 
         for event in self.events() {
             match &event.data {
@@ -323,24 +322,21 @@ impl<'a> TurnRef<'a> {
                     append_todo_key(&mut activities, event.sequence, &message.todos);
                 }
                 ThreadEventData::ToolCall(call) => {
-                    let value = serde_json::to_value(call).unwrap_or(Value::Null);
                     let index = activities.len();
                     activities.push(ActivityKey::Tool {
                         call: event.sequence,
-                        result: None,
-                        identity: call_key(&value),
-                        approvals: Vec::new(),
+                        identity: tool_call_identity(call).map(str::to_owned),
                     });
-                    if let Some(key) = call_key(&value) {
-                        pending_tools.insert(key, index);
+                    pending_tool_indices.push(index);
+                    if let Some(identity) = tool_call_identity(call) {
+                        pending_tools.insert(identity.to_owned(), index);
                     }
                 }
                 ThreadEventData::ToolResult(result) => {
-                    let value = serde_json::to_value(result).unwrap_or(Value::Null);
-                    if let Some(index) = call_key(&value).and_then(|key| pending_tools.remove(&key))
-                        && let Some(ActivityKey::Tool { result, .. }) = activities.get_mut(index)
+                    if let Some(index) = tool_result_identity(result)
+                        .and_then(|identity| pending_tools.remove(identity))
                     {
-                        *result = Some(event.sequence);
+                        pending_tool_indices.retain(|pending| *pending != index);
                     } else {
                         activities.push(ActivityKey::Event(event.sequence));
                     }
@@ -354,13 +350,7 @@ impl<'a> TurnRef<'a> {
                     activities.push(ActivityKey::Event(event.sequence));
                 }
                 ThreadEventData::ApprovalDecision(_) => {
-                    if let Some(ActivityKey::Tool { approvals, .. }) = activities
-                        .iter_mut()
-                        .rev()
-                        .find(|key| matches!(key, ActivityKey::Tool { result: None, .. }))
-                    {
-                        approvals.push(event.sequence);
-                    } else {
+                    if pending_tool_indices.is_empty() {
                         activities.push(ActivityKey::Event(event.sequence));
                     }
                 }
@@ -484,17 +474,15 @@ pub(super) fn activity<'a>(
                 _ => None,
             }
         }
-        ActivityKey::Tool {
-            call,
-            result,
-            identity,
-            approvals,
-        } => {
-            let call = match &event(state, *call)?.data {
+        ActivityKey::Tool { call, identity } => {
+            let call_sequence = *call;
+            let call = match &event(state, call_sequence)?.data {
                 ThreadEventData::ToolCall(call) => call,
                 _ => return None,
             };
-            let result = result
+            let details = tool_activity_state(state, call_sequence);
+            let result = details
+                .result
                 .and_then(|sequence| event(state, sequence))
                 .and_then(|event| match &event.data {
                     ThreadEventData::ToolResult(result) => Some(result),
@@ -507,21 +495,13 @@ pub(super) fn activity<'a>(
                     call,
                     result,
                     identity.as_deref(),
-                    approvals,
+                    &details.approvals,
                 ))),
                 "question" => Some(question_display(call, result)),
                 _ => Some(ActivityDisplay::Unsupported {
                     summary: tool_summary(call),
                 }),
             }
-            .map(|view| {
-                if approvals.is_empty() {
-                    view
-                } else {
-                    // Approval decisions are rendered by the command view from the same ToolCall.
-                    view
-                }
-            })
         }
         ActivityKey::Todo { source } => {
             let message = match &event(state, *source)?.data {
@@ -1395,12 +1375,69 @@ fn append_todo_key(
     }
 }
 
-fn call_key(value: &Value) -> Option<String> {
-    value
-        .get("call_id")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("item_id").and_then(Value::as_str))
-        .map(str::to_owned)
+fn tool_call_identity(call: &ToolCallEvent) -> Option<&str> {
+    match call {
+        ToolCallEvent::Custom { call_id, .. } => Some(call_id),
+        ToolCallEvent::Function { call_id, .. } => Some(call_id),
+    }
+}
+
+fn tool_result_identity(result: &ToolResultEvent) -> Option<&str> {
+    match result {
+        ToolResultEvent::Custom { call_id, .. } => call_id.as_deref(),
+        ToolResultEvent::Function { call_id, .. } => Some(call_id),
+    }
+}
+
+#[derive(Default)]
+struct ToolActivityState {
+    result: Option<EventSequence>,
+    approvals: Vec<EventSequence>,
+}
+
+fn tool_activity_state(state: &ThreadState, target: EventSequence) -> ToolActivityState {
+    let Some(turn) = turn_key_for_event(state, target).and_then(|key| turn(state, key)) else {
+        return ToolActivityState::default();
+    };
+    let events = turn.events();
+    let Ok(target_index) = events.binary_search_by_key(&target, |event| event.sequence) else {
+        return ToolActivityState::default();
+    };
+    let ThreadEventData::ToolCall(target_call) = &events[target_index].data else {
+        return ToolActivityState::default();
+    };
+    let target_identity = tool_call_identity(target_call);
+    let mut state = ToolActivityState::default();
+    let mut later_pending = Vec::new();
+
+    for event in &events[target_index + 1..] {
+        match &event.data {
+            ThreadEventData::ToolCall(call) => {
+                later_pending.push(tool_call_identity(call));
+            }
+            ThreadEventData::ToolResult(result) => {
+                if let Some(identity) = tool_result_identity(result) {
+                    if let Some(index) = later_pending
+                        .iter()
+                        .rposition(|pending| *pending == Some(identity))
+                    {
+                        later_pending.remove(index);
+                    } else if target_identity == Some(identity) {
+                        state.result = Some(event.sequence);
+                        break;
+                    }
+                }
+            }
+            ThreadEventData::ApprovalDecision(_) => {
+                if later_pending.is_empty() {
+                    state.approvals.push(event.sequence);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state
 }
 
 pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
@@ -1448,7 +1485,7 @@ fn tool_call_matches_identity(call: &ToolCallEvent, identity: &str) -> bool {
         ToolCallEvent::Custom {
             item_id, call_id, ..
         } => call_id == identity || item_id.as_deref() == Some(identity),
-        ToolCallEvent::Function { call_id, .. } => call_id.as_deref() == Some(identity),
+        ToolCallEvent::Function { call_id, .. } => call_id == identity,
     }
 }
 
@@ -1666,9 +1703,7 @@ mod tests {
             turn.activity_keys(),
             vec![ActivityKey::Tool {
                 call: EventSequence(2),
-                result: Some(EventSequence(3)),
                 identity: Some("call-1".to_owned()),
-                approvals: Vec::new(),
             }]
         );
     }
@@ -1847,6 +1882,86 @@ mod tests {
             Some("call-1")
         );
         assert_eq!(activity_type_label(&state, &selected), "command");
+    }
+
+    #[test]
+    fn finalized_command_selection_reads_the_latest_tool_result() {
+        let mut state = state(vec![
+            event(1, "user_message", json!({"content": "run"})),
+            event(
+                2,
+                "tool_call",
+                json!({
+                    "name": "command",
+                    "call_id": "call-1",
+                    "arguments": {"command": "*** Runner sandbox\necho hello"}
+                }),
+            ),
+        ]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(8),
+                ActiveItemData::RunnerTool {
+                    call_id: "call-1".to_owned(),
+                    operation_index: 1,
+                    runner: Some("sandbox".to_owned()),
+                    update: RunnerOperationUpdate::Completed {
+                        artifact: ToolArtifact::RunnerOperation(RunnerOperationArtifact {
+                            operation: 1,
+                            runner: "sandbox".to_owned(),
+                            label: "Command".to_owned(),
+                            result: Value::String("streamed\n".to_owned()),
+                            artifacts: Vec::new(),
+                        }),
+                    },
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let selected = turn(&state, TurnKey(EventSequence(1)))
+            .unwrap()
+            .activity_keys()[0]
+            .clone();
+
+        ThreadOperation::ToolResultFinalized {
+            event: event(
+                3,
+                "tool_result",
+                json!({
+                    "name": "command",
+                    "call_id": "call-1",
+                    "result": "persisted\n",
+                    "artifacts": [{
+                        "kind": "runner_operation",
+                        "data": {
+                            "operation": 1,
+                            "runner": "sandbox",
+                            "label": "Command",
+                            "result": "persisted\n",
+                            "artifacts": []
+                        }
+                    }]
+                }),
+            ),
+            runner_ids: vec![ActiveItemId(8)],
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        let ActivityDisplay::Command(completed) = activity(&state, &selected).unwrap() else {
+            panic!("expected command display");
+        };
+        assert_eq!(
+            completed.operations[0].status,
+            OperationStatus::Finished { exit: None }
+        );
+        assert_eq!(completed.operations[0].output, "persisted\n");
     }
 
     #[test]
