@@ -165,10 +165,10 @@ Concurrent tabs and the TUI Client are allowed. The Controller response is autho
 ## Packaging and toolchain
 
 - Pin the current stable Dioxus 0.7 release rather than a 0.8 prerelease.
-- Add Tailwind and Playwright through pnpm with a committed lockfile.
+- Add Playwright through pnpm with a committed lockfile; keep Web Client CSS as a committed static asset with no Tailwind dependency.
 - Keep the Dioxus/WASM application separate from the native daemon target inside the Web package boundary.
 - Production packaging is a two-stage build:
-  1. build Tailwind and the Dioxus Web distribution;
+  1. build the Dioxus Web distribution;
   2. archive that distribution and compile it into `atra-web`.
 - The native build must only consume generated assets; it must not recursively invoke Cargo.
 - Development may serve a filesystem asset directory, but release artifacts must be self-contained.
@@ -181,7 +181,7 @@ The first implementation gate is a packaging spike proving that a clean checkout
 
 - `crates/atra-web/`: native binary, daemon lifecycle, HTTP/SSE adapter, discovery, embedded asset serving.
 - `crates/atra-web-ui/`: Dioxus CSR application compiled for `wasm32-unknown-unknown`.
-- `web/`: Tailwind source/configuration, pnpm workspace metadata, and Playwright smoke tests.
+- `web/`: pnpm workspace metadata and Playwright smoke tests.
 - `tools/build-web-assets.*`: explicit asset pipeline used by local release builds and Nix; never called recursively by Cargo tests.
 - `crates/atra-cli/src/workspace.rs`: write the private runtime Workspace sidecar during existing startup preparation.
 - `Cargo.toml`, `flake.nix`, and packaging scripts: add the two Web packages, WASM/Node tooling, and the `atra-web` release artifact.
@@ -220,7 +220,7 @@ Do not recursively launch Cargo from integration tests.
 
 ## Delivery sequence
 
-1. **Packaging gate** — prove Dioxus 0.7 CSR, Tailwind, pnpm, WASM, and embedded assets can produce a reproducible `atra-web` binary.
+1. **Packaging gate** — prove Dioxus 0.7 CSR, pnpm, WASM, and embedded assets can produce a reproducible `atra-web` binary.
 2. **Daemon foundation** — lifecycle commands, fixed loopback origin, static assets, security checks, readiness, and tests.
 3. **Workspace discovery** — runtime sidecar, global discovery stream, Workspace switcher, and connection status.
 4. **Read-only shell** — deep links, Controller/Thread subscriptions, reducers, responsive layout, and transcript rendering.

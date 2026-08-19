@@ -76,7 +76,6 @@
               hostRust
               hostPkgs.binaryen
               hostPkgs.dioxus-cli
-              hostPkgs.tailwindcss_4
             ];
             buildPhase = ''
               runHook preBuild
@@ -199,7 +198,6 @@
               pnpm
               pkg-config
               rustToolchain
-              tailwindcss_4
             ];
             PLAYWRIGHT_CHROMIUM_EXECUTABLE = pkgs.lib.getExe pkgs.chromium;
             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";

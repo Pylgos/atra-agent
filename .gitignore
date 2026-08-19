@@ -11,4 +11,3 @@ __pycache__/
 /web/node_modules/
 /web/test-results/
 /web/playwright-report/
-/crates/atra-web-ui/assets/tailwind.css

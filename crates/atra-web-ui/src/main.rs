@@ -614,7 +614,7 @@ fn App() -> Element {
     });
 
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("/assets/tailwind.css") }
+        document::Link { rel: "stylesheet", href: asset!("/assets/atra-web.css") }
         document::Script { src: asset!("/assets/prism.min.js") }
         main {
             class: "{shell_class}",

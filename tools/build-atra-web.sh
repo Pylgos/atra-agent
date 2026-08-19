@@ -4,7 +4,6 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 ui="$root/crates/atra-web-ui"
 dist="$root/target/dx/atra-web-ui/release/web/public"
 
-command -v tailwindcss >/dev/null
 rm -rf "$dist"
 
 (
