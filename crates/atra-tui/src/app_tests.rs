@@ -983,7 +983,7 @@ fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
         Author::User,
         "transcript".to_owned(),
     )];
-    prepare_transcript(&mut items, &HashSet::new(), 42, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 42);
     let mut app = test_app(items);
     let (effects, mut pending_effects) = tokio::sync::mpsc::unbounded_channel();
     app.message_input.set("message".to_owned());
@@ -1043,7 +1043,7 @@ fn layout_mapping_does_not_insert_soft_wraps() {
         masked: false,
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 4, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 4);
     let layout = layout_transcript(&items, Rect::new(1, 1, 4, 8), 0);
 
     let text = transcript_text(&items);
@@ -1074,10 +1074,10 @@ fn running_command_timer_uses_the_runner_snapshot() {
         masked: false,
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 38_000);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     assert!(transcript_text(&items).contains("running · elapsed 37s · detach in 1m23s"));
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 39_000);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     assert!(transcript_text(&items).contains("running · elapsed 37s · detach in 1m23s"));
 }
 
@@ -1102,7 +1102,7 @@ fn paused_command_timer_uses_the_runner_snapshot() {
         masked: false,
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 61_000);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     assert!(transcript_text(&items).contains("running · elapsed 1m50s · detach in 10s · paused"));
 }
 
@@ -1119,7 +1119,7 @@ fn detached_command_is_not_rendered_as_running() {
         masked: false,
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     let rendered = transcript_text(&items);
     assert!(rendered.contains("detached"));
     assert!(!rendered.contains("running"));
@@ -1142,7 +1142,7 @@ fn markdown_and_patch_command_render_before_completion() {
         }),
     ];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     let lines = transcript_lines(&items, None, None, 80, 0..usize::MAX);
     let rendered = lines
         .iter()
@@ -1173,7 +1173,7 @@ fn question_tool_call_has_a_structured_transcript_rendering() {
         })),
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     let rendered = transcript_text(&items);
 
     assert!(rendered.contains("question"));
@@ -1215,7 +1215,7 @@ fn answered_question_marks_the_selection_and_shows_the_note() {
         ]),
     })];
 
-    prepare_transcript(&mut items, &HashSet::new(), 80, 0);
+    prepare_transcript(&mut items, &HashSet::new(), 80);
     let rendered = transcript_text(&items);
 
     assert!(rendered.contains("○ Stacked  ★ recommended"));

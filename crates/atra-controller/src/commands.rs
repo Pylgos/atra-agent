@@ -902,7 +902,7 @@ fn tool_call_key(call: &ToolCallEvent) -> Option<&str> {
 
 fn tool_result_call_id(result: &ToolResultEvent) -> Option<&str> {
     match result {
-        ToolResultEvent::Custom { call_id, .. } => call_id.as_deref(),
+        ToolResultEvent::Custom { call_id, .. } => Some(call_id),
         ToolResultEvent::Function { call_id, .. } => Some(call_id),
     }
 }

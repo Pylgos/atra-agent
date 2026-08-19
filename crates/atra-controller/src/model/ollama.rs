@@ -931,7 +931,6 @@ mod tests {
             Event {
                 sequence: EventSequence(2),
                 data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                    call_type: None,
                     name: "web_search".to_owned(),
                     call_id: "call".to_owned(),
                     result: json!({"results": []}),

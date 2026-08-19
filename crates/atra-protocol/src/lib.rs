@@ -342,11 +342,9 @@ pub struct ModelOutputEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolCallEvent {
     Custom {
-        #[serde(rename = "type")]
-        call_type: CustomToolType,
         item_id: Option<String>,
         name: String,
         input: String,
@@ -359,28 +357,18 @@ pub enum ToolCallEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CustomToolType {
-    Custom,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolResultEvent {
     Custom {
-        #[serde(rename = "type")]
-        call_type: CustomToolType,
         name: String,
-        call_id: Option<String>,
+        call_id: String,
         result: Value,
         artifacts: Vec<ToolArtifact>,
         #[serde(skip_serializing_if = "Option::is_none")]
         masked_result: Option<Value>,
     },
     Function {
-        #[serde(rename = "type")]
-        call_type: Option<CustomToolType>,
         name: String,
         call_id: String,
         result: Value,

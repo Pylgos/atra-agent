@@ -360,7 +360,7 @@ pub enum ActiveItemData {
     RunnerTool {
         call_id: String,
         operation_index: usize,
-        runner: Option<String>,
+        runner: String,
         update: RunnerOperationUpdate,
     },
 }
@@ -940,17 +940,9 @@ impl ThreadOperation {
             Self::ToolResultFinalized { event, runner_ids } => {
                 let call_id = match &event.data {
                     ThreadEventData::ToolResult(
-                        ToolResultEvent::Custom {
-                            call_id: Some(call_id),
-                            ..
-                        }
+                        ToolResultEvent::Custom { call_id, .. }
                         | ToolResultEvent::Function { call_id, .. },
                     ) => call_id,
-                    ThreadEventData::ToolResult(_) => {
-                        return Err(ApplyError::new(
-                            "finalized tool result does not identify a tool call",
-                        ));
-                    }
                     _ => {
                         return Err(ApplyError::new(
                             "finalized tool result event is not a tool result",
@@ -1563,7 +1555,7 @@ mod tests {
                     ActiveItemData::RunnerTool {
                         call_id: "call-1".to_owned(),
                         operation_index: id.0 as usize,
-                        runner: Some("sandbox".to_owned()),
+                        runner: "sandbox".to_owned(),
                         update: RunnerOperationUpdate::CommandStarted {
                             timer: CommandTimerState {
                                 elapsed_ms: 0,
@@ -1580,7 +1572,6 @@ mod tests {
         let result = ThreadEvent {
             sequence: EventSequence(1),
             data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                call_type: None,
                 name: "command".to_owned(),
                 call_id: "call-1".to_owned(),
                 result: serde_json::json!("done"),
@@ -1622,7 +1613,7 @@ mod tests {
                 ActiveItemData::RunnerTool {
                     call_id: "call-1".to_owned(),
                     operation_index: 1,
-                    runner: Some("sandbox".to_owned()),
+                    runner: "sandbox".to_owned(),
                     update: RunnerOperationUpdate::CommandStarted {
                         timer: CommandTimerState {
                             elapsed_ms: 0,

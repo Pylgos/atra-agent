@@ -886,14 +886,12 @@ fn model_input(events: &[Event]) -> Result<Vec<Value>> {
             )),
             ThreadEventData::UserMessage(value) => Some(message("user", value.content.clone())),
             ThreadEventData::ToolResult(ToolResultEvent::Custom { call_id, name, .. }) => {
-                call_id.as_ref().map(|call_id| {
-                    json!({
-                        "type": "custom_tool_call_output",
-                        "call_id": call_id,
-                        "name": name,
-                        "output": tool_result_text(projected_tool_result(event, &masked))
-                    })
-                })
+                Some(json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "name": name,
+                    "output": tool_result_text(projected_tool_result(event, &masked))
+                }))
             }
             ThreadEventData::ToolResult(ToolResultEvent::Function { call_id, .. }) => Some(json!({
                 "type": "function_call_output",

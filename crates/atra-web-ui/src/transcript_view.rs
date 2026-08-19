@@ -396,6 +396,10 @@ impl<'a> TurnRef<'a> {
                             identity,
                         },
                     ),
+                    ActiveItemData::WebSearch { item_id, .. } => ActivityKey::StableActive {
+                        id: item.id(),
+                        identity: item_id.clone(),
+                    },
                     _ => ActivityKey::Active(item.id()),
                 });
             }
@@ -545,7 +549,6 @@ fn active_activity<'a>(
         } => match canonical_tool_name(name) {
             "command" => {
                 let call = ToolCallEvent::Custom {
-                    call_type: atra_protocol::CustomToolType::Custom,
                     item_id: Some(item_id.clone()),
                     name: name.clone(),
                     input: input.clone(),
@@ -573,7 +576,7 @@ fn active_activity<'a>(
             Some(ActivityDisplay::Search { summary, detail })
         }
         ActiveItemData::RunnerTool { runner, update, .. } => {
-            Some(orphan_runner_display(runner.as_deref(), update))
+            Some(orphan_runner_display(runner, update))
         }
         ActiveItemData::Assistant { content, .. } => {
             Some(ActivityDisplay::Commentary { markdown: content })
@@ -824,9 +827,7 @@ fn command_display(
             }
             let index = operation_index.saturating_sub(1);
             if let Some(operation) = operations.get_mut(index) {
-                if let Some(runner) = runner {
-                    operation.runner.clone_from(runner);
-                }
+                operation.runner.clone_from(runner);
                 apply_runner_update(update, operation);
             }
         }
@@ -1044,12 +1045,9 @@ fn format_apply_patch(
     }
 }
 
-fn orphan_runner_display(
-    runner: Option<&str>,
-    update: &RunnerOperationUpdate,
-) -> ActivityDisplay<'static> {
+fn orphan_runner_display(runner: &str, update: &RunnerOperationUpdate) -> ActivityDisplay<'static> {
     let mut operation = CommandOperationDisplay {
-        runner: runner.unwrap_or("unknown").to_owned(),
+        runner: runner.to_owned(),
         command: String::new(),
         output: String::new(),
         status: OperationStatus::Running {
@@ -1102,7 +1100,7 @@ fn activity_type_label(state: &ThreadState, key: &ActivityKey) -> &'static str {
         && state
             .active_turn()
             .is_none_or(|turn| turn.items().iter().all(|item| item.id() != *id))
-        && let Some(key) = finalized_tool_key(state, identity)
+        && let Some(key) = finalized_activity_key(state, identity)
     {
         return activity_type_label(state, &key);
     }
@@ -1193,7 +1191,7 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
         && state
             .active_turn()
             .is_none_or(|turn| turn.items().iter().all(|item| item.id() != *id))
-        && let Some(key) = finalized_tool_key(state, identity)
+        && let Some(key) = finalized_activity_key(state, identity)
     {
         return activity_header(state, &key);
     }
@@ -1342,13 +1340,9 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
                         .unwrap_or_else(|| "Searching…".to_owned()),
                     true,
                 )),
-                ActiveItemData::RunnerTool { runner, .. } => Some((
-                    runner
-                        .as_deref()
-                        .map(|runner| format!("Running on {runner}"))
-                        .unwrap_or_else(|| "Running…".to_owned()),
-                    true,
-                )),
+                ActiveItemData::RunnerTool { runner, .. } => {
+                    Some((format!("Running on {runner}"), true))
+                }
                 ActiveItemData::Assistant { content, .. } => Some((
                     meaningful_text(content).unwrap_or_else(|| "Writing…".to_owned()),
                     true,
@@ -1405,7 +1399,7 @@ fn tool_call_identity(call: &ToolCallEvent) -> Option<&str> {
 
 fn tool_result_identity(result: &ToolResultEvent) -> Option<&str> {
     match result {
-        ToolResultEvent::Custom { call_id, .. } => call_id.as_deref(),
+        ToolResultEvent::Custom { call_id, .. } => Some(call_id),
         ToolResultEvent::Function { call_id, .. } => Some(call_id),
     }
 }
@@ -1479,25 +1473,31 @@ pub(super) fn resolve_activity_key(state: &ThreadState, key: &ActivityKey) -> Ac
     if is_active {
         key.clone()
     } else {
-        finalized_tool_key(state, identity).unwrap_or_else(|| key.clone())
+        finalized_activity_key(state, identity).unwrap_or_else(|| key.clone())
     }
 }
 
-fn finalized_tool_key(state: &ThreadState, identity: &str) -> Option<ActivityKey> {
+fn finalized_activity_key(state: &ThreadState, identity: &str) -> Option<ActivityKey> {
     turn_keys(state)
         .into_iter()
         .filter_map(|key| turn(state, key))
         .flat_map(|turn| turn.activity_keys())
-        .find(|key| {
-            let ActivityKey::Tool { call, .. } = key else {
-                return false;
-            };
-            event(state, *call)
+        .find(|key| match key {
+            ActivityKey::Tool { call, .. } => event(state, *call)
                 .and_then(|event| match &event.data {
                     ThreadEventData::ToolCall(call) => Some(call),
                     _ => None,
                 })
-                .is_some_and(|call| tool_call_matches_identity(call, identity))
+                .is_some_and(|call| tool_call_matches_identity(call, identity)),
+            ActivityKey::Event(sequence) => event(state, *sequence)
+                .and_then(|event| match &event.data {
+                    ThreadEventData::WebSearch(search) => Some(&search.item),
+                    _ => None,
+                })
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == identity),
+            _ => false,
         })
 }
 
@@ -1706,12 +1706,13 @@ mod tests {
             event(
                 2,
                 "tool_call",
-                json!({"call_id": "call-1", "name": "shell", "arguments": {"cmd": "pwd"}}),
+                json!({"type": "function", "call_id": "call-1", "name": "shell", "arguments": {"cmd": "pwd"}}),
             ),
             event(
                 3,
                 "tool_result",
                 json!({
+                    "type": "function",
                     "call_id": "call-1",
                     "name": "shell",
                     "result": {"output": "/tmp"},
@@ -1835,7 +1836,7 @@ mod tests {
                 ActiveItemData::RunnerTool {
                     call_id: "call-1".to_owned(),
                     operation_index: 1,
-                    runner: Some("sandbox".to_owned()),
+                    runner: "sandbox".to_owned(),
                     update: RunnerOperationUpdate::CommandOutput {
                         content: "first\nsecond\n".to_owned(),
                         omitted_bytes: 0,
@@ -1906,6 +1907,59 @@ mod tests {
     }
 
     #[test]
+    fn stable_web_search_selection_follows_item_id_to_the_finalized_event() {
+        let mut state = state(vec![event(1, "user_message", json!({"content": "search"}))]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(7),
+                ActiveItemData::WebSearch {
+                    item_id: "item-1".to_owned(),
+                    action: None,
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let selected = ActivityKey::StableActive {
+            id: ActiveItemId(7),
+            identity: "item-1".to_owned(),
+        };
+
+        // While the item is still active the selection resolves to the streaming item.
+        assert!(matches!(
+            activity(&state, &selected),
+            Some(ActivityDisplay::Search { .. })
+        ));
+        assert_eq!(activity_type_label(&state, &selected), "search");
+
+        // Finalizing the item into a WebSearch event carrying the same id keeps the selection.
+        ThreadOperation::ActiveItemFinalized {
+            active_id: ActiveItemId(7),
+            event: event(
+                2,
+                "web_search",
+                json!({"item": {"id": "item-1", "type": "search", "query": "atra"}}),
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        assert_eq!(
+            resolve_activity_key(&state, &selected),
+            ActivityKey::Event(EventSequence(2))
+        );
+        let ActivityDisplay::Search { summary, .. } = activity(&state, &selected).unwrap() else {
+            panic!("expected search display");
+        };
+        assert_eq!(summary, "search: atra");
+        assert_eq!(activity_type_label(&state, &selected), "search");
+    }
+
+    #[test]
     fn finalized_command_selection_reads_the_latest_tool_result() {
         let mut state = state(vec![
             event(1, "user_message", json!({"content": "run"})),
@@ -1913,6 +1967,7 @@ mod tests {
                 2,
                 "tool_call",
                 json!({
+                    "type": "function",
                     "name": "command",
                     "call_id": "call-1",
                     "arguments": {
@@ -1933,7 +1988,7 @@ mod tests {
                 ActiveItemData::RunnerTool {
                     call_id: "call-1".to_owned(),
                     operation_index: 1,
-                    runner: Some("sandbox".to_owned()),
+                    runner: "sandbox".to_owned(),
                     update: RunnerOperationUpdate::Completed {
                         artifact: ToolArtifact::RunnerOperation(RunnerOperationArtifact {
                             operation: 1,
@@ -1958,6 +2013,7 @@ mod tests {
                 3,
                 "tool_result",
                 json!({
+                    "type": "function",
                     "name": "command",
                     "call_id": "call-1",
                     "result": "persisted\n",
@@ -1996,6 +2052,7 @@ mod tests {
                 2,
                 "tool_call",
                 json!({
+                    "type": "function",
                     "name": "command",
                     "call_id": "call-1",
                     "arguments": {
@@ -2027,7 +2084,7 @@ mod tests {
                 ActiveItemData::RunnerTool {
                     call_id: "call-1".to_owned(),
                     operation_index: 1,
-                    runner: Some("sandbox".to_owned()),
+                    runner: "sandbox".to_owned(),
                     update: RunnerOperationUpdate::CommandOutput {
                         content: "hello\n".to_owned(),
                         omitted_bytes: 0,
@@ -2266,6 +2323,7 @@ mod tests {
                 2,
                 "tool_call",
                 json!({
+                    "type": "function",
                     "call_id": "call-1",
                     "name": "command",
                     "arguments": {"command": "*** Runner sandbox\necho hello"}
@@ -2275,6 +2333,7 @@ mod tests {
                 3,
                 "tool_result",
                 json!({
+                    "type": "function",
                     "call_id": "call-1",
                     "name": "command",
                     "result": {"output": "hello"},

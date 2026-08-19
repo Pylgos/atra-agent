@@ -236,7 +236,6 @@ pub(crate) fn prepare_transcript(
     entries: &mut [TranscriptEntry],
     expanded_tools: &HashSet<usize>,
     width: u16,
-    _now_ms: i64,
 ) {
     for (item_index, entry) in entries.iter_mut().enumerate() {
         let expanded = expanded_tools.contains(&item_index);

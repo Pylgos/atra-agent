@@ -668,28 +668,19 @@ pub(crate) fn merge_runner_tool_result(
             artifacts,
             masked_result,
             ..
-        } => (name, call_id.as_deref(), result, artifacts, masked_result),
-        ToolResultEvent::Function {
+        }
+        | ToolResultEvent::Function {
             name,
             call_id,
             result,
             artifacts,
             masked_result,
             ..
-        } => (
-            name,
-            Some(call_id.as_str()),
-            result,
-            artifacts,
-            masked_result,
-        ),
+        } => (name, call_id.as_str(), result, artifacts, masked_result),
     };
     if name != "command" {
         return false;
     }
-    let Some(call_id) = call_id else {
-        return false;
-    };
     let Some(entry) = transcript.iter_mut().rev().find(|entry| {
         matches!(
             &entry.item,
@@ -732,20 +723,17 @@ fn merge_question_tool_result(transcript: &mut [TranscriptEntry], event: &Thread
             call_id,
             result,
             ..
-        } => (name, call_id.as_deref(), result),
-        ToolResultEvent::Function {
+        }
+        | ToolResultEvent::Function {
             name,
             call_id,
             result,
             ..
-        } => (name, Some(call_id.as_str()), result),
+        } => (name, call_id.as_str(), result),
     };
     if name != "question" {
         return false;
     }
-    let Some(call_id) = call_id else {
-        return false;
-    };
     let Some(entry) = transcript.iter_mut().rev().find(|entry| {
         matches!(
             &entry.item,
@@ -931,7 +919,6 @@ mod tests {
         let result = ThreadEvent {
             sequence: EventSequence(2),
             data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                call_type: None,
                 name: "question".to_owned(),
                 call_id: "question-1".to_owned(),
                 result: serde_json::json!([{

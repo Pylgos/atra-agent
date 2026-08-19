@@ -74,7 +74,6 @@ fn response_event(response: &mut ModelResponse) -> ThreadEventData {
             input,
             call_id,
         } => ThreadEventData::ToolCall(ToolCallEvent::Custom {
-            call_type: CustomToolType::Custom,
             item_id: item_id.clone(),
             name: name.clone(),
             input: input.clone(),
@@ -93,7 +92,7 @@ fn tool_result_matches_call(result: &ToolResultEvent, call: &ToolCallEvent) -> b
                 call_id: result_id, ..
             },
             ToolCallEvent::Custom { call_id, .. },
-        ) => result_id.as_deref() == Some(call_id),
+        ) => result_id == call_id,
         (
             ToolResultEvent::Function {
                 call_id: result_id, ..
@@ -1173,7 +1172,7 @@ impl State {
                         send_operation_update(
                             &operation_context,
                             updates,
-                            Some(&runner),
+                            &runner,
                             RunnerOperationUpdate::Completed {
                                 artifact: artifact.clone(),
                             },
@@ -1324,7 +1323,7 @@ impl State {
         send_operation_update(
             operation,
             updates,
-            Some(&runner_name),
+            &runner_name,
             RunnerOperationUpdate::CommandStarted {
                 timer: command_timer_state(&started.timing),
             },
@@ -1459,16 +1458,14 @@ impl State {
     ) -> Result<()> {
         let data = if custom {
             ThreadEventData::ToolResult(ToolResultEvent::Custom {
-                call_type: CustomToolType::Custom,
                 name: name.to_owned(),
-                call_id: Some(call_id.to_owned()),
+                call_id: call_id.to_owned(),
                 result: outcome.result,
                 artifacts: outcome.artifacts,
                 masked_result: None,
             })
         } else {
             ThreadEventData::ToolResult(ToolResultEvent::Function {
-                call_type: None,
                 name: name.to_owned(),
                 call_id: call_id.to_owned(),
                 result: outcome.result,

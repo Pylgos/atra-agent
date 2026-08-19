@@ -497,7 +497,7 @@ pub(super) struct OperationContext {
 pub(super) async fn send_operation_update(
     operation: &OperationContext,
     updates: Option<&TurnProjector>,
-    runner: Option<&str>,
+    runner: &str,
     update: RunnerOperationUpdate,
 ) -> Result<()> {
     updates
@@ -505,7 +505,7 @@ pub(super) async fn send_operation_update(
         .apply_update(ModelStreamEvent::RunnerOperationUpdate {
             call_id: operation.call_id.clone(),
             operation_index: operation.index,
-            runner: runner.map(str::to_owned),
+            runner: runner.to_owned(),
             update,
         })
         .await?;

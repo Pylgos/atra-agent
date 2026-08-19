@@ -89,7 +89,7 @@ pub(crate) enum ModelStreamEvent {
     RunnerOperationUpdate {
         call_id: String,
         operation_index: usize,
-        runner: Option<String>,
+        runner: String,
         update: RunnerOperationUpdate,
     },
     RunnerOperationOutput {

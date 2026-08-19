@@ -667,7 +667,7 @@ fn tool_result_matches_call(
                 call_id: result_id, ..
             },
             atra_protocol::ToolCallEvent::Custom { call_id, .. },
-        ) => result_id.as_deref() == Some(call_id),
+        ) => result_id == call_id,
         (
             atra_protocol::ToolResultEvent::Function {
                 call_id: result_id, ..
@@ -1357,7 +1357,6 @@ mod tests {
             call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
-            call_type: None,
             name: "command".to_owned(),
             call_id: "call-1".to_owned(),
             result: json!({"success": true, "large": "body must not be shown"}),
@@ -1399,7 +1398,6 @@ mod tests {
             call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
-            call_type: None,
             name: "lookup".to_owned(),
             call_id: "call-1".to_owned(),
             result: json!({"secret_result_body": "omitted"}),
@@ -1431,7 +1429,6 @@ mod tests {
             call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
-            call_type: None,
             name: "command".to_owned(),
             call_id: "call-1".to_owned(),
             result: json!("error is expected output"),
@@ -1465,7 +1462,6 @@ mod tests {
     #[test]
     fn nested_command_failure_uses_artifact_status() {
         let call = ToolCallEvent::Custom {
-            call_type: atra_protocol::CustomToolType::Custom,
             item_id: Some("item-1".to_owned()),
             name: "command".to_owned(),
             input: "runner=sandbox\nfalse".to_owned(),
@@ -1478,9 +1474,8 @@ mod tests {
             full_output_path: PathBuf::from("output"),
         };
         let result = ToolResultEvent::Custom {
-            call_type: atra_protocol::CustomToolType::Custom,
             name: "command".to_owned(),
-            call_id: Some("call-1".to_owned()),
+            call_id: "call-1".to_owned(),
             result: json!("Process exited with code 7"),
             artifacts: vec![ToolArtifact::RunnerOperation(
                 atra_protocol::RunnerOperationArtifact {
@@ -1517,7 +1512,6 @@ mod tests {
             call_id: "call-1".to_owned(),
         };
         let result = ToolResultEvent::Function {
-            call_type: None,
             name: "lookup".to_owned(),
             call_id: "call-1".to_owned(),
             result: json!({"body": "omitted"}),
