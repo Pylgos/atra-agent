@@ -675,8 +675,8 @@ pre {
 .turn-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 0.35rem;
-  margin-bottom: 0.35rem;
+  gap: 0.25rem;
+  margin-top: 0.35rem;
   opacity: 0;
   transition: opacity 120ms ease;
 }
@@ -686,17 +686,40 @@ pre {
   opacity: 1;
 }
 
-.turn-actions button {
-  min-height: 28px;
-  padding: 0.25rem 0.45rem;
+.turn-action {
+  display: inline-grid;
+  width: 26px;
+  min-height: 26px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
   color: var(--muted);
-  font-size: 0.72rem;
+}
+
+.turn-action:hover:not(:disabled),
+.turn-action:focus-visible {
+  background: transparent;
+  color: var(--text);
+}
+
+.turn-action:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.turn-action svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .user-message {
-  width: fit-content;
-  max-width: min(90%, 650px);
-  margin: 0 0 0 auto;
   padding: 0.8rem 1rem;
   border-radius: 10px;
   background: var(--surface);
@@ -917,7 +940,6 @@ pre {
 }
 
 .activity-commentary {
-  max-width: 72ch;
   color: color-mix(in srgb, var(--text) 78%, var(--muted));
   font-size: 0.9rem;
   line-height: 1.62;
@@ -1932,8 +1954,7 @@ pre {
 
   .turn-actions {
     opacity: 1;
-    overflow-x: auto;
-    justify-content: flex-start;
+    justify-content: flex-end;
   }
 
   .composer {

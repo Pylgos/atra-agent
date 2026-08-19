@@ -2033,20 +2033,11 @@ fn TurnCard(
                     class: "turn-prose markdown",
                     dangerous_inner_html: "{prompt_html}",
                 }
-                div { class: "turn-actions",
-                    TurnCopyButton { store, turn_key, target: TurnCopyTarget::Prompt }
-                    if let Some(sequence) = prompt_sequence {
-                        button {
-                            disabled: active || !connected,
-                            onclick: {
-                                move |_| dialog.set(Some(DialogState::Rewind {
-                                    checkpoint: None,
-                                    sequence,
-                                }))
-                            },
-                            "Rewind"
-                        }
-                    }
+            }
+            div { class: "turn-actions",
+                TurnCopyButton { store, turn_key, target: TurnCopyTarget::Prompt }
+                if let Some(sequence) = prompt_sequence {
+                    TurnRewindButton { dialog, sequence, active, connected }
                 }
             }
             if !activities.is_empty() {
@@ -2086,20 +2077,11 @@ fn TurnCard(
                         class: "turn-prose markdown",
                         dangerous_inner_html: "{answer_html}",
                     }
-                    div { class: "turn-actions",
-                        TurnCopyButton { store, turn_key, target: TurnCopyTarget::Answer }
-                        if let Some(sequence) = sequence {
-                            button {
-                                disabled: active || !connected,
-                                onclick: {
-                                    move |_| dialog.set(Some(DialogState::Rewind {
-                                        checkpoint: None,
-                                        sequence,
-                                    }))
-                                },
-                                "Rewind"
-                            }
-                        }
+                }
+                div { class: "turn-actions",
+                    TurnCopyButton { store, turn_key, target: TurnCopyTarget::Answer }
+                    if let Some(sequence) = sequence {
+                        TurnRewindButton { dialog, sequence, active, connected }
                     }
                 }
             }
@@ -2147,14 +2129,16 @@ enum TurnCopyTarget {
 fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget) -> Element {
     let mut copied = use_signal(|| false);
     let mut generation = use_signal(|| 0_u64);
-    let aria_label = match target {
+    let label = match target {
         TurnCopyTarget::Prompt => "Copy prompt",
         TurnCopyTarget::Answer => "Copy response",
     };
 
     rsx! {
         button {
-            aria_label,
+            class: "turn-action",
+            aria_label: label,
+            title: if copied() { "Copied" } else { label },
             onclick: move |_| {
                 let value = {
                     let turn = store.peek_turn(turn_key);
@@ -2187,7 +2171,44 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
                     }
                 });
             },
-            if copied() { "Copied" } else { "Copy" }
+            if copied() {
+                svg {
+                    view_box: "0 0 24 24",
+                    path { d: "M20 6 9 17l-5-5" }
+                }
+            } else {
+                svg {
+                    view_box: "0 0 24 24",
+                    rect { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }
+                    path { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TurnRewindButton(
+    dialog: Signal<Option<DialogState>>,
+    sequence: EventSequence,
+    active: bool,
+    connected: bool,
+) -> Element {
+    rsx! {
+        button {
+            class: "turn-action",
+            aria_label: "Rewind",
+            title: "Rewind",
+            disabled: active || !connected,
+            onclick: move |_| dialog.set(Some(DialogState::Rewind {
+                checkpoint: None,
+                sequence,
+            })),
+            svg {
+                view_box: "0 0 24 24",
+                polygon { points: "11 19 2 12 11 5 11 19" }
+                polygon { points: "22 19 13 12 22 5 22 19" }
+            }
         }
     }
 }
