@@ -159,7 +159,9 @@ pub(super) enum OperationStatus {
         elapsed_ms: Option<u64>,
         remaining_ms: Option<u64>,
     },
-    Finished { exit: Option<i32> },
+    Finished {
+        exit: Option<i32>,
+    },
 }
 
 impl std::fmt::Display for OperationStatus {
@@ -433,6 +435,8 @@ pub(super) fn activity<'a>(
     state: &'a ThreadState,
     key: &ActivityKey,
 ) -> Option<ActivityDisplay<'a>> {
+    let resolved = resolve_activity_key(state, key);
+    let key = &resolved;
     match key {
         ActivityKey::Event(sequence) => {
             let event = event(state, *sequence)?;
@@ -536,15 +540,11 @@ pub(super) fn activity<'a>(
                 .find(|item| item.id() == *id)?;
             active_activity(state, item)
         }
-        ActivityKey::StableActive { id, identity } => {
-            if let Some(item) = state
+        ActivityKey::StableActive { id, .. } => {
+            let item = state
                 .active_turn()
-                .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))
-            {
-                return active_activity(state, item);
-            }
-            let key = finalized_tool_key(state, identity)?;
-            activity(state, &key)
+                .and_then(|turn| turn.items().iter().find(|item| item.id() == *id))?;
+            active_activity(state, item)
         }
     }
 }
@@ -1411,20 +1411,45 @@ pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
     }
 }
 
+pub(super) fn resolve_activity_key(state: &ThreadState, key: &ActivityKey) -> ActivityKey {
+    let ActivityKey::StableActive { id, identity } = key else {
+        return key.clone();
+    };
+    let is_active = state
+        .active_turn()
+        .is_some_and(|turn| turn.items().iter().any(|item| item.id() == *id));
+    if is_active {
+        key.clone()
+    } else {
+        finalized_tool_key(state, identity).unwrap_or_else(|| key.clone())
+    }
+}
+
 fn finalized_tool_key(state: &ThreadState, identity: &str) -> Option<ActivityKey> {
     turn_keys(state)
         .into_iter()
         .filter_map(|key| turn(state, key))
         .flat_map(|turn| turn.activity_keys())
         .find(|key| {
-            matches!(
-                key,
-                ActivityKey::Tool {
-                    identity: Some(current),
-                    ..
-                } if current == identity
-            )
+            let ActivityKey::Tool { call, .. } = key else {
+                return false;
+            };
+            event(state, *call)
+                .and_then(|event| match &event.data {
+                    ThreadEventData::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+                .is_some_and(|call| tool_call_matches_identity(call, identity))
         })
+}
+
+fn tool_call_matches_identity(call: &ToolCallEvent, identity: &str) -> bool {
+    match call {
+        ToolCallEvent::Custom {
+            item_id, call_id, ..
+        } => call_id == identity || item_id.as_deref() == Some(identity),
+        ToolCallEvent::Function { call_id, .. } => call_id.as_deref() == Some(identity),
+    }
 }
 
 fn format_patch_operation(
@@ -1708,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_command_selection_survives_finalization_and_runner_updates() {
+    fn stable_command_selection_follows_item_id_to_call_id() {
         let mut state = state(vec![event(1, "user_message", json!({"content": "run"}))]);
         ThreadOperation::ActiveTurnStarted {
             phase: TurnPhase::Running,
@@ -1720,7 +1745,7 @@ mod tests {
                 ActiveItemId(7),
                 ActiveItemData::ToolCall {
                     item_id: "item-1".to_owned(),
-                    call_id: Some("call-1".to_owned()),
+                    call_id: None,
                     name: "command".to_owned(),
                     input: r#"{"command":"*** Runner sandbox\necho hello"}"#.to_owned(),
                 },
@@ -1730,7 +1755,7 @@ mod tests {
         .unwrap();
         let selected = ActivityKey::StableActive {
             id: ActiveItemId(7),
-            identity: "call-1".to_owned(),
+            identity: "item-1".to_owned(),
         };
         ThreadOperation::ActiveItemFinalized {
             active_id: ActiveItemId(7),
@@ -1816,6 +1841,10 @@ mod tests {
         assert_eq!(
             completed.operations[0].status,
             OperationStatus::Finished { exit: None }
+        );
+        assert_eq!(
+            activity_identity(&resolve_activity_key(&state, &selected)).as_deref(),
+            Some("call-1")
         );
         assert_eq!(activity_type_label(&state, &selected), "command");
     }

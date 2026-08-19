@@ -464,6 +464,34 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
           data: {
             kind: "tool_call",
             item_id: "command-item",
+            call_id: null,
+            name: "command",
+            input: "*** Runner sandbox\nset -e\necho hello"
+          }
+        }
+      }
+    });
+  });
+  await expect(
+    page.locator(".activity-command:has(.command-row-status .status-dots)")
+  ).toBeVisible();
+  await page.locator(".activity-command:has(.command-row-status .status-dots)").click();
+  await expect(page.locator(".utility .command-operation header span")).toHaveText("queued");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_item_finalized",
+        active_id: 20,
+        event: {
+          sequence: 8,
+          kind: "tool_call",
+          payload: {
+            type: "custom",
+            item_id: "command-item",
             call_id: "command-call",
             name: "command",
             input: "*** Runner sandbox\nset -e\necho hello"
@@ -496,7 +524,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(
     page.locator(".activity-command:has(.command-row-status .status-spinner)")
   ).toBeVisible();
-  await page.locator(".activity-command:has(.command-row-status .status-spinner)").click();
   await expect(page.locator(".utility .command-source")).toContainText("echo hello");
   await expect(page.locator(".utility .command-operation header code")).toHaveText("sandbox");
   await expect(page.locator(".utility .command-output")).toContainText("hello");
@@ -504,24 +531,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
     );
-    source.emit({
-      message: "operation",
-      operation: {
-        operation: "active_item_finalized",
-        active_id: 20,
-        event: {
-          sequence: 8,
-          kind: "tool_call",
-          payload: {
-            type: "custom",
-            item_id: "command-item",
-            call_id: "command-call",
-            name: "command",
-            input: "*** Runner sandbox\nset -e\necho hello"
-          }
-        }
-      }
-    });
     source.emit({
       message: "operation",
       operation: {
@@ -533,7 +542,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await page.locator(".activity-command:has(.command-row-status .status-spinner)").click();
   await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
   await expect(page.locator(".utility .command-operation header span")).toContainText("elapsed");
   await page.evaluate(() => {

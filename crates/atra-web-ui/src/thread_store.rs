@@ -371,13 +371,20 @@ impl ThreadStore {
     }
 
     pub(super) fn read_activity(self, turn: TurnKey, key: ActivityKey) -> ActivityRead {
-        let state = match key {
+        let resolved = self
+            .inner
+            .peek()
+            .value
+            .as_ref()
+            .map(|state| transcript_view::resolve_activity_key(state, &key))
+            .unwrap_or_else(|| key.clone());
+        let state = match resolved {
             ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
                 self.read(ThreadScope::ActiveItem(id))
             }
             _ => self.read(ThreadScope::Turn(turn.sequence())),
         };
-        let identity = transcript_view::activity_identity(&key);
+        let identity = transcript_view::activity_identity(&resolved);
         let related = identity
             .as_deref()
             .and_then(|identity| {
