@@ -629,9 +629,35 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     );
     source.emit({
       message: "operation",
-      operation: { operation: "active_item_discarded", id: 21 }
+      operation: {
+        operation: "tool_result_finalized",
+        event: {
+          sequence: 9,
+          kind: "tool_result",
+          payload: {
+            type: "custom",
+            name: "command",
+            call_id: "command-call",
+            result: "hello\nworld\n",
+            artifacts: [{
+              kind: "runner_operation",
+              data: {
+                operation: 1,
+                runner: "sandbox",
+                label: "Command",
+                result: "hello\nworld\n",
+                artifacts: []
+              }
+            }]
+          }
+        },
+        runner_ids: [21]
+      }
     });
   });
+  await expect(page.locator(".utility .command-operation header span")).toHaveText("finished");
+  await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
+  await expect(page.locator(".utility .command-operation header span")).not.toHaveText("queued");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"

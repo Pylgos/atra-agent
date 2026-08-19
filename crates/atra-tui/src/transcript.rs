@@ -88,6 +88,21 @@ impl TranscriptState {
                     self.append_event(event);
                 }
             }
+            ThreadChange::ToolResultFinalized {
+                sequence,
+                runner_ids,
+            } => {
+                for id in runner_ids {
+                    self.remove_active(*id, state);
+                }
+                if let Some(event) = state
+                    .events()
+                    .iter()
+                    .find(|event| event.sequence == *sequence)
+                {
+                    self.append_event(event);
+                }
+            }
             ThreadChange::EventsReplaced => self.rebuild(state),
             ThreadChange::InteractionUpdated => {
                 if let Some(approval) = state.active_turn().and_then(|turn| turn.pending_approval())

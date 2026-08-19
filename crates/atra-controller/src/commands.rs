@@ -853,6 +853,7 @@ async fn project_final_event(
     projection: &mut TurnProjection,
     event: ThreadEvent,
 ) -> Result<()> {
+    let mut runner_ids = Vec::new();
     let active_id = match &event.data {
         ThreadEventData::AssistantMessage(_) => projection.assistant.take(),
         ThreadEventData::Reasoning(_) => projection.reasoning.take(),
@@ -865,7 +866,7 @@ async fn project_final_event(
         ThreadEventData::ToolCall(call) => projection.finish_tool_call(tool_call_key(call)),
         ThreadEventData::ToolResult(result) => {
             if let Some(call_id) = tool_result_call_id(result) {
-                let ids = projection
+                runner_ids = projection
                     .runner_tools
                     .iter()
                     .filter_map(|((current, _), id)| (current == call_id).then_some(*id))
@@ -873,20 +874,15 @@ async fn project_final_event(
                 projection
                     .runner_tools
                     .retain(|(current, _), _| current != call_id);
-                for id in ids {
-                    state
-                        .views
-                        .apply_thread(thread_id, ThreadOperation::ActiveItemDiscarded { id })
-                        .await?;
-                }
             }
             None
         }
         _ => None,
     };
-    let operation = match active_id {
-        Some(active_id) => ThreadOperation::ActiveItemFinalized { active_id, event },
-        None => ThreadOperation::EventAppended { event },
+    let operation = match (active_id, runner_ids.is_empty()) {
+        (Some(active_id), _) => ThreadOperation::ActiveItemFinalized { active_id, event },
+        (None, false) => ThreadOperation::ToolResultFinalized { event, runner_ids },
+        (None, true) => ThreadOperation::EventAppended { event },
     };
     state.views.apply_thread(thread_id, operation).await?;
     Ok(())

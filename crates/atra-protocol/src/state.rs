@@ -6,7 +6,8 @@ use serde_json::Value;
 use crate::{
     ApprovalPolicy, AssistantMessagePhase, CheckpointId, CommandTimerState, EventSequence,
     HistoryTarget, InteractionId, MAX_COMMAND_OUTPUT_BYTES, Model, ProcessId, ProcessStatus,
-    Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadId,
+    Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadEventData,
+    ThreadId, ToolResultEvent,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -753,6 +754,10 @@ pub enum ThreadOperation {
         active_id: ActiveItemId,
         event: ThreadEvent,
     },
+    ToolResultFinalized {
+        event: ThreadEvent,
+        runner_ids: Vec<ActiveItemId>,
+    },
     PhaseChanged {
         phase: TurnPhase,
     },
@@ -792,6 +797,10 @@ pub enum ThreadChange {
     ActiveItemFinalized {
         active_id: ActiveItemId,
         sequence: EventSequence,
+    },
+    ToolResultFinalized {
+        sequence: EventSequence,
+        runner_ids: Vec<ActiveItemId>,
     },
     InteractionUpdated,
     TurnFinished,
@@ -926,6 +935,70 @@ impl ThreadOperation {
                 Ok(ThreadChange::ActiveItemFinalized {
                     active_id,
                     sequence,
+                })
+            }
+            Self::ToolResultFinalized { event, runner_ids } => {
+                let call_id = match &event.data {
+                    ThreadEventData::ToolResult(
+                        ToolResultEvent::Custom {
+                            call_id: Some(call_id),
+                            ..
+                        }
+                        | ToolResultEvent::Function {
+                            call_id: Some(call_id),
+                            ..
+                        },
+                    ) => call_id,
+                    ThreadEventData::ToolResult(_) => {
+                        return Err(ApplyError::new(
+                            "finalized tool result does not identify a tool call",
+                        ));
+                    }
+                    _ => {
+                        return Err(ApplyError::new(
+                            "finalized tool result event is not a tool result",
+                        ));
+                    }
+                };
+                if runner_ids.is_empty() {
+                    return Err(ApplyError::new(
+                        "finalized tool result does not contain Runner items",
+                    ));
+                }
+                validate_appended_event(&state.events, &event)?;
+                let turn = state
+                    .active_turn
+                    .as_ref()
+                    .ok_or_else(|| ApplyError::new("thread has no active turn"))?;
+                if runner_ids.iter().enumerate().any(|(index, id)| {
+                    runner_ids[..index].contains(id)
+                        || !turn.items.iter().any(|item| {
+                            item.id == *id
+                                && matches!(
+                                    &item.data,
+                                    ActiveItemData::RunnerTool {
+                                        call_id: runner_call_id,
+                                        ..
+                                    } if runner_call_id == call_id
+                                )
+                        })
+                }) {
+                    return Err(ApplyError::new(
+                        "finalized tool result contains an invalid Runner item",
+                    ));
+                }
+
+                let sequence = event.sequence;
+                state.events.push(event);
+                state
+                    .active_turn
+                    .as_mut()
+                    .expect("active turn was validated")
+                    .items
+                    .retain(|item| !runner_ids.contains(&item.id));
+                Ok(ThreadChange::ToolResultFinalized {
+                    sequence,
+                    runner_ids,
                 })
             }
             Self::PhaseChanged { phase } => {
@@ -1401,7 +1474,7 @@ pub enum CheckpointSubscriptionMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MessageEvent, ThreadEventData};
+    use crate::{MessageEvent, ThreadEventData, ToolResultEvent};
 
     fn thread() -> Thread {
         Thread {
@@ -1475,6 +1548,66 @@ mod tests {
         );
         assert!(state.active_turn().unwrap().items().is_empty());
         assert_eq!(state.events(), &[event(1)]);
+    }
+
+    #[test]
+    fn finalizing_a_tool_result_atomically_replaces_runner_items() {
+        let mut state =
+            ThreadState::materialize(thread(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        for id in [ActiveItemId(9), ActiveItemId(10)] {
+            ThreadOperation::ActiveItemAdded {
+                item: ActiveItem::new(
+                    id,
+                    ActiveItemData::RunnerTool {
+                        call_id: "call-1".to_owned(),
+                        operation_index: id.0 as usize,
+                        runner: Some("sandbox".to_owned()),
+                        update: RunnerOperationUpdate::CommandStarted {
+                            timer: CommandTimerState {
+                                elapsed_ms: 0,
+                                remaining_ms: 20,
+                                paused: false,
+                            },
+                        },
+                    },
+                ),
+            }
+            .apply(&mut state)
+            .unwrap();
+        }
+        let result = ThreadEvent {
+            sequence: EventSequence(1),
+            data: ThreadEventData::ToolResult(ToolResultEvent::Function {
+                call_type: None,
+                name: "command".to_owned(),
+                call_id: Some("call-1".to_owned()),
+                result: serde_json::json!("done"),
+                artifacts: Vec::new(),
+                masked_result: None,
+            }),
+        };
+
+        let change = ThreadOperation::ToolResultFinalized {
+            event: result.clone(),
+            runner_ids: vec![ActiveItemId(9), ActiveItemId(10)],
+        }
+        .apply(&mut state)
+        .unwrap();
+
+        assert_eq!(
+            change,
+            ThreadChange::ToolResultFinalized {
+                sequence: EventSequence(1),
+                runner_ids: vec![ActiveItemId(9), ActiveItemId(10)],
+            }
+        );
+        assert!(state.active_turn().unwrap().items().is_empty());
+        assert_eq!(state.events(), &[result]);
     }
 
     #[test]

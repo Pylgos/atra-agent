@@ -503,6 +503,7 @@ impl ThreadStore {
                 | ThreadChange::ActiveItemUpdated(_)
                 | ThreadChange::ActiveItemRemoved(_)
                 | ThreadChange::ActiveItemFinalized { .. }
+                | ThreadChange::ToolResultFinalized { .. }
                 | ThreadChange::TurnFinished
         ) {
             self.scope(ThreadScope::RawTranscriptContent)
@@ -514,6 +515,7 @@ impl ThreadStore {
                 | ThreadChange::ActiveItemAdded(_)
                 | ThreadChange::ActiveItemRemoved(_)
                 | ThreadChange::ActiveItemFinalized { .. }
+                | ThreadChange::ToolResultFinalized { .. }
                 | ThreadChange::TurnFinished
         ) {
             self.scope(ThreadScope::RawTranscriptStructure)
@@ -567,7 +569,8 @@ impl ThreadStore {
                 self.scope(ThreadScope::PrettyTranscriptContent)
                     .mark_dirty_shallow();
             }
-            ThreadChange::ActiveItemFinalized { sequence, .. } => {
+            ThreadChange::ActiveItemFinalized { sequence, .. }
+            | ThreadChange::ToolResultFinalized { sequence, .. } => {
                 self.scope(ThreadScope::ActiveItemList).mark_dirty();
                 let target = {
                     let remote = self.inner.peek();
