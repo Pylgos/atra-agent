@@ -315,6 +315,59 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   const reasoningSelector = page.getByLabel("Reasoning effort");
   await expect(modelSelector).toHaveValue("fake\ntest-model");
   await expect(reasoningSelector).toHaveValue("medium");
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/controller/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "provider_updated",
+        provider: {
+          id: "fake",
+          lifecycle: { status: "refreshing" },
+          models: [],
+          rate_limits: null
+        }
+      }
+    });
+  });
+  await expect(modelSelector).toBeVisible();
+  await expect(modelSelector).toBeDisabled();
+  await expect(modelSelector).toHaveValue("fake\ntest-model");
+  await expect(page.getByText("Model options are temporarily unavailable.")).toBeVisible();
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/controller/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "provider_updated",
+        provider: {
+          id: "fake",
+          lifecycle: { status: "logged_in", account: null },
+          models: [{
+            provider: "fake",
+            id: "test-model",
+            display_name: "Test Model",
+            description: "No-provider test model",
+            default_reasoning_effort: "medium",
+            supported_reasoning_efforts: ["low", "medium", "high"]
+          }, {
+            provider: "fake",
+            id: "alternate-model",
+            display_name: "Alternate Model",
+            description: "Model with a different reasoning effort",
+            default_reasoning_effort: "high",
+            supported_reasoning_efforts: ["high"]
+          }],
+          rate_limits: null
+        }
+      }
+    });
+  });
+  await expect(modelSelector).toBeEnabled();
   await modelSelector.selectOption("fake\nalternate-model");
   await expect(reasoningSelector).toHaveValue("high");
 

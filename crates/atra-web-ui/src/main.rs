@@ -3092,6 +3092,11 @@ fn ThreadUtility(
         .iter()
         .flat_map(|provider| provider.models().iter().cloned())
         .collect::<Vec<_>>();
+    let models_available = !models.is_empty();
+    let current_model = format!("{}\n{}", metadata.provider, metadata.model);
+    let current_model_listed = models
+        .iter()
+        .any(|model| format!("{}\n{}", model.provider, model.id) == current_model);
     let efforts = models
         .iter()
         .find(|model| format!("{}\n{}", model.provider, model.id) == selected_model())
@@ -3116,69 +3121,83 @@ fn ThreadUtility(
                 "Rename Thread"
             }
         }
-        if !models.is_empty() {
-            form {
-                class: "utility-section",
-                onsubmit: move |event| {
-                    event.prevent_default();
-                    let Some((provider, model)) = selected_model()
-                        .split_once('\n')
-                        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
-                    else { return; };
-                    pending.set(true);
-                    let workspace = workspace.clone();
-                    let effort = reasoning();
-                    spawn(async move {
-                        if let Err(message) = command(&workspace, &Command::ThreadSetModel {
-                            thread_id: ThreadId(thread),
-                            provider,
-                            model,
-                            reasoning_effort: effort,
-                        }).await {
-                            error.set(message);
-                        } else {
-                            error.set(String::new());
+        form {
+            class: "utility-section",
+            onsubmit: move |event| {
+                event.prevent_default();
+                let Some((provider, model)) = selected_model()
+                    .split_once('\n')
+                    .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+                else { return; };
+                pending.set(true);
+                let workspace = workspace.clone();
+                let effort = reasoning();
+                spawn(async move {
+                    if let Err(message) = command(&workspace, &Command::ThreadSetModel {
+                        thread_id: ThreadId(thread),
+                        provider,
+                        model,
+                        reasoning_effort: effort,
+                    }).await {
+                        error.set(message);
+                    } else {
+                        error.set(String::new());
+                    }
+                    pending.set(false);
+                });
+            },
+            h3 { "Model" }
+            label {
+                "Provider and model"
+                select {
+                    disabled: !models_available,
+                    onchange: move |event| {
+                        let selection = event.value();
+                        let effort = reasoning_effort_for_model(
+                            &selectable_models,
+                            &selection,
+                            &reasoning(),
+                        );
+                        selected_model.set(selection);
+                        reasoning.set(effort);
+                    },
+                    if !current_model_listed {
+                        option {
+                            value: "{current_model}",
+                            selected: current_model == selected_model(),
+                            "{metadata.model} ({metadata.provider}, current)"
                         }
-                        pending.set(false);
-                    });
-                },
-                h3 { "Model" }
-                label {
-                    "Provider and model"
-                    select {
-                        onchange: move |event| {
-                            let selection = event.value();
-                            let effort = reasoning_effort_for_model(
-                                &selectable_models,
-                                &selection,
-                                &reasoning(),
-                            );
-                            selected_model.set(selection);
-                            reasoning.set(effort);
-                        },
-                        for model in &models {
-                            option {
-                                value: "{model.provider}\n{model.id}",
-                                selected: format!("{}\n{}", model.provider, model.id) == selected_model(),
-                                "{model.display_name} ({model.provider})"
-                            }
+                    }
+                    for model in &models {
+                        option {
+                            value: "{model.provider}\n{model.id}",
+                            selected: format!("{}\n{}", model.provider, model.id) == selected_model(),
+                            "{model.display_name} ({model.provider})"
                         }
                     }
                 }
-                label {
-                    "Reasoning effort"
-                    select {
-                        onchange: move |event| reasoning.set(event.value()),
-                        for effort in efforts {
-                            option {
-                                value: "{effort}",
-                                selected: effort == reasoning(),
-                                "{effort}"
-                            }
+            }
+            label {
+                "Reasoning effort"
+                select {
+                    disabled: !models_available,
+                    onchange: move |event| reasoning.set(event.value()),
+                    for effort in efforts {
+                        option {
+                            value: "{effort}",
+                            selected: effort == reasoning(),
+                            "{effort}"
                         }
                     }
                 }
-                button { r#type: "submit", disabled: !connected || pending(), "Apply model" }
+            }
+            if !models_available {
+                p { role: "status", "Model options are temporarily unavailable." }
+            }
+            button {
+                r#type: "submit",
+                disabled: !connected || pending() || !models_available,
+                "Apply model"
             }
         }
         if diagnostics.usage_raw.is_some() || diagnostics.limits_raw.is_some() {
