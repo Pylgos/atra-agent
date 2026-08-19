@@ -439,25 +439,12 @@ impl OllamaStream {
                         ModelStreamEvent::ReasoningSummaryDelta(chunk.message.thinking),
                     )));
                 }
-                let started_tool_call =
-                    self.message.tool_calls.is_empty() && !chunk.message.tool_calls.is_empty();
                 self.message.tool_calls.extend(chunk.message.tool_calls);
                 if !chunk.message.content.is_empty() {
                     let content = chunk.message.content;
                     self.message.content.push_str(&content);
-                    self.pending.push_back(Ok(ModelEvent::Update(
-                        ModelStreamEvent::AssistantDelta {
-                            content,
-                            phase: assistant_phase(&self.message),
-                        },
-                    )));
-                } else if started_tool_call && !self.message.content.is_empty() {
-                    self.pending.push_back(Ok(ModelEvent::Update(
-                        ModelStreamEvent::AssistantDelta {
-                            content: String::new(),
-                            phase: AssistantMessagePhase::Commentary,
-                        },
-                    )));
+                    self.pending
+                        .push_back(Ok(ModelEvent::Update(assistant_delta(content))));
                 }
                 if chunk.done {
                     self.finish(chunk.prompt_eval_count, chunk.eval_count);
@@ -496,7 +483,7 @@ impl OllamaStream {
             data: serde_json::to_value(vec![message.clone()]).expect("message serializes"),
         };
         if !message.content.is_empty() {
-            let phase = assistant_phase(&message);
+            let phase = completed_assistant_phase(&message);
             self.pending.push_back(Ok(ModelEvent::OutputItemDone {
                 output: stored,
                 response: Some(ModelResponse::AssistantMessage {
@@ -542,7 +529,14 @@ impl OllamaStream {
     }
 }
 
-fn assistant_phase(message: &Message) -> AssistantMessagePhase {
+fn assistant_delta(content: String) -> ModelStreamEvent {
+    ModelStreamEvent::AssistantDelta {
+        content,
+        phase: AssistantMessagePhase::Commentary,
+    }
+}
+
+fn completed_assistant_phase(message: &Message) -> AssistantMessagePhase {
     if message.tool_calls.is_empty() {
         AssistantMessagePhase::FinalAnswer
     } else {
@@ -867,13 +861,24 @@ mod tests {
     }
 
     #[test]
-    fn assistant_content_is_commentary_before_tools_and_final_without_tools() {
+    fn assistant_content_streams_as_commentary() {
+        let ModelStreamEvent::AssistantDelta { content, phase } =
+            assistant_delta("working".to_owned())
+        else {
+            panic!("expected assistant delta");
+        };
+        assert_eq!(content, "working");
+        assert_eq!(phase, AssistantMessagePhase::Commentary);
+    }
+
+    #[test]
+    fn completed_assistant_content_is_commentary_with_tools_and_final_without_tools() {
         let mut message = Message {
             content: "working".to_owned(),
             ..Message::default()
         };
         assert_eq!(
-            assistant_phase(&message),
+            completed_assistant_phase(&message),
             AssistantMessagePhase::FinalAnswer
         );
 
@@ -884,7 +889,10 @@ mod tests {
                 arguments: json!({"runner": "sandbox", "command": "echo"}),
             },
         });
-        assert_eq!(assistant_phase(&message), AssistantMessagePhase::Commentary);
+        assert_eq!(
+            completed_assistant_phase(&message),
+            AssistantMessagePhase::Commentary
+        );
     }
 
     #[test]
