@@ -337,7 +337,7 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        Ok(super::text_tokens(&serde_json::to_string(events)?))
+        context_tokens(events)
     }
 }
 
@@ -641,6 +641,12 @@ fn request_messages(request: &ModelRequest<'_>) -> Result<Vec<Message>> {
     Ok(messages)
 }
 
+fn context_tokens(events: &[Event]) -> Result<usize> {
+    Ok(super::text_tokens(&serde_json::to_string(
+        &event_messages(events)?,
+    )?))
+}
+
 fn event_messages(events: &[Event]) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
     if let Some(context) = events.iter().find_map(|event| match &event.data {
@@ -781,7 +787,7 @@ fn system_instruction(label: &str, event: &InstructionEvent) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atra_protocol::{EventSequence, ModelOutputEvent, ToolArtifact};
+    use atra_protocol::{EventSequence, FrozenBoundaryEvent, ModelOutputEvent, ToolArtifact};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -947,6 +953,34 @@ mod tests {
         assert_eq!(messages[1].tool_calls[0].function.name, "web_search");
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_name.as_deref(), Some("web_search"));
+    }
+
+    #[test]
+    fn context_tokens_use_masked_tool_results() {
+        let events = vec![
+            Event {
+                sequence: EventSequence(0),
+                data: ThreadEventData::ToolResult(ToolResultEvent::Function {
+                    name: "command".to_owned(),
+                    call_id: "call".to_owned(),
+                    result: Value::String("large output ".repeat(10_000)),
+                    artifacts: Vec::<ToolArtifact>::new(),
+                    masked_result: Some(Value::String("output masked".to_owned())),
+                }),
+            },
+            Event {
+                sequence: EventSequence(1),
+                data: ThreadEventData::FrozenBoundary(FrozenBoundaryEvent {
+                    through_sequence: EventSequence(0),
+                    masked_sequences: vec![EventSequence(0)],
+                }),
+            },
+        ];
+
+        let full_tokens = context_tokens(&events[..1]).unwrap();
+        let masked_tokens = context_tokens(&events).unwrap();
+
+        assert!(masked_tokens < full_tokens);
     }
 
     #[test]
