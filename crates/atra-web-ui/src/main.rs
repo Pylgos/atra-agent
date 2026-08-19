@@ -381,14 +381,16 @@ fn swipe_start_allowed(event: &Event<TouchData>) -> bool {
     {
         return true;
     }
-    let blocks_swipe = target
-        .closest(
-            "button, a, input, textarea, select, summary, pre, code, table, \
-             [contenteditable='true'], .composer-region, .process-output",
-        )
-        .ok()
-        .flatten()
-        .is_some();
+    let inside_activity_group = target.closest(".activity-group").ok().flatten().is_some();
+    let blocks_swipe = !inside_activity_group
+        && target
+            .closest(
+                "button, a, input, textarea, select, summary, pre, code, table, \
+                 [contenteditable='true'], .composer-region, .process-output",
+            )
+            .ok()
+            .flatten()
+            .is_some();
     let has_selection = web_sys::window()
         .and_then(|window| window.get_selection().ok().flatten())
         .is_some_and(|selection| !selection.is_collapsed());
@@ -1507,6 +1509,9 @@ fn ThreadPage(
             if selected_activity().is_some() {
                 utility_tab.set(UtilityTab::Activity);
                 utility_open.set(true);
+                if is_narrow_viewport() {
+                    mobile_panel.set(MobilePanel::Utility);
+                }
                 storage_set(UTILITY_OPEN_KEY, "open");
                 storage_set(UTILITY_TAB_KEY, "activity");
             }
@@ -2087,12 +2092,13 @@ fn TurnCard(
                 section { class: "activity-group",
                     if group_open() {
                         div { class: "collapsible-expanded",
-                            button {
-                                class: "collapse-bar",
-                                aria_label: "Collapse activities",
-                                onclick: move |_| group_open.set(false),
-                            }
                             div { class: "activity-list",
+                                button {
+                                    class: "collapse-bar",
+                                    aria_label: "Collapse activities",
+                                    title: "Collapse activities",
+                                    onclick: move |_| group_open.set(false),
+                                }
                                 for activity_key in activities {
                                     ActivityRow {
                                         key: "{activity_key}",

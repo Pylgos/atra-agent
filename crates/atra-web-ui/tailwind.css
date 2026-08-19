@@ -111,9 +111,11 @@ button {
   cursor: pointer;
 }
 
-button:hover:not(:disabled),
-summary:hover {
-  background: var(--panel-subtle);
+@media (hover: hover) and (pointer: fine) {
+  button:hover:not(:disabled),
+  summary:hover {
+    background: var(--panel-subtle);
+  }
 }
 
 button:focus-visible,
@@ -895,8 +897,10 @@ pre {
   cursor: pointer;
 }
 
-.collapsible-compact:hover {
-  color: var(--text);
+@media (hover: hover) and (pointer: fine) {
+  .collapsible-compact:hover {
+    color: var(--text);
+  }
 }
 
 .collapsible-expanded {
@@ -907,31 +911,26 @@ pre {
 }
 
 .collapse-bar {
-  width: 3px;
-  flex-shrink: 0;
-  align-self: stretch;
-  position: relative;
-  padding: 0;
-  border: 0;
-  border-radius: 2px;
-  background: var(--line);
-  cursor: pointer;
-}
-
-.collapse-bar::before {
-  content: "";
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -0.6rem;
-  right: -0.6rem;
+  left: -0.75rem;
+  width: 1.5rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
 }
 
-.collapse-bar:hover {
-  background: var(--accent);
+@media (hover: hover) and (pointer: fine) {
+  .collapse-bar:hover,
+  .collapse-bar:focus-visible {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
 }
 
 .activity-list {
+  position: relative;
   display: grid;
   gap: 0.85rem;
   margin: 0.55rem 0 1rem 0.2rem;
@@ -1024,8 +1023,10 @@ pre {
   font-size: 0.74rem;
 }
 
-.activity-reasoning .collapsible-compact:hover {
-  color: var(--muted);
+@media (hover: hover) and (pointer: fine) {
+  .activity-reasoning .collapsible-compact:hover {
+    color: var(--muted);
+  }
 }
 
 .reasoning-detail {
@@ -2040,6 +2041,28 @@ pre {
 
   .shortcut-hint {
     display: none;
+  }
+
+  /* Hover affordances are meaningless on touch. Keep taps from leaving
+     a sticky hover highlight on tappable rows in the mobile layout. */
+  button:hover:not(:disabled),
+  summary:hover {
+    background: transparent;
+  }
+
+  .collapsible-compact:hover,
+  .collapsible-compact:focus-visible {
+    color: var(--muted);
+  }
+
+  .activity-reasoning .collapsible-compact:hover,
+  .activity-reasoning .collapsible-compact:focus-visible {
+    color: color-mix(in srgb, var(--muted) 62%, var(--panel));
+  }
+
+  .collapse-bar:hover,
+  .collapse-bar:focus-visible {
+    background: transparent;
   }
 }
 
