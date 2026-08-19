@@ -787,14 +787,7 @@ fn command_display(
     identity: Option<&str>,
     approvals: &[EventSequence],
 ) -> CommandDisplay {
-    let input = tool_call_input(call);
-    let parsed = atra_protocol::parse_command_input(&input).unwrap_or_else(|_| {
-        vec![atra_protocol::RunnerCommand::from_parts(
-            "unknown".to_owned(),
-            input.clone(),
-        )]
-    });
-    let mut operations = parsed
+    let mut operations = command_operations(call)
         .into_iter()
         .map(|operation| CommandOperationDisplay {
             runner: operation.runner().to_owned(),
@@ -868,6 +861,34 @@ fn command_display(
         operations,
         masked,
         approvals,
+    }
+}
+
+fn command_operations(call: &ToolCallEvent) -> Vec<atra_protocol::RunnerCommand> {
+    match call {
+        ToolCallEvent::Custom { input, .. } => atra_protocol::parse_command_input(input)
+            .unwrap_or_else(|_| {
+                vec![atra_protocol::RunnerCommand::from_parts(
+                    "unknown".to_owned(),
+                    input.clone(),
+                )]
+            }),
+        ToolCallEvent::Function { arguments, .. } => {
+            let runner = arguments.get("runner").and_then(Value::as_str);
+            let command = arguments.get("command").and_then(Value::as_str);
+            match (runner, command) {
+                (Some(runner), Some(command)) => {
+                    vec![atra_protocol::RunnerCommand::from_parts(
+                        runner.to_owned(),
+                        command.to_owned(),
+                    )]
+                }
+                _ => vec![atra_protocol::RunnerCommand::from_parts(
+                    "unknown".to_owned(),
+                    tool_call_input(call),
+                )],
+            }
+        }
     }
 }
 
@@ -1894,7 +1915,10 @@ mod tests {
                 json!({
                     "name": "command",
                     "call_id": "call-1",
-                    "arguments": {"command": "*** Runner sandbox\necho hello"}
+                    "arguments": {
+                        "runner": "sandbox",
+                        "command": "echo hello"
+                    }
                 }),
             ),
         ]);
@@ -1974,10 +1998,24 @@ mod tests {
                 json!({
                     "name": "command",
                     "call_id": "call-1",
-                    "arguments": {"command": "*** Runner sandbox\necho hello"}
+                    "arguments": {
+                        "runner": "sandbox",
+                        "command": "echo hello"
+                    }
                 }),
             ),
         ]);
+        let selected = turn(&state, TurnKey(EventSequence(1)))
+            .unwrap()
+            .activity_keys()[0]
+            .clone();
+        let ActivityDisplay::Command(queued) = activity(&state, &selected).unwrap() else {
+            panic!("expected command display");
+        };
+        assert_eq!(queued.operations[0].runner, "sandbox");
+        assert_eq!(queued.operations[0].command, "echo hello");
+        assert_eq!(queued.operations[0].status, OperationStatus::Queued);
+
         ThreadOperation::ActiveTurnStarted {
             phase: TurnPhase::Running,
         }
@@ -1988,7 +2026,7 @@ mod tests {
                 ActiveItemId(8),
                 ActiveItemData::RunnerTool {
                     call_id: "call-1".to_owned(),
-                    operation_index: 0,
+                    operation_index: 1,
                     runner: Some("sandbox".to_owned()),
                     update: RunnerOperationUpdate::CommandOutput {
                         content: "hello\n".to_owned(),

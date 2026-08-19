@@ -1060,8 +1060,13 @@ impl State {
                             continue;
                         }
                         crate::tools::ValidatedFunctionTool::Command(command) => {
+                            let operation = OperationContext {
+                                call_id: call_id.clone(),
+                                index: 1,
+                                label: "Command".to_owned(),
+                            };
                             let outcome = self
-                                .approve_and_execute(thread_id, &name, command, None, updates)
+                                .approve_and_execute(thread_id, &name, command, &operation, updates)
                                 .await?;
                             needs_follow_up = true;
                             self.save_tool_result(
@@ -1145,7 +1150,7 @@ impl State {
                                 thread_id,
                                 operation_name,
                                 operation,
-                                Some(&operation_context),
+                                &operation_context,
                                 updates,
                             )
                             .await?;
@@ -1166,7 +1171,7 @@ impl State {
                             artifacts: outcome.artifacts,
                         });
                         send_operation_update(
-                            Some(&operation_context),
+                            &operation_context,
                             updates,
                             Some(&runner),
                             RunnerOperationUpdate::Completed {
@@ -1221,7 +1226,7 @@ impl State {
         thread_id: ThreadId,
         name: &str,
         arguments: atra_protocol::RunnerCommand,
-        operation: Option<&OperationContext>,
+        operation: &OperationContext,
         updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
         let runner = self.runners.get(arguments.runner()).await?;
@@ -1236,8 +1241,8 @@ impl State {
                         approval_id,
                         name.to_owned(),
                         arguments_json,
-                        operation.map(|operation| operation.index),
-                        operation.map(|operation| operation.label.clone()),
+                        Some(operation.index),
+                        Some(operation.label.clone()),
                     ),
                 ))
                 .await?;
@@ -1282,7 +1287,7 @@ impl State {
         &self,
         thread_id: ThreadId,
         arguments: atra_protocol::RunnerCommand,
-        operation: Option<&OperationContext>,
+        operation: &OperationContext,
         updates: Option<&TurnProjector>,
     ) -> Result<ToolOutcome> {
         let runner_name = arguments.runner().to_owned();

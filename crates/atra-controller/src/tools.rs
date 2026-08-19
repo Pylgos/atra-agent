@@ -495,44 +495,40 @@ pub(super) struct OperationContext {
 }
 
 pub(super) async fn send_operation_update(
-    operation: Option<&OperationContext>,
+    operation: &OperationContext,
     updates: Option<&TurnProjector>,
     runner: Option<&str>,
     update: RunnerOperationUpdate,
 ) -> Result<()> {
-    if let Some(operation) = operation {
-        updates
-            .context("runner operation update requires a streaming turn")?
-            .apply_update(ModelStreamEvent::RunnerOperationUpdate {
-                call_id: operation.call_id.clone(),
-                operation_index: operation.index,
-                runner: runner.map(str::to_owned),
-                update,
-            })
-            .await?;
-    }
+    updates
+        .context("runner operation update requires a streaming turn")?
+        .apply_update(ModelStreamEvent::RunnerOperationUpdate {
+            call_id: operation.call_id.clone(),
+            operation_index: operation.index,
+            runner: runner.map(str::to_owned),
+            update,
+        })
+        .await?;
     Ok(())
 }
 
 pub(super) async fn send_operation_output(
-    operation: Option<&OperationContext>,
+    operation: &OperationContext,
     updates: Option<&TurnProjector>,
     content: String,
     omitted_bytes: usize,
     timer: CommandTimerState,
 ) -> Result<()> {
-    if let Some(operation) = operation {
-        updates
-            .context("runner operation output requires a streaming turn")?
-            .apply_update(ModelStreamEvent::RunnerOperationOutput {
-                call_id: operation.call_id.clone(),
-                operation_index: operation.index,
-                content,
-                omitted_bytes,
-                timer,
-            })
-            .await?;
-    }
+    updates
+        .context("runner operation output requires a streaming turn")?
+        .apply_update(ModelStreamEvent::RunnerOperationOutput {
+            call_id: operation.call_id.clone(),
+            operation_index: operation.index,
+            content,
+            omitted_bytes,
+            timer,
+        })
+        .await?;
     Ok(())
 }
 
