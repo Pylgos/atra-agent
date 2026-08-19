@@ -767,20 +767,8 @@ fn ControllerMonitor(
                 };
                 let mut states = controllers.write();
                 let remote = states.entry(workspace_id.clone()).or_default();
-                let previous = status_update.and_then(|(thread, _)| {
-                    remote
-                        .value
-                        .as_ref()
-                        .and_then(|controller| controller.thread_status(thread))
-                });
                 remote.apply(message);
                 if let Some((thread_id, status)) = status_update {
-                    if previous == Some(status)
-                        || route.read().workspace.as_deref() == Some(&workspace_id)
-                            && route.read().thread == Some(thread_id.0)
-                    {
-                        return;
-                    }
                     let summary = match status {
                         AgentStatus::AwaitingApproval => "Approval required",
                         AgentStatus::AwaitingQuestion => "Questions require answers",
@@ -800,13 +788,21 @@ fn ControllerMonitor(
                         })
                         .map(thread_name)
                         .unwrap_or_else(|| format!("Thread {}", thread_id.0));
-                    attention
-                        .write()
-                        .insert((workspace_id.clone(), thread_id.0), status);
+                    let selected = route.read();
+                    if selected.workspace.as_deref() != Some(&workspace_id)
+                        || selected.thread != Some(thread_id.0)
+                    {
+                        attention
+                            .write()
+                            .insert((workspace_id.clone(), thread_id.0), status);
+                    }
                     if notifications()
                         && matches!(
                             status,
-                            AgentStatus::AwaitingApproval | AgentStatus::AwaitingQuestion
+                            AgentStatus::AwaitingApproval
+                                | AgentStatus::AwaitingQuestion
+                                | AgentStatus::Completed
+                                | AgentStatus::Failed
                         )
                     {
                         notify(&format!("{workspace_name} · {thread_name} · {summary}"));
