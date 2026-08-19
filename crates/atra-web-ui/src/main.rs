@@ -2,6 +2,7 @@ mod model;
 mod syntax;
 mod thread_store;
 mod transcript_view;
+mod web_push;
 
 use std::{
     cell::RefCell,
@@ -21,11 +22,10 @@ use dioxus::web::WebEventExt;
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
-    Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, NOTIFICATIONS_KEY, PINS_KEY, Pin,
-    RemoteState, Route, SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY,
-    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
-    WorkspaceList, draft_key, factual_status, family_threads, render_markdown, root_id,
-    root_threads, thread_name,
+    Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, PINS_KEY, Pin, RemoteState, Route,
+    SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY, UTILITY_TAB_KEY,
+    UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace, WorkspaceList, draft_key,
+    factual_status, family_threads, render_markdown, root_id, root_threads, thread_name,
 };
 use syntax::{highlight, setup_markdown_highlighting};
 use thread_store::ThreadStore;
@@ -34,6 +34,7 @@ use transcript_view::{
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
+use web_push::PushSettings;
 use web_sys::{
     ErrorEvent, Event as WebEvent, EventSource, HtmlDialogElement, HtmlFormElement,
     HtmlTextAreaElement, MessageEvent, PromiseRejectionEvent, ScrollBehavior, ScrollToOptions,
@@ -329,20 +330,6 @@ fn insert_composer_text(workspace: &str, thread: i64, draft: Signal<String>, ins
     });
 }
 
-fn request_notification_permission() {
-    spawn(async {
-        if let Ok(permission) = web_sys::Notification::request_permission() {
-            let _ = JsFuture::from(permission).await;
-        }
-    });
-}
-
-fn notify(title: &str) {
-    if web_sys::Notification::permission() == web_sys::NotificationPermission::Granted {
-        let _ = web_sys::Notification::new(title);
-    }
-}
-
 async fn copy_text(value: String) -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -504,7 +491,6 @@ fn App() -> Element {
         "dark" => "dark".to_owned(),
         _ => "system".to_owned(),
     });
-    let notifications = use_signal(|| storage_get(NOTIFICATIONS_KEY) == "enabled");
     let pins = use_signal(|| storage_json::<Vec<Pin>>(PINS_KEY));
     let mut attention = use_signal(ThreadAttention::new);
     let nav_open = use_signal(|| storage_get(NAV_OPEN_KEY) != "closed");
@@ -734,7 +720,6 @@ fn App() -> Element {
                     controllers,
                     route,
                     attention,
-                    notifications,
                 }
             }
             Navigation {
@@ -747,7 +732,6 @@ fn App() -> Element {
                 nav_width,
                 mobile_panel,
                 theme,
-                notifications,
             }
             if nav_open() {
                 ResizeHandle {
@@ -841,10 +825,8 @@ fn ControllerMonitor(
     controllers: Signal<Controllers>,
     route: Signal<Route>,
     mut attention: Signal<ThreadAttention>,
-    notifications: Signal<bool>,
 ) -> Element {
     let workspace_id = workspace.workspace_id.clone();
-    let workspace_name = workspace.name.clone();
     let workspace_for_status = workspace_id.clone();
     let _stream = use_hook(move || {
         connect_sse(
@@ -864,25 +846,16 @@ fn ControllerMonitor(
                 let remote = states.entry(workspace_id.clone()).or_default();
                 remote.apply(message);
                 if let Some((thread_id, status)) = status_update {
-                    let summary = match status {
-                        AgentStatus::AwaitingApproval => "Approval required",
-                        AgentStatus::AwaitingQuestion => "Questions require answers",
-                        AgentStatus::Failed => "Turn failed",
-                        AgentStatus::Completed => "Turn completed",
-                        AgentStatus::Cancelled => "Turn cancelled",
-                        _ => return,
-                    };
-                    let thread_name = remote
-                        .value
-                        .as_ref()
-                        .and_then(|controller| {
-                            controller
-                                .threads()
-                                .iter()
-                                .find(|thread| thread.id == thread_id)
-                        })
-                        .map(thread_name)
-                        .unwrap_or_else(|| format!("Thread {}", thread_id.0));
+                    if !matches!(
+                        status,
+                        AgentStatus::AwaitingApproval
+                            | AgentStatus::AwaitingQuestion
+                            | AgentStatus::Failed
+                            | AgentStatus::Completed
+                            | AgentStatus::Cancelled
+                    ) {
+                        return;
+                    }
                     let selected = route.read();
                     if selected.workspace.as_deref() != Some(&workspace_id)
                         || selected.thread != Some(thread_id.0)
@@ -890,17 +863,6 @@ fn ControllerMonitor(
                         attention
                             .write()
                             .insert((workspace_id.clone(), thread_id.0), status);
-                    }
-                    if notifications()
-                        && matches!(
-                            status,
-                            AgentStatus::AwaitingApproval
-                                | AgentStatus::AwaitingQuestion
-                                | AgentStatus::Completed
-                                | AgentStatus::Failed
-                        )
-                    {
-                        notify(&format!("{workspace_name} · {thread_name} · {summary}"));
                     }
                 }
             },
@@ -993,7 +955,6 @@ fn Navigation(
     nav_width: Signal<i32>,
     mobile_panel: Signal<MobilePanel>,
     theme: Signal<String>,
-    notifications: Signal<bool>,
 ) -> Element {
     let mut collapsed = use_signal(|| storage_json::<HashSet<String>>(WORKSPACE_COLLAPSE_KEY));
     let mut dragging_pin = use_signal(|| None::<usize>);
@@ -1222,24 +1183,7 @@ fn Navigation(
                         option { value: "dark", "Dark" }
                     }
                 }
-                label { class: "check-row",
-                    input {
-                        r#type: "checkbox",
-                        checked: notifications(),
-                        onchange: move |event| {
-                            let enabled = event.checked();
-                            storage_set(NOTIFICATIONS_KEY, if enabled { "enabled" } else { "" });
-                            if enabled {
-                                request_notification_permission();
-                            }
-                            notifications.set(enabled);
-                        }
-                    }
-                    "Browser notifications"
-                }
-                if web_sys::Notification::permission() == web_sys::NotificationPermission::Denied {
-                    small { "Notifications are blocked by your browser." }
-                }
+                PushSettings {}
                 div { class: "button-row",
                     button {
                         onclick: move |_| {

@@ -57,19 +57,6 @@ async function installWebClientMocks(
       }
     });
     Object.defineProperty(window, "__atraEventSources", { value: sources });
-    const notificationTitles: string[] = [];
-    Object.defineProperty(window, "Notification", {
-      configurable: true,
-      value: class {
-        static permission = "granted";
-        static requestPermission() { return Promise.resolve("granted"); }
-        constructor(title: string) { notificationTitles.push(title); }
-      }
-    });
-    Object.defineProperty(window, "__atraNotificationTitles", {
-      value: notificationTitles
-    });
-    localStorage.setItem("atra:notifications", "enabled");
   }, snapshots);
 }
 
@@ -419,9 +406,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(workspaceRow.locator(".thread-status-indicator")).toHaveCount(0);
-  await expect.poll(() =>
-    page.evaluate(() => (window as any).__atraNotificationTitles)
-  ).toEqual(["workspace · Web Thread · Turn completed"]);
 
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
@@ -452,12 +436,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   });
   const backgroundRow = page.locator(".workspace-thread-row").filter({ hasText: "Background Thread" });
   await expect(backgroundRow.getByRole("img", { name: "Completed" })).toBeVisible();
-  await expect.poll(() =>
-    page.evaluate(() => (window as any).__atraNotificationTitles)
-  ).toEqual([
-    "workspace · Web Thread · Turn completed",
-    "workspace · Background Thread · Turn completed"
-  ]);
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/controller/events"
@@ -473,15 +451,6 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       });
     }
   });
-  await expect.poll(() =>
-    page.evaluate(() => (window as any).__atraNotificationTitles)
-  ).toEqual([
-    "workspace · Web Thread · Turn completed",
-    "workspace · Background Thread · Turn completed",
-    "workspace · Background Thread · Approval required",
-    "workspace · Background Thread · Questions require answers",
-    "workspace · Background Thread · Turn failed"
-  ]);
   await backgroundRow.locator(".navigation-link").click();
   await expect(modelSelector).toHaveValue("fake\ntest-model");
   await expect(reasoningSelector).toHaveValue("medium");

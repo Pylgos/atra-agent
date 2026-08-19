@@ -51,6 +51,7 @@
               ./Cargo.toml
               ./Cargo.lock
               ./crates
+              ./tools/build-atra-web-assets.sh
             ];
           };
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
@@ -60,7 +61,7 @@
             # `hash = pkgs.lib.fakeHash;`, run `nix build .#atra`, then copy
             # the `got: sha256-...` value from the hash mismatch below.
             # hash = pkgs.lib.fakeHash;
-            hash = "sha256-yDhDPbYWHK6SxvGzFRrKBQy9MUVd5tzDwK4WELmypvg=";
+            hash = "sha256-DhR3gNyUeWaoxCVCkCcOBRf/LzX01jtjRLaxJa8lj6g=";
           };
           cargoVendorDir = pkgs.runCommand "atra-cargo-vendor" { } ''
             mkdir "$out"
@@ -82,14 +83,12 @@
               export CARGO_HOME=$TMPDIR/cargo-home
               mkdir -p "$CARGO_HOME" .cargo
               cp ${cargoVendorDir}/config.toml .cargo/config.toml
-              (
-                cd crates/atra-web-ui
-                dx build --release
-              )
+              bash ./tools/build-atra-web-assets.sh
               runHook postBuild
             '';
             installPhase = ''
               runHook preInstall
+              test -f target/dx/atra-web-ui/release/web/public/service-worker.js
               cp -R target/dx/atra-web-ui/release/web/public "$out"
               runHook postInstall
             '';

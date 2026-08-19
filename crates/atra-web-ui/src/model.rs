@@ -184,7 +184,6 @@ pub struct Pin {
 }
 
 pub const THEME_KEY: &str = "atra:theme";
-pub const NOTIFICATIONS_KEY: &str = "atra:notifications";
 pub const PINS_KEY: &str = "atra:pins";
 pub const LAST_ROUTE_KEY: &str = "atra:last-route";
 pub const NAV_OPEN_KEY: &str = "atra:navigation-open";

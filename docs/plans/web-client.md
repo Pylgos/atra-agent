@@ -120,7 +120,7 @@ No authentication token is required because the local OS user is the trust bound
 - Controller, Thread, checkpoint, process, approval, question, and execution state come only from SSE snapshots and operations.
 - Reuse `atra-protocol` state types and their operation-application logic in WASM.
 - Keep URL navigation state in the URL.
-- Keep only UI state in `localStorage`: per-Thread drafts, global sent-message history, theme, collapsed sections, and notification preference.
+- Keep only UI state in `localStorage`: per-Thread drafts, global sent-message history, theme, and collapsed sections.
 - Do not copy conversation or execution state into browser persistence.
 - During disconnection, show status, retain drafts, disable state-changing actions, and let EventSource reconnect.
 
@@ -151,14 +151,16 @@ Use a safe Markdown subset for model text. Raw HTML remains text. External links
 
 ### Notifications
 
-Maintain Controller subscriptions for all discovered Workspaces so Thread status badges remain current. Notify when a Thread enters `AwaitingApproval` or `AwaitingQuestion`.
+Maintain Controller subscriptions for all discovered Workspaces so Thread status badges remain current. The native Web daemon also watches them for Web Push transitions.
 
 - Always show in-application Workspace and Thread badges.
-- Browser notifications are opt-in from settings.
-- Send them only while a Web Client page is connected.
-- Include only Workspace name, Thread name, and the wait category.
+- Android Web Push is opt-in from settings and uses a minimal Service Worker; an installable PWA manifest and offline cache are not required.
+- Send notifications after every Web Client page has closed.
+- Notify for `AwaitingApproval`, `AwaitingQuestion`, `Failed`, and `Completed`; do not notify for `Idle`, `Running`, or `Cancelled`.
+- Include only Workspace name, Thread name, and the notification category.
 - If permission is absent or denied, badges remain the fallback.
-- Deduplicate notifications by Workspace, Thread, status transition, and active interaction identity where available.
+- Persist the VAPID key and browser subscriptions in private user state, and remove subscriptions rejected as expired by the Push service.
+- Remote use requires an authenticated HTTPS loopback proxy as described by ADR 0003.
 
 Concurrent tabs and the TUI Client are allowed. The Controller response is authoritative if two Clients race to answer or mutate the same resource; stale Web actions surface the returned rejection and then converge through the subscription.
 

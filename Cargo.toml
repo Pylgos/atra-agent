@@ -82,6 +82,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tiktoken-rs = "0.9.1"
 tui-markdown = "0.3.9"
 webbrowser = "1.0.6"
+web-push-native = { version = "0.5.0", default-features = false }
 unicode-width = "0.2.2"
 xdg = "3.0.0"
 yaml-rust = "0.4.5"

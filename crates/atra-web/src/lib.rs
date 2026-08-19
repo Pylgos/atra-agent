@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt},
@@ -9,9 +10,9 @@ use std::{
 use anyhow::{Context, Result};
 use atra_client::Client;
 use atra_protocol::{
-    CheckpointId, CheckpointSubscriptionMessage, Command, ControllerSubscriptionMessage, ProcessId,
-    ProcessLocator, ProcessSubscriptionMessage, SubscriptionTerminal, ThreadId,
-    ThreadSubscriptionMessage,
+    AgentStatus, CheckpointId, CheckpointSubscriptionMessage, Command, ControllerOperation,
+    ControllerSubscriptionMessage, ProcessId, ProcessLocator, ProcessSubscriptionMessage,
+    SubscriptionTerminal, ThreadId, ThreadSubscriptionMessage,
 };
 use axum::{
     Json, Router,
@@ -23,13 +24,16 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures_util::Stream;
 use rustix::process::getuid;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
+
+mod push;
+use push::{PushManager, PushPayload, PushSubscription, PushTestRequest};
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/assets.rs"));
@@ -40,6 +44,7 @@ struct AppState {
     runtime: PathBuf,
     authority: String,
     pid: u32,
+    push: PushManager,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -82,11 +87,12 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn router(runtime: PathBuf, port: u16) -> Router {
+fn router(runtime: PathBuf, push: PushManager, port: u16) -> Router {
     let state = AppState {
         runtime,
         authority: format!("127.0.0.1:{port}"),
         pid: std::process::id(),
+        push,
     };
     Router::new()
         .route("/health", get(health))
@@ -109,6 +115,12 @@ fn router(runtime: PathBuf, port: u16) -> Router {
             get(process_events),
         )
         .route("/api/workspaces/{workspace}/commands", post(commands))
+        .route("/api/push/key", get(push_key))
+        .route(
+            "/api/push/subscription",
+            put(push_subscribe).delete(push_unsubscribe),
+        )
+        .route("/api/push/test", post(push_test))
         .fallback(get(asset))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(
@@ -172,7 +184,7 @@ async fn asset(uri: axum::http::Uri) -> Response {
         normalized.as_str()
     };
     if let Some((bytes, content_type)) = embedded::get(asset_path) {
-        let cache = if asset_path == "/index.html" {
+        let cache = if matches!(asset_path, "/index.html" | "/service-worker.js") {
             "no-cache"
         } else {
             "public, max-age=31536000, immutable"
@@ -208,11 +220,131 @@ async fn asset(uri: axum::http::Uri) -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-pub async fn serve(listener: TcpListener, runtime: PathBuf) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    runtime: PathBuf,
+    push_state_path: PathBuf,
+) -> Result<()> {
     let port = listener.local_addr()?.port();
-    axum::serve(listener, router(runtime, port))
+    let push = PushManager::open(push_state_path)?;
+    let watchers = spawn_push_watchers(runtime.clone(), push.clone());
+    let result = axum::serve(listener, router(runtime, push, port))
         .await
-        .context("Web daemon failed")
+        .context("Web daemon failed");
+    watchers.abort();
+    result
+}
+
+async fn push_key(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = state
+        .push
+        .public_key()
+        .await
+        .map_err(ApiError::unavailable)?;
+    Ok(Json(json!({"public_key": key})))
+}
+
+async fn push_subscribe(
+    State(state): State<AppState>,
+    Json(subscription): Json<PushSubscription>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .push
+        .subscribe(subscription)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushUnsubscribeRequest {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(state): State<AppState>,
+    Json(request): Json<PushUnsubscribeRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .push
+        .unsubscribe(&request.endpoint)
+        .await
+        .map_err(ApiError::unavailable)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn push_test(
+    State(state): State<AppState>,
+    Json(request): Json<PushTestRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .push
+        .send_test(&request.endpoint)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, format!("{error:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn spawn_push_watchers(runtime: PathBuf, push: PushManager) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut watchers = HashMap::new();
+        loop {
+            watchers.retain(|_, task: &mut tokio::task::JoinHandle<()>| !task.is_finished());
+            for workspace in discover(&runtime).await {
+                if watchers.contains_key(&workspace.workspace_id) {
+                    continue;
+                }
+                let id = workspace.workspace_id.clone();
+                let manager = push.clone();
+                watchers.insert(id, tokio::spawn(watch_workspace(workspace, manager)));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+}
+
+async fn watch_workspace(workspace: Workspace, push: PushManager) {
+    let client = Client::new(&workspace.endpoint);
+    let Ok(mut subscription) = client.subscribe_controller().await else {
+        return;
+    };
+    loop {
+        let Ok((operation, _)) = subscription.receive_operation().await else {
+            return;
+        };
+        let ControllerOperation::ThreadStatusUpdated { thread_id, status } = operation else {
+            continue;
+        };
+        let Some((title, status_name)) = notification_status(status) else {
+            continue;
+        };
+        let thread_name = subscription
+            .state()
+            .threads()
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .and_then(|thread| thread.display_name.as_deref())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Thread {thread_id}"));
+        push.send_all(&PushPayload {
+            title: title.to_owned(),
+            body: format!("{} · {thread_name}", workspace.name),
+            tag: format!("atra-{}-{thread_id}-{status_name}", workspace.workspace_id),
+            url: format!("/w/{}/threads/{thread_id}", workspace.workspace_id),
+        })
+        .await;
+    }
+}
+
+fn notification_status(status: AgentStatus) -> Option<(&'static str, &'static str)> {
+    match status {
+        AgentStatus::AwaitingApproval => Some(("Approval required", "approval")),
+        AgentStatus::AwaitingQuestion => Some(("Question waiting", "question")),
+        AgentStatus::Completed => Some(("Agent completed", "completed")),
+        AgentStatus::Failed => Some(("Agent failed", "failed")),
+        _ => None,
+    }
 }
 
 async fn workspaces(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -494,8 +626,13 @@ fn private(path: &Path, mode: u32, directory: bool) -> bool {
 mod tests {
     use super::*;
     use atra_protocol::CommandResult;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
+    use web_push_native::p256::{
+        SecretKey,
+        elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
+    };
 
     #[test]
     fn command_security_requires_exact_host_and_json() {
@@ -515,7 +652,11 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(serve(listener, runtime.path().to_owned()));
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            runtime.path().join("push.json"),
+        ));
         let response = reqwest::Client::new()
             .post(format!("http://{address}/api/workspaces/missing/commands"))
             .header(header::ORIGIN, "https://atra.example.com")
@@ -532,7 +673,11 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(serve(listener, runtime.path().to_owned()));
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            runtime.path().join("push.json"),
+        ));
         let body = reqwest::get(format!("http://{address}/w/example/threads/1"))
             .await
             .unwrap()
@@ -544,11 +689,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_worker_is_served_without_immutable_caching() {
+        let runtime = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            runtime.path().join("push.json"),
+        ));
+        let response = reqwest::get(format!("http://{address}/service-worker.js"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        assert!(response.text().await.unwrap().contains("notificationclick"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn push_subscription_can_be_registered_and_removed() {
+        let runtime = tempfile::tempdir().unwrap();
+        let state_path = runtime.path().join("push.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            state_path.clone(),
+        ));
+        let client = reqwest::Client::new();
+        let origin = format!("http://{address}");
+        let key = client
+            .get(format!("{origin}/api/push/key"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert!(key["public_key"].as_str().unwrap().len() > 80);
+
+        let secret = SecretKey::random(&mut OsRng);
+        let subscription = json!({
+            "endpoint": "https://push.example.test/subscription",
+            "keys": {
+                "auth": URL_SAFE_NO_PAD.encode([7_u8; 16]),
+                "p256dh": URL_SAFE_NO_PAD.encode(
+                    secret.public_key().to_encoded_point(false).as_bytes()
+                ),
+            },
+        });
+        let response = client
+            .put(format!("{origin}/api/push/subscription"))
+            .json(&subscription)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            fs::read_to_string(&state_path)
+                .unwrap()
+                .contains("push.example.test")
+        );
+
+        let response = client
+            .delete(format!("{origin}/api/push/subscription"))
+            .json(&json!({"endpoint": "https://push.example.test/subscription"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !fs::read_to_string(&state_path)
+                .unwrap()
+                .contains("push.example.test")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn all_routes_require_the_exact_host() {
         let runtime = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(serve(listener, runtime.path().to_owned()));
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            runtime.path().join("push.json"),
+        ));
         let response = reqwest::Client::new()
             .get(format!("http://{address}/health"))
             .header(header::HOST, format!("localhost:{}", address.port()))
@@ -564,7 +793,11 @@ mod tests {
         let runtime = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(serve(listener, runtime.path().to_owned()));
+        let task = tokio::spawn(serve(
+            listener,
+            runtime.path().to_owned(),
+            runtime.path().join("push.json"),
+        ));
         let response = reqwest::get(format!("http://{address}/assets/missing.js"))
             .await
             .unwrap();
@@ -616,7 +849,8 @@ mod tests {
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve(listener, runtime));
+        let push_state = runtime.join("push.json");
+        let server = tokio::spawn(serve(listener, runtime, push_state));
         let client = reqwest::Client::new();
         let origin = format!("http://{address}");
 

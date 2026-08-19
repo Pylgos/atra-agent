@@ -510,8 +510,10 @@ Browser notifications are explicit opt-in:
 - request permission only when the user enables notifications;
 - do not repeatedly request after denial;
 - explain denied browser state in Global settings;
-- enable Approval and Question notifications by default after opt-in;
-- make Failed and Completed notifications separate settings.
+- use Android Web Push with a minimal Service Worker rather than requiring an
+  installable PWA;
+- notify for Approval, Question, Failed, and Completed transitions;
+- provide a test-notification button beside the setting.
 
 ## Connection, loading, and feedback
 

@@ -75,7 +75,11 @@ async fn serve(port: u16) -> Result<()> {
         },
     )?;
     println!("serving http://127.0.0.1:{port}");
-    let result = atra_web::serve(listener, controller_runtime()).await;
+    let push_state = xdg::BaseDirectories::with_prefix("atra-web")
+        .get_state_home()
+        .context("XDG state directory is unavailable")?
+        .join("push.json");
+    let result = atra_web::serve(listener, controller_runtime(), push_state).await;
     let _ = fs::remove_file(runtime.join("daemon.json"));
     result
 }
