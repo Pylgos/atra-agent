@@ -22,10 +22,10 @@ use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
     Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, NOTIFICATIONS_KEY, PINS_KEY, Pin,
-    RemoteState, Route, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY, UTILITY_TAB_KEY,
-    UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace, WorkspaceList, draft_key,
-    factual_status, family_threads, history_key, render_markdown, root_id, root_threads,
-    thread_name,
+    RemoteState, Route, SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY,
+    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
+    WorkspaceList, draft_key, factual_status, family_threads, render_markdown, root_id,
+    root_threads, thread_name,
 };
 use syntax::{highlight, setup_markdown_highlighting};
 use thread_store::ThreadStore;
@@ -253,15 +253,14 @@ fn save_json(key: &str, value: &impl serde::Serialize) {
     }
 }
 
-fn push_history_entry(workspace: &str, thread: i64, value: String) -> Vec<String> {
-    let key = history_key(workspace, thread);
-    let mut history = storage_json::<Vec<String>>(&key);
+fn push_history_entry(value: String) -> Vec<String> {
+    let mut history = storage_json::<Vec<String>>(SENT_HISTORY_KEY);
     if history.last().map(String::as_str) != Some(value.as_str()) {
         history.push(value);
         if history.len() > 100 {
             history.drain(..history.len() - 100);
         }
-        save_json(&key, &history);
+        save_json(SENT_HISTORY_KEY, &history);
     }
     history
 }
@@ -2653,7 +2652,7 @@ fn Composer(
     let mut composing = use_signal(|| false);
     let mut history_open = use_signal(|| false);
     let _history_close = use_hook(move || Rc::new(HistoryCloseListener::new(history_open)));
-    let history = storage_json::<Vec<String>>(&history_key(&workspace, thread));
+    let history = storage_json::<Vec<String>>(SENT_HISTORY_KEY);
     let active = active_turn.is_active();
     let awaiting = active_turn.is_awaiting_interaction();
     let diagnostics = diagnostics_read.value().unwrap_or_default();
@@ -2669,7 +2668,7 @@ fn Composer(
             if value.trim().is_empty() {
                 return;
             }
-            push_history_entry(&workspace, thread, value);
+            push_history_entry(value);
             set_draft(&workspace, thread, draft, String::new());
             history_index.set(None);
         }
@@ -2743,7 +2742,7 @@ fn Composer(
                             allow_questions: true,
                         }).await {
                             Ok(_) => {
-                                push_history_entry(&workspace, thread, message.clone());
+                                push_history_entry(message.clone());
                                 set_draft(&workspace, thread, draft, String::new());
                                 history_index.set(None);
                                 ensure_pin(pins, &workspace, ThreadId(thread), &controller);

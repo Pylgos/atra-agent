@@ -842,7 +842,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
 
   await page.evaluate(() => {
     localStorage.setItem(
-      "atra:sent-history:workspace-1:1",
+      "atra:sent-history",
       JSON.stringify(["Previous prompt"])
     );
   });
@@ -1006,7 +1006,7 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
   };
   await page.addInitScript(() => {
     localStorage.setItem(
-      "atra:sent-history:workspace-1:1",
+      "atra:sent-history",
       JSON.stringify(["First prompt", "Second prompt"])
     );
   });
@@ -1059,7 +1059,7 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
   await composer.press("Control+c");
   await expect(composer).toHaveValue("");
   await expect.poll(() => page.evaluate(() =>
-    localStorage.getItem("atra:sent-history:workspace-1:1")
+    localStorage.getItem("atra:sent-history")
   )).toContain("Stashed draft");
 
   await page.locator(".turn-actions").getByRole("button", { name: "Rewind" }).first().click();
@@ -1074,7 +1074,7 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
 
   await page.evaluate(() => {
     localStorage.setItem(
-      "atra:sent-history:workspace-1:1",
+      "atra:sent-history",
       JSON.stringify(Array.from({ length: 20 }, (_, index) => `Prompt ${index}`))
     );
   });

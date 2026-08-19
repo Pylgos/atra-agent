@@ -21,7 +21,7 @@ The Web Client is experimental until the complete parity checklist in this docum
 - Allow or deny approvals and answer structured questions.
 - Create and inspect checkpoints; fork, rewind, and restore.
 - Inspect managed processes and stop them.
-- Preserve per-Thread drafts, per-Workspace sent-message history, and display preferences in browser storage.
+- Preserve per-Thread drafts, global sent-message history, and display preferences in browser storage.
 - Notify about approval and question waits across all running Workspaces.
 
 Provider login is intentionally excluded and remains a CLI/TUI workflow.
@@ -120,7 +120,7 @@ No authentication token is required because the local OS user is the trust bound
 - Controller, Thread, checkpoint, process, approval, question, and execution state come only from SSE snapshots and operations.
 - Reuse `atra-protocol` state types and their operation-application logic in WASM.
 - Keep URL navigation state in the URL.
-- Keep only UI state in `localStorage`: per-Thread drafts, per-Workspace sent-message history, theme, collapsed sections, and notification preference.
+- Keep only UI state in `localStorage`: per-Thread drafts, global sent-message history, theme, collapsed sections, and notification preference.
 - Do not copy conversation or execution state into browser persistence.
 - During disconnection, show status, retain drafts, disable state-changing actions, and let EventSource reconnect.
 

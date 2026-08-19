@@ -193,13 +193,10 @@ pub const UTILITY_TAB_KEY: &str = "atra:utility-tab";
 pub const NAV_WIDTH_KEY: &str = "atra:navigation-width";
 pub const UTILITY_WIDTH_KEY: &str = "atra:utility-width";
 pub const WORKSPACE_COLLAPSE_KEY: &str = "atra:workspace-collapse";
+pub const SENT_HISTORY_KEY: &str = "atra:sent-history";
 
 pub fn draft_key(workspace: &str, thread: i64) -> String {
     format!("atra:draft:{workspace}:{thread}")
-}
-
-pub fn history_key(workspace: &str, thread: i64) -> String {
-    format!("atra:sent-history:{workspace}:{thread}")
 }
 
 pub fn thread_name(thread: &Thread) -> String {
@@ -610,11 +607,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_storage_is_scoped_per_thread() {
+    fn browser_storage_scopes_drafts_per_thread_and_history_globally() {
         assert_eq!(draft_key("one", 2), "atra:draft:one:2");
-        assert_eq!(history_key("one", 2), "atra:sent-history:one:2");
         assert_ne!(draft_key("one", 2), draft_key("two", 2));
-        assert_ne!(history_key("one", 2), history_key("one", 3));
+        assert_ne!(draft_key("one", 2), draft_key("one", 3));
+        assert_eq!(SENT_HISTORY_KEY, "atra:sent-history");
     }
 
     #[test]
