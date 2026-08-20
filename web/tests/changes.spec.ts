@@ -52,7 +52,40 @@ function snapshots() {
   };
 }
 
-async function openChanges(page: Page, mockEventSources: MockEventSources) {
+function changedFile(path = "src/lib.rs", lineCount = 1) {
+  return {
+    change: {
+      status: "modified",
+      path: { encoding: "utf8", value: path }
+    },
+    additions: lineCount,
+    deletions: 0,
+    mode_change: path === "src/lib.rs" ? { old: "100644", new: "100755" } : null,
+    kind: { kind: "text" },
+    truncated: false,
+    hunks: [{
+      header: `@@ -1 +1,${lineCount} @@`,
+      old_start: 1,
+      old_lines: 1,
+      new_start: 1,
+      new_lines: lineCount,
+      truncated: false,
+      lines: Array.from({ length: lineCount }, (_, index) => ({
+        kind: "addition",
+        content: index === 0 ? "let value = 1;" : `let value_${index} = ${index};`,
+        old_line: null,
+        new_line: index + 1,
+        no_newline_at_eof: false
+      }))
+    }]
+  };
+}
+
+async function openChanges(
+  page: Page,
+  mockEventSources: MockEventSources,
+  files = [changedFile()]
+) {
   await mockEventSources(snapshots());
   const requests: any[] = [];
   await page.route("**/api/workspaces/workspace-1/queries", async (route) => {
@@ -78,32 +111,7 @@ async function openChanges(page: Page, mockEventSources: MockEventSources) {
             additions: 1,
             deletions: 0,
             truncated: false,
-            files: [{
-              change: {
-                status: "modified",
-                path: { encoding: "utf8", value: "src/lib.rs" }
-              },
-              additions: 1,
-              deletions: 0,
-              mode_change: { old: "100644", new: "100755" },
-              kind: { kind: "text" },
-              truncated: false,
-              hunks: [{
-                header: "@@ -1 +1 @@",
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 1,
-                truncated: false,
-                lines: [{
-                  kind: "addition",
-                  content: "let value = 1;",
-                  old_line: null,
-                  new_line: 1,
-                  no_newline_at_eof: false
-                }]
-              }]
-            }]
+            files
           }
         };
     await route.fulfill({ contentType: "application/json", body: JSON.stringify(response) });
@@ -112,7 +120,9 @@ async function openChanges(page: Page, mockEventSources: MockEventSources) {
   await page.goto("/");
   await page.locator(".workspace-thread-row .navigation-link").click();
   await page.getByRole("tab", { name: "Changes" }).click();
-  await expect(page.locator(".github-diff-file", { hasText: "src/lib.rs" })).toBeVisible();
+  await expect(page.locator(".github-diff-file", {
+    hasText: files[0].change.path.value
+  })).toBeVisible();
   return requests;
 }
 
@@ -196,6 +206,67 @@ test("Changes keeps file navigation stable while expanding context", async ({ pa
       && request.path === "src/lib.rs"
       && request.context_lines === 4294967295
   )).toBe(true);
+});
+
+test("Changes highlights source and unmounts diff bodies outside the viewport", async ({
+  page,
+  mockEventSources
+}) => {
+  const files = Array.from(
+    { length: 4 },
+    (_, index) => changedFile(`src/file_${index}.rs`, 120)
+  );
+  files[0].mode_change = { old: "100644", new: "100755" };
+  files[0].hunks[0].lines[0].no_newline_at_eof = true;
+  files[1].hunks[0].truncated = true;
+  files[2].truncated = true;
+  await openChanges(page, mockEventSources, files);
+
+  const first = page.locator(".github-diff-file").first();
+  const last = page.locator(".github-diff-file").last();
+  await expect(first.locator(".diff-body")).toHaveCount(1);
+  await expect(first.locator(".token.keyword").first()).toContainText("let");
+  await expect.poll(() => page.locator(".diff-body").count()).toBeLessThan(files.length);
+  const utility = page.locator(".utility-content");
+  const initialHeight = await utility.evaluate((element) => element.scrollHeight);
+
+  await last.scrollIntoViewIfNeeded();
+  await expect(last.locator(".diff-body")).toHaveCount(1);
+  await expect(first.locator(".diff-body")).toHaveCount(0);
+  const finalHeight = await utility.evaluate((element) => element.scrollHeight);
+
+  expect(Math.abs(finalHeight - initialHeight)).toBeLessThanOrEqual(1);
+});
+
+test("Changes reuses measured spacer heights while wrapping lines", async ({
+  page,
+  mockEventSources
+}) => {
+  const files = [
+    changedFile("src/first.rs", 80),
+    changedFile("src/last.rs", 80)
+  ];
+  await openChanges(page, mockEventSources, files);
+  await page.getByLabel("Wrap lines").check();
+
+  const first = page.locator(".github-diff-file").first();
+  const last = page.locator(".github-diff-file").last();
+  await expect(first.locator(".diff-body")).toHaveCount(1);
+  const measuredHeight = await first.locator(".diff-body").evaluate(
+    (element) => element.getBoundingClientRect().height
+  );
+
+  await last.scrollIntoViewIfNeeded();
+  await expect(last.locator(".diff-body")).toHaveCount(1);
+  await page.locator(".utility-content").evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect(first.locator(".diff-body")).toHaveCount(0);
+  const spacerHeight = await first.locator(".diff-virtual-spacer").evaluate(
+    (element) => element.getBoundingClientRect().height
+  );
+
+  expect(Math.abs(spacerHeight - measuredHeight)).toBeLessThanOrEqual(1);
 });
 
 test("Changes refreshes after a Runner tool completes", async ({ page, mockEventSources }) => {

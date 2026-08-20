@@ -10,30 +10,35 @@ pub(crate) struct DiffPreferences {
     pub line_wrap: Signal<bool>,
 }
 
-struct LazyObserver {
+struct ViewportObserver {
     observer: web_sys::IntersectionObserver,
     _callback: Closure<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>,
 }
 
-impl LazyObserver {
-    fn new(id: &str, mut visible: impl FnMut() + 'static) -> Option<Self> {
+impl ViewportObserver {
+    fn new(id: &str, mut visibility_changed: impl FnMut(bool, f64) + 'static) -> Option<Self> {
+        let id = id.to_owned();
+        let element = web_sys::window()?.document()?.get_element_by_id(&id)?;
+        let callback_id = id.clone();
         let callback = Closure::wrap(Box::new(
-            move |entries: js_sys::Array, observer: web_sys::IntersectionObserver| {
+            move |entries: js_sys::Array, _observer: web_sys::IntersectionObserver| {
                 let intersects = entries.iter().any(|entry| {
                     entry
                         .dyn_into::<web_sys::IntersectionObserverEntry>()
-                        .is_ok_and(|entry| entry.is_intersecting())
+                        .is_ok_and(|entry| {
+                            entry.is_intersecting() && entry.intersection_ratio() > 0.0
+                        })
                 });
-                if intersects {
-                    observer.disconnect();
-                    visible();
-                }
+                let width = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.get_element_by_id(&callback_id))
+                    .map_or(0.0, |element| element.get_bounding_client_rect().width());
+                visibility_changed(intersects, width);
             },
         )
             as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
         let observer =
             web_sys::IntersectionObserver::new(callback.as_ref().unchecked_ref()).ok()?;
-        let element = web_sys::window()?.document()?.get_element_by_id(id)?;
         observer.observe(&element);
         Some(Self {
             observer,
@@ -42,7 +47,7 @@ impl LazyObserver {
     }
 }
 
-impl Drop for LazyObserver {
+impl Drop for ViewportObserver {
     fn drop(&mut self) {
         self.observer.disconnect();
     }
@@ -141,6 +146,10 @@ impl SnapshotFile {
 
     fn shared(file: Rc<DiffViewFile>) -> Self {
         Self(file)
+    }
+
+    fn identity(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
     }
 }
 
@@ -338,18 +347,37 @@ fn DiffFile(
     let mut collapsed = use_signal(|| false);
     let path = file.path().to_owned();
     let id = file_anchor_id(&id_scope, &path);
+    let body_id = format!("{id}-body");
+    let revision = file.identity();
     let mut body_visible = use_signal(|| false);
-    let observer = use_hook(|| Rc::new(RefCell::new(None::<LazyObserver>)));
+    let mut observed_width = use_signal(|| 0.0);
+    let mut measured_body = use_signal(|| None::<MeasuredBody>);
+    let observer = use_hook(|| Rc::new(RefCell::new(None::<ViewportObserver>)));
     use_effect({
         let id = id.clone();
         move || {
-            if body_visible() || observer.borrow().is_some() {
+            if observer.borrow().is_some() {
                 return;
             }
-            *observer.borrow_mut() = LazyObserver::new(&id, move || body_visible.set(true));
+            *observer.borrow_mut() = ViewportObserver::new(&id, move |visible, width| {
+                observed_width.set(width);
+                body_visible.set(visible);
+            });
         }
     });
     let language = language_for_path(&path);
+    let placeholder_style = if line_wrap {
+        measured_body()
+            .filter(|measurement| {
+                measurement.revision == revision
+                    && measurement.line_wrap == line_wrap
+                    && widths_match(measurement.width, observed_width())
+            })
+            .map(|measurement| format!("height: {}px", measurement.height))
+            .unwrap_or_else(|| "height: 8rem".to_owned())
+    } else {
+        unwrapped_body_height(&file)
+    };
     rsx! {
         article {
             class: if line_wrap { "github-diff-file line-wrap" } else { "github-diff-file" },
@@ -382,63 +410,135 @@ fn DiffFile(
                 }
             }
             if !collapsed() && body_visible() {
-                if let Some(message) = &file.message {
-                    p { class: "diff-message", "{message}" }
-                }
-                if let Some(mode_change) = &file.mode_change {
-                    p { class: "diff-message", "File mode changed: {mode_change}" }
-                }
-                if file.hunks.is_empty() && file.status.is_unmerged() {
-                    p { class: "diff-message", "Resolve this conflict to view its diff." }
-                } else if file.hunks.is_empty() && !file.kind.is_text() {
-                    p { class: "diff-message", "Content is not shown for this file type." }
-                }
-                for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-                    section { class: "github-diff-hunk",
-                        header { class: "diff-hunk-header",
-                            code { "{hunk.header}" }
-                            if let Some(handler) = on_expand {
-                                button {
-                                    onclick: {
-                                        let path = path.clone();
-                                        move |_| handler.call(path.clone())
-                                    },
-                                    "20 more lines"
-                                }
-                            }
-                            if let Some(handler) = on_expand_all {
-                                button {
-                                    onclick: {
-                                        let path = path.clone();
-                                        move |_| handler.call(path.clone())
-                                    },
-                                    "Expand all"
-                                }
-                            }
+                div {
+                    key: "{revision}-{line_wrap}",
+                    class: "diff-body",
+                    id: "{body_id}",
+                    onmounted: {
+                        let body_id = body_id.clone();
+                        let article_id = id.clone();
+                        move |_| {
+                            let Some(document) =
+                                web_sys::window().and_then(|window| window.document())
+                            else {
+                                return;
+                            };
+                            let Some(body) = document.get_element_by_id(&body_id) else {
+                                return;
+                            };
+                            let Some(article) = document.get_element_by_id(&article_id) else {
+                                return;
+                            };
+                            measured_body.set(Some(MeasuredBody {
+                                revision,
+                                line_wrap,
+                                width: article.get_bounding_client_rect().width(),
+                                height: body.get_bounding_client_rect().height(),
+                            }));
                         }
-                        div { class: "diff-lines",
-                            for line_index in 0..hunk.lines.len() {
-                                DiffLine {
-                                    file: file.clone(),
-                                    hunk_index,
-                                    line_index,
-                                    language,
+                    },
+                    if let Some(message) = &file.message {
+                        p { class: "diff-message", "{message}" }
+                    }
+                    if let Some(mode_change) = &file.mode_change {
+                        p { class: "diff-message", "File mode changed: {mode_change}" }
+                    }
+                    if file.hunks.is_empty() && file.status.is_unmerged() {
+                        p { class: "diff-message", "Resolve this conflict to view its diff." }
+                    } else if file.hunks.is_empty() && !file.kind.is_text() {
+                        p { class: "diff-message", "Content is not shown for this file type." }
+                    }
+                    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                        section { class: "github-diff-hunk",
+                            header { class: "diff-hunk-header",
+                                code { "{hunk.header}" }
+                                if let Some(handler) = on_expand {
+                                    button {
+                                        onclick: {
+                                            let path = path.clone();
+                                            move |_| handler.call(path.clone())
+                                        },
+                                        "20 more lines"
+                                    }
+                                }
+                                if let Some(handler) = on_expand_all {
+                                    button {
+                                        onclick: {
+                                            let path = path.clone();
+                                            move |_| handler.call(path.clone())
+                                        },
+                                        "Expand all"
+                                    }
                                 }
                             }
-                        }
-                        if hunk.truncated {
-                            div { class: "diff-truncated", "Hunk truncated." }
+                            div { class: "diff-lines",
+                                for line_index in 0..hunk.lines.len() {
+                                    DiffLine {
+                                        file: file.clone(),
+                                        hunk_index,
+                                        line_index,
+                                        language,
+                                    }
+                                }
+                            }
+                            if hunk.truncated {
+                                div { class: "diff-truncated", "Hunk truncated." }
+                            }
                         }
                     }
-                }
-                if file.truncated {
-                    div { class: "diff-truncated", "File diff truncated." }
+                    if file.truncated {
+                        div { class: "diff-truncated", "File diff truncated." }
+                    }
                 }
             } else if !collapsed() {
-                div { class: "diff-lazy-placeholder", "Loading file diff…" }
+                div {
+                    class: "diff-virtual-spacer",
+                    style: "{placeholder_style}",
+                    aria_hidden: "true",
+                }
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MeasuredBody {
+    revision: usize,
+    line_wrap: bool,
+    width: f64,
+    height: f64,
+}
+
+fn widths_match(left: f64, right: f64) -> bool {
+    left > 0.0 && right > 0.0 && (left - right).abs() < 0.5
+}
+
+fn unwrapped_body_height(file: &DiffViewFile) -> String {
+    let rows = file
+        .hunks
+        .iter()
+        .map(|hunk| hunk.lines.len())
+        .sum::<usize>() as f64;
+    let hunk_headers = file.hunks.len() as f64;
+    let mut notes = file
+        .hunks
+        .iter()
+        .map(|hunk| {
+            usize::from(hunk.truncated)
+                + hunk
+                    .lines
+                    .iter()
+                    .filter(|line| line.no_newline_at_eof)
+                    .count()
+        })
+        .sum::<usize>();
+    notes += usize::from(file.message.is_some());
+    notes += usize::from(file.mode_change.is_some());
+    notes +=
+        usize::from(file.hunks.is_empty() && (file.status.is_unmerged() || !file.kind.is_text()));
+    notes += usize::from(file.truncated);
+    let height = rows * 1.25 + hunk_headers * 1.75 + notes as f64 * 2.0;
+    format!("height: {height}rem")
 }
 
 #[component]
@@ -511,7 +611,8 @@ fn language_for_path(path: &str) -> &'static str {
     match extension {
         Some("rs") => "rust",
         Some("js" | "mjs" | "cjs") => "javascript",
-        Some("ts" | "tsx") => "typescript",
+        Some("ts") => "typescript",
+        Some("tsx") => "tsx",
         Some("py") => "python",
         Some("sh" | "bash") => "bash",
         Some("json") => "json",

@@ -2324,13 +2324,14 @@ pre {
 }
 
 .github-diff-file {
+  --diff-row-height: 1.25rem;
+  --diff-note-height: 2rem;
+  --diff-hunk-header-height: 1.75rem;
   min-width: 0;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--panel);
-  content-visibility: auto;
-  contain-intrinsic-size: auto 420px;
 }
 
 .github-diff-header {
@@ -2391,15 +2392,16 @@ pre {
   overflow: hidden;
 }
 
-.diff-lazy-placeholder {
-  min-height: 8rem;
-  padding: 0.75rem;
-  color: var(--muted);
+.diff-body,
+.diff-virtual-spacer {
+  min-width: 0;
 }
 
 .diff-hunk-header {
   display: flex;
+  height: var(--diff-hunk-header-height);
   min-width: max-content;
+  box-sizing: border-box;
   align-items: center;
   gap: 0.4rem;
   padding: 0.3rem 0.55rem;
@@ -2425,6 +2427,10 @@ pre {
   display: grid;
   grid-template-columns: 3.2rem 3.2rem max-content;
   min-width: max-content;
+}
+
+.github-diff-file:not(.line-wrap) .diff-code {
+  min-height: var(--diff-row-height);
 }
 
 .diff-code.context {
@@ -2485,9 +2491,28 @@ pre {
 .diff-message,
 .diff-truncated {
   display: block;
+  box-sizing: border-box;
+  height: var(--diff-note-height);
+  margin: 0;
   padding: 0.4rem 0.65rem;
+  overflow: hidden;
   color: var(--muted);
   font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-no-newline {
+  grid-column: 1 / -1;
+}
+
+.line-wrap .diff-no-newline,
+.line-wrap .diff-message,
+.line-wrap .diff-truncated {
+  height: auto;
+  min-height: var(--diff-note-height);
+  overflow: visible;
+  white-space: normal;
 }
 
 .file-viewer {
