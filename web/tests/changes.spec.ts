@@ -269,6 +269,21 @@ test("Changes reuses measured spacer heights while wrapping lines", async ({
   expect(Math.abs(spacerHeight - measuredHeight)).toBeLessThanOrEqual(1);
 });
 
+test("Changes refreshes when the window regains focus", async ({
+  page,
+  mockEventSources
+}) => {
+  const requests = await openChanges(page, mockEventSources);
+  const pageErrors: Error[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  const beforeFocus = requests.length;
+
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  await expect.poll(() => requests.length).toBeGreaterThan(beforeFocus);
+  expect(pageErrors).toEqual([]);
+});
+
 test("Changes refreshes after a Runner tool completes", async ({ page, mockEventSources }) => {
   const requests = await openChanges(page, mockEventSources);
   const beforeCompletion = requests.length;

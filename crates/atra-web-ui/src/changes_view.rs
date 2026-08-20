@@ -271,10 +271,10 @@ struct FocusListener {
 }
 
 impl FocusListener {
-    fn new(mut focused: impl FnMut() + 'static) -> Option<Self> {
+    fn new(focused: Callback<()>) -> Option<Self> {
         let window = web_sys::window()?;
         let callback =
-            Closure::wrap(Box::new(move |_event: Event| focused()) as Box<dyn FnMut(Event)>);
+            Closure::wrap(Box::new(move |_event: Event| focused.call(())) as Box<dyn FnMut(Event)>);
         window
             .add_event_listener_with_callback("focus", callback.as_ref().unchecked_ref())
             .ok()?;
@@ -388,13 +388,13 @@ pub(crate) fn ChangesView(
     });
 
     let _focus_listener = use_hook(move || {
-        FocusListener::new(move || {
+        let focused = Callback::new(move |()| {
             if !initialized() {
                 return;
             }
             state.external_change();
-        })
-        .map(Rc::new)
+        });
+        FocusListener::new(focused).map(Rc::new)
     });
 
     let current = caches.read().diff(scope()).cloned();
