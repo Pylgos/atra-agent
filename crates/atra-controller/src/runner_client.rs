@@ -485,6 +485,17 @@ impl RunnerClient {
         }
     }
 
+    pub(super) async fn query(
+        &self,
+        query: atra_protocol::RunnerQuery,
+    ) -> Result<atra_protocol::QueryResponse> {
+        match self.request_raw(RunnerRequest::Query { query }).await? {
+            RunnerResponse::Query { response } => Ok(response),
+            RunnerResponse::Error { message } => bail!("{message}"),
+            _ => bail!("runner returned an invalid query response"),
+        }
+    }
+
     pub(super) async fn prepare_tree(&self, manifest: TreeManifest) -> Result<PrepareTreeResult> {
         match self
             .request_raw(RunnerRequest::PrepareTree { manifest })

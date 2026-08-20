@@ -12,7 +12,8 @@ use atra_client::Client;
 use atra_protocol::{
     AgentStatus, CheckpointId, CheckpointSubscriptionMessage, Command, ControllerOperation,
     ControllerSubscriptionMessage, ProcessId, ProcessLocator, ProcessSubscriptionMessage,
-    SubscriptionTerminal, ThreadId, ThreadSubscriptionMessage,
+    Query as WorkspaceQuery, QueryResponse, SubscriptionTerminal, ThreadId,
+    ThreadSubscriptionMessage,
 };
 use axum::{
     Json, Router,
@@ -115,6 +116,7 @@ fn router(runtime: PathBuf, push: PushManager, port: u16) -> Router {
             get(process_events),
         )
         .route("/api/workspaces/{workspace}/commands", post(commands))
+        .route("/api/workspaces/{workspace}/queries", post(queries))
         .route("/api/push/key", get(push_key))
         .route(
             "/api/push/subscription",
@@ -517,6 +519,21 @@ async fn commands(
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
+async fn queries(
+    State(state): State<AppState>,
+    AxumPath(workspace): AxumPath<String>,
+    headers: HeaderMap,
+    Json(query): Json<WorkspaceQuery>,
+) -> Result<Json<QueryResponse>, ApiError> {
+    check_command_headers(&state.authority, &headers)?;
+    let client = workspace_client(&state.runtime, &workspace).await?;
+    client
+        .query(query)
+        .await
+        .map(Json)
+        .map_err(ApiError::unavailable)
+}
+
 fn check_command_headers(authority: &str, headers: &HeaderMap) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
@@ -625,7 +642,7 @@ fn private(path: &Path, mode: u32, directory: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atra_protocol::CommandResult;
+    use atra_protocol::{CommandResult, Query, QueryError, RunnerQuery};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::StreamExt;
     use std::os::unix::fs::PermissionsExt;
@@ -877,6 +894,29 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, CommandResult::ThreadCreated { .. }));
+
+        let response = client
+            .post(format!("{origin}/api/workspaces/workspace-1/queries"))
+            .header(header::ORIGIN, &origin)
+            .json(&Query {
+                runner: "missing".to_owned(),
+                request: RunnerQuery::RepositoryInfo {
+                    cwd: workspace.clone(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result: QueryResponse = serde_json::from_str(&body).unwrap();
+        assert!(matches!(
+            result,
+            QueryResponse::Error {
+                error: QueryError::RunnerUnavailable { runner }
+            } if runner == "missing"
+        ));
 
         let response = client
             .get(format!(

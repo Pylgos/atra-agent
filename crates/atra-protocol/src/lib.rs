@@ -7,9 +7,11 @@ use serde_json::Value;
 
 mod command;
 mod state;
+mod workspace;
 
 pub use command::{CommandParseError, RunnerCommand, parse_command_input};
 pub use state::*;
+pub use workspace::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -661,6 +663,9 @@ pub enum RunnerRequest {
     ProcessStatus {
         process_handle: ProcessHandle,
     },
+    Query {
+        query: RunnerQuery,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -702,6 +707,9 @@ pub enum RunnerResponse {
     },
     ProcessStatus {
         process_status: ProcessStatus,
+    },
+    Query {
+        response: QueryResponse,
     },
     PatchCompleted {
         result: ApplyPatchResult,

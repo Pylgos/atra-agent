@@ -1,7 +1,8 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "./support/test";
 
-test("embedded Web Client is responsive and reports its connection", async ({ page }) => {
+test("embedded Web Client uses the real event stream and stays responsive", async ({ page }) => {
   await page.goto("/");
+  await expect.poll(() => page.evaluate(() => !("__atraEventSources" in window))).toBe(true);
   await expect(page.getByRole("heading", { name: "Atra" })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Workspaces" })).toBeVisible();
   await page.setViewportSize({ width: 1024, height: 768 });
@@ -12,33 +13,12 @@ test("embedded Web Client is responsive and reports its connection", async ({ pa
   await expect(page.locator(".app-shell")).toHaveCSS("display", "block");
 });
 
-test("dark theme keeps foreground text legible", async ({ page }) => {
+test("dark theme keeps foreground text legible", async ({ page, mockEventSources }) => {
   await page.addInitScript(() => {
     localStorage.setItem("atra:theme", "dark");
-    class FakeEventSource {
-      static readonly OPEN = 1;
-      readonly readyState = FakeEventSource.OPEN;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-
-      constructor(url: string) {
-        if (url.endsWith("/api/workspaces/events")) {
-          setTimeout(() => {
-            this.onmessage?.({
-              data: JSON.stringify({ workspaces: [] })
-            } as MessageEvent);
-            this.onopen?.(new Event("open"));
-          }, 0);
-        }
-      }
-
-      close() {}
-    }
-    Object.defineProperty(window, "EventSource", {
-      configurable: true,
-      value: FakeEventSource
-    });
+  });
+  await mockEventSources({
+    "/api/workspaces/events": { workspaces: [] }
   });
 
   await page.goto("/");

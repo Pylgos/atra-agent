@@ -1,7 +1,7 @@
 use atra_protocol::{
     ActiveItemData, ActiveItemId, EventSequence, PendingInteraction, ProcessLocator,
-    ProcessSummary, Thread, ThreadChange, ThreadCheckpoint, ThreadEventData, ThreadState,
-    ThreadSubscriptionMessage,
+    ProcessSummary, RunnerOperationUpdate, Thread, ThreadChange, ThreadCheckpoint, ThreadEventData,
+    ThreadState, ThreadSubscriptionMessage,
 };
 use dioxus::{
     prelude::{Readable, ReadableExt, ReadableRef, Store, WriteSignal},
@@ -70,6 +70,7 @@ pub(super) struct ActivityRead {
     key: ActivityKey,
 }
 pub(super) struct ActiveTurnRead(StateRead);
+pub(super) struct ActiveRunnerToolsRead(StateRead);
 pub(super) struct InteractionRead(StateRead);
 pub(super) struct CheckpointsRead(StateRead);
 pub(super) struct ProcessesRead(StateRead);
@@ -169,6 +170,32 @@ impl ActiveTurnRead {
             .as_ref()
             .and_then(ThreadState::active_turn)
             .is_some_and(|turn| turn.pending_interaction().is_some())
+    }
+}
+
+impl ActiveRunnerToolsRead {
+    pub fn identities(&self, runner: &str) -> Vec<String> {
+        self.0
+            .value
+            .as_ref()
+            .and_then(ThreadState::active_turn)
+            .into_iter()
+            .flat_map(|turn| turn.items())
+            .filter_map(|item| match item.data() {
+                ActiveItemData::RunnerTool {
+                    call_id,
+                    operation_index,
+                    runner: item_runner,
+                    update,
+                    ..
+                } if item_runner == runner
+                    && !matches!(update, RunnerOperationUpdate::Completed { .. }) =>
+                {
+                    Some(format!("{call_id}:{operation_index}"))
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -419,6 +446,10 @@ impl ThreadStore {
 
     pub(super) fn read_active_turn(self) -> ActiveTurnRead {
         ActiveTurnRead(self.read(ThreadScope::ActiveTurnSlot))
+    }
+
+    pub(super) fn read_active_runner_tools(self) -> ActiveRunnerToolsRead {
+        ActiveRunnerToolsRead(self.read(ThreadScope::Root))
     }
 
     pub(super) fn read_interaction(self) -> InteractionRead {

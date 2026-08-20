@@ -1,3 +1,6 @@
+mod changes_state;
+mod changes_view;
+mod diff_view;
 mod model;
 mod syntax;
 mod thread_store;
@@ -17,15 +20,18 @@ use atra_protocol::{
     ProcessStatus, ProcessSubscriptionMessage, QuestionAnswer, ThreadId, ThreadState,
     ThreadSubscriptionMessage,
 };
+use changes_view::ChangesView;
+use diff_view::{DiffPreferences, SnapshotDiffViewer};
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
     Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, PINS_KEY, Pin, RemoteState, Route,
-    SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_OPEN_KEY, UTILITY_TAB_KEY,
-    UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace, WorkspaceList, draft_key,
-    factual_status, family_threads, render_markdown, root_id, root_threads, thread_name,
+    SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_EXPANDED_KEY, UTILITY_OPEN_KEY,
+    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
+    WorkspaceList, draft_key, factual_status, family_threads, render_markdown, root_id,
+    root_threads, thread_name,
 };
 use syntax::{highlight, setup_markdown_highlighting};
 use thread_store::ThreadStore;
@@ -42,6 +48,7 @@ use web_sys::{
 
 type Controllers = HashMap<String, RemoteState<ControllerState>>;
 type ThreadAttention = HashMap<(String, i64), AgentStatus>;
+const DIFF_WRAP_KEY: &str = "atra:diff:line-wrap";
 
 #[derive(Clone, Copy)]
 struct TranscriptScrollState {
@@ -499,10 +506,14 @@ fn App() -> Element {
         "children" => UtilityTab::Children,
         "checkpoints" => UtilityTab::Checkpoints,
         "processes" => UtilityTab::Processes,
+        "changes" => UtilityTab::Changes,
         _ => UtilityTab::Thread,
     });
     let nav_width = use_signal(|| storage_get(NAV_WIDTH_KEY).parse::<i32>().unwrap_or(288));
     let utility_width = use_signal(|| storage_get(UTILITY_WIDTH_KEY).parse::<i32>().unwrap_or(352));
+    let utility_expanded = use_signal(|| storage_get(UTILITY_EXPANDED_KEY) == "expanded");
+    let line_wrap = use_signal(|| storage_get(DIFF_WRAP_KEY) == "wrap");
+    use_context_provider(|| DiffPreferences { line_wrap });
     let mut mobile_panel = use_signal(|| MobilePanel::None);
     let modes = use_signal(HashMap::<String, TranscriptMode>::new);
     let scroll_positions = use_signal(HashMap::<String, TranscriptScrollState>::new);
@@ -635,18 +646,27 @@ fn App() -> Element {
     });
 
     let shell_class = format!(
-        "app-shell{}{}",
+        "app-shell{}{}{}",
         if nav_open() { "" } else { " navigation-closed" },
         if utility_open() {
             ""
         } else {
             " utility-closed"
         },
+        if utility_expanded() {
+            " utility-expanded"
+        } else {
+            ""
+        },
     );
     let shell_style = format!(
-        "--navigation-width: {}px; --utility-width: {}px",
+        "--navigation-width: {}px; --utility-width: {}",
         nav_width().clamp(224, 420),
-        utility_width().clamp(272, 520),
+        if utility_expanded() {
+            "min(75vw, calc(100vw - var(--navigation-width) - 120px))".to_owned()
+        } else {
+            format!("{}px", utility_width().clamp(272, 520))
+        },
     );
     let has_thread_header = current.workspace.as_ref().is_some_and(|workspace| {
         current.thread.is_some()
@@ -775,6 +795,7 @@ fn App() -> Element {
                                     utility_open,
                                     utility_tab,
                                     utility_width,
+                                    utility_expanded,
                                     mobile_panel,
                                     modes,
                                     scroll_positions,
@@ -1437,6 +1458,7 @@ fn ThreadPage(
     utility_open: Signal<bool>,
     utility_tab: Signal<UtilityTab>,
     utility_width: Signal<i32>,
+    utility_expanded: Signal<bool>,
     mobile_panel: Signal<MobilePanel>,
     modes: Signal<HashMap<String, TranscriptMode>>,
     scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
@@ -1601,12 +1623,13 @@ fn ThreadPage(
                 route,
                 utility_open,
                 utility_tab,
+                utility_expanded,
                 mobile_panel,
                 dialog,
                 error,
                 selected_activity,
             }
-            if utility_open() && !is_narrow_viewport() {
+            if utility_open() && !utility_expanded() && !is_narrow_viewport() {
                 ResizeHandle {
                     side: "Utility",
                     value: utility_width,
@@ -2583,6 +2606,7 @@ fn ActivityDetail(
 
 #[component]
 fn CommandOperations(display: CommandDisplay) -> Element {
+    let preferences = use_context::<DiffPreferences>();
     rsx! {
         div { class: "command-operations",
             for approval in &display.approvals {
@@ -2597,7 +2621,7 @@ fn CommandOperations(display: CommandDisplay) -> Element {
                     }
                 }
             }
-            for operation in &display.operations {
+            for (index, operation) in display.operations.iter().enumerate() {
                 section { class: "command-operation",
                     header {
                         code { "{operation.runner}" }
@@ -2617,10 +2641,11 @@ fn CommandOperations(display: CommandDisplay) -> Element {
                             "… {operation.omitted_bytes} output bytes omitted"
                         }
                     }
-                    for diff in &operation.diffs {
-                        div {
-                            class: "command-diff highlighted diff-view",
-                            dangerous_inner_html: "{highlight(diff, \"diff\")}",
+                    if !operation.diff_files.is_empty() {
+                        SnapshotDiffViewer {
+                            id_scope: format!("command-{}-{index}", display.id_scope),
+                            diff: operation.diff_files.clone(),
+                            line_wrap: (preferences.line_wrap)(),
                         }
                     }
                 }
@@ -3257,6 +3282,7 @@ fn UtilityPanel(
     route: Signal<Route>,
     utility_open: Signal<bool>,
     utility_tab: Signal<UtilityTab>,
+    utility_expanded: Signal<bool>,
     mobile_panel: Signal<MobilePanel>,
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
@@ -3269,6 +3295,19 @@ fn UtilityPanel(
             header { class: "utility-header",
                 h2 { "{utility_tab().label()}" }
                 button {
+                    class: "icon-button utility-expand",
+                    aria_label: if utility_expanded() { "Restore utility panel width" } else { "Expand utility panel" },
+                    onclick: move |_| {
+                        let next = !utility_expanded();
+                        utility_expanded.set(next);
+                        storage_set(
+                            UTILITY_EXPANDED_KEY,
+                            if next { "expanded" } else { "restored" },
+                        );
+                    },
+                    if utility_expanded() { "↘" } else { "↖" }
+                }
+                button {
                     class: "icon-button",
                     aria_label: "Close utility panel",
                     onclick: move |_| {
@@ -3280,7 +3319,7 @@ fn UtilityPanel(
                 }
             }
             div { class: "utility-tabs", role: "tablist",
-                for tab in [UtilityTab::Thread, UtilityTab::Activity, UtilityTab::Children, UtilityTab::Checkpoints, UtilityTab::Processes] {
+                for tab in [UtilityTab::Thread, UtilityTab::Activity, UtilityTab::Children, UtilityTab::Checkpoints, UtilityTab::Processes, UtilityTab::Changes] {
                     button {
                         role: "tab",
                         aria_selected: utility_tab() == tab,
@@ -3329,6 +3368,14 @@ fn UtilityPanel(
                             route,
                             dialog,
                             error,
+                        }
+                    },
+                    UtilityTab::Changes => rsx! {
+                        ChangesView {
+                            workspace: workspace.clone(),
+                            thread,
+                            controller: controller.clone(),
+                            store,
                         }
                     },
                 }

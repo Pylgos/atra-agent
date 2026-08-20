@@ -1,64 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
-
-async function installWebClientMocks(
-  page: Page,
-  snapshots: Record<string, unknown>
-) {
-  await page.addInitScript((snapshots) => {
-    class FakeEventSource {
-      static readonly CONNECTING = 0;
-      static readonly OPEN = 1;
-      static readonly CLOSED = 2;
-      readonly CONNECTING = 0;
-      readonly OPEN = 1;
-      readonly CLOSED = 2;
-      readyState = FakeEventSource.CONNECTING;
-      onopen: ((event: Event) => void) | null = null;
-      onmessage: ((event: MessageEvent) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      readonly url: string;
-      withCredentials = false;
-
-      constructor(url: string | URL) {
-        this.url = String(url);
-        queueMicrotask(() => {
-          this.readyState = FakeEventSource.OPEN;
-          this.onopen?.(new Event("open"));
-          const path = new URL(this.url, window.location.href).pathname;
-          const snapshot = snapshots[path];
-          if (snapshot !== undefined) {
-            this.onmessage?.(new MessageEvent("message", {
-              data: JSON.stringify(snapshot)
-            }));
-          }
-        });
-      }
-
-      addEventListener() {}
-      removeEventListener() {}
-      dispatchEvent() { return true; }
-      close() { this.readyState = FakeEventSource.CLOSED; }
-
-      emit(message: unknown) {
-        this.onmessage?.(new MessageEvent("message", {
-          data: JSON.stringify(message)
-        }));
-      }
-    }
-
-    const sources = new Map<string, FakeEventSource>();
-    Object.defineProperty(window, "EventSource", {
-      configurable: true,
-      value: class extends FakeEventSource {
-        constructor(url: string | URL) {
-          super(url);
-          sources.set(new URL(this.url, window.location.href).pathname, this);
-        }
-      }
-    });
-    Object.defineProperty(window, "__atraEventSources", { value: sources });
-  }, snapshots);
-}
+import { expect, test, type Page } from "./support/test";
 
 async function swipe(
   page: Page,
@@ -87,7 +27,7 @@ async function swipe(
   await client.detach();
 }
 
-test("critical Thread workflow uses streamed snapshots and forwards commands", async ({ page }) => {
+test("critical Thread workflow uses streamed snapshots and forwards commands", async ({ page, mockEventSources }) => {
   const pageErrors: Error[] = [];
   page.on("pageerror", (error) => pageErrors.push(error));
   const workspace = {
@@ -242,7 +182,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     }
   };
 
-  await installWebClientMocks(page, messages);
+  await mockEventSources(messages);
 
   let sentCommand: unknown;
   await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
@@ -902,7 +842,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   expect(mobileComposer!.y + mobileComposer!.height).toBeLessThanOrEqual(844);
 });
 
-test("composer history navigation, stash, and rewind prefill", async ({ page }) => {
+test("composer history navigation, stash, and rewind prefill", async ({ page, mockEventSources }) => {
   const pageErrors: Error[] = [];
   page.on("pageerror", (error) => pageErrors.push(error));
   const snapshots: Record<string, unknown> = {
@@ -979,7 +919,7 @@ test("composer history navigation, stash, and rewind prefill", async ({ page }) 
       JSON.stringify(["First prompt", "Second prompt"])
     );
   });
-  await installWebClientMocks(page, snapshots);
+  await mockEventSources(snapshots);
 
   let sentCommand: unknown;
   await page.route("**/api/workspaces/workspace-1/commands", async (route) => {

@@ -1,6 +1,10 @@
 use std::fmt;
 use std::{borrow::Cow, collections::HashMap};
 
+use crate::diff_view::{
+    DiffViewFile, DiffViewHunk, DiffViewKind, DiffViewLine, DiffViewLineKind, DiffViewStatus,
+    SnapshotDiff,
+};
 use crate::model::pretty;
 use atra_patch_types::{
     ApplyPatchResult, DiffLineKind, FileDiff, PatchOperationOutcome, PatchOperationResult,
@@ -127,6 +131,7 @@ pub(super) enum ActivityDisplay<'a> {
 
 #[derive(Clone, PartialEq)]
 pub(super) struct CommandDisplay {
+    pub id_scope: String,
     pub summary: String,
     pub operations: Vec<CommandOperationDisplay>,
     pub masked: bool,
@@ -146,7 +151,7 @@ pub(super) struct CommandOperationDisplay {
     pub output: String,
     pub status: OperationStatus,
     pub omitted_bytes: usize,
-    pub diffs: Vec<String>,
+    pub diff_files: SnapshotDiff,
     pub file_changes: Vec<FileChangeSummary>,
 }
 
@@ -576,7 +581,7 @@ fn active_activity<'a>(
             Some(ActivityDisplay::Search { summary, detail })
         }
         ActiveItemData::RunnerTool { runner, update, .. } => {
-            Some(orphan_runner_display(runner, update))
+            Some(orphan_runner_display(item.id().0, runner, update))
         }
         ActiveItemData::Assistant { content, .. } => {
             Some(ActivityDisplay::Commentary { markdown: content })
@@ -798,7 +803,7 @@ fn command_display(
             output: String::new(),
             status: OperationStatus::Queued,
             omitted_bytes: 0,
-            diffs: Vec::new(),
+            diff_files: SnapshotDiff::default(),
             file_changes: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -858,6 +863,7 @@ fn command_display(
         })
         .collect();
     CommandDisplay {
+        id_scope: tool_call_identity(call).unwrap_or("command").to_owned(),
         summary,
         operations,
         masked,
@@ -1001,11 +1007,12 @@ fn apply_operation_artifact(artifact: &ToolArtifact, operation: &mut CommandOper
             operation.status = OperationStatus::Finished { exit: *exit_code };
         }
         ToolArtifact::PatchOperations(patch) => {
-            let mut diff = String::new();
-            format_apply_patch(patch, &mut diff, &mut operation.file_changes);
-            if !diff.is_empty() {
-                operation.diffs.push(diff);
-            }
+            format_apply_patch(
+                patch,
+                &mut operation.output,
+                &mut operation.file_changes,
+                &mut operation.diff_files,
+            );
         }
         ToolArtifact::RunnerOperation(runner) => {
             operation.runner.clone_from(&runner.runner);
@@ -1030,6 +1037,7 @@ fn format_apply_patch(
     patch: &ApplyPatchResult,
     output: &mut String,
     file_changes: &mut Vec<FileChangeSummary>,
+    diff_files: &mut SnapshotDiff,
 ) {
     match patch {
         ApplyPatchResult::ParseError { error } => {
@@ -1039,13 +1047,17 @@ fn format_apply_patch(
         }
         ApplyPatchResult::Operations { results } => {
             for result in results {
-                format_patch_operation(result, output, file_changes);
+                format_patch_operation(result, output, file_changes, diff_files);
             }
         }
     }
 }
 
-fn orphan_runner_display(runner: &str, update: &RunnerOperationUpdate) -> ActivityDisplay<'static> {
+fn orphan_runner_display(
+    identity: u64,
+    runner: &str,
+    update: &RunnerOperationUpdate,
+) -> ActivityDisplay<'static> {
     let mut operation = CommandOperationDisplay {
         runner: runner.to_owned(),
         command: String::new(),
@@ -1055,11 +1067,12 @@ fn orphan_runner_display(runner: &str, update: &RunnerOperationUpdate) -> Activi
             remaining_ms: None,
         },
         omitted_bytes: 0,
-        diffs: Vec::new(),
+        diff_files: SnapshotDiff::default(),
         file_changes: Vec::new(),
     };
     apply_runner_update(update, &mut operation);
     ActivityDisplay::Command(CommandDisplay {
+        id_scope: format!("runner-{identity}"),
         summary: format!("{} — {}", operation.status, operation.runner),
         operations: vec![operation],
         masked: false,
@@ -1514,6 +1527,7 @@ fn format_patch_operation(
     result: &PatchOperationResult,
     output: &mut String,
     file_changes: &mut Vec<FileChangeSummary>,
+    diff_files: &mut SnapshotDiff,
 ) {
     let (operation, path, outcome) = match result {
         PatchOperationResult::Added { path, outcome } => ("added", path, outcome),
@@ -1527,7 +1541,7 @@ fn format_patch_operation(
     };
     match outcome {
         PatchOperationOutcome::Applied { diff: Ok(diff) } => {
-            format_file_diff(diff, output);
+            diff_files.push(adapt_patch_diff(operation, diff));
             let (added, deleted) = diff_stat(diff);
             file_changes.push(FileChangeSummary {
                 path: diff
@@ -1549,6 +1563,73 @@ fn format_patch_operation(
     }
 }
 
+fn adapt_patch_diff(operation: &str, diff: &FileDiff) -> DiffViewFile {
+    DiffViewFile {
+        status: DiffViewStatus::Patch(operation.to_owned()),
+        old_path: diff
+            .old_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        new_path: diff
+            .new_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        additions: diff_stat(diff).0 as u64,
+        deletions: diff_stat(diff).1 as u64,
+        kind: DiffViewKind::Text,
+        mode_change: None,
+        hunks: diff
+            .hunks
+            .iter()
+            .map(|hunk| {
+                let mut old_line = u32::try_from(hunk.old_start).unwrap_or(u32::MAX);
+                let mut new_line = u32::try_from(hunk.new_start).unwrap_or(u32::MAX);
+                DiffViewHunk {
+                    header: format!(
+                        "@@ -{},{} +{},{} @@",
+                        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                    ),
+                    lines: hunk
+                        .lines
+                        .iter()
+                        .map(|line| {
+                            let (kind, old_number, new_number) = match line.kind {
+                                DiffLineKind::Context => {
+                                    let result =
+                                        (DiffViewLineKind::Context, Some(old_line), Some(new_line));
+                                    old_line += 1;
+                                    new_line += 1;
+                                    result
+                                }
+                                DiffLineKind::Added => {
+                                    let result = (DiffViewLineKind::Addition, None, Some(new_line));
+                                    new_line += 1;
+                                    result
+                                }
+                                DiffLineKind::Removed => {
+                                    let result = (DiffViewLineKind::Deletion, Some(old_line), None);
+                                    old_line += 1;
+                                    result
+                                }
+                            };
+                            DiffViewLine {
+                                kind,
+                                content: line.text.clone(),
+                                old_line: old_number,
+                                new_line: new_number,
+                                no_newline_at_eof: false,
+                            }
+                        })
+                        .collect(),
+                    truncated: false,
+                }
+            })
+            .collect(),
+        truncated: false,
+        message: None,
+    }
+}
+
 fn diff_stat(diff: &FileDiff) -> (usize, usize) {
     let mut added = 0;
     let mut deleted = 0;
@@ -1564,6 +1645,7 @@ fn diff_stat(diff: &FileDiff) -> (usize, usize) {
     (added, deleted)
 }
 
+#[cfg(test)]
 fn format_file_diff(diff: &FileDiff, output: &mut String) {
     output.push_str("--- ");
     output.push_str(
@@ -2212,12 +2294,18 @@ mod tests {
             output: String::new(),
             status: OperationStatus::Queued,
             omitted_bytes: 0,
-            diffs: Vec::new(),
+            diff_files: SnapshotDiff::default(),
             file_changes: Vec::new(),
         }];
         apply_command_artifact(&artifact, &mut operations);
-        assert_eq!(operations[0].diffs.len(), 1);
-        assert!(operations[0].diffs[0].contains("+++ b/src/main.rs"));
+        assert_eq!(operations[0].diff_files.len(), 1);
+        assert_eq!(
+            operations[0]
+                .diff_files
+                .file(0)
+                .and_then(|file| file.new_path.as_deref()),
+            Some("src/main.rs")
+        );
         assert_eq!(operations[0].file_changes.len(), 1);
         let change = &operations[0].file_changes[0];
         assert_eq!(change.path, "src/main.rs");

@@ -3,8 +3,8 @@ use std::{io::ErrorKind, sync::Arc};
 use anyhow::{Context, Result};
 use atra_protocol::{
     CheckpointSubscriptionMessage, Command, CommandResponse, CommandResult,
-    ControllerSubscriptionMessage, ProcessSubscriptionMessage, StateRequest, Subscribe,
-    SubscriptionTerminal, ThreadSubscriptionMessage,
+    ControllerSubscriptionMessage, ProcessSubscriptionMessage, QueryResponse, StateRequest,
+    Subscribe, SubscriptionTerminal, ThreadSubscriptionMessage,
 };
 use serde::Serialize;
 use tokio::{
@@ -62,6 +62,24 @@ async fn handle_state_request(
                 Ok(result) => CommandResponse::Success { result },
                 Err(error) => CommandResponse::Error {
                     message: format!("{error:#}"),
+                },
+            };
+            write_message(&mut stream, &response).await
+        }
+        StateRequest::Query(query) => {
+            let response = match state.runners.get(&query.runner).await {
+                Ok(runner) => match runner.client.query(query.request).await {
+                    Ok(response) => response,
+                    Err(error) => QueryResponse::Error {
+                        error: atra_protocol::QueryError::Internal {
+                            message: format!("{error:#}"),
+                        },
+                    },
+                },
+                Err(_) => QueryResponse::Error {
+                    error: atra_protocol::QueryError::RunnerUnavailable {
+                        runner: query.runner,
+                    },
                 },
             };
             write_message(&mut stream, &response).await

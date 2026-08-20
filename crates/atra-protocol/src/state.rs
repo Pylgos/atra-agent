@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     ApprovalPolicy, AssistantMessagePhase, CheckpointId, CommandTimerState, EventSequence,
-    HistoryTarget, InteractionId, MAX_COMMAND_OUTPUT_BYTES, Model, ProcessId, ProcessStatus,
+    HistoryTarget, InteractionId, MAX_COMMAND_OUTPUT_BYTES, Model, ProcessId, ProcessStatus, Query,
     Runner, RunnerOperationUpdate, Thread, ThreadCheckpoint, ThreadEvent, ThreadEventData,
     ThreadId, ToolResultEvent,
 };
@@ -1424,6 +1424,7 @@ pub enum Subscribe {
 )]
 pub enum StateRequest {
     Command(Command),
+    Query(Query),
     Subscribe(Subscribe),
 }
 

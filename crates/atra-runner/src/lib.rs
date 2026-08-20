@@ -36,6 +36,8 @@ use tokio::{
     time::{Instant, sleep, sleep_until, timeout},
 };
 
+mod workspace;
+
 pub async fn run_stdio() -> Result<()> {
     serve(BufReader::new(io::stdin()), io::stdout()).await
 }
@@ -280,6 +282,9 @@ async fn handle_request(
             processes.inspect(&process_handle).await
         }
         RunnerRequest::ProcessStatus { process_handle } => processes.status(&process_handle).await,
+        RunnerRequest::Query { query } => Ok(RunnerResponse::Query {
+            response: workspace::handle(query).await,
+        }),
     }
 }
 

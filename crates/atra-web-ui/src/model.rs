@@ -163,6 +163,7 @@ pub enum UtilityTab {
     Children,
     Checkpoints,
     Processes,
+    Changes,
 }
 
 impl UtilityTab {
@@ -173,6 +174,7 @@ impl UtilityTab {
             Self::Children => "Children",
             Self::Checkpoints => "Checkpoints",
             Self::Processes => "Processes",
+            Self::Changes => "Changes",
         }
     }
 }
@@ -191,6 +193,7 @@ pub const UTILITY_OPEN_KEY: &str = "atra:utility-open";
 pub const UTILITY_TAB_KEY: &str = "atra:utility-tab";
 pub const NAV_WIDTH_KEY: &str = "atra:navigation-width";
 pub const UTILITY_WIDTH_KEY: &str = "atra:utility-width";
+pub const UTILITY_EXPANDED_KEY: &str = "atra:utility-expanded";
 pub const WORKSPACE_COLLAPSE_KEY: &str = "atra:workspace-collapse";
 pub const SENT_HISTORY_KEY: &str = "atra:sent-history";
 

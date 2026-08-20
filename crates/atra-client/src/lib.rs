@@ -5,8 +5,9 @@ use atra_protocol::{
     CheckpointId, CheckpointState, CheckpointSubscriptionMessage, Command, CommandResponse,
     CommandResult, ControllerChange, ControllerOperation, ControllerState,
     ControllerSubscriptionMessage, ProcessChange, ProcessLocator, ProcessOperation, ProcessState,
-    ProcessSubscriptionMessage, StateRequest, Subscribe, SubscriptionTerminal, ThreadChange,
-    ThreadId, ThreadOperation, ThreadState, ThreadSubscriptionMessage,
+    ProcessSubscriptionMessage, Query, QueryResponse, StateRequest, Subscribe,
+    SubscriptionTerminal, ThreadChange, ThreadId, ThreadOperation, ThreadState,
+    ThreadSubscriptionMessage,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
@@ -122,6 +123,11 @@ impl Client {
             CommandResponse::Success { result } => Ok(result),
             CommandResponse::Error { message } => bail!(message),
         }
+    }
+
+    pub async fn query(&self, query: Query) -> Result<QueryResponse> {
+        let mut connection = Connection::open(&self.endpoint, &StateRequest::Query(query)).await?;
+        connection.receive().await
     }
 
     pub async fn subscribe_controller(&self) -> Result<ControllerSubscription> {
