@@ -268,26 +268,16 @@ async fn run_replace(endpoint: &Path, path: PathBuf, replace_all: bool) -> Resul
             .context("ATRI_PROCESS_HANDLE is not set; atri must run as an Atra command")?,
     );
     let cwd = env::current_dir().context("failed to determine the current directory")?;
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .await
-        .context("failed to read replacement from stdin")?;
-    let input = input
-        .strip_prefix("--- Old\n")
-        .context("replacement must start with '--- Old'")?;
-    let (old, new) = input
-        .split_once("\n--- New\n")
-        .context("replacement must contain a line with '--- New'")?;
-    let new = new.strip_suffix('\n').unwrap_or(new);
+    let old = read_replacement_input("/dev/fd/3", "old").await?;
+    let new = read_replacement_input("/dev/fd/4", "new").await?;
     match request(
         endpoint,
         RunnerRequest::ReplaceText {
             process_handle,
             cwd,
             path,
-            old: old.to_owned(),
-            new: new.to_owned(),
+            old,
+            new,
             replace_all,
         },
     )
@@ -297,6 +287,24 @@ async fn run_replace(endpoint: &Path, path: PathBuf, replace_all: bool) -> Resul
         RunnerResponse::Error { message } => bail!("{message}"),
         _ => bail!("Runner returned an invalid replace response"),
     }
+}
+
+async fn read_replacement_input(path: &str, label: &str) -> Result<String> {
+    let mut input = String::new();
+    tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open {label} replacement text"))?
+        .read_to_string(&mut input)
+        .await
+        .with_context(|| format!("failed to read {label} replacement text"))?;
+    Ok(strip_heredoc_newline(input))
+}
+
+fn strip_heredoc_newline(mut input: String) -> String {
+    if input.ends_with('\n') {
+        input.pop();
+    }
+    input
 }
 
 async fn run_proc(endpoint: PathBuf, command: ProcCommand) -> Result<bool> {
@@ -763,5 +771,16 @@ mod tests {
     #[test]
     fn agent_create_requires_a_name() {
         assert!(Cli::try_parse_from(["atri", "agent", "create"]).is_err());
+    }
+
+    #[test]
+    fn strips_one_heredoc_newline() {
+        assert_eq!(strip_heredoc_newline("text\n".to_owned()), "text");
+        assert_eq!(strip_heredoc_newline("text\n\n".to_owned()), "text\n");
+    }
+
+    #[test]
+    fn preserves_empty_heredoc() {
+        assert_eq!(strip_heredoc_newline(String::new()), "");
     }
 }

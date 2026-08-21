@@ -55,13 +55,25 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
         Do not make an additional operation solely to obtain line numbers unless doing so avoids a substantially larger patch.
 
         Replacements:
-        Run `atri replace <path>` and pass exact old and new text on standard input:
-        `atri replace path/to/file <<'REPLACE'`
-        `--- Old`
+        Run `atri replace <path>` with the exact old text on file descriptor 3 and new text on file descriptor 4:
+        `atri replace path/to/file 3<<'OLD' 4<<'NEW'`
         `old text`
-        `--- New`
+        `OLD`
         `new text`
-        `REPLACE`
+        `NEW`
+        A single trailing newline is removed from each heredoc. Add a blank line before its delimiter when the text must end with a newline.
+        For example, this replaces `old text\n` with `new text`:
+        `atri replace path/to/file 3<<'OLD' 4<<'NEW'`
+        `old text`
+        ``
+        `OLD`
+        `new text`
+        `NEW`
+        This replaces `old text` with an empty string:
+        `atri replace path/to/file 3<<'OLD' 4<<'NEW'`
+        `old text`
+        `OLD`
+        `NEW`
         The replacement fails without changing the file unless the old text occurs exactly once.
         Use `atri replace --all <path>` to replace every occurrence.
 
