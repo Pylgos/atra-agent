@@ -2289,13 +2289,13 @@ pre {
   white-space: nowrap;
 }
 
-.github-diff-list {
+.diff-list {
   display: grid;
   min-width: 0;
   gap: 0.85rem;
 }
 
-.github-diff-file {
+.diff-file {
   --diff-row-height: 1.25rem;
   --diff-note-height: 2rem;
   --diff-hunk-header-height: 1.75rem;
@@ -2306,7 +2306,7 @@ pre {
   background: var(--panel);
 }
 
-.github-diff-header {
+.diff-header {
   display: flex;
   min-width: 0;
   align-items: center;
@@ -2359,7 +2359,7 @@ pre {
   color: var(--danger);
 }
 
-.github-diff-hunk {
+.diff-hunk {
   min-width: 0;
   overflow: hidden;
 }
@@ -2406,7 +2406,7 @@ pre {
   min-width: 100%;
 }
 
-.github-diff-file:not(.line-wrap) .diff-code {
+.diff-file:not(.line-wrap) .diff-code {
   min-height: var(--diff-row-height);
 }
 

@@ -120,7 +120,7 @@ async function openChanges(
   await page.goto("/");
   await page.locator(".workspace-thread-row .navigation-link").click();
   await page.getByRole("tab", { name: "Changes" }).click();
-  await expect(page.locator(".github-diff-file", {
+  await expect(page.locator(".diff-file", {
     hasText: files[0].change.path.value
   })).toBeVisible();
   return requests;
@@ -170,7 +170,7 @@ test("Changes persists line wrapping independently of query state", async ({ pag
 
   await page.getByLabel("Wrap lines").check();
 
-  await expect(page.locator(".github-diff-file")).toHaveClass(/line-wrap/);
+  await expect(page.locator(".diff-file")).toHaveClass(/line-wrap/);
   await expect.poll(() => page.evaluate(() =>
     localStorage.getItem("atra:diff:line-wrap")
   )).toBe("wrap");
@@ -245,8 +245,8 @@ test("Changes highlights source and unmounts diff bodies outside the viewport", 
   files[2].truncated = true;
   await openChanges(page, mockEventSources, files);
 
-  const first = page.locator(".github-diff-file").first();
-  const last = page.locator(".github-diff-file").last();
+  const first = page.locator(".diff-file").first();
+  const last = page.locator(".diff-file").last();
   await expect(first.locator(".diff-body")).toHaveCount(1);
   await expect(first.locator(".shiki-token", { hasText: "let" }).first()).toContainText("let");
   await expect.poll(() => page.locator(".diff-body").count()).toBeLessThan(files.length);
@@ -272,8 +272,8 @@ test("Changes reuses measured spacer heights while wrapping lines", async ({
   await openChanges(page, mockEventSources, files);
   await page.getByLabel("Wrap lines").check();
 
-  const first = page.locator(".github-diff-file").first();
-  const last = page.locator(".github-diff-file").last();
+  const first = page.locator(".diff-file").first();
+  const last = page.locator(".diff-file").last();
   await expect(first.locator(".diff-body")).toHaveCount(1);
   const measuredHeight = await first.locator(".diff-body").evaluate(
     (element) => element.getBoundingClientRect().height

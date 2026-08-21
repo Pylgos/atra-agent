@@ -269,7 +269,7 @@ pub(crate) fn SnapshotDiffViewer(
         return rsx! { p { class: "empty-copy", "No changes." } };
     }
     rsx! {
-        div { class: "github-diff-list",
+        div { class: "diff-list",
             for file in diff.0.files.iter() {
                 DiffFile {
                     key: "{file.path()}",
@@ -295,7 +295,7 @@ pub(crate) fn ReactiveDiffViewer(
         return rsx! { p { class: "empty-copy", "No changes." } };
     }
     rsx! {
-        div { class: "github-diff-list",
+        div { class: "diff-list",
             for file in files.iter() {
                 ReactiveFile {
                     key: "{file.path()}",
@@ -378,9 +378,9 @@ fn DiffFile(
     };
     rsx! {
         article {
-            class: if line_wrap { "github-diff-file line-wrap" } else { "github-diff-file" },
+            class: if line_wrap { "diff-file line-wrap" } else { "diff-file" },
             id: "{id}",
-            header { class: "github-diff-header",
+            header { class: "diff-header",
                 button {
                     class: "diff-collapse",
                     aria_expanded: !collapsed(),
@@ -447,7 +447,7 @@ fn DiffFile(
                         p { class: "diff-message", "Content is not shown for this file type." }
                     }
                     for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-                        section { class: "github-diff-hunk",
+                        section { class: "diff-hunk",
                             header { class: "diff-hunk-header",
                                 code { "{hunk.header}" }
                                 if let Some(handler) = on_expand {

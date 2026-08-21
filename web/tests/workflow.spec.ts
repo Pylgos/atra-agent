@@ -647,7 +647,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(page.locator(".utility .command-operation > header > span")).toHaveText("finished");
-  const runningCommandDiff = page.locator(".utility .github-diff-file");
+  const runningCommandDiff = page.locator(".utility .diff-file");
   await expect(runningCommandDiff).toHaveCount(1);
   await runningCommandDiff.evaluate((element) => {
     element.setAttribute("data-test-running-diff", "true");
@@ -681,7 +681,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(
-    page.locator('.utility .github-diff-file[data-test-running-diff="true"]')
+    page.locator('.utility .diff-file[data-test-running-diff="true"]')
   ).toHaveCount(1);
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
@@ -749,7 +749,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".utility .command-operation > header > span")).toHaveText("finished");
   await expect(page.locator(".utility .command-output")).toContainText("persisted");
   await expect(page.locator(".utility .command-operation > header > span")).not.toHaveText("queued");
-  const selectedCommandDiff = page.locator(".utility .github-diff-file");
+  const selectedCommandDiff = page.locator(".utility .diff-file");
   await expect(selectedCommandDiff).toHaveCount(1);
   await selectedCommandDiff.evaluate((element) => {
     element.setAttribute("data-test-stable-diff", "true");
@@ -774,7 +774,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(
-    page.locator('.utility .github-diff-file[data-test-stable-diff="true"]')
+    page.locator('.utility .diff-file[data-test-stable-diff="true"]')
   ).toHaveCount(1);
   const currentTurn = page.locator(".turn").last();
   const streamingCommentary = currentTurn.locator(".activity-commentary", {
