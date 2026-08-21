@@ -45,13 +45,13 @@ trialを指す相対symlinkだけを置きます。
 - DockerとCompose plugin
 - Python 3.12以降と`uv`
 - `codex login`済みのCodex 0.146.0
-- Nixでビルドでき、`atra codex login`済みのAtra
+- Nixでビルドでき、`atra provider login codex`済みのAtra
 
 Atraを初めて使う場合は、リポジトリrootで認証します。
 
 ```bash
 nix build .#atra --out-link result-atra
-result-atra/bin/atra codex login
+result-atra/bin/atra provider login codex
 ```
 
 AtraのControllerと認証情報はhostに残ります。task containerへ配置するのは

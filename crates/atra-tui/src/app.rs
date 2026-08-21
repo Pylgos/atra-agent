@@ -128,7 +128,6 @@ pub(crate) enum TurnUpdate {
         thread_id: ThreadId,
         result: Result<()>,
     },
-    LoginCompleted(Result<()>),
     ThreadSelected {
         thread_id: ThreadId,
         result: Result<ThreadSubscription>,
@@ -178,8 +177,6 @@ pub(crate) struct App {
     pub(crate) overlay: Overlay,
     pub(crate) word_segmenter: WordSegmenterBorrowed<'static>,
     pub(crate) error: Option<anyhow::Error>,
-    pub(crate) login_required: bool,
-    pub(crate) login_pending: bool,
     pub(crate) view: ViewState,
     pub(crate) layout: ViewLayout,
     pub(crate) turn: TurnState,
@@ -326,17 +323,6 @@ impl App {
         if let Some(subscription) = &thread_subscription {
             transcript.rebuild(subscription.state());
         }
-        let codex = controller_subscription
-            .state()
-            .providers()
-            .iter()
-            .find(|provider| provider.id() == "codex");
-        let login_required = codex.is_none_or(|provider| {
-            !matches!(
-                provider.lifecycle(),
-                atra_protocol::ProviderLifecycle::LoggedIn { .. }
-            )
-        });
         let models = controller_subscription
             .state()
             .providers()
@@ -371,8 +357,6 @@ impl App {
             overlay: Overlay::None,
             word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
             error: None,
-            login_required,
-            login_pending: false,
             view: ViewState::default(),
             layout: ViewLayout::default(),
             turn: TurnState::Idle,

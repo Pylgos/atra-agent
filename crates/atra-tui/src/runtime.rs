@@ -34,9 +34,6 @@ pub(crate) enum HistoryOperation {
 }
 
 pub(crate) enum Effect {
-    Login {
-        endpoint: std::path::PathBuf,
-    },
     SelectThread {
         endpoint: std::path::PathBuf,
         thread_id: ThreadId,
@@ -234,16 +231,6 @@ impl Effect {
     fn start(self, updates: mpsc::UnboundedSender<TurnUpdate>) {
         tokio::spawn(async move {
             match self {
-                Self::Login { endpoint } => {
-                    let result = Client::new(&endpoint)
-                        .command(StateCommand::ProviderLogin {
-                            provider: "codex".to_owned(),
-                            credential: None,
-                        })
-                        .await
-                        .and_then(accepted);
-                    let _ = updates.send(TurnUpdate::LoginCompleted(result));
-                }
                 Self::SelectThread {
                     endpoint,
                     thread_id,

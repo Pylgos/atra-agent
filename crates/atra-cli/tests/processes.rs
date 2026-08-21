@@ -16,6 +16,28 @@ use tokio::{
 
 const ATRA: &str = env!("CARGO_BIN_EXE_atra");
 
+#[test]
+fn provider_list_works_without_a_controller() {
+    let workspace = tempfile::tempdir().unwrap();
+    let script = workspace.path().join("script.json");
+    fs::write(&script, "[]").unwrap();
+    let output = std::process::Command::new(ATRA)
+        .args(["provider", "list"])
+        .env(
+            "ATRA_CONTROLLER_ENDPOINT",
+            workspace.path().join("missing.sock"),
+        )
+        .env("XDG_DATA_HOME", workspace.path().join("data"))
+        .env("ATRA_FAKE_MODEL_SCRIPT", &script)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("fake"));
+    assert!(stdout.contains("gpt-5.6-sol"));
+}
+
 fn process_has_exited(pid: Pid) -> bool {
     if test_kill_process(pid).is_err() {
         return true;
@@ -259,28 +281,26 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
-            "model_output",
             "tool_call",
             "tool_result",
             "model_request",
-            "model_output",
             "assistant_message",
             "turn_outcome"
         ]
     );
     assert_eq!(
-        tool_result(&events[7]),
+        tool_result(&events[6]),
         serde_json::json!("Operation 1 [one] Command:\nmodel-output")
     );
     assert_eq!(
-        match &events[10].data {
+        match &events[8].data {
             ThreadEventData::AssistantMessage(message) => message.content.as_str(),
             _ => panic!("expected assistant message"),
         },
         "observed Operation 1 [one] Command:\nmodel-output"
     );
     assert!(matches!(
-        events[11].data,
+        events[9].data,
         ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Completed)
     ));
     let denied_events = system.events(denied_thread).await;
@@ -295,18 +315,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
-            "model_output",
             "tool_call",
             "approval_decision",
             "tool_result",
             "model_request",
-            "model_output",
             "assistant_message",
             "turn_outcome",
         ]
     );
     assert_eq!(
-        tool_result(&denied_events[8]),
+        tool_result(&denied_events[7]),
         serde_json::json!(
             "Operation 1 [two] Command:\nuser denied the tool call: not in this environment"
         )
@@ -323,18 +341,16 @@ async fn two_real_runners_execute_commands_and_exit_with_the_controller() {
             "runners",
             "user_message",
             "model_request",
-            "model_output",
             "tool_call",
             "approval_decision",
             "tool_result",
             "model_request",
-            "model_output",
             "assistant_message",
             "turn_outcome",
         ]
     );
     assert_eq!(
-        tool_result(&allowed_events[8]),
+        tool_result(&allowed_events[7]),
         serde_json::json!("Operation 1 [two] Command:\napproved-output")
     );
 }

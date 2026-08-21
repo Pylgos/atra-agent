@@ -36,3 +36,23 @@ An Assistant Message emitted while the current turn still requires further model
 
 **Final Answer**:
 An Assistant Message that completes the current turn.
+
+**Provider**:
+A concrete facade that binds authentication, a Model Catalog, an API Adapter, rate limits, and model invocation for one external model service.
+_Avoid_: Provider trait hierarchy
+
+**Model Surface**:
+The ordered, model-visible conversation derived purely from the append-only Thread Event log. It is not persisted separately.
+_Avoid_: Provider history, wire messages
+
+**API Adapter**:
+A private serializer and stream parser for one upstream model API shape, such as Responses, Chat Completions, or Messages.
+_Avoid_: Universal model API
+
+**Exact Reasoning Option**:
+A model-specific reasoning setting accepted by that model's API. Changing models requires selecting one of the destination model's exact options.
+_Avoid_: Generic reasoning effort
+
+**Tool Binding**:
+The model-specific realization of a logical tool, either hosted by the model API or exposed as a function and executed by Atra.
+_Avoid_: Tool route

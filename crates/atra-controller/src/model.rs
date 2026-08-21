@@ -3,22 +3,31 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use atra_protocol::{
-    ApprovalPolicy, AssistantMessagePhase, CommandTimerState, Model, Runner, RunnerOperationUpdate,
-    SkillInvocationEvent,
+    ApprovalPolicy, AssistantMessagePhase, CommandTimerState, CredentialSource, Model, OpaqueState,
+    ProviderAuthMethod, Runner, RunnerOperationUpdate, SkillInvocationEvent,
 };
 use futures_util::stream::BoxStream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::storage::Event;
 
+mod api;
+mod api_key_auth;
 pub(crate) mod codex;
 pub(crate) mod codex_auth;
 mod fake;
 pub(crate) mod ollama;
+mod opencode_go;
+mod registry;
+mod surface;
+mod tool_binding;
+
+pub(crate) use registry::ProviderRegistry;
 
 pub(crate) const CODEX_PROVIDER: &str = "codex";
 pub(crate) const FAKE_PROVIDER: &str = "fake";
 pub(crate) const OLLAMA_PROVIDER: &str = "ollama";
+pub(crate) const OPENCODE_GO_PROVIDER: &str = "opencode-go";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
@@ -57,7 +66,8 @@ pub(crate) enum ModelResponse {
         call_id: String,
     },
     Reasoning {
-        item: serde_json::Value,
+        summary: String,
+        opaque: OpaqueState,
     },
 }
 
@@ -101,28 +111,15 @@ pub(crate) enum ModelStreamEvent {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ProviderOutput {
-    pub provider: String,
-    pub data: serde_json::Value,
-}
-
 pub(crate) enum ModelEvent {
     Update(ModelStreamEvent),
     OutputItemDone {
-        output: ProviderOutput,
         response: Option<ModelResponse>,
     },
     Completed {
-        metadata: Option<ModelResponseMetadata>,
         token_usage: Option<serde_json::Value>,
         rate_limits: Vec<serde_json::Value>,
     },
-}
-
-pub(crate) struct ModelResponseMetadata {
-    pub provider: String,
-    pub response_id: String,
 }
 
 pub(crate) enum ProviderLoginStatus {
@@ -166,8 +163,10 @@ pub(crate) struct ModelToolFormat {
 }
 
 #[async_trait]
-pub(crate) trait ModelProvider: Send + Sync {
+pub(crate) trait ProviderRuntime: Send + Sync {
     fn id(&self) -> &'static str;
+    fn auth_method(&self) -> ProviderAuthMethod;
+    fn credential_source(&self) -> Option<CredentialSource>;
 
     async fn models(&self) -> Result<Vec<Model>>;
 
@@ -183,32 +182,121 @@ pub(crate) trait ModelProvider: Send + Sync {
 
     async fn execute_tool(
         &self,
+        model: &str,
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>>;
 
-    async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>>;
+    async fn stream(
+        &self,
+        session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<ModelEventStream>;
+
+    async fn server_compact(
+        &self,
+        _session_id: &str,
+        _request: &ModelRequest<'_>,
+    ) -> Result<Option<OpaqueState>> {
+        Ok(None)
+    }
 
     fn context_tokens(&self, events: &[Event]) -> Result<usize>;
 }
 
-#[async_trait]
-pub(crate) trait ModelSession: Send + Sync {
-    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream>;
-
-    async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>>;
+pub(crate) struct Provider {
+    runtime: Arc<dyn ProviderRuntime>,
 }
 
-pub(crate) fn fake(path: &std::path::Path) -> Result<Arc<dyn ModelProvider>> {
-    Ok(Arc::new(fake::FakeProvider::load(path)?))
+impl Provider {
+    pub(crate) fn new(runtime: impl ProviderRuntime + 'static) -> Arc<Self> {
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    pub(crate) fn from_runtime(runtime: Arc<dyn ProviderRuntime>) -> Arc<Self> {
+        Arc::new(Self { runtime })
+    }
+
+    pub(crate) fn id(&self) -> &'static str {
+        self.runtime.id()
+    }
+
+    pub(crate) fn auth_method(&self) -> ProviderAuthMethod {
+        self.runtime.auth_method()
+    }
+
+    pub(crate) fn credential_source(&self) -> Option<CredentialSource> {
+        self.runtime.credential_source()
+    }
+
+    pub(crate) async fn models(&self) -> Result<Vec<Model>> {
+        self.runtime.models().await
+    }
+
+    pub(crate) async fn login(&self, credential: Option<String>) -> Result<ProviderLoginStatus> {
+        self.runtime.login(credential).await
+    }
+
+    pub(crate) async fn login_status(&self) -> Result<ProviderLoginStatus> {
+        self.runtime.login_status().await
+    }
+
+    pub(crate) async fn reload_auth(&self) -> Result<()> {
+        self.runtime.reload_auth().await
+    }
+
+    pub(crate) async fn logout(&self) -> Result<()> {
+        self.runtime.logout().await
+    }
+
+    pub(crate) async fn rate_limits(&self) -> Result<serde_json::Value> {
+        self.runtime.rate_limits().await
+    }
+
+    pub(crate) async fn execute_tool(
+        &self,
+        model: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        self.runtime.execute_tool(model, name, arguments).await
+    }
+
+    pub(crate) async fn stream(
+        &self,
+        session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<ModelEventStream> {
+        self.runtime.stream(session_id, request).await
+    }
+
+    pub(crate) async fn server_compact(
+        &self,
+        session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<Option<OpaqueState>> {
+        self.runtime.server_compact(session_id, request).await
+    }
+
+    pub(crate) fn context_tokens(&self, events: &[Event]) -> Result<usize> {
+        self.runtime.context_tokens(events)
+    }
 }
 
-pub(crate) async fn codex(auth_home: std::path::PathBuf) -> Arc<codex::CodexProvider> {
-    Arc::new(codex::CodexProvider::new(auth_home).await)
+pub(crate) fn fake(path: &std::path::Path) -> Result<Arc<Provider>> {
+    Ok(Provider::new(fake::FakeProvider::load(path)?))
 }
 
-pub(crate) fn ollama(auth_home: std::path::PathBuf) -> Arc<ollama::OllamaProvider> {
-    Arc::new(ollama::OllamaProvider::new(auth_home))
+pub(crate) async fn codex(auth_home: std::path::PathBuf) -> Arc<Provider> {
+    Provider::new(codex::CodexProvider::new(auth_home).await)
+}
+
+pub(crate) fn ollama(auth_home: std::path::PathBuf) -> Arc<Provider> {
+    Provider::new(ollama::OllamaProvider::new(auth_home))
+}
+
+pub(crate) fn opencode_go(auth_home: std::path::PathBuf) -> Arc<Provider> {
+    Provider::new(opencode_go::OpenCodeGoProvider::new(auth_home))
 }
 
 pub(crate) fn text_tokens(text: &str) -> usize {

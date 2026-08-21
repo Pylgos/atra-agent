@@ -7,34 +7,25 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
-use rand::Rng;
 use reqwest::{
     Client, Response, StatusCode,
     header::{HeaderMap, HeaderValue},
 };
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 
-use atra_protocol::{
-    AssistantMessagePhase, InstructionEvent, Model, RunnersEvent, ThreadEventData, ToolResultEvent,
-};
+use atra_protocol::Model;
 
 use super::{
-    ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
-    ModelResponseMetadata, ModelSession, ModelStreamEvent, ModelTool, ProviderLoginStatus,
-    ProviderOutput,
+    ModelEventStream, ModelRequest, ProviderLoginStatus, ProviderRuntime,
     codex_auth::{Auth, AuthManager},
-    format_runners,
 };
 use crate::storage::Event;
 
 const PROVIDER_ID: &str = super::CODEX_PROVIDER;
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const STREAM_MAX_RETRIES: u64 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const BUNDLED_MODELS: &str = r#"[
   {
@@ -93,13 +84,7 @@ struct CodexSession {
     client: Client,
     session_id: String,
     rate_limits: Arc<RwLock<Vec<Value>>>,
-    retries: Mutex<u64>,
     last_used: std::sync::Mutex<Instant>,
-}
-
-pub(crate) struct CodexTurn {
-    session: Arc<CodexSession>,
-    turn_state: Arc<Mutex<Option<String>>>,
 }
 
 impl CodexProvider {
@@ -131,12 +116,35 @@ impl CodexProvider {
         self.reload_auth_inner().await
     }
 
+    async fn session(&self, session_id: &str) -> Result<Arc<CodexSession>> {
+        anyhow::ensure!(
+            self.auth.auth().await?.is_some(),
+            "Codex login required; run `atra provider login codex`"
+        );
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, session| session.idle_for() < SESSION_IDLE_TTL);
+        let session = sessions
+            .entry(session_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(CodexSession {
+                    auth: self.auth.clone(),
+                    client: self.client.clone(),
+                    session_id: session_id.to_owned(),
+                    rate_limits: self.rate_limits.clone(),
+                    last_used: std::sync::Mutex::new(Instant::now()),
+                })
+            })
+            .clone();
+        session.touch();
+        Ok(session)
+    }
+
     async fn rate_limits_inner(&self) -> Result<Vec<Value>> {
         let auth = self
             .auth
             .auth()
             .await?
-            .context("Codex login required; run `atra codex login`")?;
+            .context("Codex login required; run `atra provider login codex`")?;
         let response = send_authenticated(
             &self.client,
             &self.auth,
@@ -162,7 +170,7 @@ impl CodexProvider {
             .auth
             .auth()
             .await?
-            .context("Codex login required; run `atra codex login`")?;
+            .context("Codex login required; run `atra provider login codex`")?;
         let response = send_authenticated(
             &self.client,
             &self.auth,
@@ -202,9 +210,16 @@ impl CodexProvider {
 }
 
 #[async_trait]
-impl ModelProvider for CodexProvider {
+impl ProviderRuntime for CodexProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
+    }
+    fn auth_method(&self) -> atra_protocol::ProviderAuthMethod {
+        atra_protocol::ProviderAuthMethod::Browser
+    }
+
+    fn credential_source(&self) -> Option<atra_protocol::CredentialSource> {
+        self.auth.credential_source()
     }
 
     async fn models(&self) -> Result<Vec<Model>> {
@@ -240,79 +255,93 @@ impl ModelProvider for CodexProvider {
         Ok(Value::Array(self.rate_limits_inner().await?))
     }
 
-    async fn execute_tool(&self, _name: &str, _arguments: &Value) -> Result<Option<Value>> {
+    async fn execute_tool(
+        &self,
+        _model: &str,
+        _name: &str,
+        _arguments: &Value,
+    ) -> Result<Option<Value>> {
         Ok(None)
     }
 
-    async fn start_turn(&self, session_id: &str) -> Result<Box<dyn ModelSession + '_>> {
-        anyhow::ensure!(
-            self.auth.auth().await?.is_some(),
-            "Codex login required; run `atra codex login`"
-        );
-        let mut sessions = self.sessions.lock().await;
-        sessions.retain(|_, session| session.idle_for() < SESSION_IDLE_TTL);
-        let session = sessions
-            .entry(session_id.to_owned())
-            .or_insert_with(|| {
-                Arc::new(CodexSession {
-                    auth: self.auth.clone(),
-                    client: self.client.clone(),
-                    session_id: session_id.to_owned(),
-                    rate_limits: self.rate_limits.clone(),
-                    retries: Mutex::new(0),
-                    last_used: std::sync::Mutex::new(Instant::now()),
-                })
-            })
-            .clone();
-        session.touch();
-        Ok(Box::new(CodexTurn {
-            session,
-            turn_state: Arc::new(Mutex::new(None)),
-        }))
+    async fn stream(
+        &self,
+        session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<ModelEventStream> {
+        stream(self.session(session_id).await?, request).await
+    }
+
+    async fn server_compact(
+        &self,
+        session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<Option<atra_protocol::OpaqueState>> {
+        server_compact(self.session(session_id).await?, request)
+            .await
+            .map(Some)
     }
 
     fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        context_tokens(events)
+        super::api::ollama::context_tokens(events)
     }
 }
 
-#[async_trait]
-impl ModelSession for CodexTurn {
-    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream> {
-        self.session.touch();
-        let body = completion_request(request)?;
-        let session = self.session.clone();
-        let turn_state = self.turn_state.clone();
-        let (sender, receiver) = mpsc::channel(32);
-        tokio::spawn(async move {
-            stream_response(session, turn_state, body, sender).await;
-        });
-        Ok(stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|event| (event, receiver))
-        })
-        .boxed())
-    }
+async fn stream(
+    session: Arc<CodexSession>,
+    request: &ModelRequest<'_>,
+) -> Result<ModelEventStream> {
+    session.touch();
+    let turn_state = Arc::new(Mutex::new(None));
+    let body = super::api::responses::request_body(request, super::api::responses::Profile::Codex)?;
+    let model = request.model.to_owned();
+    Ok(super::api::responses::decode(
+        move || {
+            let session = Arc::clone(&session);
+            let turn_state = Arc::clone(&turn_state);
+            let body = body.clone();
+            async move {
+                let response = session
+                    .send(
+                        reqwest::Method::POST,
+                        &format!("{BASE_URL}/responses"),
+                        Some(body),
+                        &turn_state,
+                    )
+                    .await?;
+                let rate_limits = rate_limit_headers(response.headers());
+                *session.rate_limits.write().await = rate_limits.clone();
+                Ok((response, rate_limits))
+            }
+        },
+        model,
+        "codex".to_owned(),
+    ))
+}
 
-    async fn compact(&self, request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
-        self.session.touch();
-        let body = compaction_request(request)?;
-        let response = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            self.session.send(
-                reqwest::Method::POST,
-                &format!("{BASE_URL}/responses"),
-                Some(body),
-                &self.turn_state,
-            ),
-        )
-        .await
-        .context("Codex compaction request timed out")??;
-        let item = decode_compaction_stream(response).await?;
-        Ok(Some(ProviderOutput {
-            provider: PROVIDER_ID.to_owned(),
-            data: Value::Array(vec![item]),
-        }))
-    }
+async fn server_compact(
+    session: Arc<CodexSession>,
+    request: &ModelRequest<'_>,
+) -> Result<atra_protocol::OpaqueState> {
+    session.touch();
+    let turn_state = Arc::new(Mutex::new(None));
+    let body = super::api::responses::server_compaction_body(request)?;
+    let response = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        session.send(
+            reqwest::Method::POST,
+            &format!("{BASE_URL}/responses"),
+            Some(body),
+            &turn_state,
+        ),
+    )
+    .await
+    .context("Codex compaction request timed out")??;
+    let payload = super::api::responses::decode_server_compaction(response).await?;
+    Ok(atra_protocol::OpaqueState {
+        replay_key: format!("codex/{}/compaction-v1", request.model),
+        payload,
+    })
 }
 
 impl CodexSession {
@@ -335,7 +364,7 @@ impl CodexSession {
             .auth
             .auth()
             .await?
-            .context("Codex login required; run `atra codex login`")?;
+            .context("Codex login required; run `atra provider login codex`")?;
         let mut headers = HeaderMap::new();
         for name in ["session-id", "thread-id", "x-client-request-id"] {
             headers.insert(
@@ -398,577 +427,9 @@ async fn send_authenticated(
         auth = manager
             .recover_unauthorized(&auth.token)
             .await?
-            .context("Codex login required; run `atra codex login`")?;
+            .context("Codex login required; run `atra provider login codex`")?;
     }
     unreachable!()
-}
-
-async fn stream_response(
-    session: Arc<CodexSession>,
-    turn_state: Arc<Mutex<Option<String>>>,
-    body: Value,
-    sender: mpsc::Sender<Result<ModelEvent>>,
-) {
-    let mut attempt = 0;
-    loop {
-        let mut emitted = false;
-        let result =
-            stream_response_once(&session, &turn_state, body.clone(), &sender, &mut emitted).await;
-        match result {
-            Ok(()) => return,
-            Err(error) if should_retry_stream(&error, emitted, attempt) => {
-                attempt += 1;
-                *session.retries.lock().await += 1;
-                let delay = backoff(attempt);
-                if sender
-                    .send(Ok(ModelEvent::Update(ModelStreamEvent::Retry {
-                        summary: error.to_string(),
-                        current: attempt,
-                        max: STREAM_MAX_RETRIES,
-                    })))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = sender.closed() => return,
-                }
-            }
-            Err(error) => {
-                let _ = sender.send(Err(error)).await;
-                return;
-            }
-        }
-    }
-}
-
-async fn stream_response_once(
-    session: &CodexSession,
-    turn_state: &Mutex<Option<String>>,
-    body: Value,
-    sender: &mpsc::Sender<Result<ModelEvent>>,
-    emitted: &mut bool,
-) -> Result<()> {
-    let url = format!("{BASE_URL}/responses");
-    let response = tokio::select! {
-        () = sender.closed() => return Ok(()),
-        response = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            session.send(
-                reqwest::Method::POST,
-                &url,
-                Some(body),
-                turn_state,
-            ),
-        ) => response
-            .map_err(|error| RetryableStreamError(error.into()))??,
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let error = response_error(response, "Codex response").await;
-        return if retryable_status(status) {
-            Err(RetryableStreamError(error).into())
-        } else {
-            Err(error)
-        };
-    }
-    let header_limits = rate_limit_headers(response.headers());
-    if !header_limits.is_empty() {
-        let mut latest_rate_limits = session.rate_limits.write().await;
-        merge_rate_limits(&mut latest_rate_limits, header_limits.clone());
-    }
-    let mut bytes = response.bytes_stream();
-    let mut buffer = Vec::new();
-    let mut response_id = None;
-    let mut token_usage = None;
-    let mut rate_limits = header_limits;
-    let mut saw_response = false;
-    let mut completed = false;
-    let mut has_response = false;
-    let mut assistant_phase = None;
-
-    'stream: loop {
-        let chunk = tokio::select! {
-            () = sender.closed() => return Ok(()),
-            chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()) => chunk
-                .map_err(|error| RetryableStreamError(error.into()))?,
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let chunk = chunk.context("failed to read Codex response stream")?;
-        buffer.extend_from_slice(&chunk);
-        while let Some(frame) = next_sse_frame(&mut buffer)? {
-            let data = frame
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                break 'stream;
-            }
-            let event: Value = serde_json::from_str(&data).context("invalid Codex SSE event")?;
-            saw_response = true;
-            if handle_sse_event(
-                event,
-                sender,
-                &mut response_id,
-                &mut token_usage,
-                &mut rate_limits,
-                emitted,
-                &mut has_response,
-                &mut assistant_phase,
-            )
-            .await?
-            {
-                completed = true;
-            }
-        }
-    }
-    if completed {
-        ensure_completed_response(has_response)?;
-        *session.retries.lock().await = 0;
-        let mut latest_rate_limits = session.rate_limits.write().await;
-        merge_rate_limits(&mut latest_rate_limits, rate_limits);
-        let rate_limits = latest_rate_limits.clone();
-        drop(latest_rate_limits);
-        let _ = sender
-            .send(Ok(ModelEvent::Completed {
-                metadata: response_id.map(|response_id| ModelResponseMetadata {
-                    provider: PROVIDER_ID.to_owned(),
-                    response_id,
-                }),
-                token_usage,
-                rate_limits,
-            }))
-            .await;
-        return Ok(());
-    }
-    if saw_response {
-        return Err(RetryableStreamError(anyhow::anyhow!(
-            "Codex response stream ended before response.completed"
-        ))
-        .into());
-    }
-    Err(RetryableStreamError(anyhow::anyhow!(
-        "Codex response stream ended without events"
-    ))
-    .into())
-}
-
-fn ensure_completed_response(has_response: bool) -> Result<()> {
-    anyhow::ensure!(
-        has_response,
-        "Codex response completed without an assistant message or tool call"
-    );
-    Ok(())
-}
-
-async fn handle_sse_event(
-    event: Value,
-    sender: &mpsc::Sender<Result<ModelEvent>>,
-    response_id: &mut Option<String>,
-    token_usage: &mut Option<Value>,
-    rate_limits: &mut Vec<Value>,
-    emitted: &mut bool,
-    has_response: &mut bool,
-    assistant_phase: &mut Option<AssistantMessagePhase>,
-) -> Result<bool> {
-    let kind = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let update = match kind {
-        "response.output_text.delta" => match event["delta"].as_str() {
-            Some(value) => Some(ModelStreamEvent::AssistantDelta {
-                content: value.to_owned(),
-                phase: (*assistant_phase)
-                    .context("assistant output delta arrived before its output item")?,
-            }),
-            None => None,
-        },
-        "response.reasoning_summary_text.delta" => event["delta"]
-            .as_str()
-            .map(|value| ModelStreamEvent::ReasoningSummaryDelta(value.to_owned())),
-        "response.reasoning_summary_part.added" => {
-            Some(ModelStreamEvent::ReasoningSummaryPartAdded)
-        }
-        "response.custom_tool_call_input.delta" => Some(ModelStreamEvent::ToolCallDelta {
-            item_id: event["item_id"].as_str().unwrap_or_default().to_owned(),
-            delta: event["delta"].as_str().unwrap_or_default().to_owned(),
-        }),
-        "response.output_item.added" => {
-            let item = &event["item"];
-            match item["type"].as_str() {
-                Some("message") => {
-                    *assistant_phase = Some(assistant_message_phase(item)?);
-                    None
-                }
-                Some("custom_tool_call") | Some("function_call") => {
-                    Some(ModelStreamEvent::ToolCallStarted {
-                        item_id: item["id"].as_str().unwrap_or_default().to_owned(),
-                        call_id: item["call_id"].as_str().map(str::to_owned),
-                        name: item["name"].as_str().unwrap_or_default().to_owned(),
-                    })
-                }
-                Some("web_search_call") => Some(ModelStreamEvent::WebSearchUpdate {
-                    item_id: item["id"].as_str().unwrap_or_default().to_owned(),
-                    action: item.get("action").filter(|value| !value.is_null()).cloned(),
-                }),
-                _ => None,
-            }
-        }
-        "response.web_search_call.in_progress"
-        | "response.web_search_call.searching"
-        | "response.web_search_call.completed" => Some(ModelStreamEvent::WebSearchUpdate {
-            item_id: event["item_id"].as_str().unwrap_or_default().to_owned(),
-            action: event
-                .get("action")
-                .filter(|value| !value.is_null())
-                .cloned(),
-        }),
-        _ => None,
-    };
-    if let Some(update) = update {
-        *emitted = true;
-        sender
-            .send(Ok(ModelEvent::Update(update)))
-            .await
-            .map_err(|_| anyhow::anyhow!("model stream receiver dropped"))?;
-    }
-    match kind {
-        "response.output_item.done" => {
-            let item = event["item"].clone();
-            if item["type"] == "message" {
-                *assistant_phase = None;
-            }
-            if item["type"] == "web_search_call" {
-                *emitted = true;
-                sender
-                    .send(Ok(ModelEvent::Update(ModelStreamEvent::WebSearchUpdate {
-                        item_id: item["id"].as_str().unwrap_or_default().to_owned(),
-                        action: item.get("action").filter(|value| !value.is_null()).cloned(),
-                    })))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("model stream receiver dropped"))?;
-            }
-            let response = response_from_item(&item)?;
-            if matches!(
-                response,
-                Some(
-                    ModelResponse::AssistantMessage { .. }
-                        | ModelResponse::ToolCall { .. }
-                        | ModelResponse::CustomToolCall { .. }
-                )
-            ) {
-                *has_response = true;
-            }
-            *emitted = true;
-            sender
-                .send(Ok(ModelEvent::OutputItemDone {
-                    response,
-                    output: ProviderOutput {
-                        provider: PROVIDER_ID.to_owned(),
-                        data: Value::Array(vec![item]),
-                    },
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("model stream receiver dropped"))?;
-        }
-        "response.completed" => {
-            let response = &event["response"];
-            *response_id = response["id"].as_str().map(str::to_owned);
-            *token_usage = response
-                .get("usage")
-                .filter(|value| !value.is_null())
-                .map(normalize_token_usage);
-            if let Some(limits) = event.get("rate_limits") {
-                *rate_limits = rate_limit_snapshots(limits);
-            }
-            return Ok(true);
-        }
-        "codex.rate_limits" => {
-            let limits = event.get("rate_limits").unwrap_or(&event);
-            merge_rate_limits(rate_limits, rate_limit_snapshots(limits));
-        }
-        "error" | "response.failed" => {
-            return Err(sse_failure(&event));
-        }
-        _ => {}
-    }
-    Ok(false)
-}
-
-fn normalize_token_usage(usage: &Value) -> Value {
-    json!({
-        "input_tokens": usage.get("input_tokens").cloned().unwrap_or(Value::Null),
-        "cached_input_tokens": usage
-            .pointer("/input_tokens_details/cached_tokens")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "cache_write_input_tokens": usage
-            .pointer("/input_tokens_details/cache_write_tokens")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "output_tokens": usage.get("output_tokens").cloned().unwrap_or(Value::Null),
-        "reasoning_output_tokens": usage
-            .pointer("/output_tokens_details/reasoning_tokens")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "total_tokens": usage.get("total_tokens").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn completion_request(request: &ModelRequest<'_>) -> Result<Value> {
-    Ok(json!({
-        "model": request.model,
-        "instructions": request.instructions,
-        "input": model_input(request.events)?,
-        "tools": tool_definitions(request.tools),
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "reasoning": {"effort": request.reasoning_effort, "summary": "detailed"},
-        "store": false,
-        "stream": true,
-        "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": request.prompt_cache_key,
-        "text": {"verbosity": "low"},
-        "client_metadata": {
-            "session_id": request.prompt_cache_key,
-            "thread_id": request.prompt_cache_key
-        }
-    }))
-}
-
-fn compaction_request(request: &ModelRequest<'_>) -> Result<Value> {
-    let mut body = completion_request(request)?;
-    body["input"]
-        .as_array_mut()
-        .context("Codex compaction input is not an array")?
-        .push(json!({"type": "compaction_trigger"}));
-    Ok(body)
-}
-
-fn response_from_item(item: &Value) -> Result<Option<ModelResponse>> {
-    Ok(match item["type"].as_str() {
-        Some("message") => {
-            let content = item["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|content| content["type"] == "output_text")
-                .filter_map(|content| content["text"].as_str())
-                .collect::<String>();
-            if content.is_empty() {
-                None
-            } else {
-                let phase = assistant_message_phase(item)?;
-                Some(ModelResponse::AssistantMessage { content, phase })
-            }
-        }
-        Some("function_call") => Some(ModelResponse::ToolCall {
-            name: string_field(item, "name")?,
-            arguments: serde_json::from_str(&string_field(item, "arguments")?)
-                .context("Codex returned invalid tool arguments")?,
-            call_id: string_field(item, "call_id")?,
-        }),
-        Some("custom_tool_call") => Some(ModelResponse::CustomToolCall {
-            item_id: item["id"].as_str().map(str::to_owned),
-            name: string_field(item, "name")?,
-            input: string_field(item, "input")?,
-            call_id: string_field(item, "call_id")?,
-        }),
-        Some("web_search_call") => Some(ModelResponse::WebSearch { item: item.clone() }),
-        Some("reasoning") => Some(ModelResponse::Reasoning { item: item.clone() }),
-        _ => None,
-    })
-}
-
-fn assistant_message_phase(item: &Value) -> Result<AssistantMessagePhase> {
-    match item["phase"].as_str() {
-        Some("commentary") => Ok(AssistantMessagePhase::Commentary),
-        Some("final_answer") => Ok(AssistantMessagePhase::FinalAnswer),
-        Some(phase) => anyhow::bail!("Codex returned unknown assistant message phase {phase}"),
-        None => anyhow::bail!("Codex returned an assistant message without a phase"),
-    }
-}
-
-fn model_input(events: &[Event]) -> Result<Vec<Value>> {
-    let mut items = Vec::new();
-    let message = |role: &str, text: String| json!({"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]});
-    if let Some(context) = events.iter().find_map(|event| match &event.data {
-        ThreadEventData::ThreadContext(context) => Some(context),
-        _ => None,
-    }) {
-        items.push(message("developer", context.content.clone()));
-    }
-    let events = if let Some(index) = events
-        .iter()
-        .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
-    {
-        let output = serde_json::from_value::<ProviderOutput>(match &events[index].data {
-            ThreadEventData::Compaction(compaction) => compaction.items.clone(),
-            _ => unreachable!(),
-        })
-        .context("stored compaction contains invalid provider output")?;
-        anyhow::ensure!(
-            output.provider == PROVIDER_ID,
-            "stored compaction belongs to another provider"
-        );
-        items.extend(
-            output
-                .data
-                .as_array()
-                .context("stored compaction contains invalid Codex response items")?
-                .iter()
-                .cloned(),
-        );
-        &events[index + 1..]
-    } else {
-        events
-    };
-    let masked = crate::storage::latest_frozen_boundary(events)
-        .map(|boundary| {
-            boundary
-                .masked_sequences
-                .into_iter()
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    for event in events {
-        if let ThreadEventData::ModelOutput(event) = &event.data {
-            let output = serde_json::from_value::<ProviderOutput>(event.output.clone())
-                .context("stored model output contains invalid provider output")?;
-            anyhow::ensure!(
-                output.provider == PROVIDER_ID,
-                "stored model output belongs to another provider"
-            );
-            items.extend(
-                output
-                    .data
-                    .as_array()
-                    .context("stored model output contains invalid Codex response items")?
-                    .iter()
-                    .cloned(),
-            );
-            continue;
-        }
-        let item = match &event.data {
-            ThreadEventData::ThreadContext(_) => None,
-            ThreadEventData::WorkspaceInstructions(value) => Some(message(
-                "developer",
-                format!(
-                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-                    instruction_text(value, "AGENTS.md instructions")
-                ),
-            )),
-            ThreadEventData::Skills(value) => {
-                Some(message("developer", instruction_text(value, "skills list")))
-            }
-            ThreadEventData::SkillInvocation(value) => {
-                Some(message("user", super::format_skill_invocation(value)))
-            }
-            ThreadEventData::Runners(value) => Some(message(
-                "developer",
-                match value {
-                    RunnersEvent::Initial(runners) => format_runners(runners),
-                    RunnersEvent::Replacement(runners) => format!(
-                        "The available Atra Runner list has changed. This list replaces the previously provided list.\n\n{}",
-                        format_runners(runners)
-                    ),
-                },
-            )),
-            ThreadEventData::UserMessage(value) => Some(message("user", value.content.clone())),
-            ThreadEventData::ToolResult(ToolResultEvent::Custom { call_id, name, .. }) => {
-                Some(json!({
-                    "type": "custom_tool_call_output",
-                    "call_id": call_id,
-                    "name": name,
-                    "output": tool_result_text(projected_tool_result(event, &masked))
-                }))
-            }
-            ThreadEventData::ToolResult(ToolResultEvent::Function { call_id, .. }) => Some(json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": tool_result_text(projected_tool_result(event, &masked))
-            })),
-            _ => None,
-        };
-        if let Some(item) = item {
-            items.push(item);
-        }
-    }
-    Ok(items)
-}
-
-fn projected_tool_result<'a>(
-    event: &'a Event,
-    masked: &HashSet<atra_protocol::EventSequence>,
-) -> &'a Value {
-    let (result, masked_result) = match &event.data {
-        ThreadEventData::ToolResult(ToolResultEvent::Custom {
-            result,
-            masked_result,
-            ..
-        })
-        | ThreadEventData::ToolResult(ToolResultEvent::Function {
-            result,
-            masked_result,
-            ..
-        }) => (result, masked_result),
-        _ => unreachable!(),
-    };
-    if masked.contains(&event.sequence) {
-        masked_result.as_ref().unwrap_or(result)
-    } else {
-        result
-    }
-}
-
-pub(super) fn context_tokens(events: &[Event]) -> Result<usize> {
-    Ok(super::text_tokens(&serde_json::to_string(&model_input(
-        events,
-    )?)?))
-}
-
-fn tool_definitions(tools: &[ModelTool]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| match tool {
-            ModelTool::WebSearch => json!({"type": "web_search", "external_web_access": true}),
-            ModelTool::Tool { name, json, custom } => {
-                if let Some(custom) = custom {
-                    json!({
-                        "type": "custom",
-                        "name": name,
-                        "description": custom.description,
-                        "format": {
-                            "type": "grammar",
-                            "syntax": custom.format.syntax,
-                            "definition": custom.format.definition,
-                        }
-                    })
-                } else {
-                    let json_interface = json
-                        .as_ref()
-                        .expect("model tool must expose a Codex-compatible interface");
-                    json!({
-                        "type": "function",
-                        "name": name,
-                        "description": json_interface.description,
-                        "parameters": json_interface.parameters,
-                        "strict": true,
-                    })
-                }
-            }
-        })
-        .collect()
 }
 
 fn parse_model(value: &Value) -> Option<Model> {
@@ -1000,6 +461,13 @@ fn parse_model(value: &Value) -> Option<Model> {
         supported_reasoning_efforts: supported,
         context_window: Some(context_window),
         auto_compact_token_limit,
+        tool_bindings: vec![atra_protocol::ModelToolBinding {
+            tool: "web_search".to_owned(),
+            implementation: super::tool_binding::codex("web_search")
+                .expect("Codex web search binding")
+                .name()
+                .to_owned(),
+        }],
     })
 }
 
@@ -1016,31 +484,14 @@ fn fallback_model() -> Model {
             .collect(),
         context_window: Some(400_000),
         auto_compact_token_limit: Some(360_000),
+        tool_bindings: vec![atra_protocol::ModelToolBinding {
+            tool: "web_search".to_owned(),
+            implementation: super::tool_binding::codex("web_search")
+                .expect("Codex web search binding")
+                .name()
+                .to_owned(),
+        }],
     }
-}
-
-fn instruction_text(event: &InstructionEvent, label: &str) -> String {
-    match event {
-        InstructionEvent::Initial(content) => content.clone(),
-        InstructionEvent::Replacement(content) => {
-            format!("These {label} replace all previously provided {label}.\n\n{content}")
-        }
-        InstructionEvent::Removal => format!("The previously provided {label} no longer apply."),
-    }
-}
-
-fn tool_result_text(result: &Value) -> String {
-    result
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| result.to_string())
-}
-
-fn string_field(value: &Value, field: &str) -> Result<String> {
-    value[field]
-        .as_str()
-        .map(str::to_owned)
-        .with_context(|| format!("Codex response item has no {field}"))
 }
 
 async fn decode_json(response: Response, label: &str) -> Result<Value> {
@@ -1053,132 +504,10 @@ async fn decode_json(response: Response, label: &str) -> Result<Value> {
         .with_context(|| format!("failed to decode {label}"))
 }
 
-async fn decode_compaction_stream(response: Response) -> Result<Value> {
-    if !response.status().is_success() {
-        return Err(response_error(response, "Codex compaction").await);
-    }
-    let mut bytes = response.bytes_stream();
-    let mut buffer = Vec::new();
-    let mut compaction = None;
-    let mut compaction_count = 0;
-    let mut output_count = 0;
-    let mut completed = false;
-    'stream: loop {
-        let chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next())
-            .await
-            .context("Codex compaction response timed out")?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        buffer.extend_from_slice(&chunk.context("failed to read Codex compaction stream")?);
-        while let Some(frame) = next_sse_frame(&mut buffer)? {
-            let data = frame
-                .lines()
-                .filter_map(|line| line.strip_prefix("data:"))
-                .map(str::trim_start)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                break 'stream;
-            }
-            let event: Value =
-                serde_json::from_str(&data).context("invalid Codex compaction SSE event")?;
-            match event["type"].as_str() {
-                Some("response.output_item.done") => {
-                    output_count += 1;
-                    if event["item"]["type"] == "compaction" {
-                        compaction_count += 1;
-                        if compaction.is_none() {
-                            compaction = Some(event["item"].clone());
-                        }
-                    }
-                }
-                Some("response.completed") => {
-                    completed = true;
-                    break 'stream;
-                }
-                Some("error" | "response.failed") => return Err(sse_failure(&event)),
-                _ => {}
-            }
-        }
-    }
-    anyhow::ensure!(
-        completed,
-        "Codex compaction stream ended before response.completed"
-    );
-    anyhow::ensure!(
-        compaction_count == 1,
-        "Codex compaction expected exactly one compaction item, got {compaction_count} from {output_count} output items"
-    );
-    compaction.context("Codex compaction response has no compaction item")
-}
-
 async fn response_error(response: Response, label: &str) -> anyhow::Error {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     anyhow::anyhow!("{label} failed ({status}): {}", error_message(&body))
-}
-
-#[derive(Debug)]
-struct RetryableStreamError(anyhow::Error);
-
-impl std::fmt::Display for RetryableStreamError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl std::error::Error for RetryableStreamError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
-    }
-}
-
-fn retryable_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT
-            | StatusCode::CONFLICT
-            | StatusCode::TOO_EARLY
-            | StatusCode::TOO_MANY_REQUESTS
-    ) || status.is_server_error()
-}
-
-fn is_retryable_stream_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| {
-        source.is::<RetryableStreamError>()
-            || source
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(|error| error.is_timeout() || error.is_connect() || error.is_body())
-    })
-}
-
-fn should_retry_stream(error: &anyhow::Error, emitted: bool, attempt: u64) -> bool {
-    !emitted && attempt < STREAM_MAX_RETRIES && is_retryable_stream_error(error)
-}
-
-fn next_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<String>> {
-    let boundary = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n" || window == b"\r\r")
-                .map(|index| (index, 2))
-        });
-    let Some((index, delimiter_len)) = boundary else {
-        return Ok(None);
-    };
-    let frame = buffer.drain(..index).collect::<Vec<_>>();
-    buffer.drain(..delimiter_len);
-    String::from_utf8(frame)
-        .context("Codex SSE event is not valid UTF-8")
-        .map(Some)
 }
 
 fn error_message(body: &str) -> String {
@@ -1273,45 +602,6 @@ fn normalize_rate_limit_window(window: Option<&Value>) -> Value {
     })
 }
 
-fn merge_rate_limits(current: &mut Vec<Value>, updates: Vec<Value>) {
-    for update in updates {
-        let limit_id = update
-            .get("limit_id")
-            .and_then(Value::as_str)
-            .unwrap_or("codex");
-        if let Some(existing) = current.iter_mut().find(|snapshot| {
-            snapshot
-                .get("limit_id")
-                .and_then(Value::as_str)
-                .unwrap_or("codex")
-                == limit_id
-        }) {
-            merge_json(existing, update);
-        } else {
-            current.push(update);
-        }
-    }
-}
-
-fn merge_json(current: &mut Value, update: Value) {
-    match (current, update) {
-        (Value::Object(current), Value::Object(update)) => {
-            for (key, value) in update {
-                if value.is_null() {
-                    continue;
-                }
-                if let Some(current) = current.get_mut(&key) {
-                    merge_json(current, value);
-                } else {
-                    current.insert(key, value);
-                }
-            }
-        }
-        (current, update) if !update.is_null() => *current = update,
-        _ => {}
-    }
-}
-
 fn rate_limit_headers(headers: &HeaderMap) -> Vec<Value> {
     let number = |name: &str| {
         headers
@@ -1383,735 +673,4 @@ fn rate_limit_headers(headers: &HeaderMap) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn sse_failure(event: &Value) -> anyhow::Error {
-    let error = event
-        .pointer("/response/error")
-        .or_else(|| event.get("error"))
-        .unwrap_or(event);
-    let message = error
-        .get("message")
-        .or_else(|| event.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown error");
-    let code = error
-        .get("code")
-        .or_else(|| error.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let status = error
-        .get("status")
-        .or_else(|| error.get("status_code"))
-        .and_then(Value::as_u64)
-        .and_then(|status| u16::try_from(status).ok())
-        .and_then(|status| StatusCode::from_u16(status).ok());
-    let retryable = status.is_some_and(retryable_status)
-        || matches!(
-            code,
-            "server_error"
-                | "internal_server_error"
-                | "rate_limit_exceeded"
-                | "overloaded"
-                | "service_unavailable"
-                | "timeout"
-        );
-    let error = anyhow::anyhow!("Codex response failed: {message}");
-    if retryable {
-        RetryableStreamError(error).into()
-    } else {
-        error
-    }
-}
-
-fn backoff(attempt: u64) -> Duration {
-    let base_ms = 200.0 * 2.0_f64.powi(attempt.saturating_sub(1) as i32);
-    Duration::from_millis((base_ms * rand::rng().random_range(0.9..1.1)) as u64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn function_call_requires_call_id() {
-        let error = response_from_item(&json!({
-            "type": "function_call",
-            "name": "question",
-            "arguments": "{}"
-        }))
-        .unwrap_err();
-
-        assert!(error.to_string().contains("has no call_id"));
-    }
-
-    #[test]
-    fn completion_request_contains_exact_context_and_omits_observer_events() {
-        let events = vec![
-            Event {
-                sequence: atra_protocol::EventSequence(0),
-                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
-                    content: "hello".to_owned(),
-                }),
-            },
-            Event {
-                sequence: atra_protocol::EventSequence(1),
-                data: ThreadEventData::ModelRequest(atra_protocol::ModelRequestEvent {
-                    kind: atra_protocol::ModelRequestKind::Response,
-                    context_window: None,
-                }),
-            },
-        ];
-        let tools = crate::tools::model_tools(true);
-        let request = completion_request(&ModelRequest {
-            model: "model",
-            reasoning_effort: "medium",
-            instructions: super::super::BASE_INSTRUCTIONS,
-            tools: &tools,
-            events: &events,
-            prompt_cache_key: "cache",
-        })
-        .unwrap();
-        assert_eq!(request["model"], "model");
-        assert_eq!(request["input"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            request.pointer("/input/0/content/0/text"),
-            Some(&json!("hello"))
-        );
-    }
-
-    #[test]
-    fn skill_invocation_is_sent_as_user_context_before_the_request() {
-        let events = vec![
-            Event {
-                sequence: atra_protocol::EventSequence(0),
-                data: ThreadEventData::SkillInvocation(atra_protocol::SkillInvocationEvent {
-                    name: "review-code".to_owned(),
-                    path: "$ATRA_SKILLS/review-code/SKILL.md".to_owned(),
-                    instructions: "Review carefully.".to_owned(),
-                }),
-            },
-            Event {
-                sequence: atra_protocol::EventSequence(1),
-                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
-                    content: "$review-code inspect this".to_owned(),
-                }),
-            },
-        ];
-
-        let input = model_input(&events).unwrap();
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["role"], "user");
-        assert!(
-            input[0]
-                .pointer("/content/0/text")
-                .and_then(serde_json::Value::as_str)
-                .unwrap()
-                .contains("Review carefully.")
-        );
-        assert_eq!(
-            input[1].pointer("/content/0/text"),
-            Some(&json!("$review-code inspect this"))
-        );
-    }
-
-    #[test]
-    fn thread_context_survives_compaction() {
-        let events = vec![
-            Event {
-                sequence: atra_protocol::EventSequence(0),
-                data: ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
-                    content: "Thread context:\n- position: root (thread 1)".to_owned(),
-                }),
-            },
-            Event {
-                sequence: atra_protocol::EventSequence(1),
-                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
-                    items: serde_json::to_value(ProviderOutput {
-                        provider: PROVIDER_ID.to_owned(),
-                        data: json!([]),
-                    })
-                    .unwrap(),
-                    checkpoint_id: atra_protocol::CheckpointId(1),
-                }),
-            },
-            Event {
-                sequence: atra_protocol::EventSequence(2),
-                data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
-                    content: "continue".to_owned(),
-                }),
-            },
-        ];
-
-        let input = model_input(&events).unwrap();
-        assert_eq!(
-            input[0].pointer("/content/0/text"),
-            Some(&json!("Thread context:\n- position: root (thread 1)"))
-        );
-        assert_eq!(
-            input[1].pointer("/content/0/text"),
-            Some(&json!("continue"))
-        );
-    }
-
-    #[test]
-    fn compaction_request_uses_responses_v2_trigger() {
-        let events = vec![Event {
-            sequence: atra_protocol::EventSequence(0),
-            data: ThreadEventData::UserMessage(atra_protocol::MessageEvent {
-                content: "hello".to_owned(),
-            }),
-        }];
-        let tools = crate::tools::model_tools(true);
-        let request = compaction_request(&ModelRequest {
-            model: "model",
-            reasoning_effort: "medium",
-            instructions: super::super::BASE_INSTRUCTIONS,
-            tools: &tools,
-            events: &events,
-            prompt_cache_key: "cache",
-        })
-        .unwrap();
-
-        assert_eq!(
-            request["input"].as_array().unwrap().last(),
-            Some(&json!({"type": "compaction_trigger"}))
-        );
-        assert_eq!(request["stream"], true);
-        assert_eq!(request["store"], false);
-        assert_eq!(request["parallel_tool_calls"], true);
-    }
-
-    #[test]
-    fn sse_frame_waits_for_complete_utf8_data() {
-        let event = "data: {\"delta\":\"日本語\"}";
-        let bytes = event.as_bytes();
-        let split = bytes
-            .windows("日".len())
-            .position(|window| window == "日".as_bytes())
-            .unwrap()
-            + 1;
-        let mut buffer = bytes[..split].to_vec();
-
-        assert!(next_sse_frame(&mut buffer).unwrap().is_none());
-        buffer.extend_from_slice(&bytes[split..]);
-        buffer.extend_from_slice(b"\r\n\r\n");
-
-        assert_eq!(next_sse_frame(&mut buffer).unwrap().as_deref(), Some(event));
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn sse_frame_keeps_following_frames_buffered() {
-        let mut buffer = b"data: one\n\ndata: two\n\n".to_vec();
-
-        assert_eq!(
-            next_sse_frame(&mut buffer).unwrap().as_deref(),
-            Some("data: one")
-        );
-        assert_eq!(
-            next_sse_frame(&mut buffer).unwrap().as_deref(),
-            Some("data: two")
-        );
-        assert!(next_sse_frame(&mut buffer).unwrap().is_none());
-    }
-
-    #[test]
-    fn stream_retry_requires_retryable_error_before_output() {
-        let retryable = anyhow::Error::new(RetryableStreamError(anyhow::anyhow!("disconnected")));
-        let permanent = anyhow::anyhow!("invalid SSE");
-
-        assert!(should_retry_stream(&retryable, false, 0));
-        assert!(!should_retry_stream(&retryable, true, 0));
-        assert!(!should_retry_stream(&retryable, false, STREAM_MAX_RETRIES));
-        assert!(!should_retry_stream(&permanent, false, 0));
-        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
-        assert!(retryable_status(StatusCode::BAD_GATEWAY));
-        assert!(!retryable_status(StatusCode::BAD_REQUEST));
-        assert!(!retryable_status(StatusCode::UNAUTHORIZED));
-    }
-
-    #[test]
-    fn completed_response_requires_assistant_message_or_tool_call() {
-        let error = ensure_completed_response(false).unwrap_err();
-
-        assert!(error.to_string().contains("without an assistant message"));
-        ensure_completed_response(true).unwrap();
-    }
-
-    #[test]
-    fn raw_usage_windows_are_normalized_and_disabled_windows_stay_null() {
-        let snapshots = rate_limit_snapshots(&json!({
-            "rate_limit": {
-                "primary_window": null,
-                "secondary_window": {
-                    "used_percent": 37.5,
-                    "limit_window_seconds": 7 * 24 * 60 * 60,
-                    "reset_at": 2_000_000_000
-                }
-            }
-        }));
-
-        assert_eq!(snapshots.len(), 1);
-        assert!(snapshots[0]["primary"].is_null());
-        assert_eq!(
-            snapshots[0]["secondary"],
-            json!({
-                "used_percent": 37.5,
-                "window_minutes": 7 * 24 * 60,
-                "resets_at": 2_000_000_000
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limits_after_completion_are_still_processed() {
-        let (sender, mut receiver) = mpsc::channel(4);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-        let mut has_response = false;
-
-        let completed = handle_sse_event(
-            json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "message",
-                    "id": "message-1",
-                    "role": "assistant",
-                    "phase": "final_answer",
-                    "content": [{"type": "output_text", "text": "done"}]
-                }
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut None,
-        )
-        .await
-        .unwrap();
-        assert!(!completed);
-        assert!(has_response);
-        assert!(receiver.recv().await.unwrap().is_ok());
-
-        let completed = handle_sse_event(
-            json!({"type": "response.completed", "response": {"id": "response-1"}}),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut None,
-        )
-        .await
-        .unwrap();
-        assert!(completed);
-
-        let completed = handle_sse_event(
-            json!({
-                "type": "codex.rate_limits",
-                "rate_limits": [{
-                    "limit_id": "codex",
-                    "primary": {"used_percent": 42}
-                }]
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut None,
-        )
-        .await
-        .unwrap();
-        assert!(!completed);
-        assert_eq!(rate_limits[0]["primary"]["used_percent"], 42);
-    }
-
-    #[tokio::test]
-    async fn assistant_deltas_keep_the_output_item_phase() {
-        let (sender, mut receiver) = mpsc::channel(2);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-        let mut has_response = false;
-        let mut assistant_phase = None;
-
-        handle_sse_event(
-            json!({
-                "type": "response.output_item.added",
-                "item": {"type": "message", "phase": "commentary"}
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut assistant_phase,
-        )
-        .await
-        .unwrap();
-        handle_sse_event(
-            json!({"type": "response.output_text.delta", "delta": "working"}),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut assistant_phase,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            receiver.recv().await,
-            Some(Ok(ModelEvent::Update(ModelStreamEvent::AssistantDelta {
-                content,
-                phase: AssistantMessagePhase::Commentary,
-            }))) if content == "working"
-        ));
-    }
-
-    #[tokio::test]
-    async fn reasoning_summary_part_boundary_is_streamed() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-        let mut has_response = false;
-
-        let completed = handle_sse_event(
-            json!({"type": "response.reasoning_summary_part.added"}),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut None,
-        )
-        .await
-        .unwrap();
-
-        assert!(!completed);
-        assert!(emitted);
-        assert!(matches!(
-            receiver.recv().await.unwrap().unwrap(),
-            ModelEvent::Update(ModelStreamEvent::ReasoningSummaryPartAdded)
-        ));
-    }
-
-    #[tokio::test]
-    async fn completed_response_usage_is_normalized() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-        let mut has_response = false;
-
-        let completed = handle_sse_event(
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "response-1",
-                    "usage": {
-                        "input_tokens": 6567,
-                        "input_tokens_details": {
-                            "cached_tokens": 3456,
-                            "cache_write_tokens": 12
-                        },
-                        "output_tokens": 17,
-                        "output_tokens_details": {"reasoning_tokens": 4},
-                        "total_tokens": 6584
-                    }
-                }
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut has_response,
-            &mut None,
-        )
-        .await
-        .unwrap();
-
-        assert!(completed);
-        assert_eq!(
-            token_usage,
-            Some(json!({
-                "input_tokens": 6567,
-                "cached_input_tokens": 3456,
-                "cache_write_input_tokens": 12,
-                "output_tokens": 17,
-                "reasoning_output_tokens": 4,
-                "total_tokens": 6584
-            }))
-        );
-    }
-
-    #[tokio::test]
-    async fn transient_sse_failure_is_retryable() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-
-        let error = handle_sse_event(
-            json!({
-                "type": "response.failed",
-                "response": {
-                    "error": {
-                        "code": "server_error",
-                        "message": "try again"
-                    }
-                }
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut false,
-            &mut None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<RetryableStreamError>().is_some());
-        assert!(should_retry_stream(&error, emitted, 0));
-    }
-
-    #[tokio::test]
-    async fn invalid_request_sse_failure_is_not_retryable() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-
-        let error = handle_sse_event(
-            json!({
-                "type": "response.failed",
-                "response": {
-                    "error": {
-                        "code": "invalid_request_error",
-                        "message": "bad input"
-                    }
-                }
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut false,
-            &mut None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<RetryableStreamError>().is_none());
-        assert!(!should_retry_stream(&error, emitted, 0));
-    }
-
-    #[test]
-    fn rate_limit_headers_include_all_series_and_preserve_cached_fields() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-codex-primary-used-percent", "12".parse().unwrap());
-        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
-        headers.insert("x-codex-primary-reset-at", "2000000000".parse().unwrap());
-        headers.insert("x-codex-credits-balance", "4.5".parse().unwrap());
-        headers.insert(
-            "x-codex-research-primary-used-percent",
-            "34".parse().unwrap(),
-        );
-
-        let updates = rate_limit_headers(&headers);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(
-            updates
-                .iter()
-                .find(|value| value["limit_id"] == "codex")
-                .and_then(|value| value.pointer("/credits/balance")),
-            Some(&json!(4.5))
-        );
-        assert_eq!(
-            updates
-                .iter()
-                .find(|value| value["limit_id"] == "research")
-                .and_then(|value| value.pointer("/primary/used_percent")),
-            Some(&json!(34.0))
-        );
-        assert!(
-            updates
-                .iter()
-                .all(|value| value.get("secondary").is_some_and(Value::is_null))
-        );
-        assert_eq!(
-            updates
-                .iter()
-                .find(|value| value["limit_id"] == "codex")
-                .and_then(|value| value.pointer("/primary/resets_at")),
-            Some(&json!(2_000_000_000.0))
-        );
-
-        let mut cached = vec![json!({
-            "limit_id": "codex",
-            "primary": {"used_percent": 1.0},
-            "credits": {"balance": 9.0},
-            "plan_type": "pro"
-        })];
-        merge_rate_limits(
-            &mut cached,
-            vec![json!({
-                "limit_id": "codex",
-                "primary": {"used_percent": 12.0},
-                "credits": null,
-                "plan_type": null
-            })],
-        );
-        assert_eq!(
-            cached[0].pointer("/primary/used_percent"),
-            Some(&json!(12.0))
-        );
-        assert_eq!(cached[0].pointer("/credits/balance"), Some(&json!(9.0)));
-        assert_eq!(cached[0]["plan_type"], "pro");
-    }
-
-    #[tokio::test]
-    async fn dropped_receiver_stops_sse_handling() {
-        let (sender, receiver) = mpsc::channel(1);
-        drop(receiver);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-        let mut assistant_phase = Some(AssistantMessagePhase::FinalAnswer);
-
-        let error = handle_sse_event(
-            json!({"type": "response.output_text.delta", "delta": "hello"}),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut false,
-            &mut assistant_phase,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("receiver dropped"));
-        assert!(emitted);
-    }
-
-    #[tokio::test]
-    async fn completed_web_search_emits_final_action_before_output() {
-        let (sender, mut receiver) = mpsc::channel(2);
-        let mut response_id = None;
-        let mut token_usage = None;
-        let mut rate_limits = Vec::new();
-        let mut emitted = false;
-
-        handle_sse_event(
-            json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "web_search_call",
-                    "id": "search-1",
-                    "status": "completed",
-                    "action": {"type": "search", "query": "atra"}
-                }
-            }),
-            &sender,
-            &mut response_id,
-            &mut token_usage,
-            &mut rate_limits,
-            &mut emitted,
-            &mut false,
-            &mut None,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            receiver.recv().await.unwrap().unwrap(),
-            ModelEvent::Update(ModelStreamEvent::WebSearchUpdate { .. })
-        ));
-        assert!(matches!(
-            receiver.recv().await.unwrap().unwrap(),
-            ModelEvent::OutputItemDone { .. }
-        ));
-    }
-
-    #[test]
-    fn assistant_messages_require_a_known_phase() {
-        let message = |phase: Option<&str>| {
-            let mut item = json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "done"}]
-            });
-            if let Some(phase) = phase {
-                item["phase"] = json!(phase);
-            }
-            item
-        };
-
-        let missing = response_from_item(&message(None)).unwrap_err();
-        assert!(missing.to_string().contains("without a phase"));
-
-        let unknown = response_from_item(&message(Some("other"))).unwrap_err();
-        assert!(
-            unknown
-                .to_string()
-                .contains("unknown assistant message phase")
-        );
-
-        assert!(matches!(
-            response_from_item(&message(Some("final_answer"))).unwrap(),
-            Some(ModelResponse::AssistantMessage {
-                phase: atra_protocol::AssistantMessagePhase::FinalAnswer,
-                ..
-            })
-        ));
-    }
-}
-#[test]
-fn codex_prefers_the_command_custom_interface() {
-    let definitions = tool_definitions(&crate::tools::model_tools(true));
-    let command = definitions
-        .iter()
-        .find(|definition| definition["name"] == "command")
-        .unwrap();
-
-    assert_eq!(command["type"], "custom");
-    assert_eq!(command["format"]["syntax"], "lark");
-    assert!(
-        command["description"]
-            .as_str()
-            .unwrap()
-            .contains("*** Runner")
-    );
-    assert_eq!(
-        definitions
-            .iter()
-            .find(|definition| definition["name"] == "question")
-            .unwrap()["type"],
-        "function"
-    );
 }

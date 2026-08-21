@@ -56,13 +56,9 @@ enum Command {
         #[command(subcommand)]
         command: PlatformCommand,
     },
-    Codex {
+    Provider {
         #[command(subcommand)]
-        command: CodexCommand,
-    },
-    Ollama {
-        #[command(subcommand)]
-        command: OllamaCommand,
+        command: ProviderCommand,
     },
     Tui,
 }
@@ -85,17 +81,11 @@ enum WorkspaceCommand {
 }
 
 #[derive(Subcommand)]
-enum CodexCommand {
-    Login,
-    Logout,
-    Status,
-}
-
-#[derive(Subcommand)]
-enum OllamaCommand {
-    Login,
-    Logout,
-    Status,
+enum ProviderCommand {
+    List,
+    Login { provider: String },
+    Logout { provider: String },
+    Status { provider: String },
 }
 
 #[derive(Subcommand)]
@@ -339,127 +329,128 @@ async fn run(command: Command) -> Result<()> {
     let endpoint = workspace::endpoint(&workspace_id)?;
 
     match command {
-        Command::Codex {
-            command: CodexCommand::Login,
+        Command::Provider {
+            command: ProviderCommand::Login { provider },
         } => {
-            atra_controller::codex_login(&provider_auth_home()?.join("codex")).await?;
+            let auth_home = provider_auth_home()?;
+            let credential =
+                match atra_controller::provider_auth_method(&auth_home, &provider).await? {
+                    atra_protocol::ProviderAuthMethod::None => None,
+                    atra_protocol::ProviderAuthMethod::Browser => None,
+                    atra_protocol::ProviderAuthMethod::ApiKey => {
+                        Some(rpassword::prompt_password(format!("{provider} API key: "))?)
+                    }
+                };
             match wait_provider_command(
                 &endpoint,
-                "codex",
-                StateCommand::ProviderReloadAuth {
-                    provider: "codex".to_owned(),
-                },
-            )
-            .await
-            {
-                Ok(ProviderLifecycle::LoggedIn { .. }) => {}
-                Ok(status) => bail!("Codex login ended in state {status:?}"),
-                Err(error) if controller_not_running(&error) => {}
-                Err(error) => return Err(error),
-            }
-            println!("logged in");
-            Ok(())
-        }
-        Command::Codex {
-            command: CodexCommand::Logout,
-        } => {
-            match wait_provider_command(
-                &endpoint,
-                "codex",
-                StateCommand::ProviderLogout {
-                    provider: "codex".to_owned(),
-                },
-            )
-            .await
-            {
-                Ok(ProviderLifecycle::LoggedOut | ProviderLifecycle::LoginRequired) => {}
-                Ok(status) => bail!("Codex logout ended in state {status:?}"),
-                Err(error) if controller_not_running(&error) => {
-                    atra_controller::codex_logout(&provider_auth_home()?.join("codex")).await?;
-                }
-                Err(error) => return Err(error),
-            }
-            println!("logged out");
-            Ok(())
-        }
-        Command::Codex {
-            command: CodexCommand::Status,
-        } => match provider_lifecycle(&endpoint, "codex").await? {
-            ProviderLifecycle::LoggedIn { account } => {
-                println!(
-                    "logged in{}",
-                    account
-                        .map(|account| format!(" as {account}"))
-                        .unwrap_or_default()
-                );
-                Ok(())
-            }
-            ProviderLifecycle::LoggedOut | ProviderLifecycle::LoginRequired => {
-                println!("logged out");
-                Ok(())
-            }
-            status => bail!("Codex provider is in state {status:?}"),
-        },
-        Command::Ollama {
-            command: OllamaCommand::Login,
-        } => {
-            let api_key = rpassword::prompt_password("Ollama API key: ")?;
-            match wait_provider_command(
-                &endpoint,
-                "ollama",
+                &provider,
                 StateCommand::ProviderLogin {
-                    provider: "ollama".to_owned(),
-                    credential: Some(api_key.clone()),
+                    provider: provider.clone(),
+                    credential: credential.clone(),
                 },
             )
             .await
             {
                 Ok(ProviderLifecycle::LoggedIn { .. }) => {}
-                Ok(status) => bail!("Ollama login ended in state {status:?}"),
+                Ok(status) => bail!("{provider} login ended in state {status:?}"),
                 Err(error) if controller_not_running(&error) => {
-                    atra_controller::ollama_login(&provider_auth_home()?.join("ollama"), api_key)
-                        .await?;
+                    atra_controller::provider_login(&auth_home, &provider, credential).await?;
                 }
                 Err(error) => return Err(error),
             }
-            println!("logged in");
+            println!("logged in to {provider}");
             Ok(())
         }
-        Command::Ollama {
-            command: OllamaCommand::Logout,
+        Command::Provider {
+            command: ProviderCommand::Logout { provider },
         } => {
             match wait_provider_command(
                 &endpoint,
-                "ollama",
+                &provider,
                 StateCommand::ProviderLogout {
-                    provider: "ollama".to_owned(),
+                    provider: provider.clone(),
                 },
             )
             .await
             {
                 Ok(ProviderLifecycle::LoggedOut | ProviderLifecycle::LoginRequired) => {}
-                Ok(status) => bail!("Ollama logout ended in state {status:?}"),
+                Ok(ProviderLifecycle::LoggedIn { .. }) => {
+                    println!(
+                        "{provider}: file credential removed; environment credential remains active"
+                    );
+                    return Ok(());
+                }
+                Ok(status) => bail!("{provider} logout ended in state {status:?}"),
                 Err(error) if controller_not_running(&error) => {
-                    atra_controller::ollama_logout(&provider_auth_home()?.join("ollama")).await?;
+                    let auth_home = provider_auth_home()?;
+                    atra_controller::provider_logout(&auth_home, &provider).await?;
+                    let (lifecycle, _) =
+                        atra_controller::provider_status(&auth_home, &provider).await?;
+                    if matches!(lifecycle, ProviderLifecycle::LoggedIn { .. }) {
+                        println!(
+                            "{provider}: file credential removed; environment credential remains active"
+                        );
+                        return Ok(());
+                    }
                 }
                 Err(error) => return Err(error),
             }
-            println!("logged out");
+            println!("logged out of {provider}");
             Ok(())
         }
-        Command::Ollama {
-            command: OllamaCommand::Status,
-        } => match provider_lifecycle(&endpoint, "ollama").await? {
-            ProviderLifecycle::LoggedIn { .. } => {
-                println!("logged in");
-                Ok(())
+        Command::Provider {
+            command: ProviderCommand::Status { provider },
+        } => {
+            let (lifecycle, source) = match provider_snapshot(&endpoint, &provider).await {
+                Ok(state) => (state.lifecycle().clone(), state.credential_source()),
+                Err(error) if controller_not_running(&error) => {
+                    atra_controller::provider_status(&provider_auth_home()?, &provider).await?
+                }
+                Err(error) => return Err(error),
+            };
+            print_provider_status(&provider, &lifecycle, source);
+            Ok(())
+        }
+        Command::Provider {
+            command: ProviderCommand::List,
+        } => {
+            let providers = match client(&endpoint).subscribe_controller().await {
+                Ok(subscription) => subscription.state().providers().to_vec(),
+                Err(error) if controller_not_running(&error) => {
+                    atra_controller::provider_states(&provider_auth_home()?).await?
+                }
+                Err(error) => return Err(error),
+            };
+            for provider in &providers {
+                println!(
+                    "{}\tauth={:?}\tstatus={:?}\tsource={:?}\tmodels={}",
+                    provider.id(),
+                    provider.auth_method(),
+                    provider.lifecycle(),
+                    provider.credential_source(),
+                    provider.models().len()
+                );
+                for model in provider.models() {
+                    println!(
+                        "  {}\t{}\treasoning=[{}]\ttools=[{}]\tcontext={}",
+                        model.id,
+                        model.display_name,
+                        model.supported_reasoning_efforts.join(","),
+                        model
+                            .tool_bindings
+                            .iter()
+                            .map(|binding| format!("{}={}", binding.tool, binding.implementation))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        model
+                            .context_window
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned())
+                    );
+                }
             }
-            ProviderLifecycle::LoggedOut | ProviderLifecycle::LoginRequired => {
-                println!("logged out");
-                Ok(())
-            }
-            status => bail!("Ollama provider is in state {status:?}"),
-        },
+            Ok(())
+        }
         Command::Platform { .. } => {
             unreachable!("platform commands are handled before workspace setup")
         }
@@ -1012,14 +1003,40 @@ fn expect_accepted(result: CommandResult) -> Result<()> {
     }
 }
 
-async fn provider_lifecycle(endpoint: &Path, provider_id: &str) -> Result<ProviderLifecycle> {
+fn print_provider_status(
+    provider: &str,
+    lifecycle: &ProviderLifecycle,
+    source: Option<atra_protocol::CredentialSource>,
+) {
+    match lifecycle {
+        ProviderLifecycle::LoggedIn { account } => println!(
+            "{provider}: logged in{}{}",
+            account
+                .as_ref()
+                .map(|account| format!(" as {account}"))
+                .unwrap_or_default(),
+            source
+                .map(|source| format!(" ({source:?})"))
+                .unwrap_or_default()
+        ),
+        ProviderLifecycle::LoggedOut | ProviderLifecycle::LoginRequired => {
+            println!("{provider}: logged out")
+        }
+        status => println!("{provider}: {status:?}"),
+    }
+}
+
+async fn provider_snapshot(
+    endpoint: &Path,
+    provider_id: &str,
+) -> Result<atra_protocol::ProviderState> {
     let subscription = client(endpoint).subscribe_controller().await?;
     subscription
         .state()
         .providers()
         .iter()
         .find(|provider| provider.id() == provider_id)
-        .map(|provider| provider.lifecycle().clone())
+        .cloned()
         .with_context(|| format!("provider {provider_id} is not available"))
 }
 

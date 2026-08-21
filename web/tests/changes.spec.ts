@@ -21,6 +21,8 @@ function snapshots() {
         thread_statuses: [{ thread_id: 1, status: "idle" }],
         providers: [{
           id: "fake",
+          auth_method: "none",
+          credential_source: null,
           lifecycle: { status: "logged_in", account: null },
           models: [{
             provider: "fake",
@@ -28,7 +30,8 @@ function snapshots() {
             display_name: "Test Model",
             description: null,
             default_reasoning_effort: "medium",
-            supported_reasoning_efforts: ["medium"]
+            supported_reasoning_efforts: ["medium"],
+            tool_bindings: []
           }],
           rate_limits: null
         }],

@@ -59,6 +59,13 @@ pub(super) struct AuthManager {
 }
 
 impl AuthManager {
+    pub(super) fn credential_source(&self) -> Option<atra_protocol::CredentialSource> {
+        self.home
+            .join("auth.json")
+            .is_file()
+            .then_some(atra_protocol::CredentialSource::File)
+    }
+
     pub(super) async fn new(home: PathBuf) -> Self {
         let tokens = match read_tokens(&home) {
             Ok(tokens) => tokens,
@@ -127,7 +134,7 @@ impl AuthManager {
             .read()
             .await
             .clone()
-            .context("Codex login required; run `atra codex login`")?;
+            .context("Codex login required; run `atra provider login codex`")?;
         #[derive(Deserialize)]
         struct Response {
             id_token: Option<String>,

@@ -557,13 +557,7 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                 .collect(),
         )),
         ThreadEventData::Reasoning(reasoning) => {
-            let summary = reasoning.item.pointer("/summary")?.as_array()?;
-            let text = summary
-                .iter()
-                .filter_map(|part| part.get("text")?.as_str())
-                .map(sanitize)
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let text = sanitize(&reasoning.summary);
             (!text.is_empty()).then_some(TranscriptItem::ReasoningSummary { text })
         }
         ThreadEventData::WebSearch(search) => Some(TranscriptItem::WebSearch {
@@ -643,7 +637,6 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
         | ThreadEventData::Skills(_)
         | ThreadEventData::Runners(_)
         | ThreadEventData::FrozenBoundary(_)
-        | ThreadEventData::ModelOutput(_)
         | ThreadEventData::ModelRequest(_)
         | ThreadEventData::TokenUsage(_)
         | ThreadEventData::RateLimits(_) => None,

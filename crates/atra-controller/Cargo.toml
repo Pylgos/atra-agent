@@ -17,6 +17,7 @@ base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 http.workspace = true
+htmd.workspace = true
 indoc.workspace = true
 rand.workspace = true
 reqwest.workspace = true

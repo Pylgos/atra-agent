@@ -29,10 +29,27 @@ pub enum ProviderLifecycle {
     Failed { message: String },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthMethod {
+    None,
+    Browser,
+    ApiKey,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    Environment,
+    File,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderState {
     id: String,
+    auth_method: ProviderAuthMethod,
+    credential_source: Option<CredentialSource>,
     lifecycle: ProviderLifecycle,
     models: Vec<Model>,
     rate_limits: Option<Value>,
@@ -41,12 +58,16 @@ pub struct ProviderState {
 impl ProviderState {
     pub fn new(
         id: String,
+        auth_method: ProviderAuthMethod,
+        credential_source: Option<CredentialSource>,
         lifecycle: ProviderLifecycle,
         models: Vec<Model>,
         rate_limits: Option<Value>,
     ) -> Self {
         Self {
             id,
+            auth_method,
+            credential_source,
             lifecycle,
             models,
             rate_limits,
@@ -59,6 +80,14 @@ impl ProviderState {
 
     pub fn lifecycle(&self) -> &ProviderLifecycle {
         &self.lifecycle
+    }
+
+    pub fn auth_method(&self) -> ProviderAuthMethod {
+        self.auth_method
+    }
+
+    pub fn credential_source(&self) -> Option<CredentialSource> {
+        self.credential_source
     }
 
     pub fn models(&self) -> &[Model] {

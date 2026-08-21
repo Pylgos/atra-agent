@@ -1506,7 +1506,9 @@ mod tests {
             .replace_with_compaction(
                 source,
                 CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: checkpoint,
                 },
                 None,
@@ -1547,7 +1549,9 @@ mod tests {
             .replace_with_compaction(
                 source,
                 CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: second_checkpoint,
                 },
                 None,
@@ -1619,7 +1623,9 @@ mod tests {
             .replace_with_compaction(
                 thread,
                 CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: first,
                 },
                 None,
@@ -1636,7 +1642,9 @@ mod tests {
             .replace_with_compaction(
                 thread,
                 CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: second,
                 },
                 None,
@@ -1646,7 +1654,9 @@ mod tests {
             .await
             .unwrap();
         let cycle = serde_json::to_string(&CompactionEvent {
-            items: serde_json::json!([]),
+            replacement: atra_protocol::CompactionReplacement::Summary {
+                content: "summary".to_owned(),
+            },
             checkpoint_id: second,
         })
         .unwrap();
@@ -1692,7 +1702,9 @@ mod tests {
             .append(
                 thread,
                 ThreadEventData::Compaction(CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: checkpoint,
                 }),
             )
@@ -1713,7 +1725,9 @@ mod tests {
             .append(
                 thread,
                 ThreadEventData::Compaction(CompactionEvent {
-                    items: serde_json::json!([]),
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
                     checkpoint_id: CheckpointId(999),
                 }),
             )

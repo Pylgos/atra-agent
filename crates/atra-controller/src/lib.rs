@@ -8,17 +8,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use atra_patch::ApplyPatchResult;
 use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
     CommandExecutionArtifact, CommandOutput, CommandTimerState, CompactionEvent, EventSequence,
     FrozenBoundaryEvent, InstructionEvent, InteractionId, ItemEvent, MAX_COMMAND_OUTPUT_BYTES,
-    MessageEvent, ModelOutputEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId,
-    ProcessStatus, RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact,
-    RunnerOperationUpdate, RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId,
-    TodoItem, TodoStatus, TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
+    MessageEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, ProcessStatus,
+    RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
+    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
+    TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -48,7 +48,7 @@ mod views;
 
 use commands::TurnProjector;
 use lifecycle::TurnLifecycle;
-use model::{ModelProvider, ModelResponse, ModelStreamEvent};
+use model::{ModelResponse, ModelStreamEvent, Provider, ProviderRegistry};
 use runner::{CommandOutcome, Runner, RunnerConfig};
 use runner_client::{
     CallbackEvent, PrepareTreeResult, ProcessSubscription, RunnerClient, WaitOutcome,
@@ -65,23 +65,55 @@ const MINIMUM_FULL_RESULT_REQUESTS: usize = 3;
 const MASK_OUTPUT_LINES: usize = 8;
 const MASK_OUTPUT_SIDE_BYTES: usize = 4 * 1024;
 
-pub async fn codex_login(auth_home: &Path) -> Result<()> {
-    model::codex_auth::login(auth_home).await
+pub async fn provider_auth_method(
+    auth_home: &Path,
+    provider: &str,
+) -> Result<atra_protocol::ProviderAuthMethod> {
+    Ok(ProviderRegistry::load(auth_home)
+        .await?
+        .get(provider)?
+        .auth_method())
 }
 
-pub async fn codex_logout(auth_home: &Path) -> Result<()> {
-    model::codex_auth::logout(auth_home).await
-}
-
-pub async fn ollama_login(auth_home: &Path, api_key: String) -> Result<()> {
-    let provider = model::ollama(auth_home.to_owned());
-    provider.login(Some(api_key)).await?;
+pub async fn provider_login(
+    auth_home: &Path,
+    provider: &str,
+    credential: Option<String>,
+) -> Result<()> {
+    ProviderRegistry::load(auth_home)
+        .await?
+        .get(provider)?
+        .login(credential)
+        .await?;
     Ok(())
 }
 
-pub async fn ollama_logout(auth_home: &Path) -> Result<()> {
-    let provider = model::ollama(auth_home.to_owned());
-    provider.logout().await
+pub async fn provider_logout(auth_home: &Path, provider: &str) -> Result<()> {
+    ProviderRegistry::load(auth_home)
+        .await?
+        .get(provider)?
+        .logout()
+        .await
+}
+
+pub async fn provider_status(
+    auth_home: &Path,
+    provider: &str,
+) -> Result<(
+    atra_protocol::ProviderLifecycle,
+    Option<atra_protocol::CredentialSource>,
+)> {
+    let registry = ProviderRegistry::load(auth_home).await?;
+    let provider = registry.get(provider)?;
+    let lifecycle = match provider.login_status().await? {
+        model::ProviderLoginStatus::LoginRequired => {
+            atra_protocol::ProviderLifecycle::LoginRequired
+        }
+        model::ProviderLoginStatus::LoggedIn(account) => {
+            atra_protocol::ProviderLifecycle::LoggedIn { account }
+        }
+    };
+    Ok((lifecycle, provider.credential_source()))
 }
 
 pub async fn run(
@@ -99,29 +131,7 @@ pub async fn run(
         "{:x}",
         Sha256::digest(database.as_os_str().as_encoded_bytes())
     );
-    let (providers, default_provider): (HashMap<String, Arc<dyn ModelProvider>>, String) =
-        match env::var_os("ATRA_FAKE_MODEL_SCRIPT") {
-            Some(path) => {
-                let provider = model::fake(Path::new(&path))?;
-                (
-                    HashMap::from([(provider.id().to_owned(), provider)]),
-                    model::FAKE_PROVIDER.to_owned(),
-                )
-            }
-            None => {
-                let codex: Arc<dyn ModelProvider> =
-                    model::codex(provider_auth_home.join(model::CODEX_PROVIDER)).await;
-                let ollama: Arc<dyn ModelProvider> =
-                    model::ollama(provider_auth_home.join(model::OLLAMA_PROVIDER));
-                (
-                    HashMap::from([
-                        (codex.id().to_owned(), codex),
-                        (ollama.id().to_owned(), ollama),
-                    ]),
-                    model::CODEX_PROVIDER.to_owned(),
-                )
-            }
-        };
+    let providers = ProviderRegistry::load(provider_auth_home).await?;
     let platform = platform.map(Arc::new);
     let skill_store =
         AtraStore::open(data_home.join("atra")).context("failed to open skill object store")?;
@@ -169,7 +179,6 @@ pub async fn run(
         )),
         store,
         providers,
-        default_provider,
         turns: TurnLifecycle::new(),
         execution_contexts: Arc::new(StdMutex::new(HashMap::new())),
         skill_store,
@@ -240,11 +249,21 @@ pub async fn run(
     Ok(())
 }
 
+pub async fn provider_states(
+    provider_auth_home: &Path,
+) -> Result<Vec<atra_protocol::ProviderState>> {
+    let providers = ProviderRegistry::load(provider_auth_home).await?;
+    let mut states = Vec::with_capacity(providers.len());
+    for provider in providers.iter() {
+        states.push(provider_state(provider).await);
+    }
+    Ok(states)
+}
+
 pub(crate) struct State {
     runners: Arc<RunnerPool>,
     store: Store,
-    providers: HashMap<String, Arc<dyn ModelProvider>>,
-    default_provider: String,
+    providers: ProviderRegistry,
     turns: TurnLifecycle,
     execution_contexts: Arc<StdMutex<HashMap<String, ThreadId>>>,
     skill_store: AtraStore,
@@ -263,15 +282,14 @@ enum WorkspaceInstructions {
     Removed,
 }
 
-fn refreshing_provider_states(
-    providers: &HashMap<String, Arc<dyn ModelProvider>>,
-) -> Vec<atra_protocol::ProviderState> {
-    let mut ids = providers.keys().cloned().collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids.into_iter()
-        .map(|id| {
+fn refreshing_provider_states(providers: &ProviderRegistry) -> Vec<atra_protocol::ProviderState> {
+    providers
+        .iter()
+        .map(|provider| {
             atra_protocol::ProviderState::new(
-                id,
+                provider.id().to_owned(),
+                provider.auth_method(),
+                provider.credential_source(),
                 atra_protocol::ProviderLifecycle::Refreshing,
                 Vec::new(),
                 None,
@@ -280,16 +298,13 @@ fn refreshing_provider_states(
         .collect()
 }
 
-fn spawn_provider_refreshes(
-    providers: &HashMap<String, Arc<dyn ModelProvider>>,
-    views: &Arc<Views>,
-) {
-    for (id, provider) in providers {
-        let id = id.clone();
+fn spawn_provider_refreshes(providers: &ProviderRegistry, views: &Arc<Views>) {
+    for provider in providers.iter() {
+        let id = provider.id().to_owned();
         let provider = Arc::clone(provider);
         let views = Arc::clone(views);
         tokio::spawn(async move {
-            let provider = provider_state(&id, &provider).await;
+            let provider = provider_state(&provider).await;
             if let Err(error) = views
                 .apply_controller(atra_protocol::ControllerOperation::ProviderUpdated { provider })
                 .await
@@ -304,14 +319,11 @@ fn spawn_provider_refreshes(
     }
 }
 
-async fn provider_state(
-    id: &str,
-    provider: &Arc<dyn ModelProvider>,
-) -> atra_protocol::ProviderState {
+async fn provider_state(provider: &Arc<Provider>) -> atra_protocol::ProviderState {
     let (lifecycle, models, rate_limits) = match provider.login_status().await {
         Ok(model::ProviderLoginStatus::LoginRequired) => (
             atra_protocol::ProviderLifecycle::LoginRequired,
-            Vec::new(),
+            provider.models().await.unwrap_or_default(),
             None,
         ),
         Ok(model::ProviderLoginStatus::LoggedIn(account)) => match provider.models().await {
@@ -336,7 +348,14 @@ async fn provider_state(
             None,
         ),
     };
-    atra_protocol::ProviderState::new(id.to_owned(), lifecycle, models, rate_limits)
+    atra_protocol::ProviderState::new(
+        provider.id().to_owned(),
+        provider.auth_method(),
+        provider.credential_source(),
+        lifecycle,
+        models,
+        rate_limits,
+    )
 }
 
 async fn watch_process(
@@ -520,10 +539,8 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn provider(&self, id: &str) -> Result<&Arc<dyn ModelProvider>> {
-        self.providers
-            .get(id)
-            .with_context(|| format!("unknown model provider {id}"))
+    pub(crate) fn provider(&self, id: &str) -> Result<&Arc<Provider>> {
+        self.providers.get(id)
     }
 
     async fn start_managed_process(
@@ -797,9 +814,16 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ModelProvider for BlockingProvider {
+    impl model::ProviderRuntime for BlockingProvider {
         fn id(&self) -> &'static str {
             "blocking"
+        }
+        fn auth_method(&self) -> atra_protocol::ProviderAuthMethod {
+            atra_protocol::ProviderAuthMethod::None
+        }
+
+        fn credential_source(&self) -> Option<atra_protocol::CredentialSource> {
+            None
         }
 
         async fn models(&self) -> Result<Vec<Model>> {
@@ -812,6 +836,7 @@ mod tests {
                 supported_reasoning_efforts: vec!["medium".to_owned()],
                 context_window: None,
                 auto_compact_token_limit: None,
+                tool_bindings: Vec::new(),
             }])
         }
 
@@ -839,13 +864,18 @@ mod tests {
 
         async fn execute_tool(
             &self,
+            _model: &str,
             _name: &str,
             _arguments: &serde_json::Value,
         ) -> Result<Option<serde_json::Value>> {
             unreachable!("tools are not used by provider startup")
         }
 
-        async fn start_turn(&self, _session_id: &str) -> Result<Box<dyn model::ModelSession + '_>> {
+        async fn stream(
+            &self,
+            _session_id: &str,
+            _request: &model::ModelRequest<'_>,
+        ) -> Result<model::ModelEventStream> {
             unreachable!("turns are not used by provider startup")
         }
 
@@ -856,14 +886,12 @@ mod tests {
 
     #[tokio::test]
     async fn provider_refresh_does_not_block_initial_controller_state() {
-        let provider = Arc::new(BlockingProvider {
+        let runtime = Arc::new(BlockingProvider {
             started: Notify::new(),
             release: Notify::new(),
         });
-        let providers = HashMap::from([(
-            provider.id().to_owned(),
-            Arc::clone(&provider) as Arc<dyn ModelProvider>,
-        )]);
+        let provider = model::Provider::from_runtime(runtime.clone());
+        let providers = ProviderRegistry::new(provider.id(), [provider]).unwrap();
         let initial = refreshing_provider_states(&providers);
         assert_eq!(initial.len(), 1);
         assert_eq!(initial[0].lifecycle(), &ProviderLifecycle::Refreshing);
@@ -885,7 +913,7 @@ mod tests {
         );
 
         spawn_provider_refreshes(&providers, &views);
-        tokio::time::timeout(Duration::from_secs(1), provider.started.notified())
+        tokio::time::timeout(Duration::from_secs(1), runtime.started.notified())
             .await
             .expect("provider refresh did not start");
         assert!(
@@ -895,7 +923,7 @@ mod tests {
             "provider updated before the blocking refresh completed"
         );
 
-        provider.release.notify_one();
+        runtime.release.notify_one();
         let message = tokio::time::timeout(Duration::from_secs(1), subscription.recv())
             .await
             .expect("provider refresh did not publish an update")

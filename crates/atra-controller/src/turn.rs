@@ -79,8 +79,11 @@ fn response_event(response: &mut ModelResponse) -> ThreadEventData {
             input: input.clone(),
             call_id: call_id.clone(),
         }),
-        ModelResponse::Reasoning { item } => {
-            ThreadEventData::Reasoning(ItemEvent { item: item.clone() })
+        ModelResponse::Reasoning { summary, opaque } => {
+            ThreadEventData::Reasoning(atra_protocol::ReasoningEvent {
+                summary: summary.clone(),
+                opaque: Some(opaque.clone()),
+            })
         }
     }
 }
@@ -358,7 +361,6 @@ impl State {
             .await
             .context("failed to load thread model")?;
         let provider = self.provider(&provider_id)?;
-        let model_session = provider.start_turn(&prompt_cache_key).await?;
         self.mask_old_command_results(provider.as_ref(), thread_id, &mut events, updates)
             .await?;
         let selected_model = provider
@@ -380,7 +382,8 @@ impl State {
         if !self
             .compact_history(
                 thread_id,
-                model_session.as_ref(),
+                provider.as_ref(),
+                &prompt_cache_key,
                 &model_request,
                 context_window,
                 updates,
@@ -395,7 +398,8 @@ impl State {
     async fn compact_history(
         &self,
         thread_id: ThreadId,
-        model_session: &dyn model::ModelSession,
+        provider: &model::Provider,
+        session_id: &str,
         model_request: &model::ModelRequest<'_>,
         context_window: Option<i64>,
         updates: Option<&TurnProjector>,
@@ -423,9 +427,16 @@ impl State {
             }
             checkpoint_id
         };
-        let Some(items) = model_session.compact(model_request).await? else {
-            return Ok(false);
-        };
+        let replacement =
+            if let Some(state) = provider.server_compact(session_id, model_request).await? {
+                atra_protocol::CompactionReplacement::Opaque { state }
+            } else {
+                let Some(content) = generic_compaction(provider, session_id, model_request).await?
+                else {
+                    return Ok(false);
+                };
+                atra_protocol::CompactionReplacement::Summary { content }
+            };
         let workspace_event = match workspace_instructions(model_request.events) {
             WorkspaceInstructions::Untracked => None,
             WorkspaceInstructions::Present(content) => Some(InstructionEvent::Initial(content)),
@@ -437,7 +448,7 @@ impl State {
                 .replace_with_compaction(
                     thread_id,
                     CompactionEvent {
-                        items: serde_json::to_value(items).map_err(|error| anyhow!(error))?,
+                        replacement,
                         checkpoint_id,
                     },
                     workspace_event,
@@ -470,7 +481,6 @@ impl State {
             .await
             .context("failed to load thread model")?;
         let provider = self.provider(&provider_id)?;
-        let model_session = provider.start_turn(&prompt_cache_key).await?;
         let model_tools = model_tools(allow_questions);
         loop {
             self.sync_runners(thread_id, updates).await?;
@@ -521,7 +531,8 @@ impl State {
                 if self
                     .compact_history(
                         thread_id,
-                        model_session.as_ref(),
+                        provider.as_ref(),
+                        &prompt_cache_key,
                         &model_request,
                         context_window,
                         updates,
@@ -555,9 +566,10 @@ impl State {
                 .await
                 .context("failed to save model request")?;
             let mut responses = VecDeque::new();
-            let mut stream = model_session.stream(&model_request).await?;
+            let mut stream = provider.stream(&prompt_cache_key, &model_request).await?;
             let mut completed = false;
             let mut stream_error = None;
+            let mut partial_text = String::new();
             while let Some(event) = stream.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -568,21 +580,23 @@ impl State {
                 };
                 match event {
                     model::ModelEvent::Update(event) => {
+                        if let model::ModelStreamEvent::AssistantDelta { content, .. } = &event {
+                            partial_text.push_str(content);
+                        }
                         if let Some(updates) = updates {
                             updates.apply_update(event).await?;
                         }
                     }
-                    model::ModelEvent::OutputItemDone {
-                        output,
-                        mut response,
-                    } => {
-                        let mut events = vec![ThreadEventData::ModelOutput(ModelOutputEvent {
-                            request_sequence,
-                            output: serde_json::to_value(output).map_err(|error| anyhow!(error))?,
-                            response_id: None,
-                        })];
+                    model::ModelEvent::OutputItemDone { mut response } => {
+                        let mut events = Vec::new();
                         if let Some(response) = &mut response {
+                            if matches!(response, ModelResponse::AssistantMessage { .. }) {
+                                partial_text.clear();
+                            }
                             events.push(response_event(response));
+                        }
+                        if events.is_empty() {
+                            continue;
                         }
                         {
                             let _mutation = self.lock_mutation().await?;
@@ -608,27 +622,9 @@ impl State {
                         }
                     }
                     model::ModelEvent::Completed {
-                        metadata,
                         token_usage,
                         rate_limits,
                     } => {
-                        if let Some(metadata) = metadata {
-                            self.append_event(
-                                thread_id,
-                                ThreadEventData::ModelOutput(ModelOutputEvent {
-                                    request_sequence,
-                                    output: serde_json::to_value(model::ProviderOutput {
-                                        provider: metadata.provider,
-                                        data: serde_json::Value::Array(Vec::new()),
-                                    })
-                                    .map_err(|error| anyhow!(error))?,
-                                    response_id: Some(metadata.response_id),
-                                }),
-                                updates,
-                            )
-                            .await
-                            .context("failed to save model response metadata")?;
-                        }
                         if let Some(usage) = token_usage {
                             self.append_event(
                                 thread_id,
@@ -661,9 +657,23 @@ impl State {
             if !completed && stream_error.is_none() {
                 stream_error = Some(anyhow!("model stream ended before completion"));
             }
+            if stream_error.is_some() && !partial_text.is_empty() {
+                self.append_event(
+                    thread_id,
+                    ThreadEventData::AssistantMessage(AssistantMessageEvent {
+                        content: std::mem::take(&mut partial_text),
+                        phase: AssistantMessagePhase::Commentary,
+                        todos: Vec::new(),
+                    }),
+                    updates,
+                )
+                .await
+                .context("failed to save partial assistant output")?;
+            }
             let completed_response = self
                 .execute_model_responses(
                     provider.as_ref(),
+                    &model,
                     thread_id,
                     responses,
                     allow_questions,
@@ -681,7 +691,7 @@ impl State {
 
     pub(super) async fn mask_old_command_results(
         &self,
-        provider: &dyn model::ModelProvider,
+        provider: &model::Provider,
         thread_id: ThreadId,
         events: &mut Vec<storage::Event>,
         stream_updates: Option<&TurnProjector>,
@@ -984,7 +994,8 @@ impl State {
 
     pub(super) async fn execute_model_responses(
         &self,
-        provider: &dyn model::ModelProvider,
+        provider: &model::Provider,
+        model_id: &str,
         thread_id: ThreadId,
         mut responses: VecDeque<ModelResponse>,
         allow_questions: bool,
@@ -1077,7 +1088,7 @@ impl State {
                         crate::tools::ValidatedFunctionTool::Provider => {}
                     }
                     let result = provider
-                        .execute_tool(&name, &arguments)
+                        .execute_tool(model_id, &name, &arguments)
                         .await?
                         .with_context(|| format!("model requested unsupported tool {name}"))?;
                     needs_follow_up = true;
@@ -1491,6 +1502,100 @@ impl State {
             send_thread_event(updates, ThreadEvent { sequence, data }).await?;
         }
         Ok(sequence)
+    }
+}
+
+async fn generic_compaction(
+    provider: &model::Provider,
+    session_id: &str,
+    request: &model::ModelRequest<'_>,
+) -> Result<Option<String>> {
+    let events = compaction_events(request.events);
+    let request = compaction_request(request, &events);
+    let mut stream = provider.stream(session_id, &request).await?;
+    let mut summary = String::new();
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event? {
+            model::ModelEvent::OutputItemDone {
+                response: Some(model::ModelResponse::AssistantMessage { content, .. }),
+            } => summary.push_str(&content),
+            model::ModelEvent::OutputItemDone {
+                response:
+                    Some(
+                        model::ModelResponse::ToolCall { .. }
+                        | model::ModelResponse::CustomToolCall { .. }
+                        | model::ModelResponse::WebSearch { .. },
+                    ),
+            } => bail!("model attempted to call a tool during compaction"),
+            model::ModelEvent::Completed { .. } => completed = true,
+            model::ModelEvent::Update(_)
+            | model::ModelEvent::OutputItemDone { response: None }
+            | model::ModelEvent::OutputItemDone {
+                response: Some(model::ModelResponse::Reasoning { .. }),
+            } => {}
+        }
+    }
+    ensure!(completed, "model compaction stream ended before completion");
+    Ok((!summary.trim().is_empty()).then_some(summary))
+}
+
+fn compaction_request<'a>(
+    request: &model::ModelRequest<'a>,
+    events: &'a [crate::storage::Event],
+) -> model::ModelRequest<'a> {
+    model::ModelRequest { events, ..*request }
+}
+
+fn compaction_events(events: &[crate::storage::Event]) -> Vec<crate::storage::Event> {
+    let mut compact = events.to_vec();
+    let sequence = compact.last().map_or(EventSequence(0), |event| {
+        EventSequence(event.sequence.0.saturating_add(1))
+    });
+    compact.push(crate::storage::Event {
+        sequence,
+        data: ThreadEventData::UserMessage(MessageEvent {
+            content: "Create a faithful handoff summary of every message before this one for another coding assistant. Preserve all decisions, constraints, code changes, file paths, relevant tool results, unfinished work, and exact literals such as identifiers, names, numbers, and markers. Do not claim that prior context is absent. Do not call tools. Return only the summary.".to_owned(),
+        }),
+    });
+    compact
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    #[test]
+    fn generic_compaction_preserves_the_request_and_appends_only_the_trigger() {
+        let events = vec![crate::storage::Event {
+            sequence: EventSequence(7),
+            data: ThreadEventData::UserMessage(MessageEvent {
+                content: "original".to_owned(),
+            }),
+        }];
+        let tools = crate::tools::model_tools(true);
+        let request = model::ModelRequest {
+            model: "model",
+            reasoning_effort: "exact",
+            instructions: "instructions",
+            tools: &tools,
+            events: &events,
+            prompt_cache_key: "cache",
+        };
+        let compact_events = compaction_events(request.events);
+        let compact = compaction_request(&request, &compact_events);
+
+        assert_eq!(compact.events.len(), events.len() + 1);
+        assert_eq!(&compact.events[..events.len()], events);
+        assert!(matches!(
+            compact.events.last().unwrap().data,
+            ThreadEventData::UserMessage(_)
+        ));
+        assert_eq!(compact.model, request.model);
+        assert_eq!(compact.reasoning_effort, request.reasoning_effort);
+        assert_eq!(compact.instructions, request.instructions);
+        assert!(std::ptr::eq(compact.tools, request.tools));
+        assert_eq!(compact.prompt_cache_key, request.prompt_cache_key);
     }
 }
 

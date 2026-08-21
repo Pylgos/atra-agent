@@ -571,12 +571,6 @@ impl App {
     }
 
     fn current_status(&self) -> Vec<Span<'static>> {
-        if self.login_pending {
-            return vec![Span::styled(
-                "Completing login",
-                Style::default().fg(Color::Yellow),
-            )];
-        }
         let (message, color) = match &self.turn {
             TurnState::Starting {
                 phase: TurnPhase::Compacting,
@@ -595,12 +589,6 @@ impl App {
             TurnState::EnteringDenyReason { .. } => ("Approval required".to_owned(), Color::Yellow),
             TurnState::Idle => {
                 let Some(turn) = self.active_turn() else {
-                    if self.login_required {
-                        return vec![Span::styled(
-                            "Login required · ctrl-l login",
-                            Style::default().fg(Color::Yellow),
-                        )];
-                    }
                     return Vec::new();
                 };
                 match turn.phase() {

@@ -1,0 +1,20 @@
+{"response":{"id":"resp_fixture","model":"gpt-5.6-luna"},"type":"response.created"}
+{"response":{"id":"resp_fixture","model":"gpt-5.6-luna"},"type":"response.in_progress"}
+{"item":{"arguments":"","call_id":"call_fixture","id":"item_fixture","name":"command","status":"in_progress","type":"function_call"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+{"delta":"{\"","item_id":"item_fixture","output_index":0,"sequence_number":3,"type":"response.function_call_arguments.delta"}
+{"delta":"runner","item_id":"item_fixture","output_index":0,"sequence_number":4,"type":"response.function_call_arguments.delta"}
+{"delta":"\":\"","item_id":"item_fixture","output_index":0,"sequence_number":5,"type":"response.function_call_arguments.delta"}
+{"delta":"sandbox","item_id":"item_fixture","output_index":0,"sequence_number":6,"type":"response.function_call_arguments.delta"}
+{"delta":"\",\"","item_id":"item_fixture","output_index":0,"sequence_number":7,"type":"response.function_call_arguments.delta"}
+{"delta":"command","item_id":"item_fixture","output_index":0,"sequence_number":8,"type":"response.function_call_arguments.delta"}
+{"delta":"\":\"","item_id":"item_fixture","output_index":0,"sequence_number":9,"type":"response.function_call_arguments.delta"}
+{"delta":"printf","item_id":"item_fixture","output_index":0,"sequence_number":10,"type":"response.function_call_arguments.delta"}
+{"delta":" '","item_id":"item_fixture","output_index":0,"sequence_number":11,"type":"response.function_call_arguments.delta"}
+{"delta":"L","item_id":"item_fixture","output_index":0,"sequence_number":12,"type":"response.function_call_arguments.delta"}
+{"delta":"UNA","item_id":"item_fixture","output_index":0,"sequence_number":13,"type":"response.function_call_arguments.delta"}
+{"delta":"_TOOL","item_id":"item_fixture","output_index":0,"sequence_number":14,"type":"response.function_call_arguments.delta"}
+{"delta":"'","item_id":"item_fixture","output_index":0,"sequence_number":15,"type":"response.function_call_arguments.delta"}
+{"delta":"\"}","item_id":"item_fixture","output_index":0,"sequence_number":16,"type":"response.function_call_arguments.delta"}
+{"arguments":"{\"runner\":\"sandbox\",\"command\":\"printf 'LUNA_TOOL'\"}","item_id":"item_fixture","output_index":0,"sequence_number":17,"type":"response.function_call_arguments.done"}
+{"item":{"arguments":"{\"runner\":\"sandbox\",\"command\":\"printf 'LUNA_TOOL'\"}","call_id":"call_fixture","id":"item_fixture","name":"command","status":"completed","type":"function_call"},"output_index":0,"sequence_number":18,"type":"response.output_item.done"}
+{"response":{"id":"resp_fixture","model":"gpt-5.6-luna","usage":{"input_tokens":2527,"input_tokens_details":{"cache_write_tokens":2524,"cached_tokens":0},"output_tokens":26,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2553}},"type":"response.completed"}

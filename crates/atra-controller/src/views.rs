@@ -273,6 +273,8 @@ impl Views {
         }
         let provider = atra_protocol::ProviderState::new(
             provider_id.to_owned(),
+            current.auth_method(),
+            current.credential_source(),
             lifecycle,
             current.models().to_vec(),
             current.rate_limits().cloned(),

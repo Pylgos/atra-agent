@@ -762,7 +762,6 @@ fn event_targets(state: &ThreadState, sequence: EventSequence) -> Vec<ThreadScop
         | ThreadEventData::WorkspaceInstructions(_)
         | ThreadEventData::Skills(_)
         | ThreadEventData::Runners(_)
-        | ThreadEventData::ModelOutput(_)
         | ThreadEventData::ModelRequest(_) => Vec::new(),
     }
 }
@@ -1076,7 +1075,7 @@ mod tests {
                     "events": [{
                         "sequence": 1,
                         "kind": "compaction",
-                        "payload": {"items": [], "checkpoint_id": 1}
+                        "payload": {"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}
                     }],
                     "active_turn": null,
                     "last_outcome": null,

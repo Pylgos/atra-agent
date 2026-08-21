@@ -971,9 +971,14 @@ fn ControllerMonitor(
         connect_sse(
             &format!("/api/workspaces/{workspace_id}/controller/events"),
             move |data| {
-                let Ok(message) = serde_json::from_str::<ControllerSubscriptionMessage>(&data)
-                else {
-                    return;
+                let message = match serde_json::from_str::<ControllerSubscriptionMessage>(&data) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        web_sys::console::error_1(
+                            &format!("invalid Controller subscription message: {error}").into(),
+                        );
+                        return;
+                    }
                 };
                 let status_update = match &message {
                     ControllerSubscriptionMessage::Operation {
@@ -4321,6 +4326,7 @@ mod tests {
                 .collect(),
             context_window: None,
             auto_compact_token_limit: None,
+            tool_bindings: Vec::new(),
         }
     }
 

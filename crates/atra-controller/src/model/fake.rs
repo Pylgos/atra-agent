@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::{
-    DEFAULT_MODEL, ModelEvent, ModelEventStream, ModelProvider, ModelRequest, ModelResponse,
-    ModelSession, ProviderLoginStatus, ProviderOutput,
+    DEFAULT_MODEL, ModelEvent, ModelEventStream, ModelRequest, ModelResponse, ProviderLoginStatus,
+    ProviderRuntime,
 };
 use crate::storage::Event;
 use atra_protocol::{AssistantMessagePhase, ThreadEventData, ToolResultEvent};
@@ -70,18 +70,12 @@ impl FakeProvider {
         {
             *content = content.replace("{{tool_output}}", output);
         }
-        let output = response_item(response.clone())?;
-        let output = ProviderOutput {
-            provider: PROVIDER_ID.to_owned(),
-            data: serde_json::to_value([output]).context("failed to encode fake model output")?,
-        };
+        response_item(response.clone())?;
         Ok(Box::pin(stream::iter([
             Ok(ModelEvent::OutputItemDone {
-                output,
                 response: Some(response),
             }),
             Ok(ModelEvent::Completed {
-                metadata: None,
                 token_usage: None,
                 rate_limits: Vec::new(),
             }),
@@ -90,9 +84,16 @@ impl FakeProvider {
 }
 
 #[async_trait]
-impl ModelProvider for FakeProvider {
+impl ProviderRuntime for FakeProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
+    }
+    fn auth_method(&self) -> atra_protocol::ProviderAuthMethod {
+        atra_protocol::ProviderAuthMethod::None
+    }
+
+    fn credential_source(&self) -> Option<atra_protocol::CredentialSource> {
+        None
     }
 
     async fn models(&self) -> Result<Vec<Model>> {
@@ -107,6 +108,7 @@ impl ModelProvider for FakeProvider {
                 .to_vec(),
             context_window: None,
             auto_compact_token_limit: None,
+            tool_bindings: Vec::new(),
         }])
     }
 
@@ -132,29 +134,23 @@ impl ModelProvider for FakeProvider {
 
     async fn execute_tool(
         &self,
+        _model: &str,
         _name: &str,
         _arguments: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
 
-    async fn start_turn(&self, _session_id: &str) -> Result<Box<dyn ModelSession + '_>> {
-        Ok(Box::new(self))
+    async fn stream(
+        &self,
+        _session_id: &str,
+        request: &ModelRequest<'_>,
+    ) -> Result<ModelEventStream> {
+        FakeProvider::stream(self, request.events).await
     }
 
     fn context_tokens(&self, events: &[Event]) -> Result<usize> {
         Ok(super::text_tokens(&serde_json::to_string(events)?))
-    }
-}
-
-#[async_trait]
-impl ModelSession for &FakeProvider {
-    async fn stream(&self, request: &ModelRequest<'_>) -> Result<ModelEventStream> {
-        FakeProvider::stream(self, request.events).await
-    }
-
-    async fn compact(&self, _request: &ModelRequest<'_>) -> Result<Option<ProviderOutput>> {
-        Ok(None)
     }
 }
 
@@ -169,13 +165,16 @@ fn response_item(response: ModelResponse) -> Result<Value> {
                 AssistantMessagePhase::FinalAnswer => MessagePhase::FinalAnswer,
             }
         }),
-        ModelResponse::WebSearch { item } | ModelResponse::Reasoning { item } => {
+        ModelResponse::WebSearch { item } => {
             anyhow::ensure!(
                 item.is_object(),
                 "fake model script contains invalid output item"
             );
             item
         }
+        ModelResponse::Reasoning {
+            summary, opaque, ..
+        } => json!({"type": "reasoning", "summary": summary, "opaque": opaque}),
         ModelResponse::ToolCall {
             name,
             arguments,

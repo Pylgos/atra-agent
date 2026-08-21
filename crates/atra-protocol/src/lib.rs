@@ -203,8 +203,7 @@ pub enum ThreadEventData {
     ToolCall(ToolCallEvent),
     ToolResult(ToolResultEvent),
     FrozenBoundary(FrozenBoundaryEvent),
-    Reasoning(ItemEvent),
-    ModelOutput(ModelOutputEvent),
+    Reasoning(ReasoningEvent),
     Compaction(CompactionEvent),
     ModelRequest(ModelRequestEvent),
     TokenUsage(TokenUsageEvent),
@@ -229,7 +228,6 @@ impl ThreadEventData {
             Self::ToolResult(_) => "tool_result",
             Self::FrozenBoundary(_) => "frozen_boundary",
             Self::Reasoning(_) => "reasoning",
-            Self::ModelOutput(_) => "model_output",
             Self::Compaction(_) => "compaction",
             Self::ModelRequest(_) => "model_request",
             Self::TokenUsage(_) => "token_usage",
@@ -336,11 +334,17 @@ pub struct ItemEvent {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ModelOutputEvent {
-    pub request_sequence: EventSequence,
-    pub output: Value,
+pub struct OpaqueState {
+    pub replay_key: String,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEvent {
+    pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_id: Option<String>,
+    pub opaque: Option<OpaqueState>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -390,8 +394,15 @@ pub struct FrozenBoundaryEvent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEvent {
-    pub items: Value,
+    pub replacement: CompactionReplacement,
     pub checkpoint_id: CheckpointId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompactionReplacement {
+    Summary { content: String },
+    Opaque { state: OpaqueState },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -475,6 +486,14 @@ pub struct Model {
     pub context_window: Option<i64>,
     #[serde(default)]
     pub auto_compact_token_limit: Option<i64>,
+    pub tool_bindings: Vec<ModelToolBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolBinding {
+    pub tool: String,
+    pub implementation: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

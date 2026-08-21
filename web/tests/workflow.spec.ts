@@ -55,6 +55,8 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
         thread_statuses: [{ thread_id: 1, status: "idle" }],
         providers: [{
           id: "fake",
+          auth_method: "none",
+          credential_source: null,
           lifecycle: { status: "logged_in", account: null },
           models: [{
             provider: "fake",
@@ -62,14 +64,16 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             display_name: "Test Model",
             description: "No-provider test model",
             default_reasoning_effort: "medium",
-            supported_reasoning_efforts: ["low", "medium", "high"]
+            supported_reasoning_efforts: ["low", "medium", "high"],
+            tool_bindings: []
           }, {
             provider: "fake",
             id: "alternate-model",
             display_name: "Alternate Model",
             description: "Model with a different reasoning effort",
             default_reasoning_effort: "high",
-            supported_reasoning_efforts: ["high"]
+            supported_reasoning_efforts: ["high"],
+            tool_bindings: []
           }],
           rate_limits: null
         }],
@@ -274,6 +278,8 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
         operation: "provider_updated",
         provider: {
           id: "fake",
+          auth_method: "none",
+          credential_source: null,
           lifecycle: { status: "refreshing" },
           models: [],
           rate_limits: null
@@ -295,6 +301,8 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
         operation: "provider_updated",
         provider: {
           id: "fake",
+          auth_method: "none",
+          credential_source: null,
           lifecycle: { status: "logged_in", account: null },
           models: [{
             provider: "fake",
@@ -302,14 +310,16 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             display_name: "Test Model",
             description: "No-provider test model",
             default_reasoning_effort: "medium",
-            supported_reasoning_efforts: ["low", "medium", "high"]
+            supported_reasoning_efforts: ["low", "medium", "high"],
+            tool_bindings: []
           }, {
             provider: "fake",
             id: "alternate-model",
             display_name: "Alternate Model",
             description: "Model with a different reasoning effort",
             default_reasoning_effort: "high",
-            supported_reasoning_efforts: ["high"]
+            supported_reasoning_efforts: ["high"],
+            tool_bindings: []
           }],
           rate_limits: null
         }
@@ -1112,6 +1122,8 @@ test("composer history navigation, stash, and rewind prefill", async ({ page, mo
         thread_statuses: [{ thread_id: 1, status: "idle" }],
         providers: [{
           id: "fake",
+          auth_method: "none",
+          credential_source: null,
           lifecycle: { status: "logged_in", account: null },
           models: [{
             provider: "fake",
@@ -1119,7 +1131,8 @@ test("composer history navigation, stash, and rewind prefill", async ({ page, mo
             display_name: "Test Model",
             description: "No-provider test model",
             default_reasoning_effort: "medium",
-            supported_reasoning_efforts: ["low", "medium", "high"]
+            supported_reasoning_efforts: ["low", "medium", "high"],
+            tool_bindings: []
           }],
           rate_limits: null
         }],

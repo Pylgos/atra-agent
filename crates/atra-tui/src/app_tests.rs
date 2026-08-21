@@ -56,8 +56,6 @@ fn test_app(items: Vec<TranscriptEntry>) -> App {
         overlay: Overlay::None,
         word_segmenter: WordSegmenter::new_auto(WordBreakInvariantOptions::default()),
         error: None,
-        login_required: false,
-        login_pending: false,
         view: ViewState::default(),
         layout: ViewLayout::default(),
         turn: TurnState::Idle,
@@ -356,6 +354,7 @@ fn model(provider: &str, id: &str, display_name: &str, description: &str) -> Mod
         supported_reasoning_efforts: vec!["low".to_owned(), "medium".to_owned()],
         context_window: None,
         auto_compact_token_limit: None,
+        tool_bindings: Vec::new(),
     }
 }
 

@@ -269,14 +269,6 @@ impl App {
                         .unwrap_or_default();
                     self.message_input.set(display_name);
                 }
-                KeyCode::Char('l') if self.login_required && !self.login_pending => {
-                    self.login_pending = true;
-                    effects
-                        .send(Effect::Login {
-                            endpoint: self.endpoint.clone(),
-                        })
-                        .ok();
-                }
                 _ => {
                     self.message_input.handle_key(key, &self.word_segmenter);
                 }

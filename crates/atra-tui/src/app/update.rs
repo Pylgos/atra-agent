@@ -7,16 +7,7 @@ use crate::state::{CheckpointPicker, FocusPane, Overlay, ThreadPickerState, Turn
 impl App {
     pub(crate) fn apply_controller_change(&mut self, _change: ControllerChange) {
         let state = self.controller_subscription.state();
-        self.login_required = state
-            .providers()
-            .iter()
-            .find(|provider| provider.id() == "codex")
-            .is_none_or(|provider| {
-                !matches!(
-                    provider.lifecycle(),
-                    atra_protocol::ProviderLifecycle::LoggedIn { .. }
-                )
-            });
+        let _ = state;
     }
 
     pub(crate) fn apply_thread_change(
@@ -137,18 +128,6 @@ impl App {
                             self.sync_turn_interaction();
                             self.error = Some(error);
                         }
-                    }
-                }
-                Ok(())
-            }
-            TurnUpdate::LoginCompleted(result) => {
-                self.login_pending = false;
-                match result {
-                    Ok(()) => {
-                        self.login_required = false;
-                    }
-                    Err(error) => {
-                        self.error = Some(error);
                     }
                 }
                 Ok(())

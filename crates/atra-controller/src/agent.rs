@@ -834,7 +834,7 @@ mod tests {
             .await
             .unwrap();
         let provider = crate::model::fake(&script).unwrap();
-        let providers = HashMap::from([(provider.id().to_owned(), provider)]);
+        let providers = crate::model::ProviderRegistry::new(provider.id(), [provider]).unwrap();
         let root = store
             .create_thread(
                 Some("root".to_owned()),
@@ -848,13 +848,7 @@ mod tests {
         let controller = ControllerState::new(
             ControllerLifecycle::Running,
             threads,
-            vec![
-                crate::provider_state(
-                    crate::model::FAKE_PROVIDER,
-                    &providers[crate::model::FAKE_PROVIDER],
-                )
-                .await,
-            ],
+            vec![crate::provider_state(providers.get(crate::model::FAKE_PROVIDER).unwrap()).await],
             Vec::new(),
         );
         let views = Arc::new(crate::views::Views::new(controller));
@@ -867,7 +861,6 @@ mod tests {
             )),
             store,
             providers,
-            default_provider: crate::model::FAKE_PROVIDER.to_owned(),
             turns: crate::lifecycle::TurnLifecycle::new(),
             execution_contexts: Arc::new(std::sync::Mutex::new(HashMap::from([(
                 "context".to_owned(),

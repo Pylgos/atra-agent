@@ -2,17 +2,18 @@
 
 ## Model providers
 
-Atra can use Codex and Ollama Cloud in the same controller. Authenticate each provider once:
+Atra can use Codex, Ollama Cloud, and OpenCode Go in the same controller. Authenticate each provider once:
 
 ```sh
-atra codex login
-atra ollama login
+atra provider login codex
+atra provider login ollama
+atra provider login opencode-go
 ```
 
-Ollama API keys are stored in the user's private Atra data directory. After login, use `/model`
-in the TUI or `atra thread model --provider ollama ...` to select an Ollama Cloud model. Ollama
-Cloud turns support streaming responses, thinking, Runner commands, web search, web fetch, token
-usage, and conversation compaction.
+API keys are read from `OLLAMA_API_KEY` or `OPENCODE_API_KEY` first and otherwise stored in the
+user's private Atra data directory. Use `atra provider list` for provider status and the complete
+model catalog, then use `/model` in the TUI or `atra thread model ...` to select a model and one of
+that model's exact reasoning options.
 
 ## Skills
 

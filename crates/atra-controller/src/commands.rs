@@ -38,7 +38,7 @@ impl State {
                     .store
                     .create_thread(
                         display_name,
-                        self.default_provider.clone(),
+                        self.providers.default_provider().to_owned(),
                         crate::model::DEFAULT_MODEL.to_owned(),
                         "medium".to_owned(),
                     )
@@ -107,10 +107,6 @@ impl State {
                 }
                 let _mutation = self.lock_mutation().await?;
                 self.turns.ensure_mutable(thread_id)?;
-                let (current_provider, _, _) = self.store.thread_model(thread_id).await?;
-                if current_provider != provider {
-                    ensure_history_provider(&self.store.events(thread_id).await?, &provider)?;
-                }
                 self.store
                     .set_thread_model(thread_id, provider, model, reasoning_effort)
                     .await?;
@@ -463,7 +459,7 @@ impl State {
             if let Ok((provider_id, _, _)) = state.store.thread_model(thread_id).await
                 && let Ok(provider) = state.provider(&provider_id)
             {
-                let provider = provider_state(&provider_id, provider).await;
+                let provider = provider_state(provider).await;
                 if let Err(error) = state
                     .views
                     .apply_controller(ControllerOperation::ProviderUpdated { provider })
@@ -494,9 +490,11 @@ impl State {
                 ProviderTask::Logout => provider.logout().await,
             };
             let public = match result {
-                Ok(()) => provider_state(&provider_id, &provider).await,
+                Ok(()) => provider_state(&provider).await,
                 Err(error) => ProviderState::new(
                     provider_id.clone(),
+                    provider.auth_method(),
+                    provider.credential_source(),
                     ProviderLifecycle::Failed {
                         message: format!("{error:#}"),
                     },
@@ -917,104 +915,9 @@ fn tool_result_call_id(result: &ToolResultEvent) -> Option<&str> {
     }
 }
 
-fn ensure_history_provider(events: &[crate::storage::Event], provider: &str) -> Result<()> {
-    for event in events {
-        let (value, label) = match &event.data {
-            ThreadEventData::ModelOutput(output) => (&output.output, "model output"),
-            ThreadEventData::Compaction(compaction) => (&compaction.items, "compaction"),
-            _ => continue,
-        };
-        let stored = serde_json::from_value::<crate::model::ProviderOutput>(value.clone())
-            .with_context(|| format!("stored {label} contains invalid provider output"))?;
-        if stored.provider != provider {
-            bail!(
-                "cannot change provider to {provider}: thread history contains {label} from {}",
-                stored.provider
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn event(sequence: i64, data: ThreadEventData) -> crate::storage::Event {
-        crate::storage::Event {
-            sequence: EventSequence(sequence),
-            data,
-        }
-    }
-
-    fn provider_output(provider: &str) -> serde_json::Value {
-        serde_json::to_value(crate::model::ProviderOutput {
-            provider: provider.to_owned(),
-            data: serde_json::json!([]),
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn provider_change_accepts_provider_neutral_history() {
-        let events = [event(
-            0,
-            ThreadEventData::ThreadContext(atra_protocol::MessageEvent {
-                content: "context".to_owned(),
-            }),
-        )];
-
-        ensure_history_provider(&events, "ollama").unwrap();
-    }
-
-    #[test]
-    fn provider_change_rejects_model_output_from_another_provider() {
-        let events = [event(
-            1,
-            ThreadEventData::ModelOutput(atra_protocol::ModelOutputEvent {
-                request_sequence: EventSequence(0),
-                output: provider_output("codex"),
-                response_id: None,
-            }),
-        )];
-
-        let error = ensure_history_provider(&events, "ollama").unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "cannot change provider to ollama: thread history contains model output from codex"
-        );
-    }
-
-    #[test]
-    fn provider_change_rejects_compaction_from_another_provider() {
-        let events = [event(
-            1,
-            ThreadEventData::Compaction(atra_protocol::CompactionEvent {
-                items: provider_output("codex"),
-                checkpoint_id: atra_protocol::CheckpointId(1),
-            }),
-        )];
-
-        let error = ensure_history_provider(&events, "ollama").unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "cannot change provider to ollama: thread history contains compaction from codex"
-        );
-    }
-
-    #[test]
-    fn provider_change_accepts_output_for_the_target_provider() {
-        let events = [event(
-            1,
-            ThreadEventData::ModelOutput(atra_protocol::ModelOutputEvent {
-                request_sequence: EventSequence(0),
-                output: provider_output("ollama"),
-                response_id: None,
-            }),
-        )];
-
-        ensure_history_provider(&events, "ollama").unwrap();
-    }
 
     #[tokio::test]
     async fn turn_panic_becomes_failed_terminal_outcome() {

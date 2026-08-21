@@ -365,7 +365,6 @@ impl<'a> TurnRef<'a> {
                 | ThreadEventData::Skills(_)
                 | ThreadEventData::Runners(_)
                 | ThreadEventData::UserMessage(_)
-                | ThreadEventData::ModelOutput(_)
                 | ThreadEventData::ModelRequest(_)
                 | ThreadEventData::TokenUsage(_)
                 | ThreadEventData::RateLimits(_) => {}
@@ -447,11 +446,9 @@ pub(super) fn activity<'a>(
                         markdown: &message.content,
                     })
                 }
-                ThreadEventData::Reasoning(reasoning) => {
-                    reasoning_summary(&reasoning.item).map(|summary| ActivityDisplay::Reasoning {
-                        summary: Cow::Owned(summary),
-                    })
-                }
+                ThreadEventData::Reasoning(reasoning) => Some(ActivityDisplay::Reasoning {
+                    summary: Cow::Borrowed(&reasoning.summary),
+                }),
                 ThreadEventData::WebSearch(search) => {
                     let (summary, detail) = search_display(&search.item);
                     Some(ActivityDisplay::Search { summary, detail })
@@ -633,18 +630,6 @@ fn meaningful_text(value: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_owned)
-}
-
-fn reasoning_summary(item: &Value) -> Option<String> {
-    let parts = item.pointer("/summary")?.as_array()?;
-    let summary = parts
-        .iter()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (!summary.is_empty()).then_some(summary)
 }
 
 fn search_display(item: &Value) -> (String, String) {
@@ -1226,14 +1211,10 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
                     false,
                 ))
             }
-            ThreadEventData::Reasoning(reasoning) => {
-                reasoning_summary(&reasoning.item).map(|summary| {
-                    (
-                        meaningful_text(&summary).unwrap_or_else(|| "Thinking…".to_owned()),
-                        false,
-                    )
-                })
-            }
+            ThreadEventData::Reasoning(reasoning) => Some((
+                meaningful_text(&reasoning.summary).unwrap_or_else(|| "Thinking…".to_owned()),
+                false,
+            )),
             ThreadEventData::WebSearch(search) => {
                 let (summary, _) = search_display(&search.item);
                 Some((summary, false))
@@ -2215,12 +2196,13 @@ mod tests {
                 2,
                 "reasoning",
                 json!({
-                    "item": {
-                        "summary": [
-                            {"type": "summary_text", "text": "Public summary"}
-                        ],
-                        "encrypted_content": "must-never-render",
-                        "provider_metadata": {"secret": true}
+                    "summary": "Public summary",
+                    "opaque": {
+                        "replay_key": "fixture/model/reasoning-v1",
+                        "payload": {
+                            "encrypted_content": "must-never-render",
+                            "provider_metadata": {"secret": true}
+                        }
                     }
                 }),
             ),
@@ -2366,7 +2348,11 @@ mod tests {
     #[test]
     fn compaction_starts_a_continued_turn() {
         let mut state = state(vec![
-            event(1, "compaction", json!({"items": [], "checkpoint_id": 1})),
+            event(
+                1,
+                "compaction",
+                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}),
+            ),
             event(
                 2,
                 "assistant_message",
@@ -2393,7 +2379,11 @@ mod tests {
     #[test]
     fn compacted_turn_remains_visible_after_the_active_turn_finishes() {
         let state = state(vec![
-            event(1, "compaction", json!({"items": [], "checkpoint_id": 1})),
+            event(
+                1,
+                "compaction",
+                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}),
+            ),
             event(
                 2,
                 "assistant_message",
