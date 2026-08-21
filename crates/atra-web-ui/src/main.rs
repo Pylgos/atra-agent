@@ -410,43 +410,56 @@ enum MobilePanel {
     Utility,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SwipeStart {
     x: f64,
     y: f64,
+    horizontal_scroller: Option<web_sys::Element>,
 }
 
-fn swipe_start_allowed(event: &Event<TouchData>) -> bool {
-    let Some(target) = event
+fn swipe_target(event: &Event<TouchData>) -> Option<web_sys::Element> {
+    event
         .data()
         .try_as_web_event()
         .and_then(|event| event.target())
         .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-    else {
-        return false;
-    };
-    if target
-        .closest(".drawer-backdrop, .navigation-row > .navigation-link")
+}
+
+fn swipe_start_allowed(target: &web_sys::Element) -> bool {
+    let blocks_swipe = target
+        .closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")
         .ok()
         .flatten()
-        .is_some()
-    {
-        return true;
-    }
-    let inside_activity_group = target.closest(".activity-group").ok().flatten().is_some();
-    let blocks_swipe = !inside_activity_group
-        && target
-            .closest(
-                "button, a, input, textarea, select, summary, pre, code, table, \
-                 [contenteditable='true'], .composer-region, .process-output",
-            )
-            .ok()
-            .flatten()
-            .is_some();
+        .is_some();
     let has_selection = web_sys::window()
         .and_then(|window| window.get_selection().ok().flatten())
         .is_some_and(|selection| !selection.is_collapsed());
     !blocks_swipe && !has_selection
+}
+
+fn horizontal_scroller(target: &web_sys::Element) -> Option<web_sys::Element> {
+    let window = web_sys::window()?;
+    let mut current = Some(target.clone());
+    while let Some(element) = current {
+        let overflow_x = window
+            .get_computed_style(&element)
+            .ok()
+            .flatten()
+            .and_then(|style| style.get_property_value("overflow-x").ok());
+        if matches!(overflow_x.as_deref(), Some("auto" | "scroll"))
+            && element.scroll_width() > element.client_width()
+        {
+            return Some(element);
+        }
+        current = element.parent_element();
+    }
+    None
+}
+
+fn scroller_consumes_swipe(scroller: &web_sys::Element, dx: f64) -> bool {
+    let scroll_left = scroller.scroll_left();
+    let max_scroll_left = scroller.scroll_width() - scroller.client_width();
+    (dx > 0.0 && scroll_left > 0) || (dx < 0.0 && scroll_left < max_scroll_left)
 }
 
 fn open_mobile_navigation(mut mobile_panel: Signal<MobilePanel>) {
@@ -688,12 +701,15 @@ fn App() -> Element {
             style: "{shell_style}",
             "data-theme": "{theme}",
             ontouchstart: move |event: Event<TouchData>| {
-                if is_narrow_viewport()
-                    && swipe_start_allowed(&event)
-                    && event.touches().len() == 1
-                {
+                if is_narrow_viewport() && event.touches().len() == 1
+                    && let Some(target) = swipe_target(&event)
+                    && swipe_start_allowed(&target) {
                     let coordinates = event.touches()[0].client_coordinates();
-                    swipe_start.set(Some(SwipeStart { x: coordinates.x, y: coordinates.y }));
+                    swipe_start.set(Some(SwipeStart {
+                        x: coordinates.x,
+                        y: coordinates.y,
+                        horizontal_scroller: horizontal_scroller(&target),
+                    }));
                 }
             },
             ontouchmove: move |event: Event<TouchData>| {
@@ -709,6 +725,14 @@ fn App() -> Element {
                 let dx = coordinates.x - start.x;
                 let dy = coordinates.y - start.y;
                 if dx.abs() <= dy.abs() * 1.25 {
+                    return;
+                }
+                if start
+                    .horizontal_scroller
+                    .as_ref()
+                    .is_some_and(|scroller| scroller_consumes_swipe(scroller, dx))
+                {
+                    swipe_start.set(None);
                     return;
                 }
                 event.prevent_default();

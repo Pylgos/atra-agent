@@ -37,6 +37,7 @@ web-sys = { version = "0.3.83", features = [
     "NotificationPermission",
     "Navigator",
     "Clipboard",
+    "CssStyleDeclaration",
     "Document",
     "Element",
     "Selection",

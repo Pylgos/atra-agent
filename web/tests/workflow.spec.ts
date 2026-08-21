@@ -949,6 +949,100 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
   await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
 
+  const responseAction = page.getByRole("button", { name: "Copy response" });
+  await responseAction.scrollIntoViewIfNeeded();
+  const responseActionBox = await responseAction.boundingBox();
+  expect(responseActionBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: responseActionBox!.x + responseActionBox!.width - 20,
+      y: responseActionBox!.y + responseActionBox!.height / 2
+    },
+    {
+      x: responseActionBox!.x + responseActionBox!.width - 160,
+      y: responseActionBox!.y + responseActionBox!.height / 2 + 5
+    }
+  );
+  await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
+  await swipe(page, { x: 10, y: 420 }, { x: 150, y: 425 });
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+
+  const activityButton = page.locator(".activity-command").first();
+  await activityButton.scrollIntoViewIfNeeded();
+  const activityButtonBox = await activityButton.boundingBox();
+  expect(activityButtonBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: activityButtonBox!.x + activityButtonBox!.width - 20,
+      y: activityButtonBox!.y + activityButtonBox!.height / 2
+    },
+    {
+      x: activityButtonBox!.x + activityButtonBox!.width - 160,
+      y: activityButtonBox!.y + activityButtonBox!.height / 2 + 5
+    }
+  );
+  await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
+  await swipe(page, { x: 10, y: 420 }, { x: 150, y: 425 });
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+
+  const horizontalScroller = page.locator("[data-test-horizontal-scroller]");
+  await page.locator("#transcript-scroll").evaluate((transcript) => {
+    const scroller = document.createElement("div");
+    scroller.dataset.testHorizontalScroller = "true";
+    scroller.style.width = "100%";
+    scroller.style.overflowX = "auto";
+    scroller.style.height = "48px";
+    const contents = document.createElement("div");
+    contents.style.width = "1000px";
+    contents.style.height = "48px";
+    scroller.append(contents);
+    transcript.prepend(scroller);
+  });
+  await horizontalScroller.scrollIntoViewIfNeeded();
+  const horizontalScrollerBox = await horizontalScroller.boundingBox();
+  expect(horizontalScrollerBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: horizontalScrollerBox!.x + horizontalScrollerBox!.width - 10,
+      y: horizontalScrollerBox!.y + horizontalScrollerBox!.height / 2
+    },
+    {
+      x: horizontalScrollerBox!.x + 120,
+      y: horizontalScrollerBox!.y + horizontalScrollerBox!.height / 2 + 5
+    }
+  );
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+  await expect.poll(() =>
+    horizontalScroller.evaluate((element) => element.scrollLeft)
+  ).toBeGreaterThan(0);
+
+  await horizontalScroller.evaluate((element) => {
+    const freshScroller = element.cloneNode(true);
+    element.replaceWith(freshScroller);
+  });
+  const freshHorizontalScrollerBox = await horizontalScroller.boundingBox();
+  expect(freshHorizontalScrollerBox).not.toBeNull();
+  await swipe(
+    page,
+    {
+      x: freshHorizontalScrollerBox!.x + 120,
+      y: freshHorizontalScrollerBox!.y + freshHorizontalScrollerBox!.height / 2
+    },
+    {
+      x: freshHorizontalScrollerBox!.x + 270,
+      y:
+        freshHorizontalScrollerBox!.y +
+        freshHorizontalScrollerBox!.height / 2 +
+        5
+    }
+  );
+  await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  await swipe(page, { x: 380, y: 420 }, { x: 240, y: 425 });
+  await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+
   const composerInput = page.locator("#composer textarea");
   await composerInput.scrollIntoViewIfNeeded();
   const composerInputBox = await composerInput.boundingBox();
