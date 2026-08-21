@@ -497,18 +497,8 @@ fn parse(
                 completed = true;
                 usage = frame.pointer("/response/usage").map(normalize_usage);
             }
-            "response.created"
-            | "response.in_progress"
-            | "response.content_part.added"
-            | "response.content_part.done"
-            | "response.output_text.done"
-            | "response.reasoning_summary_part.done"
-            | "response.reasoning_summary_text.done"
-            | "response.function_call_arguments.done"
-            | "response.custom_tool_call_input.done"
-            | "ping" => {}
             "error" | "response.failed" => bail!("Responses error: {frame}"),
-            other => bail!("unknown Responses event {other}"),
+            _ => {}
         }
     }
     if !completed {
