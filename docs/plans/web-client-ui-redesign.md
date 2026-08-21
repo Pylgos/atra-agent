@@ -563,7 +563,9 @@ Process set, scroll positions, or Pretty/Raw mode.
 
 - Selecting a Checkpoint or focused Process pushes browser history.
 - Back returns to the live Transcript or previous meaningful resource.
-- Utility tab changes and panel open/close do not create history entries.
+- Utility tab changes and desktop panel open/close do not create history
+  entries. Opening a mobile drawer creates a temporary same-path query entry so the browser or device Back button closes the drawer before
+  navigating away.
 - A Process deep link focuses and expands one Process while preserving other
   browser-local expanded Processes.
 

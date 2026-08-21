@@ -146,9 +146,28 @@ struct PopstateListener {
 }
 
 impl PopstateListener {
-    fn new(mut route: Signal<Route>) -> Self {
-        let callback = Closure::wrap(Box::new(move |_event: WebEvent| route.set(browser_route()))
-            as Box<dyn FnMut(WebEvent)>);
+    fn new(mut route: Signal<Route>, mut mobile_panel: Signal<MobilePanel>) -> Self {
+        let callback = Closure::wrap(Box::new(move |_event: WebEvent| {
+            let next_route = browser_route();
+            if *route.peek() != next_route {
+                route.set(next_route);
+            }
+            let next_panel = browser_mobile_panel();
+            if *mobile_panel.peek() == MobilePanel::None && next_panel != MobilePanel::None {
+                if let Some(window) = web_sys::window() {
+                    let path = window.location().pathname().ok();
+                    let _ = window.history().and_then(|history| {
+                        history.replace_state_with_url(
+                            &wasm_bindgen::JsValue::NULL,
+                            "",
+                            path.as_deref(),
+                        )
+                    });
+                }
+            } else if *mobile_panel.peek() != next_panel {
+                mobile_panel.set(next_panel);
+            }
+        }) as Box<dyn FnMut(WebEvent)>);
         if let Some(window) = web_sys::window() {
             window.set_onpopstate(Some(callback.as_ref().unchecked_ref()));
         }
@@ -222,11 +241,31 @@ fn browser_route() -> Route {
         .unwrap_or_else(|| Route::parse("/"))
 }
 
+fn browser_mobile_panel() -> MobilePanel {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|hash| MobilePanel::from_history_query(&hash))
+        .unwrap_or(MobilePanel::None)
+}
+
 fn navigate(mut route: Signal<Route>, next: Route) {
     storage_set(LAST_ROUTE_KEY, &next.path());
     if let Some(window) = web_sys::window() {
         let _ = window.history().and_then(|history| {
-            history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next.path()))
+            if let Some(fragment) = browser_mobile_panel().history_query() {
+                history.replace_state_with_url(
+                    &wasm_bindgen::JsValue::NULL,
+                    "",
+                    Some(&next.path()),
+                )?;
+                history.push_state_with_url(
+                    &wasm_bindgen::JsValue::NULL,
+                    "",
+                    Some(&format!("{}{fragment}", next.path())),
+                )
+            } else {
+                history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next.path()))
+            }
         });
     }
     route.set(next);
@@ -410,6 +449,24 @@ enum MobilePanel {
     Utility,
 }
 
+impl MobilePanel {
+    fn history_query(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Navigation => Some("?atra-mobile=navigation"),
+            Self::Utility => Some("?atra-mobile=utility"),
+        }
+    }
+
+    fn from_history_query(fragment: &str) -> Option<Self> {
+        match fragment {
+            "?atra-mobile=navigation" => Some(Self::Navigation),
+            "?atra-mobile=utility" => Some(Self::Utility),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SwipeStart {
     x: f64,
@@ -462,8 +519,42 @@ fn scroller_consumes_swipe(scroller: &web_sys::Element, dx: f64) -> bool {
     (dx > 0.0 && scroll_left > 0) || (dx < 0.0 && scroll_left < max_scroll_left)
 }
 
-fn open_mobile_navigation(mut mobile_panel: Signal<MobilePanel>) {
-    mobile_panel.set(MobilePanel::Navigation);
+fn open_mobile_panel(mut mobile_panel: Signal<MobilePanel>, panel: MobilePanel) {
+    if mobile_panel() == panel {
+        return;
+    }
+    if let Some(fragment) = panel.history_query()
+        && let Some(window) = web_sys::window()
+    {
+        let _ = window.history().and_then(|history| {
+            if browser_mobile_panel() == MobilePanel::None {
+                history.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(fragment))
+            } else {
+                history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(fragment))
+            }
+        });
+    }
+    mobile_panel.set(panel);
+}
+
+fn close_mobile_panel(mut mobile_panel: Signal<MobilePanel>) {
+    if mobile_panel() == MobilePanel::None {
+        return;
+    }
+    if browser_mobile_panel() != MobilePanel::None {
+        mobile_panel.set(MobilePanel::None);
+        if let Some(window) = web_sys::window()
+            && let Ok(history) = window.history()
+            && history.back().is_ok()
+        {
+            return;
+        }
+    }
+    mobile_panel.set(MobilePanel::None);
+}
+
+fn open_mobile_navigation(mobile_panel: Signal<MobilePanel>) {
+    open_mobile_panel(mobile_panel, MobilePanel::Navigation);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,7 +593,6 @@ enum DialogState {
 #[component]
 fn App() -> Element {
     let route = use_signal(browser_route);
-    let _popstate = use_hook(move || Rc::new(PopstateListener::new(route)));
     let mut workspaces = use_signal(WorkspaceList::default);
     let controllers = use_signal(Controllers::new);
     let mut daemon_connected = use_signal(|| false);
@@ -527,7 +617,8 @@ fn App() -> Element {
     let utility_expanded = use_signal(|| storage_get(UTILITY_EXPANDED_KEY) == "expanded");
     let line_wrap = use_signal(|| storage_get(DIFF_WRAP_KEY) == "wrap");
     use_context_provider(|| DiffPreferences { line_wrap });
-    let mut mobile_panel = use_signal(|| MobilePanel::None);
+    let mobile_panel = use_signal(|| MobilePanel::None);
+    let _popstate = use_hook(move || Rc::new(PopstateListener::new(route, mobile_panel)));
     let modes = use_signal(HashMap::<String, TranscriptMode>::new);
     let scroll_positions = use_signal(HashMap::<String, TranscriptScrollState>::new);
     let mut route_notice = use_signal(String::new);
@@ -747,13 +838,13 @@ fn App() -> Element {
                     MobilePanel::None if route.read().thread.is_some() => {
                         utility_open.set(true);
                         storage_set(UTILITY_OPEN_KEY, "open");
-                        mobile_panel.set(MobilePanel::Utility);
+                        open_mobile_panel(mobile_panel, MobilePanel::Utility);
                     }
                     MobilePanel::Navigation if dx < 0.0 => {
-                        mobile_panel.set(MobilePanel::None);
+                        close_mobile_panel(mobile_panel);
                     }
                     MobilePanel::Utility if dx > 0.0 => {
-                        mobile_panel.set(MobilePanel::None);
+                        close_mobile_panel(mobile_panel);
                     }
                     _ => {}
                 }
@@ -850,7 +941,7 @@ fn App() -> Element {
                 button {
                     class: "drawer-backdrop",
                     aria_label: "Close drawer",
-                    onclick: move |_| mobile_panel.set(MobilePanel::None),
+                    onclick: move |_| close_mobile_panel(mobile_panel),
                 }
             }
             if !route_notice().is_empty() {
@@ -1026,7 +1117,7 @@ fn Navigation(
                 button {
                     class: "icon-button mobile-only",
                     aria_label: "Close navigation",
-                    onclick: move |_| mobile_panel.set(MobilePanel::None),
+                    onclick: move |_| close_mobile_panel(mobile_panel),
                     "×"
                 }
             }
@@ -1063,7 +1154,7 @@ fn Navigation(
                                             thread: Some(pin.thread),
                                             detail: None,
                                         });
-                                        mobile_panel.set(MobilePanel::None);
+                                        close_mobile_panel(mobile_panel);
                                     }
                                 },
                                 div { class: "thread-title-line",
@@ -1102,11 +1193,14 @@ fn Navigation(
                                 class: "navigation-link",
                                 onclick: {
                                     let workspace = pin.workspace.clone();
-                                    move |_| navigate(route, Route {
-                                        workspace: Some(workspace.clone()),
-                                        thread: Some(pin.thread),
-                                        detail: None,
-                                    })
+                                    move |_| {
+                                        navigate(route, Route {
+                                            workspace: Some(workspace.clone()),
+                                            thread: Some(pin.thread),
+                                            detail: None,
+                                        });
+                                        close_mobile_panel(mobile_panel);
+                                    }
                                 },
                                 div { class: "thread-title-line",
                                     span { class: "row-title", "Thread {pin.thread}" }
@@ -1183,7 +1277,7 @@ fn Navigation(
                                                         thread: Some(thread.id.0),
                                                         detail: None,
                                                     });
-                                                    mobile_panel.set(MobilePanel::None);
+                                                    close_mobile_panel(mobile_panel);
                                                 }
                                             },
                                             div { class: "thread-title-line",
@@ -1561,7 +1655,7 @@ fn ThreadPage(
                 utility_tab.set(UtilityTab::Activity);
                 utility_open.set(true);
                 if is_narrow_viewport() {
-                    mobile_panel.set(MobilePanel::Utility);
+                    open_mobile_panel(mobile_panel, MobilePanel::Utility);
                 }
                 storage_set(UTILITY_OPEN_KEY, "open");
                 storage_set(UTILITY_TAB_KEY, "activity");
@@ -1716,12 +1810,12 @@ fn ContextHeader(
                         nav_open.set(true);
                         storage_set(NAV_OPEN_KEY, "open");
                         if mobile_panel() == MobilePanel::Navigation {
-                            mobile_panel.set(MobilePanel::None);
+                            close_mobile_panel(mobile_panel);
                         } else {
-                            mobile_panel.set(MobilePanel::Navigation);
+                            open_mobile_panel(mobile_panel, MobilePanel::Navigation);
                         }
                     } else {
-                        mobile_panel.set(MobilePanel::None);
+                        close_mobile_panel(mobile_panel);
                         let next = !nav_open();
                         nav_open.set(next);
                         storage_set(NAV_OPEN_KEY, if next { "open" } else { "closed" });
@@ -1820,12 +1914,12 @@ fn ContextHeader(
                         utility_open.set(true);
                         storage_set(UTILITY_OPEN_KEY, "open");
                         if mobile_panel() == MobilePanel::Utility {
-                            mobile_panel.set(MobilePanel::None);
+                            close_mobile_panel(mobile_panel);
                         } else {
-                            mobile_panel.set(MobilePanel::Utility);
+                            open_mobile_panel(mobile_panel, MobilePanel::Utility);
                         }
                     } else {
-                        mobile_panel.set(MobilePanel::None);
+                        close_mobile_panel(mobile_panel);
                         let next = !utility_open();
                         utility_open.set(next);
                         storage_set(UTILITY_OPEN_KEY, if next { "open" } else { "closed" });
@@ -3349,7 +3443,7 @@ fn UtilityPanel(
                     aria_label: "Close utility panel",
                     onclick: move |_| {
                         utility_open.set(false);
-                        mobile_panel.set(MobilePanel::None);
+                        close_mobile_panel(mobile_panel);
                         storage_set(UTILITY_OPEN_KEY, "closed");
                     },
                     "×"

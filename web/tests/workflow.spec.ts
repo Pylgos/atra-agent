@@ -224,6 +224,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
 
   await swipe(page, { x: 30, y: 420 }, { x: 150, y: 425 });
   await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.search)).toBe("?atra-mobile=navigation");
   const initialThreadLink = page.locator(".workspace-thread-row .navigation-link");
   const initialThreadLinkBox = await initialThreadLink.boundingBox();
   expect(initialThreadLinkBox).not.toBeNull();
@@ -246,6 +247,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await page.locator(".workspace-thread-row .navigation-link").click();
   await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
   await expect(page.getByText("Existing prompt")).toBeVisible();
+  expect(await page.evaluate(() => location.search)).toBe("");
 
   await page.setViewportSize({ width: 1280, height: 720 });
   const workspaceRow = page.locator(".workspace-thread-row").filter({ hasText: "Web Thread" });
@@ -1042,6 +1044,9 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
   await swipe(page, { x: 380, y: 420 }, { x: 240, y: 425 });
   await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.search)).toBe("");
+  await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
 
   const composerInput = page.locator("#composer textarea");
   await composerInput.scrollIntoViewIfNeeded();
@@ -1070,6 +1075,15 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   const mobileComposer = await page.locator("#composer").boundingBox();
   expect(mobileComposer).not.toBeNull();
   expect(mobileComposer!.y + mobileComposer!.height).toBeLessThanOrEqual(844);
+
+  const threadPath = await page.evaluate(() => location.pathname);
+  await page.getByRole("button", { name: "Toggle navigation" }).click();
+  await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.search)).toBe("?atra-mobile=navigation");
+  await page.goBack();
+  await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.pathname)).toBe(threadPath);
+  expect(await page.evaluate(() => location.search)).toBe("");
 });
 
 test("composer history navigation, stash, and rewind prefill", async ({ page, mockEventSources }) => {
