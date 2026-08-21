@@ -186,15 +186,10 @@ async fn asset(uri: axum::http::Uri) -> Response {
         normalized.as_str()
     };
     if let Some((bytes, content_type)) = embedded::get(asset_path) {
-        let cache = if matches!(asset_path, "/index.html" | "/service-worker.js") {
-            "no-cache"
-        } else {
-            "public, max-age=31536000, immutable"
-        };
         return (
             [
                 (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, cache),
+                (header::CACHE_CONTROL, asset_cache_control(asset_path)),
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             ],
             bytes,
@@ -220,6 +215,17 @@ async fn asset(uri: axum::http::Uri) -> Response {
             .into_response();
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn asset_cache_control(path: &str) -> &'static str {
+    if matches!(
+        path,
+        "/index.html" | "/service-worker.js" | "/assets/shiki/index.mjs"
+    ) {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
+    }
 }
 
 pub async fn serve(
@@ -650,6 +656,16 @@ mod tests {
         SecretKey,
         elliptic_curve::{rand_core::OsRng, sec1::ToEncodedPoint},
     };
+
+    #[test]
+    fn mutable_asset_entrypoints_are_not_cached_immutably() {
+        assert_eq!(asset_cache_control("/index.html"), "no-cache");
+        assert_eq!(asset_cache_control("/assets/shiki/index.mjs"), "no-cache");
+        assert_eq!(
+            asset_cache_control("/assets/shiki/chunks/bash-HASH.mjs"),
+            "public, max-age=31536000, immutable"
+        );
+    }
 
     #[test]
     fn command_security_requires_exact_host_and_json() {

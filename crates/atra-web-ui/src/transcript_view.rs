@@ -538,6 +538,14 @@ pub(super) fn activity<'a>(
     }
 }
 
+pub(super) fn activity_can_receive_active_updates(state: &ThreadState, key: &ActivityKey) -> bool {
+    match resolve_activity_key(state, key) {
+        ActivityKey::Active(_) | ActivityKey::StableActive { .. } => true,
+        ActivityKey::Tool { call, .. } => tool_activity_state(state, call).result.is_none(),
+        ActivityKey::Event(_) | ActivityKey::Todo { .. } => false,
+    }
+}
+
 fn active_activity<'a>(
     state: &'a ThreadState,
     item: &'a ActiveItem,
@@ -2089,6 +2097,7 @@ mod tests {
             .unwrap()
             .activity_keys()[0]
             .clone();
+        assert!(activity_can_receive_active_updates(&state, &selected));
 
         ThreadOperation::ToolResultFinalized {
             event: event(
@@ -2124,6 +2133,7 @@ mod tests {
             OperationStatus::Finished { exit: None }
         );
         assert_eq!(completed.operations[0].output, "persisted\n");
+        assert!(!activity_can_receive_active_updates(&state, &selected));
     }
 
     #[test]

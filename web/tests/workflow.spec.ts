@@ -481,7 +481,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             item_id: "command-item",
             call_id: null,
             name: "command",
-            input: "*** Runner sandbox\nset -e\necho hello"
+            input: "*** Runner sandbox\nset -e\necho hel"
           }
         }
       }
@@ -490,6 +490,39 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(
     page.locator(".activity-command:has(.command-row-status .status-dots)")
   ).toBeVisible();
+  const streamingCommand = page.locator(
+    ".activity-command:has(.command-row-status .status-dots) .command-row-source"
+  );
+  await expect(streamingCommand).toContainText("echo hel");
+  await expect(streamingCommand).toHaveClass(/truncated/);
+  expect(
+    await streamingCommand.evaluate(
+      (element) => getComputedStyle(element).maskImage !== "none"
+    )
+  ).toBe(true);
+  await streamingCommand.locator(".shiki-token").first().evaluate((element) => {
+    element.setAttribute("data-test-stable-token", "true");
+  });
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_text_appended",
+        id: 20,
+        content: "lo\nprintf hidden"
+      }
+    });
+  });
+  await expect(streamingCommand).toContainText("echo hello");
+  await expect(streamingCommand).not.toContainText("printf hidden");
+  await expect(streamingCommand).toHaveAttribute(
+    "data-atra-command",
+    "set -e\necho hello"
+  );
+  await expect(streamingCommand.locator('[data-test-stable-token="true"]')).toHaveCount(1);
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -507,7 +540,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             item_id: "command-item",
             call_id: "command-call",
             name: "command",
-            input: "*** Runner sandbox\nset -e\necho hello"
+            input: "*** Runner sandbox\nset -e\necho hello\nprintf hidden"
           }
         }
       }
@@ -557,7 +590,7 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     });
   });
   await expect(page.locator(".utility .command-output")).toContainText("hello\nworld");
-  await expect(page.locator(".utility .command-operation header span")).toContainText("elapsed");
+  await expect(page.locator(".utility .command-operation > header > span")).toContainText("elapsed");
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -576,14 +609,78 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
               runner: "sandbox",
               label: "Command",
               result: "hello\nworld\n",
-              artifacts: []
+              artifacts: [{
+                kind: "patch_operations",
+                data: {
+                  status: "operations",
+                  results: [{
+                    kind: "updated",
+                    path: "src/lib.rs",
+                    outcome: {
+                      status: "applied",
+                      diff: {
+                        Ok: {
+                          old_path: "a/src/lib.rs",
+                          new_path: "b/src/lib.rs",
+                          hunks: [{
+                            old_start: 1,
+                            old_count: 1,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: [
+                              { kind: "removed", old_line: 1, new_line: null, text: "let old = 1;" },
+                              { kind: "added", old_line: null, new_line: 1, text: "let new = 1;" }
+                            ]
+                          }]
+                        }
+                      }
+                    }
+                  }]
+                }
+              }]
             }
           }
         }
       }
     });
   });
-  await expect(page.locator(".utility .command-operation header span")).toHaveText("finished");
+  await expect(page.locator(".utility .command-operation > header > span")).toHaveText("finished");
+  const runningCommandDiff = page.locator(".utility .github-diff-file");
+  await expect(runningCommandDiff).toHaveCount(1);
+  await runningCommandDiff.evaluate((element) => {
+    element.setAttribute("data-test-running-diff", "true");
+  });
+  await page.evaluate(() => {
+    const source = (window as any).__atraEventSources.get(
+      "/api/workspaces/workspace-1/threads/1/events"
+    );
+    source.emit({
+      message: "operation",
+      operation: {
+        operation: "active_item_added",
+        item: {
+          id: 22,
+          data: {
+            kind: "runner_tool",
+            call_id: "other-command",
+            operation_index: 1,
+            runner: "sandbox",
+            update: {
+              kind: "command_started",
+              timer: {
+                elapsed_ms: 0,
+                remaining_ms: 30000,
+                timeout_ms: 30000
+              }
+            }
+          }
+        }
+      }
+    });
+  });
+  await expect(
+    page.locator('.utility .github-diff-file[data-test-running-diff="true"]')
+  ).toHaveCount(1);
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -600,25 +697,61 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
             name: "command",
             call_id: "command-call",
             result: "hello\nworld\n",
-            artifacts: [{
-              kind: "runner_operation",
-              data: {
-                operation: 1,
-                runner: "sandbox",
-                label: "Command",
-                result: "persisted\n",
-                artifacts: []
+            artifacts: [
+              {
+                kind: "runner_operation",
+                data: {
+                  operation: 1,
+                  runner: "sandbox",
+                  label: "Command",
+                  result: "persisted\n",
+                  artifacts: []
+                }
+              },
+              {
+                kind: "patch_operations",
+                data: {
+                  status: "operations",
+                  results: [{
+                    kind: "updated",
+                    path: "src/lib.rs",
+                    outcome: {
+                      status: "applied",
+                      diff: {
+                        Ok: {
+                          old_path: "a/src/lib.rs",
+                          new_path: "b/src/lib.rs",
+                          hunks: [{
+                            old_start: 1,
+                            old_count: 1,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: [
+                              { kind: "removed", old_line: 1, new_line: null, text: "let old = 1;" },
+                              { kind: "added", old_line: null, new_line: 1, text: "let new = 1;" }
+                            ]
+                          }]
+                        }
+                      }
+                    }
+                  }]
+                }
               }
-            }]
+            ]
           }
         },
         runner_ids: [21]
       }
     });
   });
-  await expect(page.locator(".utility .command-operation header span")).toHaveText("finished");
+  await expect(page.locator(".utility .command-operation > header > span")).toHaveText("finished");
   await expect(page.locator(".utility .command-output")).toContainText("persisted");
-  await expect(page.locator(".utility .command-operation header span")).not.toHaveText("queued");
+  await expect(page.locator(".utility .command-operation > header > span")).not.toHaveText("queued");
+  const selectedCommandDiff = page.locator(".utility .github-diff-file");
+  await expect(selectedCommandDiff).toHaveCount(1);
+  await selectedCommandDiff.evaluate((element) => {
+    element.setAttribute("data-test-stable-diff", "true");
+  });
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/threads/1/events"
@@ -638,6 +771,9 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
+  await expect(
+    page.locator('.utility .github-diff-file[data-test-stable-diff="true"]')
+  ).toHaveCount(1);
   const currentTurn = page.locator(".turn").last();
   const streamingCommentary = currentTurn.locator(".activity-commentary", {
     hasText: "Streaming commentary"

@@ -1,12 +1,18 @@
 {
-  "name": "atra-web-tests",
+  "name": "atra-web",
   "private": true,
   "packageManager": "pnpm@10.17.1",
   "scripts": {
+    "build": "vite build",
     "test": "playwright test"
   },
   "devDependencies": {
     "@playwright/test": "1.55.0",
-    "prismjs": "1.30.0"
+    "@shikijs/core": "4.4.3",
+    "@shikijs/engine-javascript": "4.4.3",
+    "@shikijs/langs": "4.4.3",
+    "@shikijs/stream": "4.4.3",
+    "@shikijs/themes": "4.4.3",
+    "vite": "8.2.2"
   }
 }

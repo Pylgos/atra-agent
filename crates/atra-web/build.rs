@@ -48,7 +48,7 @@ fn mime(path: &str) -> &'static str {
         "text/html; charset=utf-8"
     } else if path.ends_with(".css") {
         "text/css; charset=utf-8"
-    } else if path.ends_with(".js") {
+    } else if path.ends_with(".js") || path.ends_with(".mjs") {
         "text/javascript; charset=utf-8"
     } else if path.ends_with(".wasm") {
         "application/wasm"

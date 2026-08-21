@@ -33,7 +33,7 @@ use model::{
     WorkspaceList, draft_key, factual_status, family_threads, render_markdown, root_id,
     root_threads, thread_name,
 };
-use syntax::{highlight, setup_markdown_highlighting};
+use syntax::setup_syntax_highlighting;
 use thread_store::ThreadStore;
 use transcript_view::{
     ActivityDisplay, ActivityKey, CommandDisplay, OperationStatus, RawKey, TurnKey,
@@ -58,7 +58,7 @@ struct TranscriptScrollState {
 
 fn main() {
     install_browser_diagnostics();
-    setup_markdown_highlighting();
+    setup_syntax_highlighting();
     dioxus::launch(App);
 }
 
@@ -679,7 +679,10 @@ fn App() -> Element {
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/atra-web.css") }
-        document::Script { src: asset!("/assets/prism.min.js") }
+        document::Script {
+            r#type: "module",
+            src: "/assets/shiki/index.mjs",
+        }
         main {
             class: "{shell_class}",
             style: "{shell_style}",
@@ -2298,6 +2301,23 @@ fn operation_status_class(status: &OperationStatus) -> &'static str {
 }
 
 #[component]
+fn CommandSourcePreview(command: String) -> Element {
+    let lines = command.lines().take(2).collect::<Vec<_>>();
+    let truncated = lines.len() > 1;
+    let source = lines.join("\n");
+    rsx! {
+        code {
+            class: if truncated {
+                "command-row-source truncated"
+            } else {
+                "command-row-source"
+            },
+            "data-atra-command": "{source}",
+        }
+    }
+}
+
+#[component]
 fn ActivityRow(
     store: ThreadStore,
     turn_key: TurnKey,
@@ -2358,14 +2378,7 @@ fn ActivityRow(
                     div { class: "command-row",
                         for operation in &operations {
                             div { class: "command-row-operation",
-                                div {
-                                    class: if operation.command.trim_end().lines().count() > 1 {
-                                        "command-row-source highlighted truncated"
-                                    } else {
-                                        "command-row-source highlighted"
-                                    },
-                                    dangerous_inner_html: "{highlight(&operation.command, \"bash\")}",
-                                }
+                                CommandSourcePreview { command: operation.command.clone() }
                                 div { class: "command-row-meta",
                                     span { class: "command-row-runner", "{operation.runner}" }
                                     span { class: operation_status_class(&operation.status),
@@ -2629,8 +2642,8 @@ fn CommandOperations(display: CommandDisplay) -> Element {
                     }
                     if !operation.command.is_empty() {
                         pre {
-                            class: "command-source highlighted",
-                            dangerous_inner_html: "{highlight(&operation.command, \"bash\")}",
+                            class: "command-source",
+                            "data-atra-command": "{operation.command}",
                         }
                     }
                     if !operation.output.is_empty() {

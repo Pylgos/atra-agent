@@ -3,8 +3,6 @@ use std::{cell::RefCell, ops::Deref, rc::Rc};
 use dioxus::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 
-use crate::syntax::highlight;
-
 #[derive(Clone, Copy)]
 pub(crate) struct DiffPreferences {
     pub line_wrap: Signal<bool>,
@@ -556,7 +554,6 @@ fn DiffLine(
     };
     let old_line = line.old_line;
     let new_line = line.new_line;
-    let highlighted = highlight(&line.content, language);
     let no_newline_at_eof = line.no_newline_at_eof;
     rsx! {
         div { class: "{class}",
@@ -581,8 +578,9 @@ fn DiffLine(
                 {new_line.map(|line| line.to_string()).unwrap_or_default()}
             }
             code {
-                class: "diff-line-content highlighted",
-                dangerous_inner_html: "{highlighted}",
+                class: "diff-line-content",
+                "data-atra-highlight": "{language}",
+                "data-atra-source": "{line.content}",
             }
             if no_newline_at_eof {
                 span { class: "diff-no-newline", "No newline at end of file" }

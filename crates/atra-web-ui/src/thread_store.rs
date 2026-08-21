@@ -33,6 +33,7 @@ enum ThreadScope {
     ActiveTurnStatus,
     ActiveItemList,
     ActiveItem(ActiveItemId),
+    RunnerCall(String),
     Interaction,
     Outcome,
     Checkpoints,
@@ -65,7 +66,7 @@ pub(super) struct TurnRead {
 }
 pub(super) struct ActivityRead {
     state: StateRead,
-    active_items: Option<StateRead>,
+    runner_call: Option<StateRead>,
     related: Vec<StateRead>,
     key: ActivityKey,
 }
@@ -143,7 +144,7 @@ impl ActivityRead {
         self.related
             .iter()
             .rev()
-            .chain(self.active_items.iter())
+            .chain(self.runner_call.iter())
             .chain(std::iter::once(&self.state))
             .find_map(|state| {
                 state
@@ -296,6 +297,10 @@ impl ThreadStore {
                 child(root, ScopeSegment::Transcript),
                 ScopeSegment::ActiveItem(id),
             ),
+            ThreadScope::RunnerCall(call_id) => child(
+                child(root, ScopeSegment::Transcript),
+                ScopeSegment::RunnerCall(call_id),
+            ),
             ThreadScope::Interaction => child(
                 child(
                     child(root, ScopeSegment::Transcript),
@@ -411,10 +416,21 @@ impl ThreadStore {
             }
             _ => self.read(ThreadScope::Turn(turn.sequence())),
         };
-        let identity = transcript_view::activity_identity(&resolved);
-        let related = identity
+        let tracks_runner_call = self.inner.peek().value.as_ref().is_some_and(|state| {
+            transcript_view::activity_can_receive_active_updates(state, &resolved)
+        });
+        let runner_call = tracks_runner_call
+            .then(|| match &resolved {
+                ActivityKey::Tool {
+                    identity: Some(call_id),
+                    ..
+                } => Some(call_id.clone()),
+                _ => None,
+            })
+            .flatten();
+        let related = runner_call
             .as_deref()
-            .and_then(|identity| {
+            .and_then(|call_id| {
                 self.inner
                     .peek()
                     .value
@@ -425,9 +441,10 @@ impl ThreadStore {
                             .items()
                             .iter()
                             .filter_map(|item| match item.data() {
-                                ActiveItemData::RunnerTool { call_id, .. }
-                                    if call_id == identity =>
-                                {
+                                ActiveItemData::RunnerTool {
+                                    call_id: item_call_id,
+                                    ..
+                                } if item_call_id == call_id => {
                                     Some(self.read(ThreadScope::ActiveItem(item.id())))
                                 }
                                 _ => None,
@@ -438,7 +455,7 @@ impl ThreadStore {
             .unwrap_or_default();
         ActivityRead {
             state,
-            active_items: identity.map(|_| self.read(ThreadScope::ActiveItemList)),
+            runner_call: runner_call.map(|call_id| self.read(ThreadScope::RunnerCall(call_id))),
             related,
             key,
         }
@@ -590,8 +607,31 @@ impl ThreadStore {
             ThreadChange::ActiveTurnStateUpdated => {
                 self.scope(ThreadScope::ActiveTurnStatus).mark_dirty();
             }
-            ThreadChange::ActiveItemAdded(_) | ThreadChange::ActiveItemRemoved(_) => {
+            ThreadChange::ActiveItemAdded(id) => {
                 self.scope(ThreadScope::ActiveItemList).mark_dirty();
+                let runner_call = {
+                    let remote = self.inner.peek();
+                    remote.value.as_ref().and_then(|state| {
+                        state
+                            .active_turn()
+                            .into_iter()
+                            .flat_map(|turn| turn.items())
+                            .find(|item| item.id() == id)
+                            .and_then(|item| match item.data() {
+                                ActiveItemData::RunnerTool { call_id, .. } => Some(call_id.clone()),
+                                _ => None,
+                            })
+                    })
+                };
+                if let Some(call_id) = runner_call {
+                    self.scope(ThreadScope::RunnerCall(call_id)).mark_dirty();
+                }
+                self.scope(ThreadScope::PrettyTranscriptContent)
+                    .mark_dirty_shallow();
+            }
+            ThreadChange::ActiveItemRemoved(id) => {
+                self.scope(ThreadScope::ActiveItemList).mark_dirty();
+                self.scope(ThreadScope::ActiveItem(id)).mark_dirty();
                 self.scope(ThreadScope::PrettyTranscriptContent)
                     .mark_dirty_shallow();
             }
@@ -600,9 +640,33 @@ impl ThreadStore {
                 self.scope(ThreadScope::PrettyTranscriptContent)
                     .mark_dirty_shallow();
             }
-            ThreadChange::ActiveItemFinalized { sequence, .. }
-            | ThreadChange::ToolResultFinalized { sequence, .. } => {
+            ThreadChange::ActiveItemFinalized {
+                active_id,
+                sequence,
+            } => {
                 self.scope(ThreadScope::ActiveItemList).mark_dirty();
+                self.scope(ThreadScope::ActiveItem(active_id)).mark_dirty();
+                let target = {
+                    let remote = self.inner.peek();
+                    remote.value.as_ref().and_then(|state| {
+                        turn_key_for_event(state, sequence)
+                            .map(|key| ThreadScope::Turn(key.sequence()))
+                    })
+                };
+                if let Some(target) = target {
+                    self.scope(target).mark_dirty();
+                }
+                self.scope(ThreadScope::PrettyTranscriptContent)
+                    .mark_dirty_shallow();
+            }
+            ThreadChange::ToolResultFinalized {
+                sequence,
+                runner_ids,
+            } => {
+                self.scope(ThreadScope::ActiveItemList).mark_dirty();
+                for id in runner_ids {
+                    self.scope(ThreadScope::ActiveItem(id)).mark_dirty();
+                }
                 let target = {
                     let remote = self.inner.peek();
                     remote.value.as_ref().and_then(|state| {
@@ -655,6 +719,7 @@ enum ScopeSegment {
     ActiveTurnStatus,
     ActiveItemList,
     ActiveItem(ActiveItemId),
+    RunnerCall(String),
     Interaction,
     Outcome,
     Checkpoints,

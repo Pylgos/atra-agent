@@ -45,6 +45,15 @@
             }
             .${system};
           platform = "${architecture}-linux-static";
+          webSource = pkgs.lib.fileset.toSource {
+            root = ./web;
+            fileset = pkgs.lib.fileset.unions [
+              ./web/package.json
+              ./web/pnpm-lock.yaml
+              ./web/src
+              ./web/vite.config.mjs
+            ];
+          };
           cargoSource = pkgs.lib.fileset.toSource {
             root = ./.;
             fileset = pkgs.lib.fileset.unions [
@@ -52,6 +61,10 @@
               ./Cargo.lock
               ./crates
               ./tools/build-atra-web-assets.sh
+              ./web/package.json
+              ./web/pnpm-lock.yaml
+              ./web/src
+              ./web/vite.config.mjs
             ];
           };
           nixCargoVendor = static.rustPlatform.fetchCargoVendor {
@@ -69,14 +82,26 @@
             substitute ${nixCargoVendor}/.cargo/config.toml "$out/config.toml" \
               --replace-fail '@vendor@' "$out"
           '';
+          pnpmDeps = hostPkgs.fetchPnpmDeps {
+            pname = "atra-web";
+            inherit version;
+            src = webSource;
+            pnpm = hostPkgs.pnpm_10;
+            fetcherVersion = 4;
+            hash = "sha256-yKPEBH/ono/JrQFuY1LT/Un3AioJqKiU5Wzwplsmu+M=";
+          };
           webAssets = pkgs.stdenv.mkDerivation {
             pname = "atra-web-assets";
-            inherit version;
+            inherit version pnpmDeps;
             src = cargoSource;
+            pnpmRoot = "web";
             nativeBuildInputs = [
               hostRust
               hostPkgs.binaryen
               hostPkgs.dioxus-cli
+              hostPkgs.nodejs
+              hostPkgs.pnpm_10
+              hostPkgs.pnpmConfigHook
             ];
             buildPhase = ''
               runHook preBuild

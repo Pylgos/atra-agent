@@ -225,7 +225,7 @@ test("Changes highlights source and unmounts diff bodies outside the viewport", 
   const first = page.locator(".github-diff-file").first();
   const last = page.locator(".github-diff-file").last();
   await expect(first.locator(".diff-body")).toHaveCount(1);
-  await expect(first.locator(".token.keyword").first()).toContainText("let");
+  await expect(first.locator(".shiki-token", { hasText: "let" }).first()).toContainText("let");
   await expect.poll(() => page.locator(".diff-body").count()).toBeLessThan(files.length);
   const utility = page.locator(".utility-content");
   const initialHeight = await utility.evaluate((element) => element.scrollHeight);
