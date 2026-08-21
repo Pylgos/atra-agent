@@ -287,6 +287,14 @@ static SPECS: &[ModelSpec] = &[
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
+        id: "ox-alpha-free",
+        name: "Ox Alpha Free",
+        api: Api::ChatCompletions,
+        context: 1_000_000,
+        reasoning: &["default"],
+        bindings: WEB_BINDINGS,
+    },
+    ModelSpec {
         id: "kimi-k3",
         name: "Kimi K3",
         api: Api::ChatCompletions,
@@ -410,7 +418,19 @@ static SPECS: &[ModelSpec] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::spec;
+    use super::{Api, spec};
+
+    #[test]
+    fn ox_alpha_free_uses_chat_completions_without_reasoning_effort() {
+        let spec = spec("ox-alpha-free").unwrap();
+        assert!(matches!(spec.api, Api::ChatCompletions));
+        assert_eq!(spec.context, 1_000_000);
+
+        let model = spec.model();
+        assert_eq!(model.display_name, "Ox Alpha Free");
+        assert_eq!(model.default_reasoning_effort, "default");
+        assert_eq!(model.supported_reasoning_efforts, ["default"]);
+    }
 
     #[test]
     fn messages_models_publish_effort_options_with_high_as_default() {
