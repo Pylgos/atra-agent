@@ -707,7 +707,8 @@ pre {
 .transcript {
   height: 100%;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
 }
 
@@ -985,6 +986,8 @@ pre {
 .activity-list {
   position: relative;
   display: grid;
+  flex: 1;
+  min-width: 0;
   gap: 0.85rem;
   margin: 0.55rem 0 1rem 0.2rem;
   padding-left: 1rem;
