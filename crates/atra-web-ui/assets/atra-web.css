@@ -2395,10 +2395,15 @@ pre {
   line-height: 1.45;
 }
 
+.diff-lines-content {
+  width: max-content;
+  min-width: 100%;
+}
+
 .diff-code {
   display: grid;
   grid-template-columns: 3.2rem 3.2rem max-content;
-  min-width: max-content;
+  min-width: 100%;
 }
 
 .github-diff-file:not(.line-wrap) .diff-code {
@@ -2440,6 +2445,11 @@ pre {
 
 .line-wrap .diff-lines {
   overflow-x: auto;
+}
+
+.line-wrap .diff-lines-content {
+  width: 100%;
+  min-width: 0;
 }
 
 .line-wrap .diff-code {

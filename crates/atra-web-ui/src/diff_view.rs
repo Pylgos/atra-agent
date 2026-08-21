@@ -470,12 +470,14 @@ fn DiffFile(
                                 }
                             }
                             div { class: "diff-lines",
-                                for line_index in 0..hunk.lines.len() {
-                                    DiffLine {
-                                        file: file.clone(),
-                                        hunk_index,
-                                        line_index,
-                                        language,
+                                div { class: "diff-lines-content",
+                                    for line_index in 0..hunk.lines.len() {
+                                        DiffLine {
+                                            file: file.clone(),
+                                            hunk_index,
+                                            line_index,
+                                            language,
+                                        }
                                     }
                                 }
                             }

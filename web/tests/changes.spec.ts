@@ -176,6 +176,29 @@ test("Changes persists line wrapping independently of query state", async ({ pag
   )).toBe("wrap");
 });
 
+test("Changes extends line backgrounds across the scrollable diff width", async ({
+  page,
+  mockEventSources
+}) => {
+  const file = changedFile("src/wide.rs", 2);
+  file.hunks[0].lines[0].content = "short";
+  file.hunks[0].lines[1].content = "x".repeat(300);
+  await openChanges(page, mockEventSources, [file]);
+
+  const diffLines = page.locator(".diff-lines");
+  const shortLine = page.locator(".diff-code").first();
+  await expect.poll(() => diffLines.evaluate((element) =>
+    element.scrollWidth > element.clientWidth
+  )).toBe(true);
+  await expect.poll(async () => {
+    const scrollWidth = await diffLines.evaluate((element) => element.scrollWidth);
+    const lineWidth = await shortLine.evaluate(
+      (element) => element.getBoundingClientRect().width
+    );
+    return Math.abs(scrollWidth - lineWidth);
+  }).toBeLessThan(1);
+});
+
 test("Changes keeps file navigation stable while expanding context", async ({ page, mockEventSources }) => {
   const requests = await openChanges(page, mockEventSources);
   await expect(page.locator(".diff-line-content")).toContainText("let value = 1;");
