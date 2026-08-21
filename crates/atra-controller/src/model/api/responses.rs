@@ -461,23 +461,36 @@ fn parse(
                 })));
             }
             "response.custom_tool_call_input.delta" => {
-                let id = required_nonempty_str(
-                    frame,
-                    "call_id",
-                    "Responses custom_tool_call_input.delta event",
-                )?;
-                let value = required_str(
+                let delta = required_str(
                     frame,
                     "delta",
                     "Responses custom_tool_call_input.delta event",
                 )?;
-                let call = custom_calls.get_mut(id).with_context(|| {
-                    format!("Responses delta referenced unknown custom tool call {id}")
+                let call = if let Some(call_id) = frame
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|call_id| !call_id.is_empty())
+                {
+                    custom_calls.get_mut(call_id)
+                } else {
+                    let item_id = required_nonempty_str(
+                        frame,
+                        "item_id",
+                        "Responses custom_tool_call_input.delta event",
+                    )?;
+                    custom_calls
+                        .values_mut()
+                        .find(|(known_item_id, _, _)| known_item_id == item_id)
+                }
+                .with_context(|| {
+                    format!(
+                        "Responses custom_tool_call_input.delta referenced an unknown custom tool call: {frame}"
+                    )
                 })?;
-                call.2.push_str(value);
+                call.2.push_str(delta);
                 output.push(Ok(ModelEvent::Update(ModelStreamEvent::ToolCallDelta {
                     item_id: call.0.clone(),
-                    delta: value.to_owned(),
+                    delta: delta.to_owned(),
                 })));
             }
             "response.completed" => {
