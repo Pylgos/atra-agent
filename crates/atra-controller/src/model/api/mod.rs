@@ -29,28 +29,11 @@ pub(super) fn function_tools(tools: &[ModelTool]) -> Vec<Value> {
                     crate::tools::web_fetch_parameters(),
                 ));
             }
-            ModelTool::Tool { name, json, custom } => {
-                if let Some(interface) = json {
-                    values.push(function_tool(
-                        name,
-                        &interface.description,
-                        interface.parameters.clone(),
-                    ));
-                } else if let Some(interface) = custom {
-                    values.push(function_tool(
-                        name,
-                        &interface.description,
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "input": {"type": "string"}
-                            },
-                            "required": ["input"],
-                            "additionalProperties": false
-                        }),
-                    ));
-                }
-            }
+            ModelTool::Tool { name, json, .. } => values.push(function_tool(
+                name,
+                &json.description,
+                json.parameters.clone(),
+            )),
         }
     }
     values
@@ -59,14 +42,14 @@ pub(super) fn function_tools(tools: &[ModelTool]) -> Vec<Value> {
 pub(super) fn request_stream<A, Fut, M, F, G>(
     mut attempt: A,
     label: &'static str,
-    live: F,
+    mut live: F,
     finish: G,
 ) -> ModelEventStream
 where
     A: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(Response, M)>> + Send + 'static,
     M: Send + 'static,
-    F: Fn(&Value) -> Result<Vec<ModelStreamEvent>> + Send + Sync + 'static,
+    F: FnMut(&Value) -> Result<Vec<ModelEvent>> + Send + 'static,
     G: Fn(Vec<Value>, M) -> Result<ModelEventStream> + Send + 'static,
 {
     let (sender, receiver) = tokio::sync::mpsc::channel(32);
@@ -130,10 +113,10 @@ where
                     }
                 };
                 match live(&frame) {
-                    Ok(updates) => {
-                        canonical_output |= !updates.is_empty();
-                        for update in updates {
-                            if sender.send(Ok(ModelEvent::Update(update))).await.is_err() {
+                    Ok(events) => {
+                        canonical_output |= !events.is_empty();
+                        for event in events {
+                            if sender.send(Ok(event)).await.is_err() {
                                 return;
                             }
                         }
@@ -473,10 +456,10 @@ mod tests {
             },
             "fixture",
             |frame| match frame["type"].as_str() {
-                Some("delta") => Ok(vec![ModelStreamEvent::AssistantDelta {
+                Some("delta") => Ok(vec![ModelEvent::Update(ModelStreamEvent::AssistantDelta {
                     content: frame["text"].as_str().unwrap().to_owned(),
                     phase: atra_protocol::AssistantMessagePhase::Commentary,
-                }]),
+                })]),
                 _ => Ok(Vec::new()),
             },
             |_, ()| completed(),
@@ -565,10 +548,10 @@ mod tests {
             },
             "fixture",
             |frame| {
-                Ok(vec![ModelStreamEvent::AssistantDelta {
+                Ok(vec![ModelEvent::Update(ModelStreamEvent::AssistantDelta {
                     content: frame["text"].as_str().unwrap().to_owned(),
                     phase: atra_protocol::AssistantMessagePhase::Commentary,
-                }])
+                })])
             },
             |_, ()| completed(),
         )

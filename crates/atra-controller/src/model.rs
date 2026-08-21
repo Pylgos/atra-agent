@@ -142,7 +142,7 @@ pub(crate) enum ModelTool {
     WebSearch,
     Tool {
         name: &'static str,
-        json: Option<ModelJsonToolInterface>,
+        json: ModelJsonToolInterface,
         custom: Option<ModelCustomToolInterface>,
     },
 }

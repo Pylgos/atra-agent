@@ -6,10 +6,10 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
     if allow_questions {
         tools.push(model::ModelTool::Tool {
             name: "question",
-            json: Some(model::ModelJsonToolInterface {
+            json: model::ModelJsonToolInterface {
                 description: "Ask the user one or more questions. Each question is answered with one option and an optional free-form note. recommended_options must contain option labels. The UI adds a final \"どれでもない\" option automatically, so do not provide it; that answer is returned with selected_option null. Use this when user input is required before continuing.".to_owned(),
                 parameters: question_parameters(),
-            }),
+            },
             custom: None,
         });
     }
@@ -82,13 +82,13 @@ pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
     tools.extend([
         model::ModelTool::Tool {
             name: "command",
-            json: Some(model::ModelJsonToolInterface {
+            json: model::ModelJsonToolInterface {
                 description: interface_description(
                     command_description,
                     "Execute exactly one Bash script. Set `runner` to the Runner name and `command` to the complete script.",
                 ),
                 parameters: command_parameters(),
-            }),
+            },
             custom: Some(model::ModelCustomToolInterface {
                 description: interface_description(
                     command_description,
@@ -829,7 +829,6 @@ mod tests {
             tool,
             model::ModelTool::Tool {
                 name: "question",
-                json: Some(_),
                 ..
             }
         )));

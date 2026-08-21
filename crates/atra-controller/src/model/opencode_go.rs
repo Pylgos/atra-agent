@@ -192,6 +192,10 @@ impl ModelSpec {
                 .map(|value| (*value).to_owned())
                 .collect()
         };
+        let default_reasoning_effort = match self.api {
+            Api::Messages if efforts.iter().any(|effort| effort == "high") => "high".to_owned(),
+            _ => efforts[0].clone(),
+        };
         Model {
             provider: PROVIDER_ID.to_owned(),
             id: self.id.to_owned(),
@@ -204,7 +208,7 @@ impl ModelSpec {
                 }
                 .to_owned(),
             ),
-            default_reasoning_effort: efforts[0].clone(),
+            default_reasoning_effort,
             supported_reasoning_efforts: efforts,
             context_window: Some(self.context),
             auto_compact_token_limit: Some(self.context * 9 / 10),
@@ -343,7 +347,7 @@ static SPECS: &[ModelSpec] = &[
         name: "MiniMax-M3",
         api: Api::Messages,
         context: 1_000_000,
-        reasoning: &["off", "on"],
+        reasoning: &["low", "medium", "high", "xhigh", "max"],
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
@@ -367,7 +371,7 @@ static SPECS: &[ModelSpec] = &[
         name: "Qwen3.8 Max",
         api: Api::Messages,
         context: 1_000_000,
-        reasoning: &["off", "on"],
+        reasoning: &["low", "medium", "high", "xhigh", "max"],
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
@@ -375,7 +379,7 @@ static SPECS: &[ModelSpec] = &[
         name: "Qwen3.7 Max",
         api: Api::Messages,
         context: 1_000_000,
-        reasoning: &["off", "on"],
+        reasoning: &["low", "medium", "high", "xhigh", "max"],
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
@@ -383,7 +387,7 @@ static SPECS: &[ModelSpec] = &[
         name: "Qwen3.7 Plus",
         api: Api::Messages,
         context: 1_000_000,
-        reasoning: &["off", "on"],
+        reasoning: &["low", "medium", "high", "xhigh", "max"],
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
@@ -391,7 +395,7 @@ static SPECS: &[ModelSpec] = &[
         name: "Qwen3.6 Plus",
         api: Api::Messages,
         context: 1_000_000,
-        reasoning: &["off", "on"],
+        reasoning: &["low", "medium", "high", "xhigh", "max"],
         bindings: WEB_BINDINGS,
     },
     ModelSpec {
@@ -403,3 +407,27 @@ static SPECS: &[ModelSpec] = &[
         bindings: WEB_BINDINGS,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::spec;
+
+    #[test]
+    fn messages_models_publish_effort_options_with_high_as_default() {
+        for id in [
+            "minimax-m3",
+            "qwen3.8-max",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.6-plus",
+        ] {
+            let model = spec(id).unwrap().model();
+            assert_eq!(model.default_reasoning_effort, "high", "{id}");
+            assert_eq!(
+                model.supported_reasoning_efforts,
+                ["low", "medium", "high", "xhigh", "max"],
+                "{id}"
+            );
+        }
+    }
+}
