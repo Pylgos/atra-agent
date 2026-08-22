@@ -1605,7 +1605,7 @@ fn ThreadPage(
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut error = use_signal(String::new);
     let dialog = use_signal(|| None::<DialogState>);
-    let selected_activity = use_signal(|| None::<(TurnKey, ActivityKey)>);
+    let mut selected_activity = use_signal(|| None::<(TurnKey, ActivityKey)>);
     let workspace_id = workspace.workspace_id.clone();
     let draft = use_signal(|| storage_get(&draft_key(&workspace_id, thread)));
     let history_index = use_signal(|| None::<usize>);
@@ -1666,20 +1666,16 @@ fn ThreadPage(
             storage_set(UTILITY_TAB_KEY, &format!("{tab:?}").to_lowercase());
         }
     });
-    use_effect({
-        let selected_activity = selected_activity.clone();
-        move || {
-            if selected_activity().is_some() {
-                utility_tab.set(UtilityTab::Activity);
-                utility_open.set(true);
-                if is_narrow_viewport() {
-                    open_mobile_panel(mobile_panel, MobilePanel::Utility);
-                }
-                storage_set(UTILITY_OPEN_KEY, "open");
-                storage_set(UTILITY_TAB_KEY, "activity");
-            }
+    let on_select_activity = move |selection: (TurnKey, ActivityKey)| {
+        selected_activity.set(Some(selection));
+        utility_tab.set(UtilityTab::Activity);
+        utility_open.set(true);
+        storage_set(UTILITY_OPEN_KEY, "open");
+        storage_set(UTILITY_TAB_KEY, "activity");
+        if is_narrow_viewport() {
+            open_mobile_panel(mobile_panel, MobilePanel::Utility);
         }
-    });
+    };
 
     rsx! {
         ContextHeader {
@@ -1728,7 +1724,7 @@ fn ThreadPage(
                     dialog,
                     error,
                     scroll_positions,
-                    selected_activity,
+                    on_select_activity: on_select_activity.clone(),
                 }
             } else {
                 Transcript {
@@ -1739,7 +1735,7 @@ fn ThreadPage(
                     dialog,
                     error,
                     scroll_positions,
-                    selected_activity,
+                    on_select_activity: on_select_activity.clone(),
                 }
                 Composer {
                     workspace: workspace_id.clone(),
@@ -2024,7 +2020,7 @@ fn Transcript(
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
     scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
-    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+    on_select_activity: EventHandler<(TurnKey, ActivityKey)>,
 ) -> Element {
     let mut following = use_signal(|| true);
     let mut has_latest = use_signal(|| false);
@@ -2142,7 +2138,7 @@ fn Transcript(
                                 store,
                                 turn_key,
                                 dialog,
-                                selected_activity,
+                                on_select_activity: on_select_activity.clone(),
                             }
                         }
                         InteractionPanel {
@@ -2205,7 +2201,7 @@ fn TurnCard(
     store: ThreadStore,
     turn_key: TurnKey,
     dialog: Signal<Option<DialogState>>,
-    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+    on_select_activity: EventHandler<(TurnKey, ActivityKey)>,
 ) -> Element {
     let mut group_open = use_signal(|| false);
     let mut activity_auto_expanded = use_signal(|| false);
@@ -2269,7 +2265,7 @@ fn TurnCard(
                                         store,
                                         turn_key,
                                         activity_key,
-                                        selected_activity,
+                                        on_select_activity: on_select_activity.clone(),
                                     }
                                 }
                             }
@@ -2458,7 +2454,7 @@ fn ActivityRow(
     store: ThreadStore,
     turn_key: TurnKey,
     activity_key: ActivityKey,
-    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+    on_select_activity: EventHandler<(TurnKey, ActivityKey)>,
 ) -> Element {
     let activity_read = store.read_activity(turn_key, activity_key.clone());
     let Some(activity) = activity_read.value() else {
@@ -2490,7 +2486,7 @@ fn ActivityRow(
             rsx! {
                 button {
                     class: "collapsible-compact activity-todo",
-                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                     span { "{compact}" }
                 }
             }
@@ -2500,7 +2496,7 @@ fn ActivityRow(
             rsx! {
                 button {
                     class: "collapsible-compact activity-reasoning",
-                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                     span { "{headline}" }
                 }
             }
@@ -2510,7 +2506,7 @@ fn ActivityRow(
             rsx! {
                 button {
                     class: "activity-command",
-                    onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                    onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                     div { class: "command-row",
                         for operation in &operations {
                             div { class: "command-row-operation",
@@ -2564,14 +2560,14 @@ fn ActivityRow(
         ActivityDisplay::Search { summary, .. } => rsx! {
             button {
                 class: "collapsible-compact activity-search",
-                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                 span { "{summary}" }
             }
         },
         ActivityDisplay::Question { summary, .. } => rsx! {
             button {
                 class: "activity-question",
-                onclick: move |_| selected_activity.set(Some((turn_key, activity_key.clone()))),
+                onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                 span { class: "question-badge", "Question" }
                 span { class: "question-summary", "{summary}" }
             }
@@ -3901,7 +3897,7 @@ fn CheckpointPreview(
     dialog: Signal<Option<DialogState>>,
     error: Signal<String>,
     scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
-    selected_activity: Signal<Option<(TurnKey, ActivityKey)>>,
+    on_select_activity: EventHandler<(TurnKey, ActivityKey)>,
 ) -> Element {
     let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
     let mut checkpoint_metadata = use_signal(|| None::<atra_protocol::ThreadCheckpoint>);
@@ -3981,7 +3977,7 @@ fn CheckpointPreview(
                 dialog,
                 error,
                 scroll_positions,
-                selected_activity,
+                on_select_activity,
             }
         } else {
             LoadingState { label: "Loading Checkpoint…" }

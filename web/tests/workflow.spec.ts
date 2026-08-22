@@ -1342,3 +1342,91 @@ test("composer history navigation, stash, and rewind prefill", async ({ page, mo
 
   expect(pageErrors).toEqual([]);
 });
+
+test("activity-opened utility drawer closes on mobile", async ({ page, mockEventSources }) => {
+  const pageErrors: Error[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error));
+  const snapshots: Record<string, unknown> = {
+    "/api/workspaces/events": {
+      workspaces: [{
+        workspace_id: "workspace-1",
+        name: "workspace",
+        path: "/tmp/workspace"
+      }]
+    },
+    "/api/workspaces/workspace-1/controller/events": {
+      message: "snapshot",
+      state: {
+        lifecycle: "running",
+        threads: [{
+          id: 1,
+          parent_thread_id: null,
+          display_name: "Web Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        }],
+        thread_statuses: [{ thread_id: 1, status: "idle" }],
+        providers: [],
+        runners: []
+      }
+    },
+    "/api/workspaces/workspace-1/threads/1/events": {
+      message: "snapshot",
+      state: {
+        metadata: {
+          id: 1,
+          parent_thread_id: null,
+          display_name: "Web Thread",
+          provider: "fake",
+          model: "test-model",
+          reasoning_effort: "medium"
+        },
+        events: [
+          { sequence: 1, kind: "user_message", payload: { content: "Existing prompt" } },
+          {
+            sequence: 2,
+            kind: "assistant_message",
+            payload: {
+              content: "Working on it.",
+              phase: "commentary",
+              todos: [
+                { step: "Inspect the result", status: "completed" },
+                { step: "Draft the response", status: "in_progress" }
+              ]
+            }
+          }
+        ],
+        active_turn: null,
+        last_outcome: null,
+        checkpoints: [],
+        processes: []
+      }
+    }
+  };
+  await mockEventSources(snapshots);
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Choose a Workspace" })).toBeVisible();
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await expect(page.locator(".navigation")).toHaveClass(/drawer-open/);
+  await page.locator(".workspace-thread-row .navigation-link").click();
+  await expect(page.getByText("Existing prompt")).toBeVisible();
+  await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
+
+  // Tapping an activity selects it and opens the utility drawer on mobile.
+  await page.locator(".activity-group-compact").first().click();
+  await page.locator(".activity-todo").first().click();
+  await expect(page.locator(".utility")).toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.search)).toBe("?atra-mobile=utility");
+
+  // Closing the drawer must not be undone by the activity selection.
+  await page.getByRole("button", { name: "Close utility panel" }).click();
+  await expect(page.locator(".utility")).not.toHaveClass(/drawer-open/);
+  expect(await page.evaluate(() => location.search)).toBe("");
+  await expect(page.locator(".drawer-backdrop")).toHaveCount(0);
+
+  // A later swipe-open close path still works.
+  expect(pageErrors).toEqual([]);
+});
