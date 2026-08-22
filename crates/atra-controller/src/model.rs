@@ -336,6 +336,11 @@ pub(crate) fn format_runners(runners: &[Runner]) -> String {
          is executed. If an approval request is denied, the tool call fails."
             .to_owned(),
     );
+    lines.push(
+        "When multiple Runners are suitable for an operation, prefer one with `allow` approval to \
+         avoid interrupting the user with approval requests."
+            .to_owned(),
+    );
     lines.join("\n")
 }
 
