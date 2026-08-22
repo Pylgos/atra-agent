@@ -572,7 +572,7 @@ fn open_mobile_navigation(mobile_panel: Signal<MobilePanel>) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeaderThreadAction {
+enum ComposerThreadAction {
     Continue,
     Compact,
     Checkpoint,
@@ -1694,11 +1694,7 @@ fn ThreadPage(
             thread,
             nav_open,
             utility_open,
-            utility_tab,
             mobile_panel,
-            controller: controller.clone(),
-            pins,
-            error,
         }
         if !connected {
             div { class: "connection-banner", role: "status",
@@ -1746,6 +1742,7 @@ fn ThreadPage(
                     thread,
                     store,
                     controller: controller.clone(),
+                    status,
                     connected,
                     pins,
                     error,
@@ -1812,11 +1809,7 @@ fn ContextHeader(
     thread: i64,
     nav_open: Signal<bool>,
     utility_open: Signal<bool>,
-    utility_tab: Signal<UtilityTab>,
     mobile_panel: Signal<MobilePanel>,
-    controller: ControllerState,
-    pins: Signal<Vec<Pin>>,
-    error: Signal<String>,
 ) -> Element {
     rsx! {
         header { class: "context-header",
@@ -1869,59 +1862,23 @@ fn ContextHeader(
                     "Raw"
                 }
             }
-            details { class: "header-menu",
+            details { class: "header-menu mobile-only",
                 summary { aria_label: "Thread and display actions", "•••" }
-                button {
-                    class: "mobile-only",
-                    onclick: {
-                        let key = mode_key.clone();
-                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Pretty); }
-                    },
-                    "Pretty"
-                }
-                button {
-                    class: "mobile-only",
-                    onclick: {
-                        let key = mode_key.clone();
-                        move |_| { modes.write().insert(key.clone(), TranscriptMode::Raw); }
-                    },
-                    "Raw"
-                }
-                button {
-                    onclick: move |_| {
-                        utility_tab.set(UtilityTab::Thread);
-                        utility_open.set(true);
-                        storage_set(UTILITY_TAB_KEY, "thread");
-                        storage_set(UTILITY_OPEN_KEY, "open");
-                    },
-                    "Thread settings"
-                }
-                HeaderActionButton {
-                    workspace: workspace.workspace_id.clone(),
-                    thread,
-                    action: HeaderThreadAction::Continue,
-                    connected: connected && !matches!(status, Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)),
-                    controller: controller.clone(),
-                    pins,
-                    error,
-                }
-                HeaderActionButton {
-                    workspace: workspace.workspace_id.clone(),
-                    thread,
-                    action: HeaderThreadAction::Compact,
-                    connected: connected && !matches!(status, Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)),
-                    controller: controller.clone(),
-                    pins,
-                    error,
-                }
-                HeaderActionButton {
-                    workspace: workspace.workspace_id.clone(),
-                    thread,
-                    action: HeaderThreadAction::Checkpoint,
-                    connected,
-                    controller: controller.clone(),
-                    pins,
-                    error,
+                div { class: "header-menu-popover",
+                    button {
+                        onclick: {
+                            let key = mode_key.clone();
+                            move |_| { modes.write().insert(key.clone(), TranscriptMode::Pretty); }
+                        },
+                        "Pretty"
+                    }
+                    button {
+                        onclick: {
+                            let key = mode_key.clone();
+                            move |_| { modes.write().insert(key.clone(), TranscriptMode::Raw); }
+                        },
+                        "Raw"
+                    }
                 }
             }
             button {
@@ -1959,58 +1916,6 @@ fn ContextHeader(
                     "Live"
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn HeaderActionButton(
-    workspace: String,
-    thread: i64,
-    action: HeaderThreadAction,
-    connected: bool,
-    controller: ControllerState,
-    pins: Signal<Vec<Pin>>,
-    error: Signal<String>,
-) -> Element {
-    let mut pending = use_signal(|| false);
-    let label = match action {
-        HeaderThreadAction::Continue => "Continue",
-        HeaderThreadAction::Compact => "Compact history",
-        HeaderThreadAction::Checkpoint => "Create Checkpoint",
-    };
-    rsx! {
-        button {
-            disabled: !connected || pending(),
-            onclick: move |_| {
-                pending.set(true);
-                let workspace = workspace.clone();
-                let controller = controller.clone();
-                spawn(async move {
-                    let next = match action {
-                        HeaderThreadAction::Continue => Command::ThreadContinue {
-                            thread_id: ThreadId(thread),
-                            allow_questions: true,
-                        },
-                        HeaderThreadAction::Compact => Command::ThreadCompact {
-                            thread_id: ThreadId(thread),
-                            allow_questions: true,
-                        },
-                        HeaderThreadAction::Checkpoint => Command::ThreadCheckpointCreate {
-                            thread_id: ThreadId(thread),
-                        },
-                    };
-                    match command(&workspace, &next).await {
-                        Ok(_) => {
-                            ensure_pin(pins, &workspace, ThreadId(thread), &controller);
-                            error.set(String::new());
-                        }
-                        Err(message) => error.set(message),
-                    }
-                    pending.set(false);
-                });
-            },
-            if pending() { "Working…" } else { "{label}" }
         }
     }
 }
@@ -3002,6 +2907,7 @@ fn Composer(
     thread: i64,
     store: ThreadStore,
     controller: ControllerState,
+    status: Option<AgentStatus>,
     connected: bool,
     pins: Signal<Vec<Pin>>,
     error: Signal<String>,
@@ -3026,6 +2932,12 @@ fn Composer(
     let history = storage_json::<Vec<String>>(SENT_HISTORY_KEY);
     let active = active_turn.is_active();
     let awaiting = active_turn.is_awaiting_interaction();
+    let thread_actions_enabled = connected
+        && !active
+        && !matches!(
+            status,
+            Some(AgentStatus::Running | AgentStatus::Compacting | AgentStatus::Cancelling)
+        );
     let diagnostics = diagnostics_read.value().unwrap_or_default();
     let Some(metadata) = metadata_read.metadata().cloned() else {
         return rsx! {};
@@ -3271,6 +3183,36 @@ fn Composer(
                                             span { "Skills" }
                                             span { class: "composer-menu-chevron", "›" }
                                         }
+                                        ComposerThreadActionButton {
+                                            workspace: workspace.clone(),
+                                            thread,
+                                            action: ComposerThreadAction::Continue,
+                                            enabled: thread_actions_enabled,
+                                            controller: controller.clone(),
+                                            pins,
+                                            error,
+                                            menu_page,
+                                        }
+                                        ComposerThreadActionButton {
+                                            workspace: workspace.clone(),
+                                            thread,
+                                            action: ComposerThreadAction::Compact,
+                                            enabled: thread_actions_enabled,
+                                            controller: controller.clone(),
+                                            pins,
+                                            error,
+                                            menu_page,
+                                        }
+                                        ComposerThreadActionButton {
+                                            workspace: workspace.clone(),
+                                            thread,
+                                            action: ComposerThreadAction::Checkpoint,
+                                            enabled: connected,
+                                            controller: controller.clone(),
+                                            pins,
+                                            error,
+                                            menu_page,
+                                        }
                                     },
                                     ComposerMenuPage::History => rsx! {
                                         ComposerMenuHeader {
@@ -3396,6 +3338,61 @@ fn Composer(
                     }
                 }
             }
+        }
+    }
+}
+
+#[component]
+fn ComposerThreadActionButton(
+    workspace: String,
+    thread: i64,
+    action: ComposerThreadAction,
+    enabled: bool,
+    controller: ControllerState,
+    pins: Signal<Vec<Pin>>,
+    error: Signal<String>,
+    menu_page: Signal<Option<ComposerMenuPage>>,
+) -> Element {
+    let mut pending = use_signal(|| false);
+    let label = match action {
+        ComposerThreadAction::Continue => "Continue",
+        ComposerThreadAction::Compact => "Compact history",
+        ComposerThreadAction::Checkpoint => "Create Checkpoint",
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            disabled: !enabled || pending(),
+            onclick: move |_| {
+                pending.set(true);
+                let workspace = workspace.clone();
+                let controller = controller.clone();
+                spawn(async move {
+                    let next = match action {
+                        ComposerThreadAction::Continue => Command::ThreadContinue {
+                            thread_id: ThreadId(thread),
+                            allow_questions: true,
+                        },
+                        ComposerThreadAction::Compact => Command::ThreadCompact {
+                            thread_id: ThreadId(thread),
+                            allow_questions: true,
+                        },
+                        ComposerThreadAction::Checkpoint => Command::ThreadCheckpointCreate {
+                            thread_id: ThreadId(thread),
+                        },
+                    };
+                    match command(&workspace, &next).await {
+                        Ok(_) => {
+                            ensure_pin(pins, &workspace, ThreadId(thread), &controller);
+                            error.set(String::new());
+                            menu_page.set(None);
+                        }
+                        Err(message) => error.set(message),
+                    }
+                    pending.set(false);
+                });
+            },
+            if pending() { "Working…" } else { "{label}" }
         }
     }
 }

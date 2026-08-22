@@ -252,6 +252,10 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(page.locator(".navigation")).not.toHaveClass(/drawer-open/);
   await expect(page.getByText("Existing prompt")).toBeVisible();
   expect(await page.evaluate(() => location.search)).toBe("");
+  await page.getByLabel("Thread and display actions").click();
+  await expect(page.locator(".header-menu").getByRole("button", { name: "Pretty" })).toBeVisible();
+  await expect(page.locator(".header-menu").getByRole("button", { name: "Raw" })).toBeVisible();
+  await page.getByLabel("Thread and display actions").click();
 
   await page.setViewportSize({ width: 1280, height: 720 });
   const workspaceRow = page.locator(".workspace-thread-row").filter({ hasText: "Web Thread" });
@@ -275,6 +279,34 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     await page.getByLabel("Composer actions").click();
     await page.getByRole("button", { name: "Model", exact: true }).click();
   };
+  const invokeComposerThreadAction = async (name: string, command: unknown) => {
+    await closeMenu();
+    await page.getByLabel("Composer actions").click();
+    await page.getByRole("button", { name, exact: true }).click();
+    await expect.poll(() => sentCommand).toEqual(command);
+    await expect(page.locator(".composer-menu-popover")).not.toBeVisible();
+  };
+  await invokeComposerThreadAction("Continue", {
+    method: "thread_continue",
+    thread_id: 1,
+    allow_questions: true
+  });
+  await invokeComposerThreadAction("Compact history", {
+    method: "thread_compact",
+    thread_id: 1,
+    allow_questions: true
+  });
+  await invokeComposerThreadAction("Create Checkpoint", {
+    method: "thread_checkpoint_create",
+    thread_id: 1
+  });
+
+  await expect(page.getByLabel("Thread and display actions")).toBeHidden();
+  await expect(page.locator(".header-menu").getByRole("button", { name: "Continue" })).toHaveCount(0);
+  await expect(page.locator(".header-menu").getByRole("button", { name: "Compact history" })).toHaveCount(0);
+  await expect(page.locator(".header-menu").getByRole("button", { name: "Create Checkpoint" })).toHaveCount(0);
+  await workspaceRow.getByRole("button", { name: "Unpin Web Thread" }).click();
+
   await openModelPicker();
   await expect(page.getByRole("button", { name: "Test Model" })).toBeVisible();
   await page.keyboard.press("Escape");
