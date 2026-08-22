@@ -11,8 +11,8 @@ use dioxus::{
 use crate::{
     model::{Diagnostics, RemoteState, latest_diagnostics},
     transcript_view::{
-        self, ActivityDisplay, ActivityKey, RawKey, TurnKey, TurnRef, raw_item, raw_keys,
-        turn_key_for_event, turn_keys,
+        self, ActivityDisplay, ActivityKey, FinalizedActivities, RawKey, TurnKey, TurnRef,
+        raw_item, raw_keys, turn_key_for_event, turn_keys,
     },
 };
 
@@ -44,10 +44,13 @@ enum ThreadScope {
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct ThreadStore {
     inner: Store<RemoteState<ThreadState>>,
+    finalized: Store<FinalizedActivities>,
 }
 
 type ThreadSelector = SelectorScope<WriteSignal<RemoteState<ThreadState>>>;
 type StateRead = ReadableRef<'static, ThreadSelector>;
+type FinalizedSelector = SelectorScope<WriteSignal<FinalizedActivities>>;
+type FinalizedRead = ReadableRef<'static, FinalizedSelector>;
 
 pub(super) struct ConnectionRead(StateRead);
 pub(super) struct MetadataRead(StateRead);
@@ -69,6 +72,7 @@ pub(super) struct ActivityRead {
     runner_call: Option<StateRead>,
     related: Vec<StateRead>,
     key: ActivityKey,
+    finalized: FinalizedRead,
 }
 pub(super) struct ActiveTurnRead(StateRead);
 pub(super) struct ActiveRunnerToolsRead(StateRead);
@@ -150,7 +154,7 @@ impl ActivityRead {
                 state
                     .value
                     .as_ref()
-                    .and_then(|state| transcript_view::activity(state, &self.key))
+                    .and_then(|state| transcript_view::activity(state, &self.key, &self.finalized))
             })
     }
 }
@@ -237,8 +241,11 @@ impl SnapshotRead {
 }
 
 impl ThreadStore {
-    pub(super) fn new(inner: Store<RemoteState<ThreadState>>) -> Self {
-        Self { inner }
+    pub(super) fn new(
+        inner: Store<RemoteState<ThreadState>>,
+        finalized: Store<FinalizedActivities>,
+    ) -> Self {
+        Self { inner, finalized }
     }
 
     fn scope(self, key: ThreadScope) -> ThreadSelector {
@@ -403,12 +410,21 @@ impl ThreadStore {
     }
 
     pub(super) fn read_activity(self, turn: TurnKey, key: ActivityKey) -> ActivityRead {
+        // The finalized map is consulted without subscribing: an entry is
+        // only added together with the ActiveItem/Turn scope invalidation
+        // that already re-renders the activity reader, so a subscription
+        // would only add re-renders without changing the result.
+        let finalized = self
+            .finalized
+            .selector()
+            .try_peek_unchecked()
+            .expect("finalized store must be readable");
         let resolved = self
             .inner
             .peek()
             .value
             .as_ref()
-            .map(|state| transcript_view::resolve_activity_key(state, &key))
+            .map(|state| transcript_view::resolve_activity_key(state, &key, &finalized))
             .unwrap_or_else(|| key.clone());
         let state = match resolved {
             ActivityKey::Active(id) | ActivityKey::StableActive { id, .. } => {
@@ -417,7 +433,7 @@ impl ThreadStore {
             _ => self.read(ThreadScope::Turn(turn.sequence())),
         };
         let tracks_runner_call = self.inner.peek().value.as_ref().is_some_and(|state| {
-            transcript_view::activity_can_receive_active_updates(state, &resolved)
+            transcript_view::activity_can_receive_active_updates(state, &resolved, &finalized)
         });
         let runner_call = tracks_runner_call
             .then(|| match &resolved {
@@ -458,6 +474,7 @@ impl ThreadStore {
             runner_call: runner_call.map(|call_id| self.read(ThreadScope::RunnerCall(call_id))),
             related,
             key,
+            finalized,
         }
     }
 
@@ -492,6 +509,14 @@ impl ThreadStore {
     pub(super) fn apply(self, message: ThreadSubscriptionMessage) {
         match message {
             ThreadSubscriptionMessage::Snapshot { state } => {
+                {
+                    let sequences: std::collections::HashSet<_> =
+                        state.events().iter().map(|event| event.sequence).collect();
+                    let mut finalized = self.finalized.selector().write_untracked();
+                    finalized
+                        .by_active_id
+                        .retain(|_, sequence| sequences.contains(sequence));
+                }
                 {
                     let mut remote = self.inner.selector().write_untracked();
                     remote.value = Some(state);
@@ -595,6 +620,25 @@ impl ThreadStore {
                 }
             }
             ThreadChange::EventsReplaced => {
+                {
+                    let sequences = self
+                        .inner
+                        .peek()
+                        .value
+                        .as_ref()
+                        .map(|state| {
+                            state
+                                .events()
+                                .iter()
+                                .map(|event| event.sequence)
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    let mut finalized = self.finalized.selector().write_untracked();
+                    finalized
+                        .by_active_id
+                        .retain(|_, sequence| sequences.contains(sequence));
+                }
                 self.scope(ThreadScope::Transcript).mark_dirty();
                 self.scope(ThreadScope::Diagnostics).mark_dirty();
             }
@@ -644,6 +688,10 @@ impl ThreadStore {
                 active_id,
                 sequence,
             } => {
+                {
+                    let mut finalized = self.finalized.selector().write_untracked();
+                    finalized.by_active_id.insert(active_id, sequence);
+                }
                 self.scope(ThreadScope::ActiveItemList).mark_dirty();
                 self.scope(ThreadScope::ActiveItem(active_id)).mark_dirty();
                 let target = {
@@ -888,7 +936,10 @@ mod tests {
     }
 
     fn app(harness: Harness) -> Element {
-        let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
+        let store = ThreadStore::new(
+            use_store(RemoteState::<ThreadState>::default),
+            use_store(FinalizedActivities::default),
+        );
         *harness.store.borrow_mut() = Some(store);
         rsx! {
             MetadataReader { store, counts: harness.counts.clone() }

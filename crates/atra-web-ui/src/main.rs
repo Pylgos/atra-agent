@@ -36,7 +36,8 @@ use model::{
 use syntax::setup_syntax_highlighting;
 use thread_store::ThreadStore;
 use transcript_view::{
-    ActivityDisplay, ActivityKey, CommandDisplay, OperationStatus, RawKey, TurnKey,
+    ActivityDisplay, ActivityKey, CommandDisplay, FinalizedActivities, OperationStatus, RawKey,
+    TurnKey,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
@@ -1602,7 +1603,10 @@ fn ThreadPage(
     modes: Signal<HashMap<String, TranscriptMode>>,
     scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
 ) -> Element {
-    let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
+    let store = ThreadStore::new(
+        use_store(RemoteState::<ThreadState>::default),
+        use_store(FinalizedActivities::default),
+    );
     let mut error = use_signal(String::new);
     let dialog = use_signal(|| None::<DialogState>);
     let mut selected_activity = use_signal(|| None::<(TurnKey, ActivityKey)>);
@@ -3899,7 +3903,10 @@ fn CheckpointPreview(
     scroll_positions: Signal<HashMap<String, TranscriptScrollState>>,
     on_select_activity: EventHandler<(TurnKey, ActivityKey)>,
 ) -> Element {
-    let store = ThreadStore::new(use_store(RemoteState::<ThreadState>::default));
+    let store = ThreadStore::new(
+        use_store(RemoteState::<ThreadState>::default),
+        use_store(FinalizedActivities::default),
+    );
     let mut checkpoint_metadata = use_signal(|| None::<atra_protocol::ThreadCheckpoint>);
     let workspace_for_stream = workspace.clone();
     let _stream = use_hook(move || {

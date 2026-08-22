@@ -54,6 +54,14 @@ pub(super) enum RawKey {
     Active(ActiveItemId),
 }
 
+/// Maps active items to the transcript events they were finalized into,
+/// so a selection made while an item was streaming keeps resolving after
+/// the item is replaced by its final event.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct FinalizedActivities {
+    pub(super) by_active_id: HashMap<ActiveItemId, EventSequence>,
+}
+
 impl fmt::Display for RawKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -432,8 +440,9 @@ impl<'a> TurnRef<'a> {
 pub(super) fn activity<'a>(
     state: &'a ThreadState,
     key: &ActivityKey,
+    finalized: &FinalizedActivities,
 ) -> Option<ActivityDisplay<'a>> {
-    let resolved = resolve_activity_key(state, key);
+    let resolved = resolve_activity_key(state, key, finalized);
     let key = &resolved;
     match key {
         ActivityKey::Event(sequence) => {
@@ -535,8 +544,12 @@ pub(super) fn activity<'a>(
     }
 }
 
-pub(super) fn activity_can_receive_active_updates(state: &ThreadState, key: &ActivityKey) -> bool {
-    match resolve_activity_key(state, key) {
+pub(super) fn activity_can_receive_active_updates(
+    state: &ThreadState,
+    key: &ActivityKey,
+    finalized: &FinalizedActivities,
+) -> bool {
+    match resolve_activity_key(state, key, finalized) {
         ActivityKey::Active(_) | ActivityKey::StableActive { .. } => true,
         ActivityKey::Tool { call, .. } => tool_activity_state(state, call).result.is_none(),
         ActivityKey::Event(_) | ActivityKey::Todo { .. } => false,
@@ -1465,17 +1478,34 @@ pub(super) fn activity_identity(key: &ActivityKey) -> Option<String> {
     }
 }
 
-pub(super) fn resolve_activity_key(state: &ThreadState, key: &ActivityKey) -> ActivityKey {
-    let ActivityKey::StableActive { id, identity } = key else {
-        return key.clone();
-    };
-    let is_active = state
-        .active_turn()
-        .is_some_and(|turn| turn.items().iter().any(|item| item.id() == *id));
-    if is_active {
-        key.clone()
-    } else {
-        finalized_activity_key(state, identity).unwrap_or_else(|| key.clone())
+pub(super) fn resolve_activity_key(
+    state: &ThreadState,
+    key: &ActivityKey,
+    finalized: &FinalizedActivities,
+) -> ActivityKey {
+    match key {
+        ActivityKey::StableActive { id, identity } => {
+            let is_active = state
+                .active_turn()
+                .is_some_and(|turn| turn.items().iter().any(|item| item.id() == *id));
+            if is_active {
+                key.clone()
+            } else {
+                finalized_activity_key(state, identity).unwrap_or_else(|| key.clone())
+            }
+        }
+        ActivityKey::Active(id)
+            if state
+                .active_turn()
+                .is_none_or(|turn| turn.items().iter().all(|item| item.id() != *id)) =>
+        {
+            finalized
+                .by_active_id
+                .get(id)
+                .map(|sequence| ActivityKey::Event(*sequence))
+                .unwrap_or_else(|| key.clone())
+        }
+        _ => key.clone(),
     }
 }
 
@@ -1853,7 +1883,11 @@ mod tests {
         );
         assert_eq!(turn.answer(), None);
         assert!(matches!(
-            activity(&state, &turn.activity_keys()[0]),
+            activity(
+                &state,
+                &turn.activity_keys()[0],
+                &FinalizedActivities::default()
+            ),
             Some(ActivityDisplay::Commentary {
                 markdown: "working"
             })
@@ -1923,7 +1957,9 @@ mod tests {
         .apply(&mut state)
         .unwrap();
 
-        let ActivityDisplay::Command(running) = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Command(running) =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected command display");
         };
         assert!(matches!(
@@ -1944,7 +1980,9 @@ mod tests {
         }
         .apply(&mut state)
         .unwrap();
-        let ActivityDisplay::Command(streaming) = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Command(streaming) =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected command display");
         };
         assert_eq!(streaming.operations[0].output, "first\nsecond\nthird\n");
@@ -1963,7 +2001,9 @@ mod tests {
         }
         .apply(&mut state)
         .unwrap();
-        let ActivityDisplay::Command(completed) = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Command(completed) =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected command display");
         };
         assert_eq!(
@@ -1971,7 +2011,12 @@ mod tests {
             OperationStatus::Finished { exit: None }
         );
         assert_eq!(
-            activity_identity(&resolve_activity_key(&state, &selected)).as_deref(),
+            activity_identity(&resolve_activity_key(
+                &state,
+                &selected,
+                &FinalizedActivities::default()
+            ))
+            .as_deref(),
             Some("call-1")
         );
         assert_eq!(activity_type_label(&state, &selected), "command");
@@ -2003,7 +2048,7 @@ mod tests {
 
         // While the item is still active the selection resolves to the streaming item.
         assert!(matches!(
-            activity(&state, &selected),
+            activity(&state, &selected, &FinalizedActivities::default()),
             Some(ActivityDisplay::Search { .. })
         ));
         assert_eq!(activity_type_label(&state, &selected), "search");
@@ -2020,14 +2065,71 @@ mod tests {
         .apply(&mut state)
         .unwrap();
         assert_eq!(
-            resolve_activity_key(&state, &selected),
+            resolve_activity_key(&state, &selected, &FinalizedActivities::default()),
             ActivityKey::Event(EventSequence(2))
         );
-        let ActivityDisplay::Search { summary, .. } = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Search { summary, .. } =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected search display");
         };
         assert_eq!(summary, "search: atra");
         assert_eq!(activity_type_label(&state, &selected), "search");
+    }
+
+    #[test]
+    fn reasoning_selection_follows_active_item_to_the_finalized_event() {
+        let mut state = state(vec![event(
+            1,
+            "user_message",
+            json!({"content": "question"}),
+        )]);
+        ThreadOperation::ActiveTurnStarted {
+            phase: TurnPhase::Running,
+        }
+        .apply(&mut state)
+        .unwrap();
+        ThreadOperation::ActiveItemAdded {
+            item: ActiveItem::new(
+                ActiveItemId(9),
+                ActiveItemData::Reasoning {
+                    content: "streaming…".to_owned(),
+                },
+            ),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let selected = ActivityKey::Active(ActiveItemId(9));
+
+        // While the item is still active the selection resolves to the streaming item.
+        assert!(matches!(
+            activity(&state, &selected, &FinalizedActivities::default()),
+            Some(ActivityDisplay::Reasoning { .. })
+        ));
+
+        // Finalizing the item into a Reasoning event keeps the selection.
+        ThreadOperation::ActiveItemFinalized {
+            active_id: ActiveItemId(9),
+            event: event(2, "reasoning", json!({"summary": "complete reasoning"})),
+        }
+        .apply(&mut state)
+        .unwrap();
+        let finalized = FinalizedActivities {
+            by_active_id: HashMap::from([(ActiveItemId(9), EventSequence(2))]),
+        };
+        assert_eq!(
+            resolve_activity_key(&state, &selected, &finalized),
+            ActivityKey::Event(EventSequence(2))
+        );
+        let ActivityDisplay::Reasoning { summary } =
+            activity(&state, &selected, &finalized).unwrap()
+        else {
+            panic!("expected reasoning display");
+        };
+        assert_eq!(summary, "complete reasoning");
+        assert!(!activity_can_receive_active_updates(
+            &state, &selected, &finalized
+        ));
     }
 
     #[test]
@@ -2078,7 +2180,11 @@ mod tests {
             .unwrap()
             .activity_keys()[0]
             .clone();
-        assert!(activity_can_receive_active_updates(&state, &selected));
+        assert!(activity_can_receive_active_updates(
+            &state,
+            &selected,
+            &FinalizedActivities::default()
+        ));
 
         ThreadOperation::ToolResultFinalized {
             event: event(
@@ -2106,7 +2212,9 @@ mod tests {
         .apply(&mut state)
         .unwrap();
 
-        let ActivityDisplay::Command(completed) = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Command(completed) =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected command display");
         };
         assert_eq!(
@@ -2114,7 +2222,11 @@ mod tests {
             OperationStatus::Finished { exit: None }
         );
         assert_eq!(completed.operations[0].output, "persisted\n");
-        assert!(!activity_can_receive_active_updates(&state, &selected));
+        assert!(!activity_can_receive_active_updates(
+            &state,
+            &selected,
+            &FinalizedActivities::default()
+        ));
     }
 
     #[test]
@@ -2139,7 +2251,9 @@ mod tests {
             .unwrap()
             .activity_keys()[0]
             .clone();
-        let ActivityDisplay::Command(queued) = activity(&state, &selected).unwrap() else {
+        let ActivityDisplay::Command(queued) =
+            activity(&state, &selected, &FinalizedActivities::default()).unwrap()
+        else {
             panic!("expected command display");
         };
         assert_eq!(queued.operations[0].runner, "sandbox");
@@ -2175,7 +2289,12 @@ mod tests {
 
         let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
         assert_eq!(turn.activity_keys().len(), 1);
-        let display = activity(&state, &turn.activity_keys()[0]).unwrap();
+        let display = activity(
+            &state,
+            &turn.activity_keys()[0],
+            &FinalizedActivities::default(),
+        )
+        .unwrap();
         let ActivityDisplay::Command(display) = display else {
             panic!("expected command display");
         };
@@ -2207,7 +2326,12 @@ mod tests {
                 }),
             ),
         ]);
-        let display = activity(&state, &ActivityKey::Event(EventSequence(2))).unwrap();
+        let display = activity(
+            &state,
+            &ActivityKey::Event(EventSequence(2)),
+            &FinalizedActivities::default(),
+        )
+        .unwrap();
         let ActivityDisplay::Reasoning { summary, .. } = display else {
             panic!("expected reasoning");
         };
