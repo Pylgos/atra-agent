@@ -80,10 +80,8 @@ pub(crate) async fn decode_server_compaction(response: reqwest::Response) -> Res
                 compaction = Some(frame["item"].clone());
             }
             "response.completed" => completed = true,
-            "response.created" | "response.in_progress" | "response.output_item.added" | "ping" => {
-            }
             "error" | "response.failed" => bail!("Codex compaction failed: {frame}"),
-            other => bail!("unknown Codex compaction event {other}"),
+            _ => {}
         }
     }
     anyhow::ensure!(
@@ -644,6 +642,26 @@ mod tests {
             events.push(event?);
         }
         Ok(events)
+    }
+
+    #[tokio::test]
+    async fn server_compaction_ignores_unknown_events() {
+        let response: reqwest::Response = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(concat!(
+                "data: {\"type\":\"response.created\"}\n\n",
+                "data: {\"type\":\"keepalive\"}\n\n",
+                "data: {\"type\":\"future.event\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+                "data: {\"type\":\"response.completed\"}\n\n",
+            )))
+            .unwrap()
+            .into();
+
+        let compaction = decode_server_compaction(response).await.unwrap();
+
+        assert_eq!(compaction["type"], "compaction");
+        assert_eq!(compaction["encrypted_content"], "opaque");
     }
 
     #[tokio::test]
