@@ -382,12 +382,6 @@ fn request_messages(request: &ModelRequest<'_>) -> Result<Vec<Message>> {
     Ok(messages)
 }
 
-pub(crate) fn context_tokens(events: &[Event]) -> Result<usize> {
-    Ok(super::super::text_tokens(&serde_json::to_string(
-        &event_messages(events, None)?,
-    )?))
-}
-
 fn event_messages(events: &[Event], replay_key: Option<&str>) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
     for item in super::super::surface::derive(events, None)?.items {
@@ -469,8 +463,8 @@ mod tests {
     use std::io;
 
     use atra_protocol::{
-        AssistantMessageEvent, EventSequence, FrozenBoundaryEvent, MessageEvent, OpaqueState,
-        ReasoningEvent, ThreadEventData, ToolArtifact, ToolCallEvent, ToolResultEvent,
+        AssistantMessageEvent, EventSequence, MessageEvent, OpaqueState, ReasoningEvent,
+        ThreadEventData, ToolCallEvent, ToolResultEvent,
     };
     use futures_util::{StreamExt, stream};
 
@@ -588,7 +582,6 @@ mod tests {
                     call_id: "call-1".to_owned(),
                     result: json!({"temperature": 20}),
                     artifacts: Vec::new(),
-                    masked_result: None,
                 }),
             ),
             event(
@@ -598,7 +591,6 @@ mod tests {
                     call_id: "call-2".to_owned(),
                     result: json!({"temperature": 21}),
                     artifacts: Vec::new(),
-                    masked_result: None,
                 }),
             ),
         ];
@@ -659,46 +651,6 @@ mod tests {
         assert_eq!(value[0]["role"], "assistant");
         assert_eq!(value[0]["content"], "");
         assert!(value[0]["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn context_tokens_use_reasoning_summaries_and_masked_tool_results() {
-        let events = vec![
-            event(
-                0,
-                ThreadEventData::Reasoning(ReasoningEvent {
-                    summary: "reasoning summary".to_owned(),
-                    opaque: None,
-                }),
-            ),
-            event(
-                1,
-                ThreadEventData::ToolResult(ToolResultEvent::Function {
-                    name: "command".to_owned(),
-                    call_id: "call".to_owned(),
-                    result: Value::String("large output ".repeat(10_000)),
-                    artifacts: Vec::<ToolArtifact>::new(),
-                    masked_result: Some(Value::String("output masked".to_owned())),
-                }),
-            ),
-            event(
-                2,
-                ThreadEventData::FrozenBoundary(FrozenBoundaryEvent {
-                    through_sequence: EventSequence(1),
-                    masked_sequences: vec![EventSequence(1)],
-                }),
-            ),
-        ];
-
-        let full_tokens = context_tokens(&events[..2]).unwrap();
-        let masked_tokens = context_tokens(&events).unwrap();
-
-        assert!(masked_tokens < full_tokens);
-        assert!(
-            event_messages(&events, None).unwrap()[0]
-                .thinking
-                .contains("reasoning summary")
-        );
     }
 
     #[tokio::test]

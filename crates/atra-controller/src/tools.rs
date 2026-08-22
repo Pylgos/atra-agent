@@ -1,5 +1,6 @@
 use super::*;
 use indoc::indoc;
+use std::collections::HashSet;
 
 pub(super) fn model_tools(allow_questions: bool) -> Vec<model::ModelTool> {
     let mut tools = vec![model::ModelTool::WebSearch];
@@ -542,127 +543,6 @@ pub(super) async fn send_operation_output(
         })
         .await?;
     Ok(())
-}
-
-pub(super) fn masked_tool_result(payload: &ToolResultEvent) -> Option<String> {
-    let (original, artifacts, custom) = match payload {
-        ToolResultEvent::Custom {
-            result, artifacts, ..
-        } => (result.as_str()?, artifacts, true),
-        ToolResultEvent::Function {
-            result, artifacts, ..
-        } => (result.as_str()?, artifacts, false),
-    };
-    if custom {
-        let mut operations = Vec::new();
-        let mut command_found = false;
-        let mut command_masked = false;
-        for artifact in artifacts {
-            let ToolArtifact::RunnerOperation(data) = artifact else {
-                continue;
-            };
-            let operation_result = data.result.as_str()?;
-            let masked = data.artifacts.iter().find_map(|artifact| match artifact {
-                ToolArtifact::CommandExecution(command) => masked_command_result(command),
-                ToolArtifact::PatchOperations(_) | ToolArtifact::RunnerOperation(_) => None,
-            });
-            let result = if let Some(masked) = masked {
-                command_found = true;
-                if model::text_tokens(&masked) < model::text_tokens(operation_result) {
-                    command_masked = true;
-                    masked
-                } else {
-                    operation_result.to_owned()
-                }
-            } else {
-                operation_result.to_owned()
-            };
-            operations.push(format!(
-                "Operation {} [{}] {}:\n{result}",
-                data.operation, data.runner, data.label
-            ));
-        }
-        if !command_found {
-            return None;
-        }
-        let masked = operations.join("\n\n");
-        return (command_masked && model::text_tokens(&masked) < model::text_tokens(original))
-            .then_some(masked);
-    }
-
-    let command = artifacts.iter().find_map(|artifact| match artifact {
-        ToolArtifact::CommandExecution(command) => Some(command),
-        ToolArtifact::PatchOperations(_) | ToolArtifact::RunnerOperation(_) => None,
-    })?;
-    let masked = masked_command_result(command)?;
-    (model::text_tokens(&masked) < model::text_tokens(original)).then_some(masked)
-}
-
-pub(super) fn masked_command_result(command: &CommandExecutionArtifact) -> Option<String> {
-    let (output, runner, full_output_path, status) = match command {
-        CommandExecutionArtifact::Started { .. } => return None,
-        CommandExecutionArtifact::Running {
-            output,
-            runner,
-            full_output_path,
-        } => (
-            output,
-            runner,
-            full_output_path,
-            "Process is still running".to_owned(),
-        ),
-        CommandExecutionArtifact::Finished {
-            output,
-            exit_code,
-            runner,
-            full_output_path,
-        } => (
-            output,
-            runner,
-            full_output_path,
-            format!(
-                "Process exited with code {}",
-                exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned())
-            ),
-        ),
-    };
-    if output.is_empty() {
-        return None;
-    }
-    let lines = output.lines().collect::<Vec<_>>();
-    let head = lines
-        .iter()
-        .take(MASK_OUTPUT_LINES)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let head = truncate_mask_head(&head);
-    let tail = lines
-        .iter()
-        .rev()
-        .take(MASK_OUTPUT_LINES)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let tail = truncate_mask_tail(&tail);
-    Some(clean_model_output(&format!(
-        "{head}\n\n... output masked ...\n\n{tail}\n\n{status}\n\
-         Full output: runner \"{runner}\": {}",
-        full_output_path.display()
-    )))
-}
-
-pub(super) fn truncate_mask_head(output: &str) -> &str {
-    &output[..floor_char_boundary(output, output.len().min(MASK_OUTPUT_SIDE_BYTES))]
-}
-
-pub(super) fn truncate_mask_tail(output: &str) -> &str {
-    &output[ceil_char_boundary(output, output.len().saturating_sub(MASK_OUTPUT_SIDE_BYTES))..]
 }
 
 pub(super) fn command_artifact(

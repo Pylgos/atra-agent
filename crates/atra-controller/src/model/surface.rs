@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use anyhow::Result;
 use atra_protocol::{
     AssistantMessagePhase, CompactionReplacement, InstructionEvent, OpaqueState, RunnersEvent,
@@ -92,15 +90,6 @@ pub(super) fn derive(events: &[Event], replay_key: Option<&str>) -> Result<Surfa
         }
     }
     let events = compaction.map_or(events, |index| &events[index + 1..]);
-    let masked = crate::storage::latest_frozen_boundary(events)
-        .map(|boundary| {
-            boundary
-                .masked_sequences
-                .into_iter()
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-
     for event in events {
         let item = match &event.data {
             ThreadEventData::ThreadContext(_) => None,
@@ -164,36 +153,29 @@ pub(super) fn derive(events: &[Event], replay_key: Option<&str>) -> Result<Surfa
                 },
             }),
             ThreadEventData::ToolResult(value) => {
-                let (kind, call_id, name, result, masked_result) = match value {
+                let (kind, call_id, name, result) = match value {
                     ToolResultEvent::Custom {
                         call_id,
                         name,
                         result,
-                        masked_result,
                         ..
-                    } => (ToolKind::Custom, call_id, name, result, masked_result),
+                    } => (ToolKind::Custom, call_id, name, result),
                     ToolResultEvent::Function {
                         call_id,
                         name,
                         result,
-                        masked_result,
                         ..
-                    } => (ToolKind::Function, call_id, name, result, masked_result),
+                    } => (ToolKind::Function, call_id, name, result),
                 };
                 Some(Item::ToolResult {
                     kind,
                     call_id: call_id.clone(),
                     name: name.clone(),
-                    output: if masked.contains(&event.sequence) {
-                        masked_result.as_ref().unwrap_or(result).clone()
-                    } else {
-                        result.clone()
-                    },
+                    output: result.clone(),
                 })
             }
             ThreadEventData::WebSearch(value) => Some(Item::WebSearch(value.item.clone())),
-            ThreadEventData::FrozenBoundary(_)
-            | ThreadEventData::Compaction(_)
+            ThreadEventData::Compaction(_)
             | ThreadEventData::ModelRequest(_)
             | ThreadEventData::TokenUsage(_)
             | ThreadEventData::RateLimits(_)

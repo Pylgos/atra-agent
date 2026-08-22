@@ -332,22 +332,11 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
             input,
             results,
             pending_approval,
-            masked,
             ..
-        } => runner_tool_lines(input, results, *pending_approval, *masked, expanded),
-        TranscriptItem::ToolResult { artifacts, masked } => {
-            let mut lines = if *masked {
-                vec![(
-                    Some('◇'),
-                    Line::from(Span::styled(
-                        "model context uses masked output",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                )]
-            } else {
-                Vec::new()
-            };
-            lines.extend(artifacts.iter().flat_map(|artifact| match artifact {
+        } => runner_tool_lines(input, results, *pending_approval, expanded),
+        TranscriptItem::ToolResult { artifacts } => artifacts
+            .iter()
+            .flat_map(|artifact| match artifact {
                 ToolArtifact::RunnerOperation(operation) => {
                     runner_operation_lines(operation, expanded)
                 }
@@ -355,9 +344,8 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
                     fold_result_lines(command_execution_lines(command, false), expanded)
                 }
                 ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
-            }));
-            lines
-        }
+            })
+            .collect(),
         TranscriptItem::SkillInvocation { name } => {
             vec![(Some('·'), Line::from(format!("Using skill: {name}")))]
         }
@@ -453,7 +441,6 @@ fn tool_call_lines(
                 .unwrap_or_default(),
             &std::collections::BTreeMap::new(),
             None,
-            false,
             false,
         ),
         "list_runners" => vec![(Some('◆'), Line::from("list runners"))],
@@ -605,7 +592,6 @@ fn runner_tool_lines(
     input: &str,
     results: &std::collections::BTreeMap<usize, RunnerResult>,
     pending_approval: Option<usize>,
-    masked: bool,
     expanded: bool,
 ) -> Vec<(Option<char>, Line<'static>)> {
     let Ok(operations) = atra_protocol::parse_command_input(input) else {
@@ -638,15 +624,6 @@ fn runner_tool_lines(
                 .map(|(index, line)| ((index == 0).then_some('$'), line)),
         );
         append_runner_result(&mut lines, results.get(&operation), expanded);
-    }
-    if masked {
-        lines.push((
-            Some('◇'),
-            Line::from(Span::styled(
-                "model context uses masked output",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ));
     }
     lines
 }

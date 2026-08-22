@@ -127,7 +127,6 @@ pub(super) enum ActivityDisplay<'a> {
         path: &'a str,
     },
     Compaction,
-    Boundary,
     Failure {
         message: &'a str,
     },
@@ -142,7 +141,6 @@ pub(super) struct CommandDisplay {
     pub id_scope: String,
     pub summary: String,
     pub operations: Vec<CommandOperationDisplay>,
-    pub masked: bool,
     pub approvals: Vec<CommandApprovalDisplay>,
 }
 
@@ -358,7 +356,6 @@ impl<'a> TurnRef<'a> {
                 | ThreadEventData::WebSearch(_)
                 | ThreadEventData::SkillInvocation(_)
                 | ThreadEventData::Compaction(_)
-                | ThreadEventData::FrozenBoundary(_)
                 | ThreadEventData::Retry(_) => {
                     activities.push(ActivityKey::Event(event.sequence));
                 }
@@ -467,7 +464,6 @@ pub(super) fn activity<'a>(
                     path: &skill.path,
                 }),
                 ThreadEventData::Compaction(_) => Some(ActivityDisplay::Compaction),
-                ThreadEventData::FrozenBoundary(_) => Some(ActivityDisplay::Boundary),
                 ThreadEventData::ApprovalDecision(decision) => Some(ActivityDisplay::Approval {
                     allowed: decision.allowed,
                     reason: decision.reason.as_deref(),
@@ -857,7 +853,6 @@ fn command_display(
             }
         })
         .unwrap_or_else(|| "Invalid command input".to_owned());
-    let masked = result.is_some_and(|result| tool_result_masked(result));
     let approvals = approvals
         .iter()
         .filter_map(|sequence| match &event(state, *sequence)?.data {
@@ -872,7 +867,6 @@ fn command_display(
         id_scope: tool_call_identity(call).unwrap_or("command").to_owned(),
         summary,
         operations,
-        masked,
         approvals,
     }
 }
@@ -909,23 +903,6 @@ fn tool_result_artifacts(result: &atra_protocol::ToolResultEvent) -> &[ToolArtif
     match result {
         atra_protocol::ToolResultEvent::Custom { artifacts, .. }
         | atra_protocol::ToolResultEvent::Function { artifacts, .. } => artifacts,
-    }
-}
-
-fn tool_result_masked(result: &atra_protocol::ToolResultEvent) -> bool {
-    match result {
-        atra_protocol::ToolResultEvent::Custom {
-            result,
-            masked_result,
-            ..
-        }
-        | atra_protocol::ToolResultEvent::Function {
-            result,
-            masked_result,
-            ..
-        } => masked_result
-            .as_ref()
-            .is_some_and(|masked| masked != result),
     }
 }
 
@@ -1081,7 +1058,6 @@ fn orphan_runner_display(
         id_scope: format!("runner-{identity}"),
         summary: format!("{} — {}", operation.status, operation.runner),
         operations: vec![operation],
-        masked: false,
         approvals: Vec::new(),
     })
 }
@@ -1138,7 +1114,6 @@ fn activity_type_label(state: &ThreadState, key: &ActivityKey) -> &'static str {
                 ThreadEventData::WebSearch(_) => "search",
                 ThreadEventData::SkillInvocation(_) => "skill",
                 ThreadEventData::Compaction(_) => "compaction",
-                ThreadEventData::FrozenBoundary(_) => "boundary",
                 ThreadEventData::Retry(_) => "retry",
                 ThreadEventData::ApprovalDecision(_) => "approval",
                 ThreadEventData::TurnOutcome(atra_protocol::TurnOutcome::Failed { .. }) => {
@@ -1237,9 +1212,6 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
             }
             ThreadEventData::Compaction(_) => {
                 Some(("Compacting conversation history".to_owned(), false))
-            }
-            ThreadEventData::FrozenBoundary(_) => {
-                Some(("Older context compacted".to_owned(), false))
             }
             ThreadEventData::Retry(retry) => Some((
                 format!(

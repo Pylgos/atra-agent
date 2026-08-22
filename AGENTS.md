@@ -16,7 +16,7 @@
 - Controller 自身で command を実行しない。ツールの数は必要最小限に絞り、主に shell command と `apply_patch` を使う。
 - 同じ要件を満たすなら、概念と永続状態が少ない設計を選ぶ。
 - 場当たり的な機能追加は避け、リファクタリングを積極的に行う。
-- prompt caching を維持するため、通常動作で会話の event 列を更新、削除、再配置せず append-only にする。compaction、rewind、checkpoint restore, output masking など履歴の置換自体を目的とする明示的な操作だけを例外とする。
+- prompt caching を維持するため、通常動作で会話の event 列を更新、削除、再配置せず append-only にする。compaction、rewind、checkpoint restore など履歴の置換自体を目的とする明示的な操作だけを例外とする。
 
 ## Testing
 

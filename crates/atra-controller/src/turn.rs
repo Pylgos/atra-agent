@@ -350,7 +350,7 @@ impl State {
             Sha256::digest(format!("{}-{thread_id}", self.prompt_cache_namespace))
         );
         let model_tools = model_tools(allow_questions);
-        let mut events = self
+        let events = self
             .store
             .events(thread_id)
             .await
@@ -361,8 +361,6 @@ impl State {
             .await
             .context("failed to load thread model")?;
         let provider = self.provider(&provider_id)?;
-        self.mask_old_command_results(provider.as_ref(), thread_id, &mut events, updates)
-            .await?;
         let selected_model = provider
             .models()
             .await?
@@ -499,10 +497,6 @@ impl State {
                 .and_then(|model| model.context_window);
             let auto_compact_token_limit =
                 selected_model.and_then(|model| model.auto_compact_token_limit);
-            let masked_tokens = self
-                .mask_old_command_results(provider.as_ref(), thread_id, &mut events, updates)
-                .await?;
-            let masked_tokens = i64::try_from(masked_tokens).unwrap_or(i64::MAX);
             let active_history_start = events
                 .iter()
                 .rposition(|event| matches!(event.data, ThreadEventData::Compaction(_)))
@@ -514,8 +508,7 @@ impl State {
                     ThreadEventData::TokenUsage(event) => Some(&event.usage),
                     _ => None,
                 })
-                .and_then(|usage| usage["total_tokens"].as_i64())
-                .map(|tokens| tokens.saturating_sub(masked_tokens));
+                .and_then(|usage| usage["total_tokens"].as_i64());
             if active_tokens
                 .zip(auto_compact_token_limit)
                 .is_some_and(|(tokens, limit)| tokens >= limit)
@@ -687,138 +680,6 @@ impl State {
                 return Ok(TurnCompletion::Completed);
             }
         }
-    }
-
-    pub(super) async fn mask_old_command_results(
-        &self,
-        provider: &model::Provider,
-        thread_id: ThreadId,
-        events: &mut Vec<storage::Event>,
-        stream_updates: Option<&TurnProjector>,
-    ) -> Result<usize> {
-        let previous_boundary = storage::latest_frozen_boundary(events);
-        let active_through = previous_boundary
-            .as_ref()
-            .map(|boundary| boundary.through_sequence)
-            .into_iter()
-            .chain(
-                events
-                    .iter()
-                    .rfind(|event| matches!(event.data, ThreadEventData::Compaction(_)))
-                    .map(|event| event.sequence),
-            )
-            .max();
-        let active_start = active_through.map_or(0, |sequence| {
-            events.partition_point(|event| event.sequence <= sequence)
-        });
-        if provider.context_tokens(&events[active_start..])? <= ACTIVE_CONTEXT_HIGH_TOKENS {
-            return Ok(0);
-        }
-        let context_tokens_before = provider.context_tokens(events)?;
-        let mut suffix_start = active_start;
-        let mut suffix_end = events.len();
-        while suffix_start < suffix_end {
-            let middle = suffix_start + (suffix_end - suffix_start) / 2;
-            if provider.context_tokens(&events[middle..])? <= ACTIVE_CONTEXT_LOW_TOKENS {
-                suffix_end = middle;
-            } else {
-                suffix_start = middle + 1;
-            }
-        }
-        let freeze_through_index = suffix_start.saturating_sub(1);
-
-        let request_sequences = events
-            .iter()
-            .filter(|event| {
-                matches!(&event.data, ThreadEventData::ModelRequest(request) if request.kind == ModelRequestKind::Response)
-            })
-            .map(|event| event.sequence)
-            .collect::<Vec<_>>();
-        let mut masked_events = Vec::new();
-        let mut through_sequence = None;
-        for (index, event) in events.iter().enumerate().skip(active_start) {
-            let later_requests =
-                request_sequences.partition_point(|sequence| *sequence <= event.sequence);
-            let ThreadEventData::ToolResult(result) = &event.data else {
-                continue;
-            };
-            if request_sequences.len() - later_requests < MINIMUM_FULL_RESULT_REQUESTS {
-                continue;
-            }
-            through_sequence = Some(event.sequence);
-            if let Some(masked_result) = masked_tool_result(result) {
-                let mut event = event.clone();
-                match &mut event.data {
-                    ThreadEventData::ToolResult(ToolResultEvent::Custom {
-                        masked_result: field,
-                        ..
-                    })
-                    | ThreadEventData::ToolResult(ToolResultEvent::Function {
-                        masked_result: field,
-                        ..
-                    }) => *field = Some(serde_json::Value::String(masked_result)),
-                    _ => unreachable!(),
-                }
-                masked_events.push((index, event));
-            }
-            if index >= freeze_through_index {
-                break;
-            }
-        }
-        if masked_events.is_empty() {
-            return Ok(0);
-        }
-        let through_sequence = through_sequence.expect("a masked event was passed");
-        let mut masked_sequences = previous_boundary
-            .map(|boundary| boundary.masked_sequences)
-            .unwrap_or_default();
-        masked_sequences.extend(masked_events.iter().map(|(_, event)| event.sequence));
-        let boundary_data = FrozenBoundaryEvent {
-            through_sequence,
-            masked_sequences,
-        };
-        let mut projected_events = events.clone();
-        for (index, event) in &masked_events {
-            projected_events[*index] = event.clone();
-        }
-        projected_events.push(storage::Event {
-            sequence: events.last().map_or(EventSequence(0), |event| {
-                EventSequence(event.sequence.0 + 1)
-            }),
-            data: ThreadEventData::FrozenBoundary(boundary_data.clone()),
-        });
-        let masked_tokens =
-            context_tokens_before.saturating_sub(provider.context_tokens(&projected_events)?);
-        if masked_tokens == 0 {
-            return Ok(0);
-        }
-        let _mutation = self.lock_mutation().await?;
-        let sequence = self
-            .store
-            .freeze_event_payloads(
-                thread_id,
-                masked_events
-                    .iter()
-                    .map(|(_, event)| (event.sequence, event.data.clone()))
-                    .collect(),
-                boundary_data.clone(),
-            )
-            .await
-            .context("failed to mask old command results")?;
-        for (index, event) in &masked_events {
-            events[*index] = event.clone();
-        }
-        let boundary = storage::Event {
-            sequence,
-            data: ThreadEventData::FrozenBoundary(boundary_data),
-        };
-        events.push(boundary.clone());
-        if let Some(stream_updates) = stream_updates {
-            stream_updates
-                .history_replaced(protocol_events(events.clone()))
-                .await?;
-        }
-        Ok(masked_tokens)
     }
 
     pub(super) async fn sync_workspace_instructions(
@@ -1473,7 +1334,6 @@ impl State {
                 call_id: call_id.to_owned(),
                 result: outcome.result,
                 artifacts: outcome.artifacts,
-                masked_result: None,
             })
         } else {
             ThreadEventData::ToolResult(ToolResultEvent::Function {
@@ -1481,7 +1341,6 @@ impl State {
                 call_id: call_id.to_owned(),
                 result: outcome.result,
                 artifacts: outcome.artifacts,
-                masked_result: None,
             })
         };
         self.append_event(thread_id, data, updates)

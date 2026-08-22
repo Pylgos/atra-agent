@@ -4,9 +4,8 @@ use std::{
 };
 
 use atra_protocol::{
-    CheckpointId, CompactionEvent, EventSequence, FrozenBoundaryEvent, HistoryTarget,
-    InstructionEvent, MessageEvent, RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData,
-    ThreadId,
+    CheckpointId, CompactionEvent, EventSequence, HistoryTarget, InstructionEvent, MessageEvent,
+    RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
 };
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -24,27 +23,6 @@ pub(crate) struct Event {
 pub(crate) struct ReportSnapshot {
     pub(crate) through: EventSequence,
     pub(crate) events: Vec<Event>,
-}
-
-pub(crate) struct FrozenBoundary {
-    pub through_sequence: EventSequence,
-    pub masked_sequences: Vec<EventSequence>,
-}
-
-pub(crate) fn latest_frozen_boundary(events: &[Event]) -> Option<FrozenBoundary> {
-    for event in events.iter().rev() {
-        match &event.data {
-            ThreadEventData::FrozenBoundary(boundary) => {
-                return Some(FrozenBoundary {
-                    through_sequence: boundary.through_sequence,
-                    masked_sequences: boundary.masked_sequences.clone(),
-                });
-            }
-            ThreadEventData::Compaction(_) => return None,
-            _ => {}
-        }
-    }
-    None
 }
 
 pub(crate) struct Store {
@@ -496,58 +474,6 @@ impl Store {
                     sequence,
                     data: event_data(kind, &payload)?,
                 }))
-            })
-            .await
-    }
-
-    pub async fn freeze_event_payloads(
-        &self,
-        thread_id: ThreadId,
-        events: Vec<(EventSequence, ThreadEventData)>,
-        boundary: FrozenBoundaryEvent,
-    ) -> tokio_rusqlite::Result<EventSequence> {
-        let events = events
-            .into_iter()
-            .map(|(sequence, data)| {
-                let (_, payload) = event_columns(&data)?;
-                serde_json::to_string(&payload)
-                    .map(|payload| (sequence.0, payload))
-                    .map_err(to_sql_error)
-            })
-            .collect::<tokio_rusqlite::Result<Vec<_>>>()?;
-        let boundary = serde_json::to_string(&boundary).map_err(to_sql_error)?;
-        self.connection
-            .call(move |connection| {
-                let thread_id = thread_id.0;
-                let transaction = connection.transaction()?;
-                for (sequence, payload) in events {
-                    transaction.execute(
-                        "
-                        UPDATE events
-                        SET payload = ?1
-                        WHERE thread_id = ?2 AND sequence = ?3
-                        ",
-                        params![payload, thread_id, sequence],
-                    )?;
-                }
-                let sequence = transaction.query_row(
-                    "
-                    SELECT COALESCE(MAX(sequence) + 1, 0)
-                    FROM events
-                    WHERE thread_id = ?1
-                    ",
-                    [thread_id],
-                    |row| row.get(0),
-                )?;
-                transaction.execute(
-                    "
-                    INSERT INTO events (thread_id, sequence, kind, payload)
-                    VALUES (?1, ?2, ?3, ?4)
-                    ",
-                    params![thread_id, sequence, "frozen_boundary", boundary],
-                )?;
-                transaction.commit()?;
-                Ok(EventSequence(sequence))
             })
             .await
     }

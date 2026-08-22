@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -14,11 +14,11 @@ use atra_platform::PlatformStore;
 use atra_protocol::{
     ApprovalPolicy, AssistantMessageEvent, AssistantMessagePhase, CommandEnvironment,
     CommandExecutionArtifact, CommandOutput, CommandTimerState, CompactionEvent, EventSequence,
-    FrozenBoundaryEvent, InstructionEvent, InteractionId, ItemEvent, MAX_COMMAND_OUTPUT_BYTES,
-    MessageEvent, ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, ProcessStatus,
-    RateLimitsEvent, Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate,
-    RunnersEvent, SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus,
-    TokenUsageEvent, ToolArtifact, ToolCallEvent, ToolResultEvent,
+    InstructionEvent, InteractionId, ItemEvent, MAX_COMMAND_OUTPUT_BYTES, MessageEvent,
+    ModelRequestEvent, ModelRequestKind, ProcessHandle, ProcessId, ProcessStatus, RateLimitsEvent,
+    Runner as RunnerInfo, RunnerOperationArtifact, RunnerOperationUpdate, RunnersEvent,
+    SpawnedProcess, ThreadEvent, ThreadEventData, ThreadId, TodoItem, TodoStatus, TokenUsageEvent,
+    ToolArtifact, ToolCallEvent, ToolResultEvent,
 };
 use atra_store::{Store as AtraStore, TreeManifest};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -59,11 +59,6 @@ use tools::*;
 use views::Views;
 
 const WORKSPACE_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
-const ACTIVE_CONTEXT_HIGH_TOKENS: usize = 96_000;
-const ACTIVE_CONTEXT_LOW_TOKENS: usize = 48_000;
-const MINIMUM_FULL_RESULT_REQUESTS: usize = 3;
-const MASK_OUTPUT_LINES: usize = 8;
-const MASK_OUTPUT_SIDE_BYTES: usize = 4 * 1024;
 
 pub async fn provider_auth_method(
     auth_home: &Path,
@@ -766,25 +761,7 @@ fn protocol_event(event: storage::Event) -> ThreadEvent {
     }
 }
 
-fn protocol_events(mut events: Vec<storage::Event>) -> Vec<ThreadEvent> {
-    let masked_sequences = storage::latest_frozen_boundary(&events)
-        .map(|boundary| {
-            boundary
-                .masked_sequences
-                .into_iter()
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    for event in &mut events {
-        if !masked_sequences.contains(&event.sequence)
-            && let ThreadEventData::ToolResult(result) = &mut event.data
-        {
-            match result {
-                ToolResultEvent::Custom { masked_result, .. }
-                | ToolResultEvent::Function { masked_result, .. } => *masked_result = None,
-            }
-        }
-    }
+fn protocol_events(events: Vec<storage::Event>) -> Vec<ThreadEvent> {
     events.into_iter().map(protocol_event).collect()
 }
 
@@ -877,10 +854,6 @@ mod tests {
             _request: &model::ModelRequest<'_>,
         ) -> Result<model::ModelEventStream> {
             unreachable!("turns are not used by provider startup")
-        }
-
-        fn context_tokens(&self, _events: &[storage::Event]) -> Result<usize> {
-            unreachable!("token counting is not used by provider startup")
         }
     }
 

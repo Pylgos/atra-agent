@@ -202,7 +202,6 @@ pub enum ThreadEventData {
     WebSearch(ItemEvent),
     ToolCall(ToolCallEvent),
     ToolResult(ToolResultEvent),
-    FrozenBoundary(FrozenBoundaryEvent),
     Reasoning(ReasoningEvent),
     Compaction(CompactionEvent),
     ModelRequest(ModelRequestEvent),
@@ -226,7 +225,6 @@ impl ThreadEventData {
             Self::WebSearch(_) => "web_search",
             Self::ToolCall(_) => "tool_call",
             Self::ToolResult(_) => "tool_result",
-            Self::FrozenBoundary(_) => "frozen_boundary",
             Self::Reasoning(_) => "reasoning",
             Self::Compaction(_) => "compaction",
             Self::ModelRequest(_) => "model_request",
@@ -371,24 +369,13 @@ pub enum ToolResultEvent {
         call_id: String,
         result: Value,
         artifacts: Vec<ToolArtifact>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        masked_result: Option<Value>,
     },
     Function {
         name: String,
         call_id: String,
         result: Value,
         artifacts: Vec<ToolArtifact>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        masked_result: Option<Value>,
     },
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FrozenBoundaryEvent {
-    pub through_sequence: EventSequence,
-    pub masked_sequences: Vec<EventSequence>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

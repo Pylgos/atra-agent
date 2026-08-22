@@ -316,11 +316,9 @@ pub(crate) enum TranscriptItem {
         input: String,
         results: BTreeMap<usize, RunnerResult>,
         pending_approval: Option<usize>,
-        masked: bool,
     },
     ToolResult {
         artifacts: Vec<ToolArtifact>,
-        masked: bool,
     },
     SkillInvocation {
         name: String,
@@ -593,7 +591,6 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     input,
                     results: BTreeMap::new(),
                     pending_approval: None,
-                    masked: false,
                 })
             } else if name == "question" {
                 Some(TranscriptItem::Question {
@@ -609,26 +606,12 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             }
         }
         ThreadEventData::ToolResult(result) => {
-            let (result, artifacts, masked_result) = match result {
-                ToolResultEvent::Custom {
-                    result,
-                    artifacts,
-                    masked_result,
-                    ..
-                }
-                | ToolResultEvent::Function {
-                    result,
-                    artifacts,
-                    masked_result,
-                    ..
-                } => (result, artifacts, masked_result),
+            let artifacts = match result {
+                ToolResultEvent::Custom { artifacts, .. }
+                | ToolResultEvent::Function { artifacts, .. } => artifacts,
             };
-            let masked = masked_result
-                .as_ref()
-                .is_some_and(|masked| masked != &result);
             Some(TranscriptItem::ToolResult {
                 artifacts: artifacts.iter().cloned().map(sanitize_artifact).collect(),
-                masked,
             })
         }
         ThreadEventData::Compaction(_) => Some(TranscriptItem::Compaction),
@@ -636,7 +619,6 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
         | ThreadEventData::WorkspaceInstructions(_)
         | ThreadEventData::Skills(_)
         | ThreadEventData::Runners(_)
-        | ThreadEventData::FrozenBoundary(_)
         | ThreadEventData::ModelRequest(_)
         | ThreadEventData::TokenUsage(_)
         | ThreadEventData::RateLimits(_) => None,
@@ -653,23 +635,19 @@ pub(crate) fn merge_runner_tool_result(
     let ThreadEventData::ToolResult(result) = &event.data else {
         return false;
     };
-    let (name, call_id, result, artifacts, masked_result) = match result {
+    let (name, call_id, artifacts) = match result {
         ToolResultEvent::Custom {
             name,
             call_id,
-            result,
             artifacts,
-            masked_result,
             ..
         }
         | ToolResultEvent::Function {
             name,
             call_id,
-            result,
             artifacts,
-            masked_result,
             ..
-        } => (name, call_id.as_str(), result, artifacts, masked_result),
+        } => (name, call_id.as_str(), artifacts),
     };
     if name != "command" {
         return false;
@@ -685,10 +663,7 @@ pub(crate) fn merge_runner_tool_result(
     }) else {
         return false;
     };
-    let TranscriptItem::RunnerTool {
-        results, masked, ..
-    } = &mut entry.item
-    else {
+    let TranscriptItem::RunnerTool { results, .. } = &mut entry.item else {
         unreachable!();
     };
     for artifact in artifacts.iter().cloned().map(sanitize_artifact) {
@@ -699,9 +674,6 @@ pub(crate) fn merge_runner_tool_result(
             ToolArtifact::CommandExecution(_) | ToolArtifact::PatchOperations(_) => {}
         }
     }
-    *masked = masked_result
-        .as_ref()
-        .is_some_and(|masked| masked != result);
     entry.rendered = None;
     true
 }
@@ -919,7 +891,6 @@ mod tests {
                     "note": "details"
                 }]),
                 artifacts: Vec::new(),
-                masked_result: None,
             }),
         };
 

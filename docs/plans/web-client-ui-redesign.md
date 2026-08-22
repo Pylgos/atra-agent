@@ -372,9 +372,8 @@ expanded. Bound the visual height and allow internal scrolling; do not
 truncate to a tail. During active streaming, follow an inner output area only
 while it is near its bottom.
 
-When output masking applies, Pretty shows the projection currently visible to
-the model. Raw continues to expose the exact domain event, including masking
-fields.
+Pretty shows the complete tool result visible to the model. Raw continues to
+expose the exact domain event.
 
 Managed Process activity in the Transcript shows the start, factual state, and
 a bounded output summary. Full Process monitoring belongs in the Processes

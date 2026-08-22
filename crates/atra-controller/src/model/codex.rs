@@ -21,7 +21,6 @@ use super::{
     ModelEventStream, ModelRequest, ProviderLoginStatus, ProviderRuntime,
     codex_auth::{Auth, AuthManager},
 };
-use crate::storage::Event;
 
 const PROVIDER_ID: &str = super::CODEX_PROVIDER;
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -280,10 +279,6 @@ impl ProviderRuntime for CodexProvider {
         server_compact(self.session(session_id).await?, request)
             .await
             .map(Some)
-    }
-
-    fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        super::api::ollama::context_tokens(events)
     }
 }
 

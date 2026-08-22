@@ -796,7 +796,6 @@ fn event_targets(state: &ThreadState, sequence: EventSequence) -> Vec<ThreadScop
         | ThreadEventData::WebSearch(_)
         | ThreadEventData::SkillInvocation(_)
         | ThreadEventData::Compaction(_)
-        | ThreadEventData::FrozenBoundary(_)
         | ThreadEventData::ApprovalDecision(_)
         | ThreadEventData::Retry(_)
         | ThreadEventData::TurnOutcome(_) => turn_key_for_event(state, sequence)

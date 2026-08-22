@@ -167,10 +167,6 @@ impl ProviderRuntime for OpenCodeGoProvider {
     ) -> Result<ModelEventStream> {
         self.stream_inner(request).await
     }
-
-    fn context_tokens(&self, events: &[crate::storage::Event]) -> Result<usize> {
-        super::api::ollama::context_tokens(events)
-    }
 }
 
 struct ModelSpec {

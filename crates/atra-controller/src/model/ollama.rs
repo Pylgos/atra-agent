@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use super::{
     ModelEventStream, ModelRequest, ProviderLoginStatus, ProviderRuntime, api_key_auth::ApiKeyAuth,
 };
-use crate::storage::Event;
 
 const PROVIDER_ID: &str = super::OLLAMA_PROVIDER;
 const API_BASE: &str = "https://ollama.com/api";
@@ -223,9 +222,5 @@ impl ProviderRuntime for OllamaProvider {
     ) -> Result<ModelEventStream> {
         self.key()?;
         super::api::ollama::stream(self, session_id, request).await
-    }
-
-    fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        super::api::ollama::context_tokens(events)
     }
 }

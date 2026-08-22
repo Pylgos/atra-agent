@@ -38,34 +38,18 @@ impl FakeProvider {
             .await
             .pop_front()
             .context("fake model script has no response remaining")?;
-        let masked_sequences = crate::storage::latest_frozen_boundary(events)
-            .map(|boundary| boundary.masked_sequences)
-            .unwrap_or_default();
         if let ModelResponse::AssistantMessage { content, .. } = &mut response
             && let Some(output) = events.iter().rev().find_map(|event| {
                 let ThreadEventData::ToolResult(result) = &event.data else {
                     return None;
                 };
-                let (result, masked_result) = match result {
-                    ToolResultEvent::Custom {
-                        result,
-                        masked_result,
-                        ..
-                    }
-                    | ToolResultEvent::Function {
-                        result,
-                        masked_result,
-                        ..
-                    } => (result, masked_result),
+                let result = match result {
+                    ToolResultEvent::Custom { result, .. }
+                    | ToolResultEvent::Function { result, .. } => result,
                 };
-                let projected = if masked_sequences.contains(&event.sequence) {
-                    masked_result.as_ref().unwrap_or(result)
-                } else {
-                    result
-                };
-                projected
+                result
                     .as_str()
-                    .or_else(|| projected.pointer("/output")?.as_str())
+                    .or_else(|| result.pointer("/output")?.as_str())
             })
         {
             *content = content.replace("{{tool_output}}", output);
@@ -147,10 +131,6 @@ impl ProviderRuntime for FakeProvider {
         request: &ModelRequest<'_>,
     ) -> Result<ModelEventStream> {
         FakeProvider::stream(self, request.events).await
-    }
-
-    fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        Ok(super::text_tokens(&serde_json::to_string(events)?))
     }
 }
 

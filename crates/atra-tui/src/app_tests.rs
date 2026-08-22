@@ -1039,7 +1039,6 @@ fn layout_mapping_does_not_insert_soft_wraps() {
                 full_output_path: "/tmp/output".into(),
             },
         )],
-        masked: false,
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 4);
@@ -1070,7 +1069,6 @@ fn running_command_timer_uses_the_runner_snapshot() {
             },
         )]),
         pending_approval: None,
-        masked: false,
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 80);
@@ -1098,7 +1096,6 @@ fn paused_command_timer_uses_the_runner_snapshot() {
             },
         )]),
         pending_approval: None,
-        masked: false,
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 80);
@@ -1115,7 +1112,6 @@ fn detached_command_is_not_rendered_as_running() {
                 full_output_path: "/tmp/output".into(),
             },
         )],
-        masked: false,
     })];
 
     prepare_transcript(&mut items, &HashSet::new(), 80);

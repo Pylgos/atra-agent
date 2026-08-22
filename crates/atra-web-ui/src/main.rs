@@ -2604,9 +2604,6 @@ fn ActivityRow(
         ActivityDisplay::Compaction => rsx! {
             div { class: "activity-compaction", "Compacting conversation history…" }
         },
-        ActivityDisplay::Boundary => rsx! {
-            div { class: "activity-boundary", "Older context was compacted." }
-        },
         ActivityDisplay::Failure { message } => {
             let headline = message.lines().next().unwrap_or("Failed");
             rsx! {
@@ -2732,9 +2729,6 @@ fn ActivityDetail(
         ActivityDisplay::Compaction => rsx! {
             div { class: "activity-compaction", "Compacting conversation history…" }
         },
-        ActivityDisplay::Boundary => rsx! {
-            div { class: "activity-boundary", "Older context was compacted." }
-        },
         ActivityDisplay::Failure { message } => {
             let headline = message.lines().next().unwrap_or("Failed");
             rsx! {
@@ -2798,9 +2792,6 @@ fn CommandOperations(display: CommandDisplay) -> Element {
                         }
                     }
                 }
-            }
-            if display.masked {
-                div { class: "command-masked", "Model context uses masked output." }
             }
         }
     }

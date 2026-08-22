@@ -1280,8 +1280,7 @@ pre {
   white-space: pre-wrap;
 }
 
-.command-omitted,
-.command-masked {
+.command-omitted {
   margin-top: 0.4rem;
   color: var(--muted);
   font-size: 0.72rem;
@@ -1292,7 +1291,6 @@ pre {
 .activity-retry,
 .activity-skill,
 .activity-compaction,
-.activity-boundary,
 .activity-cancelled,
 .activity-unsupported {
   color: var(--muted);

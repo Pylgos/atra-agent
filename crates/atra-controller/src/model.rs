@@ -200,8 +200,6 @@ pub(crate) trait ProviderRuntime: Send + Sync {
     ) -> Result<Option<OpaqueState>> {
         Ok(None)
     }
-
-    fn context_tokens(&self, events: &[Event]) -> Result<usize>;
 }
 
 pub(crate) struct Provider {
@@ -276,10 +274,6 @@ impl Provider {
         request: &ModelRequest<'_>,
     ) -> Result<Option<OpaqueState>> {
         self.runtime.server_compact(session_id, request).await
-    }
-
-    pub(crate) fn context_tokens(&self, events: &[Event]) -> Result<usize> {
-        self.runtime.context_tokens(events)
     }
 }
 

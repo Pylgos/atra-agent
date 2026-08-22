@@ -1608,7 +1608,6 @@ mod tests {
                 call_id: "call-1".to_owned(),
                 result: serde_json::json!("done"),
                 artifacts: Vec::new(),
-                masked_result: None,
             }),
         };
 

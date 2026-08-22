@@ -1367,7 +1367,6 @@ mod tests {
                     full_output_path: PathBuf::from("output"),
                 },
             )],
-            masked_result: None,
         };
         let events = vec![
             crate::storage::Event {
@@ -1401,7 +1400,6 @@ mod tests {
             call_id: "call-1".to_owned(),
             result: json!({"secret_result_body": "omitted"}),
             artifacts: vec![],
-            masked_result: None,
         };
         let events = vec![
             crate::storage::Event {
@@ -1439,7 +1437,6 @@ mod tests {
                     full_output_path: PathBuf::from("output"),
                 },
             )],
-            masked_result: None,
         };
         let events = vec![
             crate::storage::Event {
@@ -1485,7 +1482,6 @@ mod tests {
                     artifacts: vec![ToolArtifact::CommandExecution(command)],
                 },
             )],
-            masked_result: None,
         };
         let events = vec![
             crate::storage::Event {
@@ -1515,7 +1511,6 @@ mod tests {
             call_id: "call-1".to_owned(),
             result: json!({"body": "omitted"}),
             artifacts: vec![],
-            masked_result: None,
         };
         let events = vec![
             crate::storage::Event {
