@@ -27,11 +27,11 @@ use dioxus::web::WebEventExt;
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use model::{
-    Detail, LAST_ROUTE_KEY, NAV_OPEN_KEY, NAV_WIDTH_KEY, PINS_KEY, Pin, RemoteState, Route,
-    SENT_HISTORY_KEY, THEME_KEY, TranscriptMode, UTILITY_EXPANDED_KEY, UTILITY_OPEN_KEY,
-    UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab, WORKSPACE_COLLAPSE_KEY, Workspace,
-    WorkspaceList, draft_key, factual_status, family_threads, render_markdown, root_id,
-    root_threads, thread_name,
+    Detail, LAST_ROUTE_KEY, ModelSelection, NAV_OPEN_KEY, NAV_WIDTH_KEY, PINS_KEY, Pin,
+    RECENT_MODELS_KEY, RemoteState, Route, SENT_HISTORY_KEY, THEME_KEY, TranscriptMode,
+    UTILITY_EXPANDED_KEY, UTILITY_OPEN_KEY, UTILITY_TAB_KEY, UTILITY_WIDTH_KEY, UtilityTab,
+    WORKSPACE_COLLAPSE_KEY, Workspace, WorkspaceList, draft_key, factual_status, family_threads,
+    push_recent_model, render_markdown, root_id, root_threads, thread_name,
 };
 use syntax::setup_syntax_highlighting;
 use thread_store::ThreadStore;
@@ -185,11 +185,15 @@ impl Drop for PopstateListener {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ComposerMenuPage {
     Root,
     History,
     Skills,
+    Model {
+        /// `None` shows the model list, `Some` shows the effort list for that model.
+        stage: Option<ModelSelection>,
+    },
 }
 
 struct ComposerMenuCloseListener {
@@ -319,6 +323,15 @@ fn push_history_entry(value: String) -> Vec<String> {
         save_json(SENT_HISTORY_KEY, &history);
     }
     history
+}
+
+fn recent_models() -> Vec<ModelSelection> {
+    storage_json::<Vec<ModelSelection>>(RECENT_MODELS_KEY)
+}
+
+fn record_recent_model(selection: &ModelSelection) {
+    let recent = push_recent_model(&recent_models(), selection);
+    save_json(RECENT_MODELS_KEY, &recent);
 }
 
 fn set_draft(workspace: &str, thread: i64, mut draft: Signal<String>, value: String) {
@@ -2794,7 +2807,190 @@ fn CommandOperations(display: CommandDisplay) -> Element {
 }
 
 #[component]
-fn ComposerMenuHeader(title: &'static str, back: EventHandler<MouseEvent>) -> Element {
+fn ComposerModelPicker(
+    workspace: String,
+    thread: i64,
+    controller: ControllerState,
+    connected: bool,
+    mut error: Signal<String>,
+    mut menu_page: Signal<Option<ComposerMenuPage>>,
+    current: ModelSelection,
+    effort: String,
+    stage: Option<ModelSelection>,
+    autofocus: bool,
+) -> Element {
+    let models = controller
+        .providers()
+        .iter()
+        .flat_map(|provider| provider.models().iter().cloned())
+        .collect::<Vec<_>>();
+    let mut query = use_signal(String::new);
+    let mut pending = use_signal(|| false);
+    let filter = query().to_lowercase();
+    let matches = |model: &Model| {
+        filter.is_empty()
+            || model.id.to_lowercase().contains(&filter)
+            || model.display_name.to_lowercase().contains(&filter)
+            || model
+                .description
+                .as_deref()
+                .is_some_and(|description| description.to_lowercase().contains(&filter))
+    };
+    if let Some(selection) = &stage {
+        let Some(model) = models
+            .iter()
+            .find(|model| model.provider == selection.provider && model.id == selection.model)
+        else {
+            return rsx! {};
+        };
+        let efforts = model.supported_reasoning_efforts.clone();
+        rsx! {
+            ComposerMenuHeader {
+                title: "{model.display_name}",
+                back: move |_| menu_page.set(Some(ComposerMenuPage::Model { stage: None })),
+            }
+            div { class: "composer-menu-list",
+                for effort in efforts {
+                    button {
+                        r#type: "button",
+                        class: if current == *selection && *effort == effort { "selected" } else { "" },
+                        disabled: !connected || pending(),
+                        onclick: {
+                            let workspace = workspace.clone();
+                            let selection = selection.clone();
+                            let effort = effort.clone();
+                            move |_| {
+                                pending.set(true);
+                                let workspace = workspace.clone();
+                                let selection = selection.clone();
+                                let effort = effort.clone();
+                                spawn(async move {
+                                    match command(&workspace, &Command::ThreadSetModel {
+                                        thread_id: ThreadId(thread),
+                                        provider: selection.provider.clone(),
+                                        model: selection.model.clone(),
+                                        reasoning_effort: effort,
+                                    }).await {
+                                        Ok(_) => {
+                                            error.set(String::new());
+                                            record_recent_model(&selection);
+                                            menu_page.set(None);
+                                        }
+                                        Err(message) => error.set(message),
+                                    }
+                                    pending.set(false);
+                                });
+                            }
+                        },
+                        span { "{effort}" }
+                        span { class: "composer-menu-chevron", "✓" }
+                    }
+                }
+            }
+        }
+    } else {
+        let recent = recent_models()
+            .into_iter()
+            .filter(|selection| {
+                models.iter().any(|model| {
+                    model.provider == selection.provider && model.id == selection.model
+                })
+            })
+            .collect::<Vec<_>>();
+        let show_recent = filter.is_empty() && !recent.is_empty();
+        let mut providers = Vec::<String>::new();
+        for model in models.iter().filter(|model| matches(model)) {
+            if !providers.contains(&model.provider) {
+                providers.push(model.provider.clone());
+            }
+        }
+        rsx! {
+            ComposerMenuHeader {
+                title: "Model",
+                back: move |_| menu_page.set(Some(ComposerMenuPage::Root)),
+            }
+            div { class: "composer-menu-search",
+                input {
+                    r#type: "search",
+                    placeholder: "Search models",
+                    aria_label: "Search models",
+                    autofocus: autofocus,
+                    value: "{query()}",
+                    oninput: move |event| query.set(event.value()),
+                }
+            }
+            div { class: "composer-menu-list",
+                if models.is_empty() {
+                    span { class: "composer-menu-empty", "Model options are temporarily unavailable." }
+                } else if providers.is_empty() {
+                    span { class: "composer-menu-empty", "No matching models" }
+                } else {
+                    if show_recent {
+                        span { class: "composer-menu-group", "Recent" }
+                        for selection in recent.iter() {
+                            ComposerModelRow {
+                                models: models.clone(),
+                                selection: selection.clone(),
+                                current: current.clone(),
+                                menu_page,
+                            }
+                        }
+                    }
+                    for provider in providers {
+                        span { class: "composer-menu-group", "{provider}" }
+                        for model in models.iter().filter(|model| {
+                            model.provider == provider && matches(model)
+                        }) {
+                            ComposerModelRow {
+                                key: "{model.provider}\n{model.id}",
+                                models: models.clone(),
+                                selection: ModelSelection {
+                                    provider: model.provider.clone(),
+                                    model: model.id.clone(),
+                                },
+                                current: current.clone(),
+                                menu_page,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ComposerModelRow(
+    models: Vec<Model>,
+    selection: ModelSelection,
+    current: ModelSelection,
+    mut menu_page: Signal<Option<ComposerMenuPage>>,
+) -> Element {
+    let model = models
+        .iter()
+        .find(|model| model.provider == selection.provider && model.id == selection.model);
+    let Some(model) = model else {
+        return rsx! {};
+    };
+    let is_current = current == selection;
+    rsx! {
+        button {
+            r#type: "button",
+            class: if is_current { "selected" } else { "" },
+            title: "{model.display_name}",
+            onclick: move |_| {
+                menu_page.set(Some(ComposerMenuPage::Model { stage: Some(selection.clone()) }));
+            },
+            span { class: "composer-menu-label", "{model.display_name}" }
+            if is_current {
+                span { class: "composer-menu-chevron", "✓" }
+            }
+        }
+    }
+}
+
+#[component]
+fn ComposerMenuHeader(title: String, back: EventHandler<MouseEvent>) -> Element {
     rsx! {
         header { class: "composer-menu-header",
             button {
@@ -2831,6 +3027,8 @@ fn Composer(
     let mut saved_draft = use_signal(String::new);
     let mut composing = use_signal(|| false);
     let mut menu_page = use_signal(|| None::<ComposerMenuPage>);
+    let mut model_picker_autofocus = use_signal(|| false);
+    let mut model_picker_touch = use_signal(|| false);
     let mut skills = use_signal(Vec::<String>::new);
     let mut skills_loading = use_signal(|| false);
     let _menu_close = use_hook(move || Rc::new(ComposerMenuCloseListener::new(menu_page)));
@@ -3003,12 +3201,6 @@ fn Composer(
                 div { class: "composer-menu-controls",
                     div {
                         class: "composer-menu",
-                        onkeydown: move |event| {
-                            if event.key() == Key::Escape {
-                                event.prevent_default();
-                                menu_page.set(None);
-                            }
-                        },
                         button {
                             class: "composer-menu-summary",
                             r#type: "button",
@@ -3031,6 +3223,25 @@ fn Composer(
                             div { class: "composer-menu-popover",
                                 match page {
                                     ComposerMenuPage::Root => rsx! {
+                                        button {
+                                            r#type: "button",
+                                            aria_label: "Model",
+                                            ontouchstart: move |_| {
+                                                model_picker_touch.set(true);
+                                            },
+                                            onclick: move |event| {
+                                                event.stop_propagation();
+                                                if model_picker_touch() {
+                                                    model_picker_autofocus.set(false);
+                                                    model_picker_touch.set(false);
+                                                } else {
+                                                    model_picker_autofocus.set(true);
+                                                }
+                                                menu_page.set(Some(ComposerMenuPage::Model { stage: None }));
+                                            },
+                                            span { "Model" }
+                                            span { class: "composer-menu-chevron", "›" }
+                                        }
                                         button {
                                             r#type: "button",
                                             aria_label: "History",
@@ -3130,6 +3341,23 @@ fn Composer(
                                                     }
                                                 }
                                             }
+                                        }
+                                    },
+                                    ComposerMenuPage::Model { stage } => rsx! {
+                                        ComposerModelPicker {
+                                            workspace: workspace.clone(),
+                                            thread,
+                                            controller: controller.clone(),
+                                            connected,
+                                            error,
+                                            menu_page,
+                                            current: ModelSelection {
+                                                provider: metadata.provider.clone(),
+                                                model: metadata.model.clone(),
+                                            },
+                                            effort: metadata.reasoning_effort.clone(),
+                                            stage,
+                                            autofocus: model_picker_autofocus(),
                                         }
                                     },
                                 }
@@ -3535,25 +3763,6 @@ fn ThreadUtility(
     let Some(metadata) = metadata_read.metadata().cloned() else {
         return rsx! {};
     };
-    let mut selected_model = use_signal(|| format!("{}\n{}", metadata.provider, metadata.model));
-    let mut reasoning = use_signal(|| metadata.reasoning_effort.clone());
-    let mut pending = use_signal(|| false);
-    let models = controller
-        .providers()
-        .iter()
-        .flat_map(|provider| provider.models().iter().cloned())
-        .collect::<Vec<_>>();
-    let models_available = !models.is_empty();
-    let current_model = format!("{}\n{}", metadata.provider, metadata.model);
-    let current_model_listed = models
-        .iter()
-        .any(|model| format!("{}\n{}", model.provider, model.id) == current_model);
-    let efforts = models
-        .iter()
-        .find(|model| format!("{}\n{}", model.provider, model.id) == selected_model())
-        .map(|model| model.supported_reasoning_efforts.clone())
-        .unwrap_or_else(|| vec![reasoning()]);
-    let selectable_models = models.clone();
     let diagnostics = diagnostics_read.value().unwrap_or_default();
     let rename_metadata = metadata.clone();
     let delete_metadata = metadata.clone();
@@ -3570,85 +3779,6 @@ fn ThreadUtility(
                 disabled: !connected,
                 onclick: move |_| dialog.set(Some(DialogState::Rename { current: thread_name(&rename_metadata) })),
                 "Rename Thread"
-            }
-        }
-        form {
-            class: "utility-section",
-            onsubmit: move |event| {
-                event.prevent_default();
-                let Some((provider, model)) = selected_model()
-                    .split_once('\n')
-                    .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
-                else { return; };
-                pending.set(true);
-                let workspace = workspace.clone();
-                let effort = reasoning();
-                spawn(async move {
-                    if let Err(message) = command(&workspace, &Command::ThreadSetModel {
-                        thread_id: ThreadId(thread),
-                        provider,
-                        model,
-                        reasoning_effort: effort,
-                    }).await {
-                        error.set(message);
-                    } else {
-                        error.set(String::new());
-                    }
-                    pending.set(false);
-                });
-            },
-            h3 { "Model" }
-            label {
-                "Provider and model"
-                select {
-                    disabled: !models_available,
-                    onchange: move |event| {
-                        let selection = event.value();
-                        let effort = reasoning_effort_for_model(
-                            &selectable_models,
-                            &selection,
-                            &reasoning(),
-                        );
-                        selected_model.set(selection);
-                        reasoning.set(effort);
-                    },
-                    if !current_model_listed {
-                        option {
-                            value: "{current_model}",
-                            selected: current_model == selected_model(),
-                            "{metadata.model} ({metadata.provider}, current)"
-                        }
-                    }
-                    for model in &models {
-                        option {
-                            value: "{model.provider}\n{model.id}",
-                            selected: format!("{}\n{}", model.provider, model.id) == selected_model(),
-                            "{model.display_name} ({model.provider})"
-                        }
-                    }
-                }
-            }
-            label {
-                "Reasoning effort"
-                select {
-                    disabled: !models_available,
-                    onchange: move |event| reasoning.set(event.value()),
-                    for effort in efforts {
-                        option {
-                            value: "{effort}",
-                            selected: effort == reasoning(),
-                            "{effort}"
-                        }
-                    }
-                }
-            }
-            if !models_available {
-                p { role: "status", "Model options are temporarily unavailable." }
-            }
-            button {
-                r#type: "submit",
-                disabled: !connected || pending() || !models_available,
-                "Apply model"
             }
         }
         if diagnostics.usage_raw.is_some() || diagnostics.limits_raw.is_some() {
@@ -4256,24 +4386,6 @@ fn AppDialog(
     }
 }
 
-fn reasoning_effort_for_model(models: &[Model], selection: &str, current: &str) -> String {
-    let Some(model) = models
-        .iter()
-        .find(|model| format!("{}\n{}", model.provider, model.id) == selection)
-    else {
-        return current.to_owned();
-    };
-    if model
-        .supported_reasoning_efforts
-        .iter()
-        .any(|effort| effort == current)
-    {
-        current.to_owned()
-    } else {
-        model.default_reasoning_effort.clone()
-    }
-}
-
 fn scroll_transcript_to_bottom(element: &web_sys::Element) {
     element.set_scroll_top(element.scroll_height());
 }
@@ -4308,46 +4420,49 @@ fn transcript_following_after_scroll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model::RECENT_MODELS_LIMIT;
 
-    fn model(
-        id: &str,
-        default_reasoning_effort: &str,
-        supported_reasoning_efforts: &[&str],
-    ) -> Model {
-        Model {
+    #[test]
+    fn recent_models_move_to_the_front_and_stay_capped() {
+        let first = ModelSelection {
             provider: "fake".to_owned(),
-            id: id.to_owned(),
-            display_name: id.to_owned(),
-            description: None,
-            default_reasoning_effort: default_reasoning_effort.to_owned(),
-            supported_reasoning_efforts: supported_reasoning_efforts
-                .iter()
-                .map(|effort| (*effort).to_owned())
-                .collect(),
-            context_window: None,
-            auto_compact_token_limit: None,
-            tool_bindings: Vec::new(),
+            model: "test-model".to_owned(),
+        };
+        let second = ModelSelection {
+            provider: "fake".to_owned(),
+            model: "alternate-model".to_owned(),
+        };
+
+        let recent = push_recent_model(&[], &first);
+        assert_eq!(recent, vec![first.clone()]);
+
+        let recent = push_recent_model(&recent, &second);
+        assert_eq!(recent, vec![second, first.clone()]);
+
+        let recent = push_recent_model(&recent, &first);
+        assert_eq!(
+            recent,
+            vec![
+                first,
+                ModelSelection {
+                    provider: "fake".to_owned(),
+                    model: "alternate-model".to_owned()
+                }
+            ]
+        );
+
+        let mut recent = Vec::new();
+        for index in 0..6 {
+            recent = push_recent_model(
+                &recent,
+                &ModelSelection {
+                    provider: "fake".to_owned(),
+                    model: format!("model-{index}"),
+                },
+            );
         }
-    }
-
-    #[test]
-    fn model_selection_preserves_a_supported_reasoning_effort() {
-        let models = [model("test-model", "medium", &["low", "medium", "high"])];
-
-        assert_eq!(
-            reasoning_effort_for_model(&models, "fake\ntest-model", "high"),
-            "high"
-        );
-    }
-
-    #[test]
-    fn model_selection_uses_the_new_models_default_reasoning_effort() {
-        let models = [model("test-model", "high", &["high"])];
-
-        assert_eq!(
-            reasoning_effort_for_model(&models, "fake\ntest-model", "medium"),
-            "high"
-        );
+        assert_eq!(recent.len(), RECENT_MODELS_LIMIT);
+        assert_eq!(recent[0].model, "model-5");
     }
 
     #[test]

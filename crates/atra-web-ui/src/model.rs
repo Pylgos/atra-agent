@@ -196,6 +196,31 @@ pub const UTILITY_WIDTH_KEY: &str = "atra:utility-width";
 pub const UTILITY_EXPANDED_KEY: &str = "atra:utility-expanded";
 pub const WORKSPACE_COLLAPSE_KEY: &str = "atra:workspace-collapse";
 pub const SENT_HISTORY_KEY: &str = "atra:sent-history";
+pub const RECENT_MODELS_KEY: &str = "atra:recent-models";
+
+/// Recently used model selection, persisted as `{provider}\n{model}` keys.
+pub const RECENT_MODELS_LIMIT: usize = 4;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Moves `selection` to the front of the recent list and truncates it.
+pub fn push_recent_model(
+    recent: &[ModelSelection],
+    selection: &ModelSelection,
+) -> Vec<ModelSelection> {
+    let mut recent = recent
+        .iter()
+        .filter(|entry| *entry != selection)
+        .cloned()
+        .collect::<Vec<_>>();
+    recent.insert(0, selection.clone());
+    recent.truncate(RECENT_MODELS_LIMIT);
+    recent
+}
 
 pub fn draft_key(workspace: &str, thread: i64) -> String {
     format!("atra:draft:{workspace}:{thread}")

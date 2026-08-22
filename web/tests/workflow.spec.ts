@@ -264,10 +264,22 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
   await expect(workspaceRow).not.toContainText("children");
   await expect(workspaceRow.locator(".thread-status-indicator")).toHaveCount(0);
 
-  const modelSelector = page.getByLabel("Provider and model");
-  const reasoningSelector = page.getByLabel("Reasoning effort");
-  await expect(modelSelector).toHaveValue("fake\ntest-model");
-  await expect(reasoningSelector).toHaveValue("medium");
+  const closeMenu = async () => {
+    if (await page.locator(".composer-menu-popover").count() > 0) {
+      await page.locator("body").click({ position: { x: 5, y: 5 } });
+      await expect(page.locator(".composer-menu-popover")).not.toBeVisible();
+    }
+  };
+  const openModelPicker = async () => {
+    await closeMenu();
+    await page.getByLabel("Composer actions").click();
+    await page.getByRole("button", { name: "Model", exact: true }).click();
+  };
+  await openModelPicker();
+  await expect(page.getByRole("button", { name: "Test Model" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Test Model" })).toBeVisible();
+  await closeMenu();
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/controller/events"
@@ -287,10 +299,11 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(modelSelector).toBeVisible();
-  await expect(modelSelector).toBeDisabled();
-  await expect(modelSelector).toHaveValue("fake\ntest-model");
+  await openModelPicker();
   await expect(page.getByText("Model options are temporarily unavailable.")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByText("Model options are temporarily unavailable.")).toBeVisible();
+  await closeMenu();
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
       "/api/workspaces/workspace-1/controller/events"
@@ -326,9 +339,59 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
       }
     });
   });
-  await expect(modelSelector).toBeEnabled();
-  await modelSelector.selectOption("fake\nalternate-model");
-  await expect(reasoningSelector).toHaveValue("high");
+  await openModelPicker();
+  await expect(page.locator(".composer-menu-popover").getByText("fake", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Alternate Model" }).click();
+  await expect(page.getByRole("button", { name: "high" })).toBeVisible();
+  let setModelCommand: unknown;
+  await page.route("**/api/workspaces/workspace-1/commands", async (route) => {
+    const sent = route.request().postDataJSON();
+    const method = (sent as { method?: string }).method;
+    if (method === "thread_set_model") {
+      setModelCommand = sent;
+    } else if (method === "thread_send") {
+      sentCommand = sent;
+      await page.evaluate(() => {
+        const source = (window as any).__atraEventSources.get(
+          "/api/workspaces/workspace-1/threads/1/events"
+        );
+        source.emit({
+          message: "operation",
+          operation: {
+            operation: "event_appended",
+            event: {
+              sequence: 7,
+              kind: "user_message",
+              payload: { content: "Sent from browser" }
+            }
+          }
+        });
+        source.emit({
+          message: "operation",
+          operation: {
+            operation: "active_turn_started",
+            phase: "running"
+          }
+        });
+      });
+    }
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ result: "accepted" })
+    });
+  });
+  await page.getByRole("button", { name: "high" }).click();
+  await expect.poll(() => setModelCommand).toEqual({
+    method: "thread_set_model",
+    thread_id: 1,
+    provider: "fake",
+    model: "alternate-model",
+    reasoning_effort: "high"
+  });
+  await expect(page.getByRole("button", { name: "Alternate Model" })).not.toBeVisible();
+  await expect.poll(() =>
+    page.evaluate(() => localStorage.getItem("atra:recent-models"))
+  ).toBe(JSON.stringify([{ provider: "fake", model: "alternate-model" }]));
 
   await page.evaluate(() => {
     const source = (window as any).__atraEventSources.get(
@@ -404,8 +467,11 @@ test("critical Thread workflow uses streamed snapshots and forwards commands", a
     }
   });
   await backgroundRow.locator(".navigation-link").click();
-  await expect(modelSelector).toHaveValue("fake\ntest-model");
-  await expect(reasoningSelector).toHaveValue("medium");
+  await openModelPicker();
+  await expect(page.getByRole("button", { name: "Test Model" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Test Model" })).toBeVisible();
+  await closeMenu();
   await expect(backgroundRow.locator(".thread-status-indicator")).toHaveCount(0);
   await workspaceRow.locator(".navigation-link").click();
 

@@ -1655,6 +1655,34 @@ pre {
   overflow-y: auto;
 }
 
+.composer-menu-search {
+  padding: 0.45rem 0.7rem 0;
+}
+
+.composer-menu-search input {
+  padding: 0.35rem 0.55rem;
+  font-size: 0.85rem;
+}
+
+.composer-menu-group {
+  display: block;
+  padding: 0.5rem 0.7rem 0.15rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.composer-menu-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer-menu-list > button.selected {
+  color: var(--accent);
+}
+
 .composer-menu-list code {
   overflow: hidden;
   color: var(--text);
