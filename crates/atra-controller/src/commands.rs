@@ -753,26 +753,6 @@ impl TurnProjector {
         let mut projection = self.projection.lock().await;
         project_final_event(&self.state, self.thread_id, &mut projection, event).await
     }
-
-    pub(super) async fn history_replaced(&self, events: Vec<ThreadEvent>) -> Result<()> {
-        self.state
-            .views
-            .apply_thread(self.thread_id, ThreadOperation::EventsReplaced { events })
-            .await
-    }
-
-    pub(super) async fn checkpoint_added(
-        &self,
-        checkpoint: atra_protocol::ThreadCheckpoint,
-    ) -> Result<()> {
-        self.state
-            .views
-            .apply_thread(
-                self.thread_id,
-                ThreadOperation::CheckpointAdded { checkpoint },
-            )
-            .await
-    }
 }
 
 async fn persist_public_event(

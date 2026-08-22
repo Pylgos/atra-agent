@@ -2447,7 +2447,7 @@ mod tests {
             event(
                 1,
                 "compaction",
-                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}),
+                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "through": 0}),
             ),
             event(
                 2,
@@ -2478,7 +2478,7 @@ mod tests {
             event(
                 1,
                 "compaction",
-                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}),
+                json!({"replacement": {"type": "summary", "content": "Earlier summary"}, "through": 0}),
             ),
             event(
                 2,

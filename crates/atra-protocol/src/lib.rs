@@ -382,7 +382,7 @@ pub enum ToolResultEvent {
 #[serde(deny_unknown_fields)]
 pub struct CompactionEvent {
     pub replacement: CompactionReplacement,
-    pub checkpoint_id: CheckpointId,
+    pub through: EventSequence,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

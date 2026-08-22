@@ -1125,7 +1125,7 @@ mod tests {
                     "events": [{
                         "sequence": 1,
                         "kind": "compaction",
-                        "payload": {"replacement": {"type": "summary", "content": "Earlier summary"}, "checkpoint_id": 1}
+                        "payload": {"replacement": {"type": "summary", "content": "Earlier summary"}, "through": 0}
                     }],
                     "active_turn": null,
                     "last_outcome": null,

@@ -69,18 +69,9 @@ pub(super) fn derive(events: &[Event], replay_key: Option<&str>) -> Result<Surfa
         items.push(message(Role::Developer, context.content.clone()));
     }
 
-    let compaction = events.iter().rposition(|event| match &event.data {
-        ThreadEventData::Compaction(event) => match &event.replacement {
-            CompactionReplacement::Summary { .. } => true,
-            CompactionReplacement::Opaque { state } => {
-                replay_key.is_some_and(|key| key == state.replay_key)
-            }
-        },
-        _ => false,
-    });
-    if let Some(index) = compaction
-        && let ThreadEventData::Compaction(compaction) = &events[index].data
-    {
+    let compaction = applicable_compaction(events, replay_key);
+    let through = compaction.map(|event| event.through);
+    if let Some(compaction) = compaction {
         match &compaction.replacement {
             CompactionReplacement::Summary { content } => items.push(message(
                 Role::Developer,
@@ -88,106 +79,182 @@ pub(super) fn derive(events: &[Event], replay_key: Option<&str>) -> Result<Surfa
             )),
             CompactionReplacement::Opaque { state } => items.push(Item::Opaque(state.clone())),
         }
+        append_shadowed_state(&mut items, events, compaction.through);
     }
-    let events = compaction.map_or(events, |index| &events[index + 1..]);
+
     for event in events {
-        let item = match &event.data {
-            ThreadEventData::ThreadContext(_) => None,
-            ThreadEventData::WorkspaceInstructions(value) => Some(message(
-                Role::Developer,
-                format!(
-                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
-                    instruction_text(value, "AGENTS.md instructions")
-                ),
-            )),
-            ThreadEventData::Skills(value) => Some(message(
-                Role::Developer,
-                instruction_text(value, "skills list"),
-            )),
-            ThreadEventData::SkillInvocation(value) => {
-                Some(message(Role::User, format_skill_invocation(value)))
-            }
-            ThreadEventData::Runners(value) => Some(message(
-                Role::Developer,
-                match value {
-                    RunnersEvent::Initial(runners) => format_runners(runners),
-                    RunnersEvent::Replacement(runners) => format!(
-                        "The available Atra Runner list has changed. This list replaces the previously provided list.\n\n{}",
-                        format_runners(runners)
-                    ),
-                },
-            )),
-            ThreadEventData::UserMessage(value) => Some(message(Role::User, value.content.clone())),
-            ThreadEventData::AssistantMessage(value) => Some(Item::Message {
-                role: Role::Assistant,
-                text: value.content.clone(),
-                phase: Some(value.phase),
-            }),
-            ThreadEventData::Reasoning(value) => Some(Item::Reasoning {
-                summary: value.summary.clone(),
-                opaque: value.opaque.clone(),
-            }),
-            ThreadEventData::ToolCall(value) => Some(match value {
-                ToolCallEvent::Custom {
-                    item_id,
-                    name,
-                    input,
-                    call_id,
-                } => Item::ToolCall {
-                    kind: ToolKind::Custom,
-                    item_id: item_id.clone(),
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    input: ToolInput::Text(input.clone()),
-                },
-                ToolCallEvent::Function {
-                    name,
-                    arguments,
-                    call_id,
-                } => Item::ToolCall {
-                    kind: ToolKind::Function,
-                    item_id: None,
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    input: ToolInput::Json(arguments.clone()),
-                },
-            }),
-            ThreadEventData::ToolResult(value) => {
-                let (kind, call_id, name, result) = match value {
-                    ToolResultEvent::Custom {
-                        call_id,
-                        name,
-                        result,
-                        ..
-                    } => (ToolKind::Custom, call_id, name, result),
-                    ToolResultEvent::Function {
-                        call_id,
-                        name,
-                        result,
-                        ..
-                    } => (ToolKind::Function, call_id, name, result),
-                };
-                Some(Item::ToolResult {
-                    kind,
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    output: result.clone(),
-                })
-            }
-            ThreadEventData::WebSearch(value) => Some(Item::WebSearch(value.item.clone())),
-            ThreadEventData::Compaction(_)
-            | ThreadEventData::ModelRequest(_)
-            | ThreadEventData::TokenUsage(_)
-            | ThreadEventData::RateLimits(_)
-            | ThreadEventData::ApprovalDecision(_)
-            | ThreadEventData::Retry(_)
-            | ThreadEventData::TurnOutcome(_) => None,
-        };
+        if through.is_some_and(|through| event.sequence <= through) {
+            continue;
+        }
+        let item = event_item(&event.data);
         if let Some(item) = item {
             items.push(item);
         }
     }
     Ok(Surface { items })
+}
+
+pub(crate) fn applicable_compaction<'a>(
+    events: &'a [Event],
+    replay_key: Option<&str>,
+) -> Option<&'a atra_protocol::CompactionEvent> {
+    events.iter().rev().find_map(|event| match &event.data {
+        ThreadEventData::Compaction(compaction)
+            if match &compaction.replacement {
+                CompactionReplacement::Summary { .. } => true,
+                CompactionReplacement::Opaque { state } => {
+                    replay_key.is_some_and(|key| key == state.replay_key)
+                }
+            } =>
+        {
+            Some(compaction)
+        }
+        _ => None,
+    })
+}
+
+fn append_shadowed_state(
+    items: &mut Vec<Item>,
+    events: &[Event],
+    through: atra_protocol::EventSequence,
+) {
+    let visible = |event: &&Event| event.sequence > through;
+    if !events
+        .iter()
+        .filter(visible)
+        .any(|event| matches!(event.data, ThreadEventData::WorkspaceInstructions(_)))
+        && let Some(value) = events.iter().rev().find_map(|event| match &event.data {
+            ThreadEventData::WorkspaceInstructions(value) => Some(value),
+            _ => None,
+        })
+    {
+        items.push(workspace_instructions_item(value));
+    }
+    if !events
+        .iter()
+        .filter(visible)
+        .any(|event| matches!(event.data, ThreadEventData::Skills(_)))
+        && let Some(value) = events.iter().rev().find_map(|event| match &event.data {
+            ThreadEventData::Skills(value) => Some(value),
+            _ => None,
+        })
+    {
+        items.push(message(
+            Role::Developer,
+            instruction_text(value, "skills list"),
+        ));
+    }
+    if !events
+        .iter()
+        .filter(visible)
+        .any(|event| matches!(event.data, ThreadEventData::Runners(_)))
+        && let Some(runners) = events.iter().rev().find_map(|event| match &event.data {
+            ThreadEventData::Runners(RunnersEvent::Initial(runners))
+            | ThreadEventData::Runners(RunnersEvent::Replacement(runners)) => Some(runners),
+            _ => None,
+        })
+    {
+        items.push(message(Role::Developer, format_runners(runners)));
+    }
+}
+
+fn event_item(event: &ThreadEventData) -> Option<Item> {
+    match event {
+        ThreadEventData::ThreadContext(_) => None,
+        ThreadEventData::WorkspaceInstructions(value) => Some(workspace_instructions_item(value)),
+        ThreadEventData::Skills(value) => Some(message(
+            Role::Developer,
+            instruction_text(value, "skills list"),
+        )),
+        ThreadEventData::SkillInvocation(value) => {
+            Some(message(Role::User, format_skill_invocation(value)))
+        }
+        ThreadEventData::Runners(value) => Some(message(
+            Role::Developer,
+            match value {
+                RunnersEvent::Initial(runners) => format_runners(runners),
+                RunnersEvent::Replacement(runners) => format!(
+                    "The available Atra Runner list has changed. This list replaces the previously provided list.\n\n{}",
+                    format_runners(runners)
+                ),
+            },
+        )),
+        ThreadEventData::UserMessage(value) => Some(message(Role::User, value.content.clone())),
+        ThreadEventData::AssistantMessage(value) => Some(Item::Message {
+            role: Role::Assistant,
+            text: value.content.clone(),
+            phase: Some(value.phase),
+        }),
+        ThreadEventData::Reasoning(value) => Some(Item::Reasoning {
+            summary: value.summary.clone(),
+            opaque: value.opaque.clone(),
+        }),
+        ThreadEventData::ToolCall(value) => Some(match value {
+            ToolCallEvent::Custom {
+                item_id,
+                name,
+                input,
+                call_id,
+            } => Item::ToolCall {
+                kind: ToolKind::Custom,
+                item_id: item_id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input: ToolInput::Text(input.clone()),
+            },
+            ToolCallEvent::Function {
+                name,
+                arguments,
+                call_id,
+            } => Item::ToolCall {
+                kind: ToolKind::Function,
+                item_id: None,
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input: ToolInput::Json(arguments.clone()),
+            },
+        }),
+        ThreadEventData::ToolResult(value) => {
+            let (kind, call_id, name, result) = match value {
+                ToolResultEvent::Custom {
+                    call_id,
+                    name,
+                    result,
+                    ..
+                } => (ToolKind::Custom, call_id, name, result),
+                ToolResultEvent::Function {
+                    call_id,
+                    name,
+                    result,
+                    ..
+                } => (ToolKind::Function, call_id, name, result),
+            };
+            Some(Item::ToolResult {
+                kind,
+                call_id: call_id.clone(),
+                name: name.clone(),
+                output: result.clone(),
+            })
+        }
+        ThreadEventData::WebSearch(value) => Some(Item::WebSearch(value.item.clone())),
+        ThreadEventData::Compaction(_)
+        | ThreadEventData::ModelRequest(_)
+        | ThreadEventData::TokenUsage(_)
+        | ThreadEventData::RateLimits(_)
+        | ThreadEventData::ApprovalDecision(_)
+        | ThreadEventData::Retry(_)
+        | ThreadEventData::TurnOutcome(_) => None,
+    }
+}
+
+fn workspace_instructions_item(value: &InstructionEvent) -> Item {
+    message(
+        Role::Developer,
+        format!(
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+            instruction_text(value, "AGENTS.md instructions")
+        ),
+    )
 }
 
 fn message(role: Role, text: String) -> Item {
@@ -227,15 +294,21 @@ mod tests {
             },
             Event {
                 sequence: EventSequence(2),
-                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: atra_protocol::CheckpointId(1),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "recent".to_owned(),
                 }),
             },
             Event {
                 sequence: EventSequence(3),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
+                    through: EventSequence(1),
+                }),
+            },
+            Event {
+                sequence: EventSequence(4),
                 data: ThreadEventData::UserMessage(MessageEvent {
                     content: "new".to_owned(),
                 }),
@@ -250,6 +323,7 @@ mod tests {
                     Role::Developer,
                     "Summary of the earlier conversation:\n\nsummary".to_owned()
                 ),
+                message(Role::User, "recent".to_owned()),
                 message(Role::User, "new".to_owned()),
             ]
         );
@@ -273,7 +347,7 @@ mod tests {
                             payload: serde_json::json!({"type": "compaction"}),
                         },
                     },
-                    checkpoint_id: atra_protocol::CheckpointId(1),
+                    through: EventSequence(0),
                 }),
             },
             Event {
@@ -303,6 +377,104 @@ mod tests {
             vec![
                 message(Role::User, "old".to_owned()),
                 message(Role::User, "new".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_compaction_replaces_an_earlier_summary_and_keeps_its_suffix() {
+        let events = vec![
+            Event {
+                sequence: EventSequence(0),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "old".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(1),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "first retained".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(2),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "second retained".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(3),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "first summary".to_owned(),
+                    },
+                    through: EventSequence(0),
+                }),
+            },
+            Event {
+                sequence: EventSequence(4),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "new".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(5),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "second summary".to_owned(),
+                    },
+                    through: EventSequence(1),
+                }),
+            },
+        ];
+
+        assert_eq!(
+            derive(&events, None).unwrap().items,
+            vec![
+                message(
+                    Role::Developer,
+                    "Summary of the earlier conversation:\n\nsecond summary".to_owned()
+                ),
+                message(Role::User, "second retained".to_owned()),
+                message(Role::User, "new".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn compaction_restores_shadowed_workspace_state() {
+        let events = vec![
+            Event {
+                sequence: EventSequence(0),
+                data: ThreadEventData::WorkspaceInstructions(InstructionEvent::Initial(
+                    "instructions".to_owned(),
+                )),
+            },
+            Event {
+                sequence: EventSequence(1),
+                data: ThreadEventData::UserMessage(MessageEvent {
+                    content: "old".to_owned(),
+                }),
+            },
+            Event {
+                sequence: EventSequence(2),
+                data: ThreadEventData::Compaction(atra_protocol::CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
+                    through: EventSequence(1),
+                }),
+            },
+        ];
+
+        assert_eq!(
+            derive(&events, None).unwrap().items,
+            vec![
+                message(
+                    Role::Developer,
+                    "Summary of the earlier conversation:\n\nsummary".to_owned()
+                ),
+                workspace_instructions_item(&InstructionEvent::Initial("instructions".to_owned())),
             ]
         );
     }

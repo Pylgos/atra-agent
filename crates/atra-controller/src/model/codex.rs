@@ -210,6 +210,10 @@ impl CodexProvider {
 
 #[async_trait]
 impl ProviderRuntime for CodexProvider {
+    fn compaction_replay_key(&self, model: &str) -> Option<String> {
+        Some(super::compaction_replay_key("codex", model))
+    }
+
     fn id(&self) -> &'static str {
         PROVIDER_ID
     }
@@ -334,7 +338,7 @@ async fn server_compact(
     .context("Codex compaction request timed out")??;
     let payload = super::api::responses::decode_server_compaction(response).await?;
     Ok(atra_protocol::OpaqueState {
-        replay_key: format!("codex/{}/compaction-v1", request.model),
+        replay_key: super::compaction_replay_key("codex", request.model),
         payload,
     })
 }

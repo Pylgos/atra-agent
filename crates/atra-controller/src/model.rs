@@ -20,6 +20,7 @@ pub(crate) mod ollama;
 mod opencode_go;
 mod registry;
 mod surface;
+pub(crate) use surface::applicable_compaction;
 mod tool_binding;
 
 pub(crate) use registry::ProviderRegistry;
@@ -29,6 +30,11 @@ pub(crate) const FAKE_PROVIDER: &str = "fake";
 pub(crate) const OLLAMA_PROVIDER: &str = "ollama";
 pub(crate) const OPENCODE_GO_PROVIDER: &str = "opencode-go";
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+
+fn compaction_replay_key(namespace: &str, model: &str) -> String {
+    format!("{namespace}/{model}/compaction-v1")
+}
+
 pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     You are an expert coding assistant operating inside Atra, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files
 
@@ -200,6 +206,10 @@ pub(crate) trait ProviderRuntime: Send + Sync {
     ) -> Result<Option<OpaqueState>> {
         Ok(None)
     }
+
+    fn compaction_replay_key(&self, _model: &str) -> Option<String> {
+        None
+    }
 }
 
 pub(crate) struct Provider {
@@ -274,6 +284,10 @@ impl Provider {
         request: &ModelRequest<'_>,
     ) -> Result<Option<OpaqueState>> {
         self.runtime.server_compact(session_id, request).await
+    }
+
+    pub(crate) fn compaction_replay_key(&self, model: &str) -> Option<String> {
+        self.runtime.compaction_replay_key(model)
     }
 }
 

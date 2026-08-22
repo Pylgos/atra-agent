@@ -728,19 +728,6 @@ fn current_runners(events: &[storage::Event]) -> Option<Vec<RunnerInfo>> {
     })
 }
 
-fn skill_event(events: &[storage::Event]) -> Option<InstructionEvent> {
-    let skills = current_skills(events);
-    match skills {
-        WorkspaceInstructions::Untracked => None,
-        WorkspaceInstructions::Present(content) => Some(InstructionEvent::Initial(content)),
-        WorkspaceInstructions::Removed => Some(InstructionEvent::Removal),
-    }
-}
-
-fn runner_event(events: &[storage::Event]) -> Option<RunnersEvent> {
-    current_runners(events).map(RunnersEvent::Initial)
-}
-
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

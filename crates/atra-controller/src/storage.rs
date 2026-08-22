@@ -1,11 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::path::Path;
 
 use atra_protocol::{
-    CheckpointId, CompactionEvent, EventSequence, HistoryTarget, InstructionEvent, MessageEvent,
-    RunnersEvent, Thread, ThreadCheckpoint, ThreadEventData, ThreadId,
+    CheckpointId, EventSequence, HistoryTarget, MessageEvent, Thread, ThreadCheckpoint,
+    ThreadEventData, ThreadId,
 };
 use serde_json::Value;
 use tokio_rusqlite::{
@@ -406,16 +403,8 @@ impl Store {
                 "SELECT sequence, kind, payload FROM events WHERE thread_id = ?1 AND sequence <= ?2 ORDER BY sequence",
                 params![thread_id.0, through.0],
             )?;
-            let mut output = Vec::new();
-            reconstruct_events(
-                &transaction,
-                thread_id.0,
-                events,
-                &mut output,
-                &mut HashSet::new(),
-            )?;
             transaction.commit()?;
-            Ok(ReportSnapshot { through, events: output })
+            Ok(ReportSnapshot { through, events })
         }).await
     }
 
@@ -658,7 +647,6 @@ impl Store {
                     checkpoint_id,
                     Some(history_end_sequence(kind, sequence)),
                 )?;
-                clone_compaction_checkpoints(&transaction, thread_id, new_thread_id)?;
                 transaction.commit()?;
                 Ok(ThreadId(new_thread_id))
             })
@@ -733,99 +721,6 @@ impl Store {
                 )?;
                 transaction.commit()?;
                 Ok(CheckpointId(saved))
-            })
-            .await
-    }
-
-    pub async fn replace_with_compaction(
-        &self,
-        thread_id: ThreadId,
-        compaction: CompactionEvent,
-        workspace_instructions: Option<InstructionEvent>,
-        skills: Option<InstructionEvent>,
-        runners: Option<RunnersEvent>,
-    ) -> tokio_rusqlite::Result<()> {
-        let items = serde_json::to_string(&compaction).map_err(to_sql_error)?;
-        let workspace_instructions = workspace_instructions
-            .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
-            .transpose()?;
-        let skills = skills
-            .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
-            .transpose()?;
-        let runners = runners
-            .map(|value| serde_json::to_string(&value).map_err(to_sql_error))
-            .transpose()?;
-        self.connection
-            .call(move |connection| {
-                let thread_id = thread_id.0;
-                let transaction = connection.transaction()?;
-                let thread_context: String = transaction.query_row(
-                    "SELECT payload FROM events WHERE thread_id = ?1 AND kind = 'thread_context'",
-                    [thread_id],
-                    |row| row.get(0),
-                )?;
-                let next_sequence: i64 = transaction.query_row(
-                    "SELECT COALESCE(MAX(sequence) + 1, 0) FROM events WHERE thread_id = ?1",
-                    [thread_id], |row| row.get(0),
-                )?;
-                transaction.execute("DELETE FROM events WHERE thread_id = ?1", [thread_id])?;
-                transaction.execute(
-                    "
-                    INSERT INTO events (thread_id, sequence, kind, payload)
-                    VALUES (?1, 0, 'thread_context', ?2)
-                    ",
-                    params![thread_id, thread_context],
-                )?;
-                transaction.execute(
-                    "
-                    INSERT INTO events (thread_id, sequence, kind, payload)
-                    VALUES (?1, ?2, ?3, ?4)
-                    ",
-                    params![thread_id, next_sequence, "compaction", items],
-                )?;
-                if let Some(workspace_instructions) = workspace_instructions {
-                    transaction.execute(
-                        "
-                        INSERT INTO events (thread_id, sequence, kind, payload)
-                        VALUES (?1, ?2, ?3, ?4)
-                        ",
-                        params![
-                            thread_id,
-                            next_sequence + 1,
-                            "workspace_instructions",
-                            workspace_instructions
-                        ],
-                    )?;
-                }
-                if let Some(skills) = skills {
-                    transaction.execute(
-                        "
-                        INSERT INTO events (thread_id, sequence, kind, payload)
-                        VALUES (
-                            ?1,
-                            COALESCE((SELECT MAX(sequence) + 1 FROM events WHERE thread_id = ?1), 0),
-                            ?2,
-                            ?3
-                        )
-                        ",
-                        params![thread_id, "skills", skills],
-                    )?;
-                }
-                if let Some(runners) = runners {
-                    transaction.execute(
-                        "
-                        INSERT INTO events (thread_id, sequence, kind, payload)
-                        VALUES (
-                            ?1,
-                            COALESCE((SELECT MAX(sequence) + 1 FROM events WHERE thread_id = ?1), 0),
-                            ?2,
-                            ?3
-                        )
-                        ",
-                        params![thread_id, "runners", runners],
-                    )?;
-                }
-                transaction.commit()
             })
             .await
     }
@@ -1074,137 +969,6 @@ fn copy_events(
     Ok(())
 }
 
-fn clone_compaction_checkpoints(
-    transaction: &rusqlite::Transaction<'_>,
-    source_thread_id: i64,
-    destination_thread_id: i64,
-) -> rusqlite::Result<()> {
-    let compactions = {
-        let mut statement = transaction.prepare(
-            "SELECT sequence, payload FROM events WHERE thread_id = ?1 AND kind = 'compaction' ORDER BY sequence",
-        )?;
-        statement
-            .query_map([destination_thread_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut cloned = HashMap::new();
-    let mut visiting = HashSet::new();
-    let mut previous_sequence = None;
-    for (sequence, payload) in compactions {
-        if previous_sequence.is_some_and(|previous| previous >= sequence) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        previous_sequence = Some(sequence);
-        let mut compaction: CompactionEvent = serde_json::from_str(&payload).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-        })?;
-        let (checkpoint_id, checkpoint_max) = clone_checkpoint_chain(
-            transaction,
-            source_thread_id,
-            destination_thread_id,
-            compaction.checkpoint_id.0,
-            &mut cloned,
-            &mut visiting,
-        )?;
-        if checkpoint_max.is_some_and(|checkpoint_max| checkpoint_max >= sequence) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        compaction.checkpoint_id = CheckpointId(checkpoint_id);
-        transaction.execute(
-            "UPDATE events SET payload = ?1 WHERE thread_id = ?2 AND sequence = ?3",
-            params![
-                serde_json::to_string(&compaction)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
-                destination_thread_id,
-                sequence
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn clone_checkpoint_chain(
-    transaction: &rusqlite::Transaction<'_>,
-    source_thread_id: i64,
-    destination_thread_id: i64,
-    source_checkpoint_id: i64,
-    cloned: &mut HashMap<i64, (i64, Option<i64>)>,
-    visiting: &mut HashSet<i64>,
-) -> rusqlite::Result<(i64, Option<i64>)> {
-    if let Some(cloned) = cloned.get(&source_checkpoint_id) {
-        return Ok(*cloned);
-    }
-    if !visiting.insert(source_checkpoint_id) {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    let metadata: (i64, i64, String, Option<String>, String, String, String) = transaction.query_row(
-        "SELECT thread_id, created_at_ms, reason, display_name, provider, model, reasoning_effort FROM checkpoints WHERE id = ?1",
-        [source_checkpoint_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-    )?;
-    if metadata.0 != source_thread_id {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    let mut events = {
-        let mut statement = transaction.prepare(
-            "SELECT sequence, kind, payload FROM checkpoint_events WHERE checkpoint_id = ?1 ORDER BY sequence",
-        )?;
-        statement
-            .query_map([source_checkpoint_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut previous_sequence = None;
-    for (sequence, kind, payload) in &mut events {
-        if previous_sequence.is_some_and(|previous| previous >= *sequence) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        previous_sequence = Some(*sequence);
-        if kind != "compaction" {
-            continue;
-        }
-        let mut compaction: CompactionEvent = serde_json::from_str(payload).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
-        })?;
-        let (checkpoint_id, checkpoint_max) = clone_checkpoint_chain(
-            transaction,
-            source_thread_id,
-            destination_thread_id,
-            compaction.checkpoint_id.0,
-            cloned,
-            visiting,
-        )?;
-        if checkpoint_max.is_some_and(|checkpoint_max| checkpoint_max >= *sequence) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        compaction.checkpoint_id = CheckpointId(checkpoint_id);
-        *payload = serde_json::to_string(&compaction)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    }
-    transaction.execute(
-        "INSERT INTO checkpoints (thread_id, created_at_ms, reason, display_name, provider, model, reasoning_effort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![destination_thread_id, metadata.1, metadata.2, metadata.3, metadata.4, metadata.5, metadata.6],
-    )?;
-    let new_id = transaction.last_insert_rowid();
-    for (sequence, kind, payload) in events {
-        transaction.execute(
-            "INSERT INTO checkpoint_events (checkpoint_id, sequence, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            params![new_id, sequence, kind, payload],
-        )?;
-    }
-    visiting.remove(&source_checkpoint_id);
-    let cloned_checkpoint = (new_id, previous_sequence);
-    cloned.insert(source_checkpoint_id, cloned_checkpoint);
-    Ok(cloned_checkpoint)
-}
-
 fn read_events(
     connection: &rusqlite::Connection,
     sql: &str,
@@ -1245,81 +1009,17 @@ fn read_event_rows<P: rusqlite::Params>(
         .collect()
 }
 
-fn reconstruct_events(
-    transaction: &rusqlite::Transaction<'_>,
-    thread_id: i64,
-    events: Vec<Event>,
-    output: &mut Vec<Event>,
-    visiting: &mut HashSet<i64>,
-) -> rusqlite::Result<()> {
-    let mut previous_sequence = None;
-    for event in events {
-        if previous_sequence.is_some_and(|previous| previous >= event.sequence) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        previous_sequence = Some(event.sequence);
-        if matches!(event.data, ThreadEventData::ThreadContext(_))
-            && output
-                .iter()
-                .any(|event| matches!(event.data, ThreadEventData::ThreadContext(_)))
-        {
-            continue;
-        }
-        if let ThreadEventData::Compaction(compaction) = &event.data {
-            if !visiting.insert(compaction.checkpoint_id.0) {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            let owner: i64 = transaction.query_row(
-                "SELECT thread_id FROM checkpoints WHERE id = ?1",
-                [compaction.checkpoint_id.0],
-                |row| row.get(0),
-            )?;
-            if owner != thread_id {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            let checkpoint_events = read_event_rows(
-                transaction,
-                "SELECT sequence, kind, payload FROM checkpoint_events WHERE checkpoint_id = ?1 ORDER BY sequence",
-                [compaction.checkpoint_id.0],
-            )?;
-            reconstruct_events(transaction, thread_id, checkpoint_events, output, visiting)?;
-            visiting.remove(&compaction.checkpoint_id.0);
-        }
-        if output
-            .last()
-            .is_some_and(|previous| previous.sequence >= event.sequence)
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        output.push(event);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 impl Store {
     async fn delete_thread(&self, thread_id: ThreadId) -> tokio_rusqlite::Result<()> {
         self.delete_threads(vec![thread_id]).await
-    }
-
-    async fn report_events(
-        &self,
-        thread_id: ThreadId,
-        through: EventSequence,
-    ) -> tokio_rusqlite::Result<Vec<Event>> {
-        Ok(self
-            .report_snapshot(thread_id)
-            .await?
-            .events
-            .into_iter()
-            .filter(|event| event.sequence <= through)
-            .collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atra_protocol::CompactionEvent;
 
     fn user(content: &str) -> ThreadEventData {
         ThreadEventData::UserMessage(atra_protocol::MessageEvent {
@@ -1414,265 +1114,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_cursors_are_monotonic_and_forks_own_checkpoint_chains() {
-        let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let source = store
-            .create_thread(None, "fake".into(), "model".into(), "medium".into())
-            .await
-            .unwrap();
-        store
-            .append_all(source, vec![user("before"), assistant("kept")])
-            .await
-            .unwrap();
-        let checkpoint = store
-            .create_checkpoint(source, 1, "compaction".into())
-            .await
-            .unwrap();
-        store
-            .replace_with_compaction(
-                source,
-                CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: checkpoint,
-                },
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .events(source)
-                .await
-                .unwrap()
-                .iter()
-                .map(|event| event.data.kind())
-                .collect::<Vec<_>>(),
-            ["thread_context", "compaction"]
-        );
-        let sequences = store
-            .append_all(source, vec![user("after"), assistant("done")])
-            .await
-            .unwrap();
-        assert_eq!(sequences, vec![EventSequence(4), EventSequence(5)]);
-        let report = store.report_events(source, EventSequence(5)).await.unwrap();
-        assert_eq!(
-            report
-                .iter()
-                .map(|event| event.sequence.0)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4, 5]
-        );
-
-        let second_checkpoint = store
-            .create_checkpoint(source, 2, "compaction".into())
-            .await
-            .unwrap();
-        store
-            .replace_with_compaction(
-                source,
-                CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: second_checkpoint,
-                },
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .events(source)
-                .await
-                .unwrap()
-                .iter()
-                .map(|event| event.data.kind())
-                .collect::<Vec<_>>(),
-            ["thread_context", "compaction"]
-        );
-        store
-            .append_all(source, vec![user("again"), assistant("finished")])
-            .await
-            .unwrap();
-
-        let fork = store
-            .fork_thread(source, None, EventSequence(8), Some("fork".into()))
-            .await
-            .unwrap();
-        let events = store.events(fork).await.unwrap();
-        let Some(ThreadEventData::Compaction(compaction)) = events
-            .iter()
-            .find(|event| matches!(event.data, ThreadEventData::Compaction(_)))
-            .map(|event| &event.data)
-        else {
-            panic!("missing compaction")
-        };
-        assert_ne!(compaction.checkpoint_id, second_checkpoint);
-        assert_eq!(
-            store
-                .checkpoint(compaction.checkpoint_id)
-                .await
-                .unwrap()
-                .thread_id,
-            fork
-        );
-        store.delete_thread(source).await.unwrap();
-        assert_eq!(
-            store
-                .report_events(fork, EventSequence(8))
-                .await
-                .unwrap()
-                .len(),
-            9
-        );
-    }
-
-    #[tokio::test]
-    async fn report_and_fork_reject_a_cyclic_checkpoint_chain() {
+    async fn compaction_is_an_append_only_report_marker() {
         let store = Store::open(Path::new(":memory:")).await.unwrap();
         let thread = store
             .create_thread(None, "fake".into(), "model".into(), "medium".into())
             .await
             .unwrap();
-        store.append(thread, user("first")).await.unwrap();
-        let first = store
-            .create_checkpoint(thread, 1, "compaction".into())
-            .await
-            .unwrap();
         store
-            .replace_with_compaction(
+            .append_all(
                 thread,
-                CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: first,
-                },
-                None,
-                None,
-                None,
+                vec![user("old"), user("recent"), assistant("answer")],
             )
             .await
             .unwrap();
-        let second = store
-            .create_checkpoint(thread, 2, "compaction".into())
-            .await
-            .unwrap();
-        store
-            .replace_with_compaction(
-                thread,
-                CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: second,
-                },
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let cycle = serde_json::to_string(&CompactionEvent {
-            replacement: atra_protocol::CompactionReplacement::Summary {
-                content: "summary".to_owned(),
-            },
-            checkpoint_id: second,
-        })
-        .unwrap();
-        store
-            .connection
-            .call(move |connection| {
-                connection.execute(
-                    "UPDATE checkpoint_events SET kind = 'compaction', payload = ?1 WHERE checkpoint_id = ?2 AND sequence = 0",
-                    params![cycle, first.0],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-
-        assert!(store.report_snapshot(thread).await.is_err());
-        let sequence = store.append(thread, user("fork point")).await.unwrap();
-        assert!(
-            store
-                .fork_thread(thread, None, sequence, None)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn report_rejects_checkpoint_owned_by_another_thread() {
-        let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let thread = store
-            .create_thread(None, "fake".into(), "model".into(), "medium".into())
-            .await
-            .unwrap();
-        let other = store
-            .create_thread(None, "fake".into(), "model".into(), "medium".into())
-            .await
-            .unwrap();
-        store.append(other, user("other")).await.unwrap();
-        let checkpoint = store
-            .create_checkpoint(other, 1, "compaction".into())
-            .await
-            .unwrap();
-        store
+        let sequence = store
             .append(
                 thread,
                 ThreadEventData::Compaction(CompactionEvent {
                     replacement: atra_protocol::CompactionReplacement::Summary {
                         content: "summary".to_owned(),
                     },
-                    checkpoint_id: checkpoint,
+                    through: EventSequence(1),
                 }),
             )
             .await
             .unwrap();
 
-        assert!(store.report_snapshot(thread).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn report_rejects_missing_and_corrupt_checkpoint_links() {
-        let store = Store::open(Path::new(":memory:")).await.unwrap();
-        let thread = store
-            .create_thread(None, "fake".into(), "model".into(), "medium".into())
-            .await
-            .unwrap();
-        store
-            .append(
-                thread,
-                ThreadEventData::Compaction(CompactionEvent {
-                    replacement: atra_protocol::CompactionReplacement::Summary {
-                        content: "summary".to_owned(),
-                    },
-                    checkpoint_id: CheckpointId(999),
-                }),
-            )
-            .await
-            .unwrap();
-        assert!(store.report_snapshot(thread).await.is_err());
-
-        store
-            .connection
-            .call(move |connection| {
-                connection.execute(
-                    "UPDATE events SET payload = 'not-json' WHERE thread_id = ?1 AND kind = 'compaction'",
-                    [thread.0],
-                )?;
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-        assert!(store.report_snapshot(thread).await.is_err());
+        assert_eq!(sequence, EventSequence(4));
+        let events = store.events(thread).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.sequence.0, event.data.kind()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "thread_context"),
+                (1, "user_message"),
+                (2, "user_message"),
+                (3, "assistant_message"),
+                (4, "compaction"),
+            ]
+        );
+        assert_eq!(store.report_snapshot(thread).await.unwrap().events, events);
     }
 
     #[tokio::test]

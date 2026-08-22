@@ -372,14 +372,13 @@ fn input(request: &ModelRequest<'_>, profile: Profile) -> Result<Vec<Value>> {
             }
             value
         };
-    let replay_key = format!(
-        "{}/{}/compaction-v1",
+    let replay_key = super::super::compaction_replay_key(
         if matches!(profile, Profile::Codex) {
             "codex"
         } else {
             "responses"
         },
-        request.model
+        request.model,
     );
     super::super::surface::derive(request.events, Some(&replay_key))?
         .items

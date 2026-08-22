@@ -2,6 +2,8 @@ use super::*;
 use crate::lifecycle::ActiveTurn;
 use futures_util::StreamExt;
 
+const COMPACTION_RETAINED_TOKENS: usize = 16_000;
+
 struct ExecutionContextGuard {
     contexts: Arc<StdMutex<HashMap<String, ThreadId>>>,
     context: String,
@@ -402,6 +404,15 @@ impl State {
         context_window: Option<i64>,
         updates: Option<&TurnProjector>,
     ) -> Result<bool> {
+        let replay_key = provider.compaction_replay_key(model_request.model);
+        let Some(plan) = compaction_plan(
+            model_request.events,
+            replay_key.as_deref(),
+            COMPACTION_RETAINED_TOKENS,
+        ) else {
+            return Ok(false);
+        };
+        let compacted_request = compaction_request(model_request, &plan.events);
         self.append_event(
             thread_id,
             ThreadEventData::ModelRequest(ModelRequestEvent {
@@ -412,54 +423,29 @@ impl State {
         )
         .await
         .context("failed to save compaction request")?;
-        let checkpoint_id = {
-            let _mutation = self.lock_mutation().await?;
-            let checkpoint_id = self
-                .store
-                .create_checkpoint(thread_id, checkpoint_time_ms(), "compaction".to_owned())
-                .await
-                .context("failed to checkpoint history before compaction")?;
-            if let Some(updates) = updates {
-                let checkpoint = self.store.checkpoint(checkpoint_id).await?;
-                updates.checkpoint_added(checkpoint).await?;
-            }
-            checkpoint_id
-        };
-        let replacement =
-            if let Some(state) = provider.server_compact(session_id, model_request).await? {
-                atra_protocol::CompactionReplacement::Opaque { state }
-            } else {
-                let Some(content) = generic_compaction(provider, session_id, model_request).await?
-                else {
-                    return Ok(false);
-                };
-                atra_protocol::CompactionReplacement::Summary { content }
-            };
-        let workspace_event = match workspace_instructions(model_request.events) {
-            WorkspaceInstructions::Untracked => None,
-            WorkspaceInstructions::Present(content) => Some(InstructionEvent::Initial(content)),
-            WorkspaceInstructions::Removed => Some(InstructionEvent::Removal),
-        };
+        let replacement = if let Some(state) = provider
+            .server_compact(session_id, &compacted_request)
+            .await?
         {
-            let _mutation = self.lock_mutation().await?;
-            self.store
-                .replace_with_compaction(
-                    thread_id,
-                    CompactionEvent {
-                        replacement,
-                        checkpoint_id,
-                    },
-                    workspace_event,
-                    skill_event(model_request.events),
-                    runner_event(model_request.events),
-                )
-                .await
-                .context("failed to replace history after compaction")?;
-            if let Some(updates) = updates {
-                let events = protocol_events(self.store.events(thread_id).await?);
-                updates.history_replaced(events).await?;
-            }
-        }
+            atra_protocol::CompactionReplacement::Opaque { state }
+        } else {
+            let Some(content) =
+                generic_compaction(provider, session_id, &compacted_request).await?
+            else {
+                return Ok(false);
+            };
+            atra_protocol::CompactionReplacement::Summary { content }
+        };
+        self.append_event(
+            thread_id,
+            ThreadEventData::Compaction(CompactionEvent {
+                replacement,
+                through: plan.through,
+            }),
+            updates,
+        )
+        .await
+        .context("failed to save compaction")?;
         Ok(true)
     }
 
@@ -1406,6 +1392,111 @@ fn compaction_request<'a>(
     model::ModelRequest { events, ..*request }
 }
 
+struct CompactionPlan {
+    through: EventSequence,
+    events: Vec<crate::storage::Event>,
+}
+
+fn compaction_plan(
+    events: &[crate::storage::Event],
+    replay_key: Option<&str>,
+    retained_tokens: usize,
+) -> Option<CompactionPlan> {
+    let previous = model::applicable_compaction(events, replay_key);
+    let previous_through = previous.map(|event| event.through).unwrap_or_else(|| {
+        events
+            .iter()
+            .find(|event| matches!(event.data, ThreadEventData::ThreadContext(_)))
+            .map_or(EventSequence(-1), |event| event.sequence)
+    });
+    let active = events
+        .iter()
+        .filter(|event| {
+            event.sequence > previous_through
+                && !matches!(event.data, ThreadEventData::Compaction(_))
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = 0;
+    let mut split = active.len();
+    while split > 0 && tokens < retained_tokens {
+        split -= 1;
+        tokens += compaction_event_tokens(&active[split].data);
+    }
+    split = preserve_references(&active, split);
+
+    (split > 0).then(|| {
+        let through = active[split - 1].sequence;
+        CompactionPlan {
+            through,
+            events: compaction_prefix(events, previous, through),
+        }
+    })
+}
+
+fn preserve_references(events: &[&crate::storage::Event], mut split: usize) -> usize {
+    loop {
+        let mut adjusted = split;
+        for event in &events[split..] {
+            let referenced = match &event.data {
+                ThreadEventData::ToolResult(result) => {
+                    events[..split].iter().rposition(|candidate| {
+                        matches!(
+                            &candidate.data,
+                            ThreadEventData::ToolCall(call)
+                                if tool_result_matches_call(result, call)
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some(index) = referenced {
+                adjusted = adjusted.min(index);
+            }
+        }
+        if adjusted == split {
+            return split;
+        }
+        split = adjusted;
+    }
+}
+
+fn compaction_prefix(
+    events: &[crate::storage::Event],
+    previous: Option<&CompactionEvent>,
+    through: EventSequence,
+) -> Vec<crate::storage::Event> {
+    events
+        .iter()
+        .filter(|event| {
+            event.sequence <= through
+                || previous.is_some_and(|compaction| {
+                    matches!(
+                        &event.data,
+                        ThreadEventData::Compaction(candidate)
+                            if std::ptr::eq(candidate, compaction)
+                    )
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn compaction_event_tokens(event: &ThreadEventData) -> usize {
+    match event {
+        ThreadEventData::ThreadContext(_)
+        | ThreadEventData::Compaction(_)
+        | ThreadEventData::ModelRequest(_)
+        | ThreadEventData::TokenUsage(_)
+        | ThreadEventData::RateLimits(_)
+        | ThreadEventData::ApprovalDecision(_)
+        | ThreadEventData::Retry(_)
+        | ThreadEventData::TurnOutcome(_) => 0,
+        _ => model::text_tokens(
+            &serde_json::to_string(event).expect("thread event data is serializable"),
+        ),
+    }
+}
+
 fn compaction_events(events: &[crate::storage::Event]) -> Vec<crate::storage::Event> {
     let mut compact = events.to_vec();
     let sequence = compact.last().map_or(EventSequence(0), |event| {
@@ -1455,6 +1546,152 @@ mod compaction_tests {
         assert_eq!(compact.instructions, request.instructions);
         assert!(std::ptr::eq(compact.tools, request.tools));
         assert_eq!(compact.prompt_cache_key, request.prompt_cache_key);
+    }
+
+    #[test]
+    fn compaction_keeps_only_the_requested_token_suffix() {
+        let events = vec![
+            event(
+                1,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "old ".repeat(100),
+                }),
+            ),
+            event(
+                2,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "recent".to_owned(),
+                }),
+            ),
+        ];
+
+        let plan =
+            compaction_plan(&events, None, compaction_event_tokens(&events[1].data)).unwrap();
+
+        assert_eq!(plan.through, EventSequence(1));
+        assert_eq!(plan.events, events[..1]);
+    }
+
+    #[test]
+    fn compaction_does_not_split_a_tool_call_from_its_result() {
+        let events = vec![
+            event(
+                1,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "old".to_owned(),
+                }),
+            ),
+            event(
+                2,
+                ThreadEventData::ToolCall(ToolCallEvent::Function {
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({"path": "file"}),
+                    call_id: "call-1".to_owned(),
+                }),
+            ),
+            event(
+                3,
+                ThreadEventData::ToolResult(ToolResultEvent::Function {
+                    name: "read".to_owned(),
+                    call_id: "call-1".to_owned(),
+                    result: serde_json::json!("result"),
+                    artifacts: Vec::new(),
+                }),
+            ),
+        ];
+
+        let plan = compaction_plan(&events, None, 1).unwrap();
+
+        assert_eq!(plan.through, EventSequence(1));
+    }
+
+    #[test]
+    fn compaction_does_not_repeat_without_advancing_the_shadowed_prefix() {
+        let events = vec![
+            event(
+                1,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "old".to_owned(),
+                }),
+            ),
+            event(
+                2,
+                ThreadEventData::Compaction(CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Summary {
+                        content: "summary".to_owned(),
+                    },
+                    through: EventSequence(1),
+                }),
+            ),
+            event(
+                3,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "new".to_owned(),
+                }),
+            ),
+        ];
+
+        assert!(compaction_plan(&events, None, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn compaction_uses_only_matching_opaque_history() {
+        let events = vec![
+            event(
+                0,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "old".to_owned(),
+                }),
+            ),
+            event(
+                1,
+                ThreadEventData::Compaction(CompactionEvent {
+                    replacement: atra_protocol::CompactionReplacement::Opaque {
+                        state: atra_protocol::OpaqueState {
+                            replay_key: "codex/model/compaction-v1".to_owned(),
+                            payload: serde_json::json!({"type": "compaction"}),
+                        },
+                    },
+                    through: EventSequence(0),
+                }),
+            ),
+            event(
+                2,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "new old ".repeat(100),
+                }),
+            ),
+            event(
+                3,
+                ThreadEventData::UserMessage(MessageEvent {
+                    content: "recent".to_owned(),
+                }),
+            ),
+        ];
+
+        let retained_tokens = compaction_event_tokens(&events[3].data);
+        let matching =
+            compaction_plan(&events, Some("codex/model/compaction-v1"), retained_tokens).unwrap();
+        assert_eq!(matching.through, EventSequence(2));
+        assert_eq!(
+            matching
+                .events
+                .iter()
+                .map(|event| event.data.kind())
+                .collect::<Vec<_>>(),
+            ["user_message", "compaction", "user_message"]
+        );
+
+        let mismatched = compaction_plan(&events, None, retained_tokens).unwrap();
+        assert_eq!(mismatched.through, EventSequence(2));
+        assert_eq!(mismatched.events, events[..3]);
+    }
+
+    fn event(sequence: i64, data: ThreadEventData) -> crate::storage::Event {
+        crate::storage::Event {
+            sequence: EventSequence(sequence),
+            data,
+        }
     }
 }
 
