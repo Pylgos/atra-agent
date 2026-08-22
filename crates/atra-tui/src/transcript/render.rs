@@ -326,42 +326,26 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
         TranscriptItem::WebSearch { action } => web_search_lines(action),
         TranscriptItem::ToolCall { name, arguments } => tool_call_lines(name, arguments.as_ref()),
         TranscriptItem::Question {
-            arguments,
-            answers,
-            forgotten,
-            ..
-        } => with_forgotten(
-            question_tool_lines(Some(arguments), answers.as_deref()),
-            forgotten.as_deref(),
-        ),
+            arguments, answers, ..
+        } => question_tool_lines(Some(arguments), answers.as_deref()),
         TranscriptItem::RunnerTool {
             input,
             results,
             pending_approval,
-            forgotten,
             ..
-        } => with_forgotten(
-            runner_tool_lines(input, results, *pending_approval, expanded),
-            forgotten.as_deref(),
-        ),
-        TranscriptItem::ToolResult {
-            artifacts,
-            forgotten,
-        } => with_forgotten(
-            artifacts
-                .iter()
-                .flat_map(|artifact| match artifact {
-                    ToolArtifact::RunnerOperation(operation) => {
-                        runner_operation_lines(operation, expanded)
-                    }
-                    ToolArtifact::CommandExecution(command) => {
-                        fold_result_lines(command_execution_lines(command, false), expanded)
-                    }
-                    ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
-                })
-                .collect(),
-            forgotten.as_deref(),
-        ),
+        } => runner_tool_lines(input, results, *pending_approval, expanded),
+        TranscriptItem::ToolResult { artifacts } => artifacts
+            .iter()
+            .flat_map(|artifact| match artifact {
+                ToolArtifact::RunnerOperation(operation) => {
+                    runner_operation_lines(operation, expanded)
+                }
+                ToolArtifact::CommandExecution(command) => {
+                    fold_result_lines(command_execution_lines(command, false), expanded)
+                }
+                ToolArtifact::PatchOperations(result) => patch_operation_lines(result),
+            })
+            .collect(),
         TranscriptItem::SkillInvocation { name } => {
             vec![(Some('·'), Line::from(format!("Using skill: {name}")))]
         }
@@ -386,27 +370,6 @@ fn displayed_item_lines(item: &TranscriptItem, expanded: bool, width: u16) -> Ve
                 })
         })
         .collect()
-}
-
-fn with_forgotten(
-    mut lines: Vec<(Option<char>, Line<'static>)>,
-    summary: Option<&str>,
-) -> Vec<(Option<char>, Line<'static>)> {
-    if let Some(summary) = summary {
-        lines.push((
-            Some('·'),
-            Line::from(vec![
-                Span::styled(
-                    "Forgotten",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {summary}")),
-            ]),
-        ));
-    }
-    lines
 }
 
 fn marker_style(item: &TranscriptItem, selected: bool) -> Style {

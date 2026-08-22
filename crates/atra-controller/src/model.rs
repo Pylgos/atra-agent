@@ -3,9 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use atra_protocol::{
-    ApprovalPolicy, AssistantMessagePhase, CommandTimerState, CredentialSource, Model,
-    ModelRequestKind, OpaqueState, ProviderAuthMethod, Runner, RunnerOperationUpdate,
-    SkillInvocationEvent,
+    ApprovalPolicy, AssistantMessagePhase, CommandTimerState, CredentialSource, Model, OpaqueState,
+    ProviderAuthMethod, Runner, RunnerOperationUpdate, SkillInvocationEvent,
 };
 use futures_util::stream::BoxStream;
 use serde::Deserialize;
@@ -49,8 +48,7 @@ pub(crate) const BASE_INSTRUCTIONS: &str = indoc::indoc! {r#"
     - Use subagents only when the user message, applicable AGENTS.md instructions, or an applicable skill explicitly instructs you to do so. Do not create subagents merely because delegation or parallelism may be useful.
     - When creating a subagent, omit `--model` and `--effort` so it inherits them from its parent unless the user message, applicable AGENTS.md instructions, or an applicable skill explicitly requires an override. Do not select a different model or reasoning effort merely because a task appears complex, important, or suited to a particular role.
     - The same rule applies to recursive delegation. A subagent may create child agents only when its thread context allows delegation and one of those instruction sources explicitly authorizes recursive delegation.
-    - You are responsible for subagents you create. Before completing your turn, wait for required results and stop every descendant that is still running. Do not leave automated child turns running in the background.
-    - After receiving tool outputs, you may make an output newly visible in the current response unavailable to later model requests by writing `<forget_output call_id="...">summary</forget_output>` in an Assistant Message. Omit the tag to keep the output. The summary must be concise and faithful, preserving every fact needed for later work because the original model-visible output will be replaced. Only outputs newly visible in the current response request may be targeted."#};
+    - You are responsible for subagents you create. Before completing your turn, wait for required results and stop every descendant that is still running. Do not leave automated child turns running in the background."#};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +136,6 @@ pub(crate) enum ProviderLoginStatus {
 pub(crate) type ModelEventStream = BoxStream<'static, Result<ModelEvent>>;
 
 pub(crate) struct ModelRequest<'a> {
-    pub kind: ModelRequestKind,
     pub model: &'a str,
     pub reasoning_effort: &'a str,
     pub instructions: &'a str,

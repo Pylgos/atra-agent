@@ -372,7 +372,6 @@ impl State {
             .as_ref()
             .and_then(|model| model.context_window);
         let model_request = model::ModelRequest {
-            kind: ModelRequestKind::Compaction,
             model: &model,
             reasoning_effort: &reasoning_effort,
             instructions: model::BASE_INSTRUCTIONS,
@@ -501,7 +500,6 @@ impl State {
                 .is_some_and(|(tokens, limit)| tokens >= limit)
             {
                 let model_request = model::ModelRequest {
-                    kind: ModelRequestKind::Response,
                     model: &model,
                     reasoning_effort: &reasoning_effort,
                     instructions: model::BASE_INSTRUCTIONS,
@@ -528,7 +526,6 @@ impl State {
                 }
             }
             let model_request = model::ModelRequest {
-                kind: ModelRequestKind::Response,
                 model: &model,
                 reasoning_effort: &reasoning_effort,
                 instructions: model::BASE_INSTRUCTIONS,
@@ -1392,11 +1389,7 @@ fn compaction_request<'a>(
     request: &model::ModelRequest<'a>,
     events: &'a [crate::storage::Event],
 ) -> model::ModelRequest<'a> {
-    model::ModelRequest {
-        kind: ModelRequestKind::Compaction,
-        events,
-        ..*request
-    }
+    model::ModelRequest { events, ..*request }
 }
 
 struct CompactionPlan {
@@ -1532,7 +1525,6 @@ mod compaction_tests {
         }];
         let tools = crate::tools::model_tools(true);
         let request = model::ModelRequest {
-            kind: ModelRequestKind::Response,
             model: "model",
             reasoning_effort: "exact",
             instructions: "instructions",

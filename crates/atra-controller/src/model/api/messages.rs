@@ -613,7 +613,7 @@ fn request_messages(request: &ModelRequest<'_>) -> Result<(String, Vec<Value>)> 
     let mut system = request.instructions.to_owned();
     let mut messages = Vec::new();
     let replay_key = format!("messages/{}/thinking-v2", request.model);
-    for item in super::super::surface::derive(request.events, None, request.kind)?.items {
+    for item in super::super::surface::derive(request.events, None)?.items {
         match item {
             Item::Message { role, text, .. } => match role {
                 Role::Developer => {
@@ -772,7 +772,6 @@ mod tests {
     #[test]
     fn sends_effort_with_adaptive_thinking() {
         let request = ModelRequest {
-            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "xhigh",
             instructions: "instructions",
@@ -792,7 +791,6 @@ mod tests {
     #[test]
     fn rejects_unknown_effort() {
         let request = ModelRequest {
-            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "on",
             instructions: "instructions",
@@ -857,7 +855,6 @@ mod tests {
             },
         ];
         let request = ModelRequest {
-            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "high",
             instructions: "instructions",
@@ -911,7 +908,6 @@ mod tests {
             },
         ];
         let request = ModelRequest {
-            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "default",
             instructions: "instructions",

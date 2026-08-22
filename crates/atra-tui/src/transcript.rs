@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap};
 use atra_protocol::{
     ActiveItemData, ActiveItemId, EventSequence, RunnerOperationUpdate, ThreadChange, ThreadEvent,
     ThreadEventData, ThreadState, TodoItem, ToolCallEvent, ToolResultEvent,
-    project_tool_output_forgetting,
 };
 use ratatui::text::Line;
 
@@ -65,11 +64,7 @@ impl TranscriptState {
                     .iter()
                     .find(|event| event.sequence == *sequence)
                 {
-                    if matches!(event.data, ThreadEventData::AssistantMessage(_)) {
-                        self.rebuild(state);
-                    } else {
-                        self.append_event(event);
-                    }
+                    self.append_event(event);
                 }
             }
             ThreadChange::ActiveItemAdded(id) | ThreadChange::ActiveItemUpdated(id) => match state
@@ -90,11 +85,7 @@ impl TranscriptState {
                     .iter()
                     .find(|event| event.sequence == *sequence)
                 {
-                    if matches!(event.data, ThreadEventData::AssistantMessage(_)) {
-                        self.rebuild(state);
-                    } else {
-                        self.append_event(event);
-                    }
+                    self.append_event(event);
                 }
             }
             ThreadChange::ToolResultFinalized {
@@ -231,7 +222,7 @@ impl TranscriptState {
             return;
         };
         for event in state.events() {
-            merge_runner_tool_result(std::slice::from_mut(&mut entry), event, None);
+            merge_runner_tool_result(std::slice::from_mut(&mut entry), event);
         }
         self.entries[index] = entry;
         if let Some(turn) = state.active_turn() {
@@ -278,7 +269,7 @@ impl TranscriptState {
     }
 
     fn append_event(&mut self, event: &ThreadEvent) {
-        if merge_tool_result(&mut self.entries, event, None) {
+        if merge_tool_result(&mut self.entries, event) {
             return;
         }
         let Some(item) = item_from_event(event.clone()) else {
@@ -319,18 +310,15 @@ pub(crate) enum TranscriptItem {
         call_id: Option<String>,
         arguments: serde_json::Value,
         answers: Option<Vec<atra_protocol::QuestionAnswer>>,
-        forgotten: Option<String>,
     },
     RunnerTool {
         call_id: String,
         input: String,
         results: BTreeMap<usize, RunnerResult>,
         pending_approval: Option<usize>,
-        forgotten: Option<String>,
     },
     ToolResult {
         artifacts: Vec<ToolArtifact>,
-        forgotten: Option<String>,
     },
     SkillInvocation {
         name: String,
@@ -603,14 +591,12 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
                     input,
                     results: BTreeMap::new(),
                     pending_approval: None,
-                    forgotten: None,
                 })
             } else if name == "question" {
                 Some(TranscriptItem::Question {
                     call_id: call_id.as_deref().map(sanitize),
                     arguments,
                     answers: None,
-                    forgotten: None,
                 })
             } else {
                 Some(TranscriptItem::ToolCall {
@@ -626,7 +612,6 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
             };
             Some(TranscriptItem::ToolResult {
                 artifacts: artifacts.iter().cloned().map(sanitize_artifact).collect(),
-                forgotten: None,
             })
         }
         ThreadEventData::Compaction(_) => Some(TranscriptItem::Compaction),
@@ -646,7 +631,6 @@ pub(crate) fn item_from_event(event: ThreadEvent) -> Option<TranscriptItem> {
 pub(crate) fn merge_runner_tool_result(
     transcript: &mut [TranscriptEntry],
     event: &ThreadEvent,
-    forgotten: Option<String>,
 ) -> bool {
     let ThreadEventData::ToolResult(result) = &event.data else {
         return false;
@@ -679,15 +663,9 @@ pub(crate) fn merge_runner_tool_result(
     }) else {
         return false;
     };
-    let TranscriptItem::RunnerTool {
-        results,
-        forgotten: entry_forgotten,
-        ..
-    } = &mut entry.item
-    else {
+    let TranscriptItem::RunnerTool { results, .. } = &mut entry.item else {
         unreachable!();
     };
-    *entry_forgotten = forgotten;
     for artifact in artifacts.iter().cloned().map(sanitize_artifact) {
         match &artifact {
             ToolArtifact::RunnerOperation(operation) => {
@@ -700,11 +678,7 @@ pub(crate) fn merge_runner_tool_result(
     true
 }
 
-fn merge_question_tool_result(
-    transcript: &mut [TranscriptEntry],
-    event: &ThreadEvent,
-    forgotten: Option<String>,
-) -> bool {
+fn merge_question_tool_result(transcript: &mut [TranscriptEntry], event: &ThreadEvent) -> bool {
     let ThreadEventData::ToolResult(result) = &event.data else {
         return false;
     };
@@ -743,71 +717,31 @@ fn merge_question_tool_result(
     };
     let TranscriptItem::Question {
         answers: entry_answers,
-        forgotten: entry_forgotten,
         ..
     } = &mut entry.item
     else {
         unreachable!();
     };
     *entry_answers = Some(answers);
-    *entry_forgotten = forgotten;
     entry.rendered = None;
     true
 }
 
-fn merge_tool_result(
-    transcript: &mut [TranscriptEntry],
-    event: &ThreadEvent,
-    forgotten: Option<String>,
-) -> bool {
-    merge_runner_tool_result(transcript, event, forgotten.clone())
-        || merge_question_tool_result(transcript, event, forgotten)
+fn merge_tool_result(transcript: &mut [TranscriptEntry], event: &ThreadEvent) -> bool {
+    merge_runner_tool_result(transcript, event) || merge_question_tool_result(transcript, event)
 }
 
 pub(crate) fn transcript_from_events(events: &[ThreadEvent]) -> Vec<TranscriptEntry> {
-    let forgetting =
-        project_tool_output_forgetting(events.iter().map(|event| (event.sequence, &event.data)));
     let mut transcript = Vec::new();
     for event in events {
-        let forgotten = forgetting.summary(event.sequence).map(sanitize);
-        if merge_tool_result(&mut transcript, event, forgotten.clone()) {
+        if merge_tool_result(&mut transcript, event) {
             continue;
         }
-        let projected_message = forgetting.projected_message(event.sequence);
-        if let Some(entry) = projected_entry(event.clone(), projected_message, forgotten) {
+        if let Some(entry) = TranscriptEntry::from_event(event.clone()) {
             transcript.push(entry);
         }
     }
     transcript
-}
-
-fn projected_entry(
-    mut event: ThreadEvent,
-    projected_message: Option<&str>,
-    forgotten: Option<String>,
-) -> Option<TranscriptEntry> {
-    if let Some(projected) = projected_message
-        && let ThreadEventData::AssistantMessage(message) = &mut event.data
-    {
-        message.content = projected.to_owned();
-        if message.content.trim().is_empty() && message.todos.is_empty() {
-            return None;
-        }
-    }
-    let mut entry = TranscriptEntry::from_event(event)?;
-    match &mut entry.item {
-        TranscriptItem::ToolResult {
-            forgotten: current, ..
-        } => *current = forgotten,
-        TranscriptItem::Question {
-            forgotten: current, ..
-        }
-        | TranscriptItem::RunnerTool {
-            forgotten: current, ..
-        } => *current = forgotten,
-        _ => {}
-    }
-    Some(entry)
 }
 
 fn sanitize_artifact(artifact: ToolArtifact) -> ToolArtifact {
@@ -967,56 +901,6 @@ mod tests {
         live.append_event(&call);
         live.append_event(&result);
         assert_answered_question(&live.entries);
-    }
-
-    #[test]
-    fn finalized_forget_directive_hides_prose_and_decorates_the_tool_result() {
-        let events = vec![
-            ThreadEvent {
-                sequence: EventSequence(1),
-                data: ThreadEventData::ToolCall(ToolCallEvent::Function {
-                    name: "lookup".to_owned(),
-                    arguments: serde_json::json!({"query": "value"}),
-                    call_id: "call-1".to_owned(),
-                }),
-            },
-            ThreadEvent {
-                sequence: EventSequence(2),
-                data: ThreadEventData::ToolResult(ToolResultEvent::Function {
-                    name: "lookup".to_owned(),
-                    call_id: "call-1".to_owned(),
-                    result: serde_json::json!({"large": "original"}),
-                    artifacts: Vec::new(),
-                }),
-            },
-            ThreadEvent {
-                sequence: EventSequence(3),
-                data: ThreadEventData::ModelRequest(atra_protocol::ModelRequestEvent {
-                    kind: atra_protocol::ModelRequestKind::Response,
-                    context_window: None,
-                }),
-            },
-            ThreadEvent {
-                sequence: EventSequence(4),
-                data: ThreadEventData::AssistantMessage(atra_protocol::AssistantMessageEvent {
-                    content: "<forget_output call_id=\"call-1\">remember this</forget_output>"
-                        .to_owned(),
-                    phase: atra_protocol::AssistantMessagePhase::Commentary,
-                    todos: Vec::new(),
-                }),
-            },
-        ];
-
-        let entries = transcript_from_events(&events);
-
-        assert_eq!(entries.len(), 2);
-        assert!(matches!(
-            &entries[1].item,
-            TranscriptItem::ToolResult {
-                forgotten: Some(summary),
-                ..
-            } if summary == "remember this"
-        ));
     }
 
     fn assert_answered_question(entries: &[TranscriptEntry]) {

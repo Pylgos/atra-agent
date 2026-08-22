@@ -7,12 +7,10 @@ use serde_json::Value;
 
 mod command;
 mod state;
-mod tool_output_forgetting;
 mod workspace;
 
 pub use command::{CommandParseError, RunnerCommand, parse_command_input};
 pub use state::*;
-pub use tool_output_forgetting::*;
 pub use workspace::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
