@@ -380,7 +380,7 @@ fn input(request: &ModelRequest<'_>, profile: Profile) -> Result<Vec<Value>> {
         },
         request.model,
     );
-    super::super::surface::derive(request.events, Some(&replay_key))?
+    super::super::surface::derive(request.events, Some(&replay_key), request.kind)?
         .items
         .into_iter()
         .filter_map(|item| {
@@ -1104,6 +1104,7 @@ mod tests {
             },
         ];
         let request = ModelRequest {
+            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "high",
             instructions: "instructions",
@@ -1141,6 +1142,7 @@ mod tests {
             }),
         }];
         let request = ModelRequest {
+            kind: atra_protocol::ModelRequestKind::Response,
             model: "fixture-model",
             reasoning_effort: "high",
             instructions: "instructions",
@@ -1167,6 +1169,7 @@ mod tests {
         let tools = crate::tools::model_tools(true);
         let events = Vec::new();
         let request = ModelRequest {
+            kind: atra_protocol::ModelRequestKind::Response,
             model: "gpt-5.2",
             reasoning_effort: "high",
             instructions: "instructions",

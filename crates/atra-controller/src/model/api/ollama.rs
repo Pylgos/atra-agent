@@ -378,13 +378,18 @@ fn request_messages(request: &ModelRequest<'_>) -> Result<Vec<Message>> {
     messages.extend(event_messages(
         request.events,
         Some(&thinking_replay_key(request.model)),
+        request.kind,
     )?);
     Ok(messages)
 }
 
-fn event_messages(events: &[Event], replay_key: Option<&str>) -> Result<Vec<Message>> {
+fn event_messages(
+    events: &[Event],
+    replay_key: Option<&str>,
+    request_kind: atra_protocol::ModelRequestKind,
+) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
-    for item in super::super::surface::derive(events, None)?.items {
+    for item in super::super::surface::derive(events, None, request_kind)?.items {
         match item {
             Item::Message { role, text, .. } => match role {
                 Role::Developer => messages.push(Message {
@@ -595,7 +600,12 @@ mod tests {
             ),
         ];
 
-        let messages = event_messages(&events, Some(&thinking_replay_key(model))).unwrap();
+        let messages = event_messages(
+            &events,
+            Some(&thinking_replay_key(model)),
+            atra_protocol::ModelRequestKind::Response,
+        )
+        .unwrap();
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].role, "assistant");
@@ -626,9 +636,13 @@ mod tests {
         )];
 
         assert!(
-            event_messages(&events, Some(&thinking_replay_key("current-model")))
-                .unwrap()
-                .is_empty()
+            event_messages(
+                &events,
+                Some(&thinking_replay_key("current-model")),
+                atra_protocol::ModelRequestKind::Response,
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -644,6 +658,7 @@ mod tests {
                 }),
             )],
             None,
+            atra_protocol::ModelRequestKind::Response,
         )
         .unwrap();
 

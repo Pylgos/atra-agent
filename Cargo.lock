@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "atra-patch-types",
  "atra-tree",
+ "regex",
  "serde",
  "serde_json",
 ]

@@ -218,7 +218,7 @@ pub(super) fn chat_messages(request: &ModelRequest<'_>) -> Result<Vec<Value>> {
         "role": "system",
         "content": request.instructions,
     })];
-    for item in super::surface::derive(request.events, None)?.items {
+    for item in super::surface::derive(request.events, None, request.kind)?.items {
         match item {
             Item::Message { role, text, .. } => messages.push(json!({
                 "role": match role {

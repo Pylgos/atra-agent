@@ -2124,7 +2124,7 @@ fn TurnCard(
     let prompt_sequence = turn.prompt_sequence();
     let answer = turn
         .answer()
-        .map(|(sequence, answer)| (sequence, render_markdown(answer)));
+        .map(|(sequence, answer)| (sequence, render_markdown(&answer)));
     let outcome = turn.outcome().cloned();
     let active = turn.is_active();
     let activities = turn.activity_keys();
@@ -2263,7 +2263,7 @@ fn TurnCopyButton(store: ThreadStore, turn_key: TurnKey, target: TurnCopyTarget)
                     turn.value().and_then(|turn| match target {
                         TurnCopyTarget::Prompt => Some(turn.prompt().to_owned()),
                         TurnCopyTarget::Answer => {
-                            turn.answer().map(|(_, answer)| answer.to_owned())
+                            turn.answer().map(|(_, answer)| answer.into_owned())
                         }
                     })
                 };
@@ -2373,7 +2373,7 @@ fn ActivityRow(
         ActivityDisplay::Commentary { markdown } => rsx! {
             article {
                 class: "activity-commentary markdown",
-                dangerous_inner_html: "{render_markdown(markdown)}",
+                dangerous_inner_html: "{render_markdown(&markdown)}",
             }
         },
         ActivityDisplay::Todo { items } => {
@@ -2412,6 +2412,7 @@ fn ActivityRow(
         }
         ActivityDisplay::Command(display) => {
             let operations = display.operations.clone();
+            let forgotten = display.forgotten.clone();
             rsx! {
                 button {
                     class: "activity-command",
@@ -2462,6 +2463,12 @@ fn ActivityRow(
                                 }
                             }
                         }
+                        if let Some(summary) = forgotten {
+                            div { class: "tool-forgotten",
+                                span { class: "tool-forgotten-badge", "Forgotten" }
+                                span { class: "tool-forgotten-summary", "{summary}" }
+                            }
+                        }
                     }
                 }
             }
@@ -2473,12 +2480,20 @@ fn ActivityRow(
                 span { "{summary}" }
             }
         },
-        ActivityDisplay::Question { summary, .. } => rsx! {
+        ActivityDisplay::Question {
+            summary, forgotten, ..
+        } => rsx! {
             button {
                 class: "activity-question",
                 onclick: move |_| on_select_activity.call((turn_key, activity_key.clone())),
                 span { class: "question-badge", "Question" }
                 span { class: "question-summary", "{summary}" }
+                if let Some(summary) = forgotten {
+                    span { class: "tool-forgotten",
+                        span { class: "tool-forgotten-badge", "Forgotten" }
+                        span { class: "tool-forgotten-summary", "{summary}" }
+                    }
+                }
             }
         },
         ActivityDisplay::Approval { allowed, reason } => rsx! {
@@ -2521,8 +2536,16 @@ fn ActivityRow(
         ActivityDisplay::Cancelled => rsx! {
             div { class: "activity-cancelled", "Cancelled" }
         },
-        ActivityDisplay::Unsupported { summary } => rsx! {
-            div { class: "activity-unsupported", "{summary}" }
+        ActivityDisplay::Unsupported { summary, forgotten } => rsx! {
+            div { class: "activity-unsupported",
+                "{summary}"
+                if let Some(summary) = forgotten {
+                    span { class: "tool-forgotten",
+                        span { class: "tool-forgotten-badge", "Forgotten" }
+                        span { class: "tool-forgotten-summary", "{summary}" }
+                    }
+                }
+            }
         },
     }
 }
@@ -2551,7 +2574,7 @@ fn ActivityDetail(
         ActivityDisplay::Commentary { markdown } => rsx! {
             div {
                 class: "activity-commentary markdown",
-                dangerous_inner_html: "{render_markdown(markdown)}",
+                dangerous_inner_html: "{render_markdown(&markdown)}",
             }
         },
         ActivityDisplay::Todo { items } => {
@@ -2589,9 +2612,20 @@ fn ActivityDetail(
                 }
             }
         },
-        ActivityDisplay::Command(display) => rsx! {
-            CommandOperations { display }
-        },
+        ActivityDisplay::Command(display) => {
+            let forgotten = display.forgotten.clone();
+            rsx! {
+                div {
+                    if let Some(summary) = forgotten {
+                        div { class: "tool-forgotten",
+                            span { class: "tool-forgotten-badge", "Forgotten" }
+                            span { class: "tool-forgotten-summary", "{summary}" }
+                        }
+                    }
+                    CommandOperations { display }
+                }
+            }
+        }
         ActivityDisplay::Search { detail, .. } => rsx! {
             div { class: "activity-search",
                 if !detail.is_empty() {
@@ -2599,8 +2633,16 @@ fn ActivityDetail(
                 }
             }
         },
-        ActivityDisplay::Question { detail, .. } => rsx! {
+        ActivityDisplay::Question {
+            detail, forgotten, ..
+        } => rsx! {
             div { class: "activity-question",
+                if let Some(summary) = forgotten {
+                    div { class: "tool-forgotten",
+                        span { class: "tool-forgotten-badge", "Forgotten" }
+                        span { class: "tool-forgotten-summary", "{summary}" }
+                    }
+                }
                 if !detail.is_empty() {
                     pre { class: "question-detail", "{detail}" }
                 }
@@ -2646,8 +2688,16 @@ fn ActivityDetail(
         ActivityDisplay::Cancelled => rsx! {
             div { class: "activity-cancelled", "Cancelled" }
         },
-        ActivityDisplay::Unsupported { summary } => rsx! {
-            div { class: "activity-unsupported", "{summary}" }
+        ActivityDisplay::Unsupported { summary, forgotten } => rsx! {
+            div { class: "activity-unsupported",
+                "{summary}"
+                if let Some(summary) = forgotten {
+                    div { class: "tool-forgotten",
+                        span { class: "tool-forgotten-badge", "Forgotten" }
+                        span { class: "tool-forgotten-summary", "{summary}" }
+                    }
+                }
+            }
         },
     }
 }

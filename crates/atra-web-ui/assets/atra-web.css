@@ -1286,6 +1286,31 @@ pre {
   font-size: 0.72rem;
 }
 
+.tool-forgotten {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  margin-top: 0.3rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.tool-forgotten-badge {
+  flex: none;
+  padding: 0.05rem 0.32rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tool-forgotten-summary {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .command-approval,
 .activity-approval,
 .activity-retry,

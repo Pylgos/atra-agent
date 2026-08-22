@@ -12,7 +12,7 @@ use atra_patch_types::{
 use atra_protocol::{
     ActiveItem, ActiveItemData, ActiveItemId, AssistantMessagePhase, CommandExecutionArtifact,
     EventSequence, RunnerOperationUpdate, ThreadEvent, ThreadEventData, ThreadState, TodoStatus,
-    ToolArtifact, ToolCallEvent, ToolResultEvent,
+    ToolArtifact, ToolCallEvent, ToolResultEvent, project_tool_output_forgetting,
 };
 use serde_json::Value;
 
@@ -96,7 +96,7 @@ pub(super) struct TurnRef<'a> {
 
 pub(super) enum ActivityDisplay<'a> {
     Commentary {
-        markdown: &'a str,
+        markdown: Cow<'a, str>,
     },
     Todo {
         items: &'a [atra_protocol::TodoItem],
@@ -112,6 +112,7 @@ pub(super) enum ActivityDisplay<'a> {
     Question {
         summary: String,
         detail: String,
+        forgotten: Option<String>,
     },
     Approval {
         allowed: bool,
@@ -133,6 +134,7 @@ pub(super) enum ActivityDisplay<'a> {
     Cancelled,
     Unsupported {
         summary: String,
+        forgotten: Option<String>,
     },
 }
 
@@ -142,6 +144,7 @@ pub(super) struct CommandDisplay {
     pub summary: String,
     pub operations: Vec<CommandOperationDisplay>,
     pub approvals: Vec<CommandApprovalDisplay>,
+    pub forgotten: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -275,7 +278,7 @@ impl<'a> TurnRef<'a> {
         self.prompt_sequence
     }
 
-    pub fn answer(&self) -> Option<(Option<EventSequence>, &'a str)> {
+    pub fn answer(&self) -> Option<(Option<EventSequence>, Cow<'a, str>)> {
         if self.is_last()
             && let Some(active) = self.state.active_turn()
             && let Some(content) = active.items().iter().find_map(|item| match item.data() {
@@ -286,8 +289,14 @@ impl<'a> TurnRef<'a> {
                 _ => None,
             })
         {
-            return Some((None, content));
+            return Some((None, Cow::Borrowed(content)));
         }
+        let forgetting = project_tool_output_forgetting(
+            self.state
+                .events()
+                .iter()
+                .map(|event| (event.sequence, &event.data)),
+        );
         if let Some(answer) = self
             .events()
             .iter()
@@ -296,7 +305,11 @@ impl<'a> TurnRef<'a> {
                 ThreadEventData::AssistantMessage(message)
                     if message.phase == AssistantMessagePhase::FinalAnswer =>
                 {
-                    Some((Some(event.sequence), message.content.as_str()))
+                    let content = forgetting.projected_message(event.sequence).map_or_else(
+                        || Cow::Borrowed(message.content.as_str()),
+                        |content| Cow::Owned(content.to_owned()),
+                    );
+                    (!content.trim().is_empty()).then_some((Some(event.sequence), content))
                 }
                 _ => None,
             })
@@ -320,13 +333,24 @@ impl<'a> TurnRef<'a> {
         let mut activities = Vec::new();
         let mut pending_tools = HashMap::<String, usize>::new();
         let mut pending_tool_indices = Vec::new();
+        let forgetting = project_tool_output_forgetting(
+            self.state
+                .events()
+                .iter()
+                .map(|event| (event.sequence, &event.data)),
+        );
 
         for event in self.events() {
             match &event.data {
                 ThreadEventData::AssistantMessage(message)
                     if message.phase == AssistantMessagePhase::Commentary =>
                 {
-                    activities.push(ActivityKey::Event(event.sequence));
+                    let content = forgetting
+                        .projected_message(event.sequence)
+                        .unwrap_or(&message.content);
+                    if !content.trim().is_empty() {
+                        activities.push(ActivityKey::Event(event.sequence));
+                    }
                     append_todo_key(&mut activities, event.sequence, &message.todos);
                 }
                 ThreadEventData::AssistantMessage(message) => {
@@ -439,6 +463,12 @@ pub(super) fn activity<'a>(
     key: &ActivityKey,
     finalized: &FinalizedActivities,
 ) -> Option<ActivityDisplay<'a>> {
+    let forgetting = project_tool_output_forgetting(
+        state
+            .events()
+            .iter()
+            .map(|event| (event.sequence, &event.data)),
+    );
     let resolved = resolve_activity_key(state, key, finalized);
     let key = &resolved;
     match key {
@@ -449,7 +479,10 @@ pub(super) fn activity<'a>(
                     if message.phase == AssistantMessagePhase::Commentary =>
                 {
                     Some(ActivityDisplay::Commentary {
-                        markdown: &message.content,
+                        markdown: forgetting.projected_message(event.sequence).map_or_else(
+                            || Cow::Borrowed(message.content.as_str()),
+                            |content| Cow::Owned(content.to_owned()),
+                        ),
                     })
                 }
                 ThreadEventData::Reasoning(reasoning) => Some(ActivityDisplay::Reasoning {
@@ -481,6 +514,7 @@ pub(super) fn activity<'a>(
                 }
                 ThreadEventData::ToolResult(_) => Some(ActivityDisplay::Unsupported {
                     summary: "Unmatched tool result".to_owned(),
+                    forgotten: forgetting.summary(event.sequence).map(str::to_owned),
                 }),
                 _ => None,
             }
@@ -492,14 +526,17 @@ pub(super) fn activity<'a>(
                 _ => return None,
             };
             let details = tool_activity_state(state, call_sequence);
-            let result = details
-                .result
+            let result_sequence = details.result;
+            let result = result_sequence
                 .and_then(|sequence| event(state, sequence))
                 .and_then(|event| match &event.data {
                     ThreadEventData::ToolResult(result) => Some(result),
                     _ => None,
                 });
             let name = tool_call_name(call);
+            let forgotten = result_sequence
+                .and_then(|sequence| forgetting.summary(sequence))
+                .map(str::to_owned);
             match canonical_tool_name(name) {
                 "command" => Some(ActivityDisplay::Command(command_display(
                     state,
@@ -507,10 +544,12 @@ pub(super) fn activity<'a>(
                     result,
                     identity.as_deref(),
                     &details.approvals,
+                    forgotten,
                 ))),
-                "question" => Some(question_display(call, result)),
+                "question" => Some(question_display(call, result, forgotten)),
                 _ => Some(ActivityDisplay::Unsupported {
                     summary: tool_summary(call),
+                    forgotten,
                 }),
             }
         }
@@ -579,12 +618,14 @@ fn active_activity<'a>(
                     None,
                     call_id.as_deref().or(Some(item_id)),
                     &[],
+                    None,
                 )))
             }
             "question" => Some(active_question_display(input)),
             _ => Some(ActivityDisplay::Unsupported {
                 summary: meaningful_text(input)
                     .unwrap_or_else(|| canonical_tool_name(name).to_owned()),
+                forgotten: None,
             }),
         },
         ActiveItemData::WebSearch { action, .. } => {
@@ -597,9 +638,9 @@ fn active_activity<'a>(
         ActiveItemData::RunnerTool { runner, update, .. } => {
             Some(orphan_runner_display(item.id().0, runner, update))
         }
-        ActiveItemData::Assistant { content, .. } => {
-            Some(ActivityDisplay::Commentary { markdown: content })
-        }
+        ActiveItemData::Assistant { content, .. } => Some(ActivityDisplay::Commentary {
+            markdown: Cow::Borrowed(content),
+        }),
     }
 }
 
@@ -697,6 +738,7 @@ fn search_results_detail(value: &Value) -> String {
 fn question_display(
     call: &ToolCallEvent,
     result: Option<&atra_protocol::ToolResultEvent>,
+    forgotten: Option<String>,
 ) -> ActivityDisplay<'static> {
     let arguments = match call {
         ToolCallEvent::Custom { input, .. } => serde_json::from_str(input).unwrap_or(Value::Null),
@@ -716,7 +758,11 @@ fn question_display(
         detail.push_str("Answer\n");
         detail.push_str(&question_answer_detail(value));
     }
-    ActivityDisplay::Question { summary, detail }
+    ActivityDisplay::Question {
+        summary,
+        detail,
+        forgotten,
+    }
 }
 
 fn active_question_display(input: &str) -> ActivityDisplay<'static> {
@@ -729,6 +775,7 @@ fn active_question_display(input: &str) -> ActivityDisplay<'static> {
     ActivityDisplay::Question {
         summary,
         detail: question_detail(&arguments),
+        forgotten: None,
     }
 }
 
@@ -796,6 +843,7 @@ fn command_display(
     result: Option<&atra_protocol::ToolResultEvent>,
     identity: Option<&str>,
     approvals: &[EventSequence],
+    forgotten: Option<String>,
 ) -> CommandDisplay {
     let mut operations = command_operations(call)
         .into_iter()
@@ -868,6 +916,7 @@ fn command_display(
         summary,
         operations,
         approvals,
+        forgotten,
     }
 }
 
@@ -1059,6 +1108,7 @@ fn orphan_runner_display(
         summary: format!("{} — {}", operation.status, operation.runner),
         operations: vec![operation],
         approvals: Vec::new(),
+        forgotten: None,
     })
 }
 
@@ -1253,7 +1303,7 @@ fn activity_header(state: &ThreadState, key: &ActivityKey) -> Option<(String, bo
                 if canonical_tool_name(tool_call_name(call)) == "command" {
                     command_input_summary(&tool_call_input(call))
                 } else if canonical_tool_name(tool_call_name(call)) == "question" {
-                    match question_display(call, None) {
+                    match question_display(call, None, None) {
                         ActivityDisplay::Question { summary, .. } => summary,
                         _ => unreachable!(),
                     }
@@ -1736,6 +1786,64 @@ mod tests {
     }
 
     #[test]
+    fn pretty_projection_hides_forget_prose_and_decorates_the_tool_activity() {
+        let state = state(vec![
+            event(0, "user_message", json!({"content": "run lookup"})),
+            event(
+                1,
+                "tool_call",
+                json!({
+                    "type": "function",
+                    "name": "lookup",
+                    "arguments": {"query": "value"},
+                    "call_id": "call-1"
+                }),
+            ),
+            event(
+                2,
+                "tool_result",
+                json!({
+                    "type": "function",
+                    "name": "lookup",
+                    "call_id": "call-1",
+                    "result": {"original": "visible in Raw"},
+                    "artifacts": []
+                }),
+            ),
+            event(
+                3,
+                "model_request",
+                json!({"kind": "response", "context_window": null}),
+            ),
+            event(
+                4,
+                "assistant_message",
+                json!({
+                    "content": "<forget_output call_id=\"call-1\">remember this</forget_output>",
+                    "phase": "commentary",
+                    "todos": []
+                }),
+            ),
+        ]);
+
+        let turn = turn(&state, TurnKey(EventSequence(0))).unwrap();
+        let keys = turn.activity_keys();
+        assert_eq!(keys.len(), 1);
+        let ActivityDisplay::Unsupported {
+            forgotten: Some(summary),
+            ..
+        } = activity(&state, &keys[0], &FinalizedActivities::default()).unwrap()
+        else {
+            panic!("tool activity should carry the forgetting summary");
+        };
+        assert_eq!(summary, "remember this");
+        assert!(
+            raw_item(&state, &RawKey::Event(EventSequence(4)))
+                .is_some_and(|raw| raw.contains("<forget_output"))
+        );
+    }
+
+    #[test]
     fn flat_events_are_exposed_as_borrowed_turns() {
         let state = state(vec![
             event(1, "user_message", json!({"content": "first"})),
@@ -1760,7 +1868,10 @@ mod tests {
         );
         let first = turn(&state, TurnKey(EventSequence(1))).unwrap();
         assert_eq!(first.prompt(), "first");
-        assert_eq!(first.answer(), Some((Some(EventSequence(3)), "answer")));
+        assert_eq!(
+            first.answer(),
+            Some((Some(EventSequence(3)), Cow::Borrowed("answer")))
+        );
         assert_eq!(
             first.activity_keys(),
             vec![
@@ -1825,7 +1936,7 @@ mod tests {
 
         let turn = turn(&state, TurnKey(EventSequence(1))).unwrap();
         assert!(turn.activity_keys().is_empty());
-        assert_eq!(turn.answer(), Some((None, "streaming")));
+        assert_eq!(turn.answer(), Some((None, Cow::Borrowed("streaming"))));
     }
 
     #[test]
@@ -1861,7 +1972,7 @@ mod tests {
                 &FinalizedActivities::default()
             ),
             Some(ActivityDisplay::Commentary {
-                markdown: "working"
+                markdown: Cow::Borrowed("working")
             })
         ));
     }

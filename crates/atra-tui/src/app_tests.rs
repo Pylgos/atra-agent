@@ -1031,6 +1031,7 @@ fn ctrl_c_prioritizes_input_copy_transcript_copy_cancel_and_clear() {
 #[test]
 fn layout_mapping_does_not_insert_soft_wraps() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
+        forgotten: None,
         artifacts: vec![ToolArtifact::CommandExecution(
             CommandExecutionArtifact::Finished {
                 output: "abcdefgh\nsecond".to_owned(),
@@ -1054,6 +1055,7 @@ fn layout_mapping_does_not_insert_soft_wraps() {
 #[test]
 fn running_command_timer_uses_the_runner_snapshot() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::RunnerTool {
+        forgotten: None,
         call_id: "call-1".to_owned(),
         input: "*** Runner sandbox\nsleep 200".to_owned(),
         results: std::collections::BTreeMap::from([(
@@ -1081,6 +1083,7 @@ fn running_command_timer_uses_the_runner_snapshot() {
 #[test]
 fn paused_command_timer_uses_the_runner_snapshot() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::RunnerTool {
+        forgotten: None,
         call_id: "call-1".to_owned(),
         input: "*** Runner sandbox\natri proc wait child".to_owned(),
         results: std::collections::BTreeMap::from([(
@@ -1105,6 +1108,7 @@ fn paused_command_timer_uses_the_runner_snapshot() {
 #[test]
 fn detached_command_is_not_rendered_as_running() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::ToolResult {
+        forgotten: None,
         artifacts: vec![ToolArtifact::CommandExecution(
             CommandExecutionArtifact::Running {
                 output: String::new(),
@@ -1181,6 +1185,7 @@ fn question_tool_call_has_a_structured_transcript_rendering() {
 #[test]
 fn answered_question_marks_the_selection_and_shows_the_note() {
     let mut items = vec![TranscriptEntry::new(TranscriptItem::Question {
+        forgotten: None,
         call_id: Some("question-1".to_owned()),
         arguments: serde_json::json!({
             "questions": [{
